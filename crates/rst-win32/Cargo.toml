@@ -1,0 +1,12 @@
+[package]
+name = "rst-win32"
+description = "Safe Win32 wrappers for resticker: windows, WinEvent hooks, hotkeys, tray, DPI, monitors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

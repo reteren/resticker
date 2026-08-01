@@ -1,0 +1,13 @@
+[package]
+name = "resticker"
+description = "Desktop sticker overlay app — entry point and thread wiring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rst-core = { path = "../rst-core" }
+
+[lints]
+workspace = true
