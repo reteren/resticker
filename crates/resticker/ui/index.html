@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <title>resticker — настройки</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        background: #1e1e28;
+        color: #e8e8ec;
+      }
+      nav {
+        display: flex;
+        border-bottom: 1px solid #33333f;
+      }
+      nav button {
+        flex: 1;
+        padding: 0.75rem;
+        background: none;
+        border: none;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+      }
+      nav button.active {
+        background: #2a2a38;
+        border-bottom: 2px solid #ff8c00;
+      }
+      section {
+        display: none;
+        padding: 1.5rem;
+      }
+      section.active {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- M0: пустой каркас вкладок (SPEC.md, раздел 3). Наполнение — следующие вехи. -->
+    <nav id="tabs">
+      <button data-tab="stickers" class="active">Стикеры</button>
+      <button data-tab="presets">Пресеты</button>
+      <button data-tab="control">Управление</button>
+      <button data-tab="general">Общие</button>
+    </nav>
+    <section id="stickers" class="active"></section>
+    <section id="presets"></section>
+    <section id="control"></section>
+    <section id="general"></section>
+    <script>
+      document.getElementById('tabs').addEventListener('click', (e) => {
+        const tab = e.target.dataset.tab;
+        if (!tab) return;
+        for (const b of document.querySelectorAll('nav button')) {
+          b.classList.toggle('active', b.dataset.tab === tab);
+        }
+        for (const s of document.querySelectorAll('section')) {
+          s.classList.toggle('active', s.id === tab);
+        }
+      });
+    </script>
+  </body>
+</html>

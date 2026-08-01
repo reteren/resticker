@@ -1,0 +1,9 @@
+{
+  "name": "resticker",
+  "private": true,
+  "version": "0.1.0",
+  "description": "resticker settings window (Tauri) — build tooling only, no runtime JS framework in M0",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
