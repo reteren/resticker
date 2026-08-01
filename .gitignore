@@ -1,0 +1,41 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Node / Tauri frontend
+node_modules/
+ui/dist/
+ui/.vite/
+.pnpm-store/
+
+# Tauri
+src-tauri/target/
+gen/
+
+# FFmpeg (locally vendored, not committed)
+/vendor/ffmpeg/
+*.dll
+*.lib
+*.exp
+
+# IDE
+.vscode/
+.idea/
+*.user
+.rr/
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Local runtime artifacts
+/logs/
+/cache/
+*.log
+
+# Profiling output
+*.wpapk
+*.etl
+*.diagsession
+*.wpix
