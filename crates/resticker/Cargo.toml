@@ -12,9 +12,11 @@ tauri-build = { version = "2" }
 [dependencies]
 rst-core = { path = "../rst-core" }
 rst-win32 = { path = "../rst-win32" }
+rst-render = { path = "../rst-render" }
 anyhow = "1"
 chrono = { workspace = true }
 tauri = { version = "2" }
+tauri-plugin-dialog = "2"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

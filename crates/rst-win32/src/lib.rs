@@ -7,6 +7,7 @@
 
 pub mod autostart;
 mod error;
+pub mod overlay;
 pub mod tray;
 
 pub use error::Win32Error;

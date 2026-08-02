@@ -1,20 +1,30 @@
 //! resticker — точка входа.
 //!
 //! M0: логирование, конфиг, трей, окно настроек (Tauri, пустые вкладки),
-//! автозапуск. Оверлей и остальные потоки — следующие вехи (ROADMAP.md).
+//! автозапуск. M1: оверлей-окно + рендерер на своём потоке
+//! (`overlay_manager`), добавление стикера из настроек, восстановление
+//! между запусками. Остальное — следующие вехи (ROADMAP.md).
 
 mod logging;
+mod overlay_manager;
 
 use std::path::PathBuf;
 
 use anyhow::Context;
 use tauri::{Manager, WindowEvent};
 
+use overlay_manager::{OverlayCommand, OverlayHandle};
 use rst_win32::tray::{self, MenuItem, TrayEvent, TrayIcon};
 
 const MENU_OPEN_SETTINGS: u32 = 1;
 const MENU_TOGGLE_VISIBLE: u32 = 2;
 const MENU_EXIT: u32 = 3;
+
+/// Добавить стикер по пути, выбранному в диалоге настроек (M1).
+#[tauri::command]
+fn add_sticker(path: String, overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::AddSticker(PathBuf::from(path)));
+}
 
 fn config_path() -> anyhow::Result<PathBuf> {
     let base = std::env::var_os("APPDATA").context("переменная APPDATA не задана")?;
@@ -64,9 +74,13 @@ fn main() -> anyhow::Result<()> {
     .context("инициализация иконки трея")?;
 
     let silent_start = cfg.settings.silent_start;
+    let overlay_handle = overlay_manager::start(cfg_path, cfg);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(tray_icon)
+        .manage(overlay_handle)
+        .invoke_handler(tauri::generate_handler![add_sticker])
         .setup(move |app| {
             if !silent_start {
                 if let Some(w) = app.get_webview_window("settings") {
@@ -85,8 +99,9 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         TrayEvent::MenuItem(MENU_TOGGLE_VISIBLE) => {
-                            // Стикеров ещё нет до M1 — переключателю нечего делать.
-                            tracing::info!("показать/скрыть все: нет стикеров, no-op до M1");
+                            // Массовый переключатель видимости — M2 (тулбар/состояние
+                            // редактирования); пункт меню уже есть, поведение — позже.
+                            tracing::info!("показать/скрыть все: пока no-op, реализация в M2");
                         }
                         TrayEvent::MenuItem(MENU_EXIT) => handle.exit(0),
                         TrayEvent::MenuItem(_) => {}

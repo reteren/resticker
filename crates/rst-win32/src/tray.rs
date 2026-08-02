@@ -15,8 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, IDI_APPLICATION,
     LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
     SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
-    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPED,
+    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP,
+    WM_RBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -100,10 +100,16 @@ impl TrayIcon {
 
 impl Drop for TrayIcon {
     fn drop(&mut self) {
-        // SAFETY: self.hwnd — наше окно, действительное до выхода из цикла
-        // сообщений на его потоке (WM_DESTROY → PostQuitMessage).
+        // Окно принадлежит потоку трея, поэтому уничтожает его он сам: шлём
+        // WM_CLOSE, DefWindowProc вызовет DestroyWindow на его потоке, а наш
+        // обработчик WM_DESTROY завершит цикл сообщений. Прямой вызов
+        // DestroyWindow отсюда (другой поток) молча проваливается — окно,
+        // созданное другим потоком, он не уничтожает, — и join() ниже
+        // зависал бы навсегда.
+        // SAFETY: self.hwnd — наше окно; PostMessage безопасен и для уже
+        // уничтоженного окна (просто вернёт ошибку, которую игнорируем).
         unsafe {
-            let _ = DestroyWindow(self.hwnd);
+            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -367,5 +373,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // SAFETY: делегирование необработанных сообщений системному обработчику.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    #[test]
+    fn create_then_drop_destroys_window() {
+        let (tray, _rx) = TrayIcon::new("test", vec![]).expect("создание трея");
+        let hwnd = tray.hwnd;
+        // SAFETY: hwnd — живое окно трея, создание выше проверено.
+        assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+
+        drop(tray);
+
+        // Если бы Drop звал DestroyWindow напрямую (чужой поток), эта
+        // проверка не выполнилась бы никогда: t.join() зависал бы навсегда,
+        // и тест не дошёл бы до сюда — таймаут раньше, чем assert-провал.
+        // SAFETY: после Drop окно уничтожено; IsWindow над мёртвым хэндлом —
+        // простое чтение, хэндл мы больше никуда не передаём.
+        assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
     }
 }

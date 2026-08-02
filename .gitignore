@@ -35,6 +35,11 @@ desktop.ini
 /cache/
 *.log
 
+# Ad-hoc debug output from build/test scratch commands (repo root only)
+/*.out
+/*.err
+/*.ps1
+
 # Profiling output
 *.wpapk
 *.etl

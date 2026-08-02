@@ -7,7 +7,7 @@
     "frontendDist": "ui"
   },
   "app": {
-    "withGlobalTauri": false,
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "settings",
