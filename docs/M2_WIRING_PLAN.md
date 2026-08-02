@@ -11,6 +11,10 @@
 Всё ниже — сшивка существующих примитивов, без нового рендера и без новых
 зависимостей (кроме пары вспомогательных функций, отмечены явно).
 
+Тулбар при мультивыделении (`selection.len() > 1`) учтён в плане напрямую:
+состав и семантика действий по `M2_MULTISELECT_TOOLBAR_NOTES.md` (§2–§6)
+вписаны в §4 и §6.
+
 ---
 
 ## 1. Текущее состояние и цель
@@ -36,7 +40,8 @@ struct EditState {
     // … существующие поля …
 
     // Retained-виджеты (hover/фокус/захват живут внутри Panel).
-    toolbar: Option<Panel>,          // есть, когда selection.len() == 1
+    toolbar: Option<Panel>,          // есть, когда selection.len() >= 1 (и
+                                     // edit.marquee.is_none()), §4 и §6
     cursor_panel: Option<Panel>,     // есть, когда active
     confirm: Option<ConfirmState>,   // модал удаления, когда Some
 
@@ -101,16 +106,28 @@ struct ConfirmState {
 
 | Панель | Показывается | Скрывается |
 |---|---|---|
-| **Тулбар** | `active && selection.len() == 1` | выход из режима; изменение числа выделенных |
+| **Тулбар** | `active && selection.len() >= 1` (мульти — без слайдера/поля, §6) | выход из режима; изменение числа выделенных; скрыт, пока `edit.marquee.is_some()` |
 | **Панель у курсора** | вход в режим (`active`), позиция — курсор | выход из режима |
 | **Модал подтверждения** | `ConfirmState::Some` (запрос на удаление) | Cancel/Delete/Esc |
 
-**Тулбар** (`toolbar::build_toolbar(selection_box, opacity, screen_h)`):
-- пересобрать при смене выделенного id (клик, `Ctrl+A`, дублирование, undo/redo,
-  `Delete`) — билдер дёшев, но **сбрасывает hover**;
+**Тулбар** (`toolbar::build_toolbar(bounds: &DipRect, opacity: Option<f64>, screen_h: f64)`):
+- билдер **унифицирован** для одиночного и мульти: `bounds` — union AABB
+  `selection.bounds(&cfg.stickers)` (для одиночного — тот же ось-выровненный
+  прямоугольник, что раньше строил `selection_aabb`); `opacity: Some(o)` —
+  одиночный со слайдером и полем, `None` — мульти без них (SPEC 3.6);
+  `TOOLBAR_WIDTH` — функция режима (без слайдера/поля панель уже);
+- `bounds()` → `None` (пустое выделение / все вырожденные стикеры) — тулбар
+  не строить;
+- пересобрать при смене числа выделенных (клик — сворачивает к одиночному,
+  `Ctrl+A`, отпускание марки, `Ctrl+D`/`TB_DUPLICATE`, undo/redo после
+  `selection.prune`, `Delete`) — билдер дёшев, но **сбрасывает hover**;
+- **во время марки не показывать**: `rubber_band` пересобирает выделение на
+  каждом `MouseMove` (§8), поэтому тулбар виден только при
+  `edit.marquee.is_none()`; после `MouseUp` марки пересобрать по финальному
+  выделению;
 - при **перетаскивании** не пересобирать, а `toolbar.translate(dx, dy)` по дельте
   стикера (SPEC 3.6: тулбар едет за выделением в том же кадре);
-- зеркало opacity: после любого изменения `slider/field` —
+- зеркало opacity (только одиночный): после любого изменения `slider/field` —
   `widget_mut::<Slider>(TB_SLIDER).set_value(v)` и
   `widget_mut::<NumericField>(TB_FIELD).set_value(v)` синхронно (§6).
 
@@ -191,6 +208,31 @@ Toolbar и копился `ui_pending_snapshot` — отбросить его; �
 иначе отбросить (клик по дорожке без движения — не тратить шаг истории).
 Модель: opacity живёт в `transform.opacity` — переиспользовать `apply_transform`
 (placement не меняется).
+
+### Тулбар (мультивыделение, `selection.len() > 1`)
+
+Состав — только 5 кнопок (§4): ползунок и числовое поле не строятся (SPEC 3.6).
+`ids = selection.ids()` — каждая операция применяется ко всему выделению и делает
+**один** `commit_undo_snapshot` до применения (`Ctrl+Z` снимает батч целиком).
+
+| Виджет | Чтение | Действие |
+|---|---|---|
+| `TB_SLIDER` / `TB_FIELD` | — | не строятся — в мульти-тулбаре их нет (§4) |
+| `TB_EYE` | `take_click()` | `commit_undo_snapshot` + `ops::set_visible_many(cfg, &ids, target)` + save; `target = !(все выбранные видимы)` — группа сходится к однородному состоянию: все видимы → скрыть всех, есть скрытый → показать всех; иконка детерминирована (`Eye`/`EyeOff`); для одиночного вырождается в существующий тоггл |
+| `TB_ORDER_UP` | `take_click()` | `commit_undo_snapshot` + `ops::step_up_many(cfg, &ids)` + save — выделение как блок: диапазон `[min..max]` по `order` сдвигается вверх на одну позицию, внутренний порядок не меняется, no-op, если верхний выбранный уже наверху |
+| `TB_ORDER_DOWN` | `take_click()` | `commit_undo_snapshot` + `ops::step_down_many(cfg, &ids)` + save — блок вниз, no-op, если нижний выбранный уже внизу |
+| `TB_DUPLICATE` | `take_click()` | общий `duplicate_selection(...)` — тот же, что у `Ctrl+D`: один снимок, копии всех выделенных на верх (`max+1`), `resync_sprites`, снять выделение, выбрать все копии, save |
+| `TB_DELETE` | `take_click()` | `begin_delete(...)` (§7) — уже батч: `count = selection.len()`, один снимок, правок не требуется |
+
+Новые чистые функции в `rst_core::ops` (+ юнит-тесты, как у существующих):
+`set_visible_many(config, ids, visible)` и `step_up_many`/`step_down_many`
+(сдвиг границы диапазона в списке, отсортированном по `order`, через
+`normalize_orders`).
+
+Общий helper `duplicate_selection(edit, cfg, renderer, sprites, config_path)`
+в `overlay_manager.rs`: извлечь из ветки `Ctrl+D` (существующий хоткей, §10) и
+звать его и из неё, и из `TB_DUPLICATE` (одиночного и мульти) — кнопка и хоткей
+не расходятся.
 
 ### Панель у курсора
 
@@ -316,6 +358,9 @@ UI) — `marquee_visuals(anchor, current)` → `fill` и `dashes` как спр�
 (`CF_UNICODETEXT`) — в `clipboard.rs` сейчас только картинки; это единственное
 новое чтение буфера.
 
+Ветка существует только в одиночном режиме: мульти-тулбар поля не имеет (§4),
+там `Ctrl+V` всегда обычная вставка (§9.Б).
+
 **Б. Обычная вставка (новая картинка):**
 ```rust
 match rst_win32::clipboard::read_image() {
@@ -363,7 +408,8 @@ match rst_win32::clipboard::read_image() {
    `VK_ESCAPE`→`Escape`, `VK_LEFT`/`VK_RIGHT`→arrows) и отдать
    `toolbar.key_event(key)`; если `consumed` — вернуть `redraw`, **не** выполняя
    сцену. Важно: `Esc` здесь обрабатывает **поле** (`take_cancelled()`),
-   а не выход из режима.
+   а не выход из режима. Ветка — только для одиночного тулбара (мульти без
+   ползунка/поля, §4).
 4. Существующие хоткеи: `Esc` (выход), `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y`,
    `Ctrl+A`, `Ctrl+D`, `Delete` (через `begin_delete`), `Ctrl+V` (§9).
 
@@ -426,8 +472,11 @@ cursor_panel → toolbar) — `post_cursor_shape(Arrow)`; иначе зона с
    и показываются (§4), действия кнопок и opacity (§6).
 4. Confirm-диалог через `begin_delete` (§7), перехват в `handle_key`.
 5. `Gesture::Marquee` + `rubber_band` + `marquee_visuals` (§8).
-6. `Ctrl+V` (§9) + фокус-поле (§10.3).
-7. Round-trip `CoordinatorRequest` (§12) для `BTN_LOAD_FILE`/`BTN_SETTINGS`.
+6. Мультивыделение тулбара: условие показа `>= 1` + скрытие во время марки (§4);
+   `ops::set_visible_many`/`step_up_many`/`step_down_many` и мульти-действия
+   кнопок (§6); общий `duplicate_selection` для `Ctrl+D` и `TB_DUPLICATE` (§6).
+7. `Ctrl+V` (§9) + фокус-поле (§10.3).
+8. Round-trip `CoordinatorRequest` (§12) для `BTN_LOAD_FILE`/`BTN_SETTINGS`.
 
 Каждый шаг — build/clippy/test + ручной прогон соответствующего действия.
 
@@ -445,3 +494,7 @@ cursor_panel → toolbar) — `post_cursor_shape(Arrow)`; иначе зона с
   позиции — SPEC 3.8, отдельный шаг (поле в config.json).
 - **Скрытые стикеры** рисуются/хитятся только `visible` (M2-срез 3); шахматка
   скрытых в режиме редактирования — остаётся следующим срезом (не блокер UI).
+- **Мульти-действия тулбара** — `ops::set_visible_many`/`step_up_many`/
+  `step_down_many` (§6), чистые функции с юнит-тестами.
+- **Мульти-драг/ресайз** (`resolve_zone`, ручки мультивыделения) — не задача
+  тулбара; в срезе не трогаем (§4), задел на следующий шаг.
