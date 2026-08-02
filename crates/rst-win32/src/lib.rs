@@ -7,6 +7,7 @@
 pub mod autostart;
 pub mod clipboard;
 mod error;
+pub mod file_dialog;
 pub mod hotkey;
 pub mod input;
 pub mod monitors;

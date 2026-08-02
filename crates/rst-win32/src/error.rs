@@ -22,6 +22,8 @@ pub enum Win32Error {
     ClipboardBusy,
     #[error("повреждённые данные в буфере обмена: {0}")]
     ClipboardDataCorrupt(&'static str),
+    #[error("путь из системного диалога выбора файла повреждён (не валидный UTF-16)")]
+    FileDialogPathInvalid,
     #[error("реестр: {0}")]
     Registry(#[from] std::io::Error),
     #[error("Win32: {0}")]
