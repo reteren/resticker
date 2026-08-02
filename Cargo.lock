@@ -2543,6 +2543,13 @@ dependencies = [
 [[package]]
 name = "rst-media"
 version = "0.1.0"
+dependencies = [
+ "image",
+ "rst-win32",
+ "tempfile",
+ "thiserror 2.0.19",
+ "uuid",
+]
 
 [[package]]
 name = "rst-render"

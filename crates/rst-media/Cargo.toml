@@ -7,6 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# Тип ClipboardImage — поверхность rst-win32; rst-core не знает про Windows
+# (CONTRIBUTING.md, «Правило зависимостей»), поэтому материализация вставок
+# живёт здесь, в rst-media.
+rst-win32 = { path = "../rst-win32" }
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

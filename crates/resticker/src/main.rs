@@ -7,6 +7,12 @@
 
 mod logging;
 mod overlay_manager;
+// Модал подтверждения удаления и тулбар — модули собираются и тестируются,
+// но вызов build() добавит координатор (вёрстка в срез 4); до этого items мертвы.
+#[allow(dead_code)]
+mod confirm_dialog;
+#[allow(dead_code)]
+mod toolbar;
 
 use std::path::PathBuf;
 

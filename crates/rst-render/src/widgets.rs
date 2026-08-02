@@ -916,6 +916,11 @@ impl Panel {
         self.id
     }
 
+    /// Границы панели (фон), DIP.
+    pub fn frame(&self) -> Box2D {
+        self.frame
+    }
+
     /// Идентификатор сфокусированного виджета, если есть.
     pub fn focused_widget(&self) -> Option<WidgetId> {
         self.focus.map(|i| self.widgets[i].id())

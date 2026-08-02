@@ -54,9 +54,10 @@ const VK_Z: u32 = 0x5A;
 /// Глубина истории undo/redo — снимков `Config` (см. заметку о снимках выше).
 const UNDO_CAPACITY: usize = 100;
 
-/// Кольцо поворота — зона за угловой ручкой (SPEC 3.3): от `ROTATE_RING_MIN_DIP`
-/// (сразу за телом стикера) до `ROTATE_RING_MAX_DIP` от центра ручки.
-const ROTATE_RING_MIN_INFLATE_DIP: f64 = 6.0;
+/// Кольцо поворота — зона за угловой ручкой (SPEC 3.3): начинается сразу за
+/// квадратом ручки (проверяется раньше в `resolve_zone`, так что здесь нет
+/// отдельной внутренней границы) и тянется до `ROTATE_RING_MAX_DIP` от её
+/// центра.
 const ROTATE_RING_MAX_DIP: f64 = 24.0;
 
 pub enum OverlayCommand {
@@ -169,6 +170,11 @@ struct EditState {
     /// Снимки, отменённые через `Ctrl+Z` — доступны для `Ctrl+Y`/`Ctrl+Shift+Z`
     /// до следующего нового действия (стандартная семантика редакторов).
     redo_stack: Vec<Config>,
+    /// `Config` на момент `MouseDown`, ещё не в `undo_stack`: жест кладёт
+    /// снимок в историю только на `MouseUp`, и только если что-то реально
+    /// изменилось — иначе клик без движения тратил бы шаг истории
+    /// (docs/M2_SLICE_REVIEW.md, пункт 1).
+    pending_snapshot: Option<Config>,
 }
 
 fn run(
@@ -260,6 +266,7 @@ fn run(
         snap: SnapConfig::default(),
         undo_stack: Vec::new(),
         redo_stack: Vec::new(),
+        pending_snapshot: None,
     };
 
     redraw(
@@ -290,7 +297,7 @@ fn run(
             }
             OverlayMessage::Command(OverlayCommand::Shutdown) => break,
             OverlayMessage::Event(OverlayEvent::ToggleEditMode) => {
-                toggle_edit_mode(&overlay, &mut edit, &mut cfg, &config_path);
+                toggle_edit_mode(&overlay, &mut edit, &mut cfg, &mut sprites, &config_path);
                 need_redraw = true;
             }
             OverlayMessage::Event(OverlayEvent::Key {
@@ -349,11 +356,25 @@ fn toggle_edit_mode(
     overlay: &OverlayWindow,
     edit: &mut EditState,
     cfg: &mut Config,
+    sprites: &mut [(Uuid, Sprite)],
     config_path: &Path,
 ) {
+    // Выход во время незавершённого жеста откатывает его — так же, как
+    // CaptureLost, а не коммитит середину перетаскивания (docs/M2_SLICE_REVIEW.md,
+    // пункт 4: раньше это было асимметрично).
+    if let Some(gesture) = edit.gesture.take() {
+        let start = gesture.start();
+        apply_transform(
+            cfg,
+            sprites,
+            start.id,
+            start.placement.clone(),
+            start.transform,
+        );
+    }
+    edit.pending_snapshot = None;
     edit.active = !edit.active;
     overlay.set_click_through(!edit.active);
-    edit.gesture = None;
     if !edit.active {
         edit.selection.clear();
         if let Err(e) = config::save(cfg, config_path) {
@@ -362,14 +383,15 @@ fn toggle_edit_mode(
     }
 }
 
-/// Сохранить текущий `cfg` в историю undo перед мутирующим действием
-/// (жест, удаление, дублирование) и очистить историю redo — новая ветка
-/// истории (семантика как у `rst_core::undo::UndoStack::push`).
-fn push_undo_snapshot(edit: &mut EditState, cfg: &Config) {
+/// Положить готовый снимок `Config` в историю undo и очистить историю redo —
+/// новая ветка истории (семантика как у `rst_core::undo::UndoStack::push`).
+/// Снимок берётся заранее (см. `pending_snapshot`), а не всегда «текущий
+/// cfg», чтобы жест мог отложить решение до `MouseUp` (пункт 1 ревью).
+fn commit_undo_snapshot(edit: &mut EditState, snapshot: Config) {
     if edit.undo_stack.len() == UNDO_CAPACITY {
         edit.undo_stack.remove(0);
     }
-    edit.undo_stack.push(cfg.clone());
+    edit.undo_stack.push(snapshot);
     edit.redo_stack.clear();
 }
 
@@ -409,6 +431,11 @@ fn perform_undo(
     let Some(prev) = edit.undo_stack.pop() else {
         return false;
     };
+    // Жест не мог быть активен здесь (Ctrl+Z игнорируется, пока
+    // `edit.gesture.is_some()`, см. `handle_key`), но снимаем защитно —
+    // docs/M2_SLICE_REVIEW.md, пункт 5.
+    edit.gesture = None;
+    edit.pending_snapshot = None;
     edit.redo_stack.push(std::mem::replace(cfg, prev));
     resync_sprites(renderer, cfg, sprites);
     edit.selection.prune(&cfg.stickers);
@@ -428,6 +455,11 @@ fn perform_redo(
     let Some(next) = edit.redo_stack.pop() else {
         return false;
     };
+    edit.gesture = None;
+    edit.pending_snapshot = None;
+    if edit.undo_stack.len() == UNDO_CAPACITY {
+        edit.undo_stack.remove(0);
+    }
     edit.undo_stack.push(std::mem::replace(cfg, next));
     resync_sprites(renderer, cfg, sprites);
     edit.selection.prune(&cfg.stickers);
@@ -452,9 +484,17 @@ fn handle_key(
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
 ) -> bool {
+    // История/удаление/дублирование во время активного жеста мутировали бы
+    // cfg из-под него — жест продолжал бы считать от своего старого
+    // GestureStart поверх уже изменённого состояния (docs/M2_SLICE_REVIEW.md,
+    // пункт 2). Esc — исключение: toggle_edit_mode сам корректно откатывает
+    // незавершённый жест перед выходом.
+    if edit.gesture.is_some() && vk != VK_ESCAPE {
+        return false;
+    }
     match vk {
         VK_ESCAPE => {
-            toggle_edit_mode(overlay, edit, cfg, config_path);
+            toggle_edit_mode(overlay, edit, cfg, sprites, config_path);
             true
         }
         VK_Z if modifiers.ctrl && modifiers.shift => {
@@ -470,7 +510,7 @@ fn handle_key(
             if edit.selection.is_empty() {
                 return false;
             }
-            push_undo_snapshot(edit, cfg);
+            commit_undo_snapshot(edit, cfg.clone());
             for id in edit.selection.ids().to_vec() {
                 let _ = ops::delete(cfg, id);
             }
@@ -485,7 +525,7 @@ fn handle_key(
             if edit.selection.is_empty() {
                 return false;
             }
-            push_undo_snapshot(edit, cfg);
+            commit_undo_snapshot(edit, cfg.clone());
             let mut new_ids = Vec::new();
             for id in edit.selection.ids().to_vec() {
                 if let Ok(new_id) = ops::duplicate(cfg, id) {
@@ -533,25 +573,22 @@ fn resolve_zone(cfg: &Config, selection: &SelectionSet, dip_x: f64, dip_y: f64) 
     if let [id] = selection.ids() {
         if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) {
             let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
-            let outside_body = !hittest::contains_inflated(
-                &sticker.placement,
-                &sticker.transform,
-                dip_x,
-                dip_y,
-                ROTATE_RING_MIN_INFLATE_DIP,
-            );
-            if outside_body {
-                for corner in CoreCorner::ALL {
-                    let (hx, hy) = sbox.handle_center(corner.handle());
-                    let dist = (dip_x - hx).hypot(dip_y - hy);
-                    if dist <= ROTATE_RING_MAX_DIP {
-                        return Zone::Rotate(*id, corner);
-                    }
-                }
-            }
+            // Ручки ресайза — высший приоритет: их квадрат (сторона
+            // HANDLE_SIZE_DIP) целиком накрывает свой угол, поэтому кольцо
+            // поворота ниже начинается ровно за его границей без мёртвой
+            // зоны и без квадратного «угла» на внутренней границе
+            // (docs/M2_SLICE_REVIEW.md, пункт 3 — раньше внутренняя граница
+            // считалась от тела стикера, а не от центра ручки).
             for (kind, rect) in sbox.handle_rects(rst_render::HANDLE_SIZE_DIP) {
                 if point_in_box2d(&rect, dip_x, dip_y) {
                     return Zone::ResizeHandle(*id, kind);
+                }
+            }
+            for corner in CoreCorner::ALL {
+                let (hx, hy) = sbox.handle_center(corner.handle());
+                let dist = (dip_x - hx).hypot(dip_y - hy);
+                if dist <= ROTATE_RING_MAX_DIP {
+                    return Zone::Rotate(*id, corner);
                 }
             }
             if hittest::contains(&sticker.placement, &sticker.transform, dip_x, dip_y) {
@@ -660,7 +697,7 @@ fn handle_input(
                         };
                         let grab_dx = dip_x - sticker.placement.cx;
                         let grab_dy = dip_y - sticker.placement.cy;
-                        push_undo_snapshot(edit, cfg);
+                        edit.pending_snapshot = Some(cfg.clone());
                         edit.gesture = Some(Gesture::Drag {
                             start,
                             grab_dx,
@@ -676,7 +713,7 @@ fn handle_input(
                             placement: sticker.placement.clone(),
                             transform: sticker.transform,
                         };
-                        push_undo_snapshot(edit, cfg);
+                        edit.pending_snapshot = Some(cfg.clone());
                         edit.gesture = Some(Gesture::Resize {
                             start,
                             handle,
@@ -692,7 +729,7 @@ fn handle_input(
                             placement: sticker.placement.clone(),
                             transform: sticker.transform,
                         };
-                        push_undo_snapshot(edit, cfg);
+                        edit.pending_snapshot = Some(cfg.clone());
                         edit.gesture = Some(Gesture::Rotate {
                             start,
                             grab: (dip_x, dip_y),
@@ -717,6 +754,14 @@ fn handle_input(
         }
         InputEvent::MouseUp { .. } => {
             if edit.gesture.take().is_some() {
+                // Снимок кладём в историю только сейчас, и только если жест
+                // реально что-то изменил — клик без движения не тратит шаг
+                // истории (docs/M2_SLICE_REVIEW.md, пункт 1).
+                if let Some(before) = edit.pending_snapshot.take() {
+                    if before != *cfg {
+                        commit_undo_snapshot(edit, before);
+                    }
+                }
                 if let Err(e) = config::save(cfg, config_path) {
                     tracing::warn!(error = %e, "не удалось сохранить config.json после жеста редактирования");
                 }
@@ -739,9 +784,9 @@ fn handle_input(
                         start.placement.clone(),
                         start.transform,
                     );
-                    // Жест не завершился — снимок, сделанный на MouseDown,
-                    // не понадобится (иначе Ctrl+Z отменял бы no-op).
-                    edit.undo_stack.pop();
+                    // Жест не завершился — отложенный снимок не понадобился,
+                    // он ещё не попал в undo_stack (pending_snapshot).
+                    edit.pending_snapshot = None;
                     true
                 }
                 None => false,
