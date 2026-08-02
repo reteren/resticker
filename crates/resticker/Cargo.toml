@@ -11,6 +11,7 @@ tauri-build = { version = "2" }
 
 [dependencies]
 rst-core = { path = "../rst-core" }
+rst-media = { path = "../rst-media" }
 rst-win32 = { path = "../rst-win32" }
 rst-render = { path = "../rst-render" }
 anyhow = "1"

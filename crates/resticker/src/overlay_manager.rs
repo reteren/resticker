@@ -13,10 +13,13 @@
 //! дублирование это оправдывает при ~25 стикерах, docs/M2_INTEGRATION_REVIEW.md,
 //! раздел 3, а не `rst_core::undo::UndoStack`: тот держит `Box<dyn Command>`,
 //! который не может владеть `&mut Config`, а снимок — проще и без Rc/RefCell),
-//! `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y`, `Ctrl+A`, `Delete`, `Ctrl+D`. `Ctrl+V`,
-//! мультивыделение и тулбар — следующий срез (docs/M2_INTEGRATION_PLAN.md,
-//! раздел 17, шаги 7–8). `Delete` пока без диалога подтверждения — удаляет
-//! сразу (страхуется через `Ctrl+Z`); диалог — часть тулбара/панели.
+//! `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y`, `Ctrl+A`, `Delete`, `Ctrl+D`.
+//! M2 (срез 4, этот файл): марка мультивыделения протяжкой по фону, диалог
+//! подтверждения удаления (`Delete`/кнопка тулбара — общий `begin_delete`),
+//! `Ctrl+V` из буфера (картинка/файлы; вставка в поле числа — когда появится
+//! само поле). Тулбар, панель у курсора и связанный с ними round-trip на
+//! главный поток (файл-диалог/настройки) — следующий срез
+//! (docs/M2_WIRING_PLAN.md, раздел 13, шаги 3/7).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,10 +33,12 @@ use rst_core::ops;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
+use rst_media::paste;
 use rst_render::{
     Box2D, Button, Panel, PointerEvent, Primitive, Renderer, SelectionBox, Sprite, Texture,
     edit_overlay, marquee_visuals, rasterize, solid_sprite, theme,
 };
+use rst_win32::clipboard::{self, ClipboardImage};
 use rst_win32::hotkey::HotkeyCombo;
 use rst_win32::input::{
     Corner as Win32Corner, CursorShape, CursorZone, Handle as Win32Handle, InputEvent, Modifiers,
@@ -54,6 +59,7 @@ const VK_ESCAPE: u32 = 0x1B;
 const VK_DELETE: u32 = 0x2E;
 const VK_A: u32 = 0x41;
 const VK_D: u32 = 0x44;
+const VK_V: u32 = 0x56;
 const VK_Y: u32 = 0x59;
 const VK_Z: u32 = 0x5A;
 
@@ -454,7 +460,7 @@ fn run(
                     vk,
                     modifiers,
                     &overlay,
-                    &renderer,
+                    &mut renderer,
                     &mut cfg,
                     &config_path,
                     &mut sprites,
@@ -671,7 +677,7 @@ fn handle_key(
     vk: u32,
     modifiers: Modifiers,
     overlay: &OverlayWindow,
-    renderer: &Renderer,
+    renderer: &mut Renderer,
     cfg: &mut Config,
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
@@ -745,7 +751,66 @@ fn handle_key(
             }
             true
         }
+        VK_V if modifiers.ctrl => {
+            paste_from_clipboard(overlay, renderer, cfg, config_path, sprites, edit)
+        }
         _ => false,
+    }
+}
+
+/// `Ctrl+V`: вставить изображение из буфера обмена как новый стикер
+/// (docs/M2_WIRING_PLAN.md, раздел 9Б — вариант «числовое поле в фокусе»,
+/// раздел 9А, ещё не подключён: тулбара с полем пока нет). Отсутствие
+/// изображения в буфере — не ошибка, просто `false` (нет перерисовки).
+fn paste_from_clipboard(
+    overlay: &OverlayWindow,
+    renderer: &mut Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    edit: &mut EditState,
+) -> bool {
+    let image = match clipboard::read_image() {
+        Ok(Some(image)) => image,
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::warn!(error = %e, "не удалось прочитать буфер обмена");
+            return false;
+        }
+    };
+    match image {
+        ClipboardImage::Files(paths) => {
+            let supported: Vec<_> = paths
+                .into_iter()
+                .filter(|p| clipboard::is_supported_image(p))
+                .collect();
+            if supported.is_empty() {
+                return false;
+            }
+            // Один снимок на всю вставку — Ctrl+Z снимает её целиком, даже
+            // если файлов несколько (докс раздел 9Б).
+            commit_undo_snapshot(edit, cfg.clone());
+            for path in supported {
+                add_sticker(overlay, renderer, cfg, config_path, sprites, path);
+            }
+            true
+        }
+        png_or_bmp @ (ClipboardImage::Png(_) | ClipboardImage::Bmp(_)) => {
+            let Some(target_dir) = config_path.parent() else {
+                return false;
+            };
+            match paste::materialize(&png_or_bmp, target_dir) {
+                Ok(path) => {
+                    commit_undo_snapshot(edit, cfg.clone());
+                    add_sticker(overlay, renderer, cfg, config_path, sprites, path);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "не удалось материализовать вставленное изображение");
+                    false
+                }
+            }
+        }
     }
 }
 
