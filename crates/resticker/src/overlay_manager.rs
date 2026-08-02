@@ -336,8 +336,15 @@ fn run(
         .and_then(|s| HotkeyCombo::parse(s).ok())
         .or_else(|| HotkeyCombo::parse(DEFAULT_EDIT_HOTKEY).ok())
         .expect("DEFAULT_EDIT_HOTKEY — валидная комбинация");
+    // В отличие от edit_hotkey, этот хоткей опционален: пустая/некорректная
+    // настройка просто не регистрирует его (нет дефолта-фолбэка).
+    let toggle_all_hotkey = cfg
+        .hotkeys
+        .toggle_all_stickers
+        .as_deref()
+        .and_then(|s| HotkeyCombo::parse(s).ok());
 
-    let (overlay, events) = match OverlayWindow::create(hotkey) {
+    let (overlay, events) = match OverlayWindow::create(hotkey, toggle_all_hotkey) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, "не удалось создать оверлей-окно");
@@ -450,6 +457,37 @@ fn run(
             OverlayMessage::Event(OverlayEvent::ToggleEditMode) => {
                 toggle_edit_mode(&overlay, &mut edit, &mut cfg, &mut sprites, &config_path);
                 need_redraw = true;
+            }
+            OverlayMessage::Event(OverlayEvent::ToggleAllStickers) => {
+                // Глобальный хоткей работает независимо от режима
+                // редактирования (M2b7) — сходится к однородному состоянию,
+                // как и «глаз» на тулбаре (docs/M2_MULTISELECT_TOOLBAR_NOTES.md,
+                // раздел 3.2): если хоть один скрыт — показать всех, иначе
+                // скрыть всех.
+                let target_visible = !cfg.stickers.iter().all(|s| s.visible);
+                let ids: Vec<Uuid> = cfg
+                    .stickers
+                    .iter()
+                    .filter(|s| s.visible != target_visible)
+                    .map(|s| s.id)
+                    .collect();
+                if !ids.is_empty() {
+                    commit_undo_snapshot(&mut edit, cfg.clone());
+                    for id in ids {
+                        let _ = ops::toggle_visibility(&mut cfg, id);
+                    }
+                    if let Err(e) = config::save(&cfg, &config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить config.json после «показать/скрыть все»");
+                    }
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::Event(OverlayEvent::HotkeyConflict(combo)) => {
+                // Окно продолжает работать без входа в режим редактирования;
+                // предупредить пользователя UI-уведомлением — отдельная
+                // задача (нужен канал в Tauri/трей), пока — хотя бы в лог,
+                // а не тихая потеря события.
+                tracing::warn!(combo = %combo, "хоткей режима редактирования уже занят другим приложением");
             }
             OverlayMessage::Event(OverlayEvent::Key {
                 vk,
@@ -945,7 +983,7 @@ fn handle_input(
         overlay_size.1 as f64 / scale as f64,
     );
     match event {
-        InputEvent::MouseDown { pos, .. } => {
+        InputEvent::MouseDown { pos, modifiers } => {
             let (dip_x, dip_y) = to_dip(pos, scale);
             // Модал модален: пока открыт, клики в сцену не уходят вообще —
             // ни по кнопкам модала, ни мимо него (docs/M2_WIRING_PLAN.md,
@@ -970,6 +1008,14 @@ fn handle_input(
                 }
                 Zone::StickerBody(id) => {
                     let before = edit.selection.ids().to_vec();
+                    if modifiers.shift {
+                        // Shift+клик строит мультивыделение по одному
+                        // (SPEC 3.2) — жест перетаскивания здесь не
+                        // начинаем: мульти-драг ещё не реализован
+                        // (docs/M2_MULTISELECT_TOOLBAR_NOTES.md, раздел 4).
+                        edit.selection.shift_click(id);
+                        return before != edit.selection.ids();
+                    }
                     edit.selection.click(Some(id));
                     let changed = before != edit.selection.ids();
                     if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
