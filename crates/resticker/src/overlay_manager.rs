@@ -150,8 +150,15 @@ enum Gesture {
     },
     /// Протяжка рамки мультивыделения по фону (SPEC 3.2). Не мутирует
     /// `Config` — только `edit.selection`/`edit.marquee` — поэтому не несёт
-    /// `GestureStart` и не откатывается через `apply_transform`.
-    Marquee { anchor: (f64, f64) },
+    /// `GestureStart` и не откатывается через `apply_transform`. `before` —
+    /// выделение на момент `MouseDown` (до того, как `rubber_band` начал его
+    /// менять) — нужно, чтобы `CaptureLost` мог вернуть выделение к тому, что
+    /// было до марки, а не оставить «зависшим» на последнем `MouseMove`
+    /// (docs/M2_SLICE4_REVIEW.md, пункт 3).
+    Marquee {
+        anchor: (f64, f64),
+        before: Vec<Uuid>,
+    },
 }
 
 impl Gesture {
@@ -397,7 +404,7 @@ fn run(
     // отрисовки берётся из cfg.stickers (по `order`) в `redraw`.
     let mut sprites: Vec<(Uuid, Sprite)> = Vec::new();
     for sticker in &cfg.stickers {
-        if let StickerSource::File { path, .. } = &sticker.source {
+        if let Some(path) = sticker_image_path(&sticker.source) {
             match renderer.load_image(path) {
                 Ok(texture) => {
                     sprites.push((
@@ -450,6 +457,7 @@ fn run(
                     &config_path,
                     &mut sprites,
                     path,
+                    false,
                 );
                 need_redraw = true;
             }
@@ -606,7 +614,7 @@ fn resync_sprites(renderer: &Renderer, cfg: &Config, sprites: &mut Vec<(Uuid, Sp
             sprite.transform = sticker.transform;
             continue;
         }
-        if let StickerSource::File { path, .. } = &sticker.source {
+        if let Some(path) = sticker_image_path(&sticker.source) {
             match renderer.load_image(path) {
                 Ok(texture) => sprites.push((
                     sticker.id,
@@ -616,6 +624,34 @@ fn resync_sprites(renderer: &Renderer, cfg: &Config, sprites: &mut Vec<(Uuid, Sp
                     tracing::warn!(path = %path.display(), error = %e, "не удалось загрузить стикер после undo/redo");
                 }
             }
+        }
+    }
+}
+
+/// Путь к изображению стикера для загрузки текстуры: есть у `File` и
+/// `Pasted` (оба ссылаются на файл на диске), нет у `Window` (M6, ещё не
+/// реализован).
+fn sticker_image_path(source: &StickerSource) -> Option<&Path> {
+    match source {
+        StickerSource::File { path, .. } => Some(path),
+        StickerSource::Pasted { path } => Some(path),
+        StickerSource::Window { .. } => None,
+    }
+}
+
+/// Удалить с диска материализованный файл вставленного стикера
+/// (`StickerSource::Pasted`, SPEC 2.5: «удаление стикера... за исключением
+/// материализованных вставок из буфера — они удаляются вместе со стикером»).
+/// No-op для `File`/`Window` — их источник удалять нельзя. Ошибка удаления —
+/// не паника: файл мог быть уже убран руками, оставлять его в этом случае
+/// не хуже, чем сейчас.
+fn cleanup_pasted_file(cfg: &Config, id: Uuid) {
+    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) else {
+        return;
+    };
+    if let StickerSource::Pasted { path } = &sticker.source {
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!(path = %path.display(), error = %e, "не удалось удалить файл вставленного стикера");
         }
     }
 }
@@ -695,6 +731,7 @@ fn begin_delete(
     } else {
         commit_undo_snapshot(edit, cfg.clone());
         for id in edit.selection.ids().to_vec() {
+            cleanup_pasted_file(cfg, id);
             let _ = ops::delete(cfg, id);
         }
         edit.selection.prune(&cfg.stickers);
@@ -826,12 +863,21 @@ fn paste_from_clipboard(
                 return false;
             }
             // Один снимок на всю вставку — Ctrl+Z снимает её целиком, даже
-            // если файлов несколько (докс раздел 9Б).
-            commit_undo_snapshot(edit, cfg.clone());
+            // если файлов несколько (докс раздел 9Б). Снимок берётся заранее,
+            // но коммитится только если хоть один файл реально добавился —
+            // иначе (все не декодировались) история получила бы пустой шаг
+            // (docs/M2_SLICE4_REVIEW.md, пункт 7).
+            let before = cfg.clone();
+            let mut added = false;
             for path in supported {
-                add_sticker(overlay, renderer, cfg, config_path, sprites, path);
+                if add_sticker(overlay, renderer, cfg, config_path, sprites, path, false) {
+                    added = true;
+                }
             }
-            true
+            if added {
+                commit_undo_snapshot(edit, before);
+            }
+            added
         }
         png_or_bmp @ (ClipboardImage::Png(_) | ClipboardImage::Bmp(_)) => {
             let Some(target_dir) = config_path.parent() else {
@@ -839,9 +885,13 @@ fn paste_from_clipboard(
             };
             match paste::materialize(&png_or_bmp, target_dir) {
                 Ok(path) => {
-                    commit_undo_snapshot(edit, cfg.clone());
-                    add_sticker(overlay, renderer, cfg, config_path, sprites, path);
-                    true
+                    let before = cfg.clone();
+                    if add_sticker(overlay, renderer, cfg, config_path, sprites, path, true) {
+                        commit_undo_snapshot(edit, before);
+                        true
+                    } else {
+                        false
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "не удалось материализовать вставленное изображение");
@@ -1002,6 +1052,7 @@ fn handle_input(
                     // выделение здесь ещё не трогаем.
                     edit.gesture = Some(Gesture::Marquee {
                         anchor: (dip_x, dip_y),
+                        before: edit.selection.ids().to_vec(),
                     });
                     edit.marquee_started = false;
                     false
@@ -1104,8 +1155,18 @@ fn handle_input(
                     .expect("ID_DELETE собран в confirm_dialog::build")
                     .take_click()
                 {
-                    commit_undo_snapshot(edit, confirm.snapshot);
+                    // Снимок взят при открытии модала — но если между
+                    // открытием и «Удалить» пользователь успел щёлкнуть
+                    // «Don't ask again», это единственная настройка, которая
+                    // могла измениться внутри окна снимка. Без синхронизации
+                    // `Ctrl+Z` откатил бы этот глобальный тумблер вместе с
+                    // удалением (docs/M2_SLICE4_REVIEW.md, пункт 2) — settings
+                    // не относится к тому, что отменяет история удаления.
+                    let mut snapshot = confirm.snapshot;
+                    snapshot.settings = cfg.settings.clone();
+                    commit_undo_snapshot(edit, snapshot);
                     for id in &confirm.ids {
+                        cleanup_pasted_file(cfg, *id);
                         let _ = ops::delete(cfg, *id);
                     }
                     edit.selection.prune(&cfg.stickers);
@@ -1126,9 +1187,22 @@ fn handle_input(
                         tracing::warn!(error = %e, "не удалось сохранить config.json после переключения подтверждения удаления");
                     }
                     edit.confirm = Some(confirm);
+                } else if confirm
+                    .panel
+                    .widget_mut::<Button>(confirm_dialog::ID_CANCEL)
+                    .expect("ID_CANCEL собран в confirm_dialog::build")
+                    .take_click()
+                {
+                    // Явная отмена — закрыть без изменений (снимок не
+                    // коммитился, отбрасываем вместе с `confirm`).
+                } else {
+                    // Клик мимо модала или по тексту сообщения — модал
+                    // модален и должен остаться открытым
+                    // (docs/M2_WIRING_PLAN.md, раздел 5: «клик мимо модала —
+                    // ничего»; ранее это ошибочно закрывало диалог,
+                    // docs/M2_SLICE4_REVIEW.md, пункт 6).
+                    edit.confirm = Some(confirm);
                 }
-                // `ID_CANCEL`, клик по сообщению или мимо модала: закрыть без
-                // изменений — снимок не коммитился, отбрасываем вместе с `confirm`.
                 return true;
             }
             if let Some(Gesture::Marquee { .. }) = &edit.gesture {
@@ -1167,6 +1241,20 @@ fn handle_input(
             // (`Gesture::start() == None`) откатывать в модели нечего —
             // только сбросить визуал (docs/M2_WIRING_PLAN.md, раздел 8).
             match edit.gesture.take() {
+                Some(Gesture::Marquee { before, .. }) => {
+                    // Марка не мутирует Config, но rubber_band уже успел
+                    // поменять edit.selection на каждом Move — вернуть его к
+                    // тому, что было до марки, а не оставить «зависшим» на
+                    // последнем частичном выделении (docs/M2_SLICE4_REVIEW.md,
+                    // пункт 3).
+                    edit.selection.clear();
+                    for id in before {
+                        edit.selection.select(id);
+                    }
+                    edit.marquee = None;
+                    edit.marquee_started = false;
+                    true
+                }
                 Some(gesture) => {
                     if let Some(start) = gesture.start() {
                         apply_transform(
@@ -1200,10 +1288,17 @@ fn apply_gesture(
     modifiers: Modifiers,
     monitor: DipRect,
 ) -> bool {
-    if let Some(Gesture::Marquee { anchor }) = &edit.gesture {
+    if let Some(Gesture::Marquee { anchor, .. }) = &edit.gesture {
         let anchor = *anchor;
         let rect = DipRect::new(anchor.0, anchor.1, dip_x - anchor.0, dip_y - anchor.1);
-        if rect.w.abs() >= MARQUEE_THRESHOLD_DIP || rect.h.abs() >= MARQUEE_THRESHOLD_DIP {
+        // Порог гейтит только переход «клик → марка»: once started, обновлять
+        // безусловно — иначе сжатие рамки обратно ниже порога «замораживает»
+        // и марку, и выделение на последней надпороговой позиции
+        // (docs/M2_SLICE4_REVIEW.md, пункт 4).
+        if edit.marquee_started
+            || rect.w.abs() >= MARQUEE_THRESHOLD_DIP
+            || rect.h.abs() >= MARQUEE_THRESHOLD_DIP
+        {
             edit.marquee_started = true;
             edit.marquee = Some((anchor.0, anchor.1, dip_x, dip_y));
             edit.selection.rubber_band(&cfg.stickers, &rect);
@@ -1370,6 +1465,13 @@ fn redraw(
     }
 }
 
+/// Добавить стикер из файла на диске. `pasted` — источник
+/// [`StickerSource::Pasted`] вместо [`StickerSource::File`] (материализованная
+/// вставка из буфера, SPEC 2.1/2.5 — удаляется вместе с файлом,
+/// `cleanup_pasted_file`); обычные файлы (диалог, `CF_HDROP`) — `false`.
+/// Возвращает `true`, если стикер реально добавлен — вызывающий код решает
+/// по этому флагу, стоит ли коммитить снимок undo (docs/M2_SLICE4_REVIEW.md,
+/// пункт 7: неудачная загрузка не должна создавать пустой шаг истории).
 fn add_sticker(
     overlay: &OverlayWindow,
     renderer: &mut Renderer,
@@ -1377,26 +1479,38 @@ fn add_sticker(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     path: PathBuf,
-) {
+    pasted: bool,
+) -> bool {
     let texture = match renderer.load_image(&path) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "не удалось загрузить выбранное изображение");
-            return;
+            return false;
         }
     };
     let (w, h) = (texture.width(), texture.height());
     let (screen_w, screen_h) = overlay.size();
     // M3: реальный device interface path монитора; M1 — один монитор, заглушка.
-    let sticker = Sticker::new_file(
-        path,
-        MediaType::Image,
-        MonitorId::default(),
-        screen_w as f64 / 2.0,
-        screen_h as f64 / 2.0,
-        w as f64,
-        h as f64,
-    );
+    let sticker = if pasted {
+        Sticker::new_pasted(
+            path,
+            MonitorId::default(),
+            screen_w as f64 / 2.0,
+            screen_h as f64 / 2.0,
+            w as f64,
+            h as f64,
+        )
+    } else {
+        Sticker::new_file(
+            path,
+            MediaType::Image,
+            MonitorId::default(),
+            screen_w as f64 / 2.0,
+            screen_h as f64 / 2.0,
+            w as f64,
+            h as f64,
+        )
+    };
     let sprite = Sprite::new(texture, sticker.placement.clone(), sticker.transform);
     let id = sticker.id;
     cfg.stickers.push(sticker);
@@ -1404,4 +1518,5 @@ fn add_sticker(
         tracing::warn!(error = %e, "не удалось сохранить config.json после добавления стикера");
     }
     sprites.push((id, sprite));
+    true
 }
