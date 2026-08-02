@@ -6,11 +6,17 @@
 //!
 //! M2 (срез 1): вход/выход из режима редактирования по хоткею, затемнение
 //! 50%, клик по стикеру/фону выбирает/снимает выделение, рамка с ручками.
-//! M2 (срез 2, этот файл): перемещение, ресайз за ручки (`Shift`/`Alt`),
-//! поворот за угловое кольцо (`Shift` — шаг 15°), магнит и ограничение
-//! видимости при перетаскивании, курсор по зоне. Undo/redo, клавиатурные
-//! команды (`Delete`/`Ctrl+D`/`Ctrl+Z`), `Ctrl+V` и тулбар — следующий срез
-//! (docs/M2_INTEGRATION_PLAN.md, раздел 17, шаги 6–8).
+//! M2 (срез 2): перемещение, ресайз за ручки (`Shift`/`Alt`), поворот за
+//! угловое кольцо (`Shift` — шаг 15°), магнит и ограничение видимости при
+//! перетаскивании, курсор по зоне.
+//! M2 (срез 3, этот файл): undo/redo (снимок всего `Config` — жест/удаление/
+//! дублирование это оправдывает при ~25 стикерах, docs/M2_INTEGRATION_REVIEW.md,
+//! раздел 3, а не `rst_core::undo::UndoStack`: тот держит `Box<dyn Command>`,
+//! который не может владеть `&mut Config`, а снимок — проще и без Rc/RefCell),
+//! `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y`, `Ctrl+A`, `Delete`, `Ctrl+D`. `Ctrl+V`,
+//! мультивыделение и тулбар — следующий срез (docs/M2_INTEGRATION_PLAN.md,
+//! раздел 17, шаги 7–8). `Delete` пока без диалога подтверждения — удаляет
+//! сразу (страхуется через `Ctrl+Z`); диалог — часть тулбара/панели.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -19,6 +25,7 @@ use std::thread::{self, JoinHandle};
 use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{Config, MediaType, MonitorId, Placement, Sticker, StickerSource, Transform};
+use rst_core::ops;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
@@ -38,6 +45,14 @@ const DEFAULT_EDIT_HOTKEY: &str = "Ctrl+Alt+S";
 /// из режима редактирования. Константа, а не зависимость от `windows`: этот
 /// крейт не работает с Win32-типами напрямую (CONTRIBUTING.md).
 const VK_ESCAPE: u32 = 0x1B;
+const VK_DELETE: u32 = 0x2E;
+const VK_A: u32 = 0x41;
+const VK_D: u32 = 0x44;
+const VK_Y: u32 = 0x59;
+const VK_Z: u32 = 0x5A;
+
+/// Глубина истории undo/redo — снимков `Config` (см. заметку о снимках выше).
+const UNDO_CAPACITY: usize = 100;
 
 /// Кольцо поворота — зона за угловой ручкой (SPEC 3.3): от `ROTATE_RING_MIN_DIP`
 /// (сразу за телом стикера) до `ROTATE_RING_MAX_DIP` от центра ручки.
@@ -143,12 +158,17 @@ enum Zone {
 }
 
 /// Состояние режима редактирования (docs/M2_INTEGRATION_PLAN.md, раздел 2).
-/// Undo — следующий срез.
 struct EditState {
     active: bool,
     selection: SelectionSet,
     gesture: Option<Gesture>,
     snap: SnapConfig,
+    /// Снимки `Config` до последних `UNDO_CAPACITY` действий (см. заметку
+    /// о снимках вместо `rst_core::undo::UndoStack` вверху файла).
+    undo_stack: Vec<Config>,
+    /// Снимки, отменённые через `Ctrl+Z` — доступны для `Ctrl+Y`/`Ctrl+Shift+Z`
+    /// до следующего нового действия (стандартная семантика редакторов).
+    redo_stack: Vec<Config>,
 }
 
 fn run(
@@ -238,6 +258,8 @@ fn run(
         selection: SelectionSet::new(),
         gesture: None,
         snap: SnapConfig::default(),
+        undo_stack: Vec::new(),
+        redo_stack: Vec::new(),
     };
 
     redraw(
@@ -272,12 +294,20 @@ fn run(
                 need_redraw = true;
             }
             OverlayMessage::Event(OverlayEvent::Key {
-                vk: VK_ESCAPE,
+                vk,
+                modifiers,
                 pressed: true,
-                ..
             }) if edit.active => {
-                toggle_edit_mode(&overlay, &mut edit, &mut cfg, &config_path);
-                need_redraw = true;
+                need_redraw = handle_key(
+                    vk,
+                    modifiers,
+                    &overlay,
+                    &renderer,
+                    &mut cfg,
+                    &config_path,
+                    &mut sprites,
+                    &mut edit,
+                );
             }
             OverlayMessage::Event(OverlayEvent::Key { .. }) => {}
             OverlayMessage::Event(OverlayEvent::Input(event)) if edit.active => {
@@ -329,6 +359,150 @@ fn toggle_edit_mode(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json при выходе из режима редактирования");
         }
+    }
+}
+
+/// Сохранить текущий `cfg` в историю undo перед мутирующим действием
+/// (жест, удаление, дублирование) и очистить историю redo — новая ветка
+/// истории (семантика как у `rst_core::undo::UndoStack::push`).
+fn push_undo_snapshot(edit: &mut EditState, cfg: &Config) {
+    if edit.undo_stack.len() == UNDO_CAPACITY {
+        edit.undo_stack.remove(0);
+    }
+    edit.undo_stack.push(cfg.clone());
+    edit.redo_stack.clear();
+}
+
+/// Привести `sprites` в соответствие с `cfg.stickers` после того, как `cfg`
+/// целиком заменили (undo/redo): убрать спрайты стикеров, которых больше
+/// нет, подгрузить текстуры для вернувшихся (undo удаления), синхронизировать
+/// `placement`/`transform` для остальных (undo ресайза/поворота/перемещения).
+fn resync_sprites(renderer: &Renderer, cfg: &Config, sprites: &mut Vec<(Uuid, Sprite)>) {
+    sprites.retain(|(id, _)| cfg.stickers.iter().any(|s| s.id == *id));
+    for sticker in &cfg.stickers {
+        if let Some((_, sprite)) = sprites.iter_mut().find(|(id, _)| *id == sticker.id) {
+            sprite.placement = sticker.placement.clone();
+            sprite.transform = sticker.transform;
+            continue;
+        }
+        if let StickerSource::File { path, .. } = &sticker.source {
+            match renderer.load_image(path) {
+                Ok(texture) => sprites.push((
+                    sticker.id,
+                    Sprite::new(texture, sticker.placement.clone(), sticker.transform),
+                )),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "не удалось загрузить стикер после undo/redo");
+                }
+            }
+        }
+    }
+}
+
+fn perform_undo(
+    renderer: &Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    edit: &mut EditState,
+) -> bool {
+    let Some(prev) = edit.undo_stack.pop() else {
+        return false;
+    };
+    edit.redo_stack.push(std::mem::replace(cfg, prev));
+    resync_sprites(renderer, cfg, sprites);
+    edit.selection.prune(&cfg.stickers);
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, "не удалось сохранить config.json после отмены");
+    }
+    true
+}
+
+fn perform_redo(
+    renderer: &Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    edit: &mut EditState,
+) -> bool {
+    let Some(next) = edit.redo_stack.pop() else {
+        return false;
+    };
+    edit.undo_stack.push(std::mem::replace(cfg, next));
+    resync_sprites(renderer, cfg, sprites);
+    edit.selection.prune(&cfg.stickers);
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, "не удалось сохранить config.json после повтора");
+    }
+    true
+}
+
+/// Клавиатурные команды режима редактирования (docs/M2_INTEGRATION_PLAN.md,
+/// раздел 12): `Esc` — выход, `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y` — отмена/повтор,
+/// `Ctrl+A` — выделить всё, `Delete` — удалить выделенное (без диалога
+/// подтверждения — см. заметку в шапке файла), `Ctrl+D` — дублировать.
+#[allow(clippy::too_many_arguments)]
+fn handle_key(
+    vk: u32,
+    modifiers: Modifiers,
+    overlay: &OverlayWindow,
+    renderer: &Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    edit: &mut EditState,
+) -> bool {
+    match vk {
+        VK_ESCAPE => {
+            toggle_edit_mode(overlay, edit, cfg, config_path);
+            true
+        }
+        VK_Z if modifiers.ctrl && modifiers.shift => {
+            perform_redo(renderer, cfg, config_path, sprites, edit)
+        }
+        VK_Z if modifiers.ctrl => perform_undo(renderer, cfg, config_path, sprites, edit),
+        VK_Y if modifiers.ctrl => perform_redo(renderer, cfg, config_path, sprites, edit),
+        VK_A if modifiers.ctrl => {
+            edit.selection.select_all(&cfg.stickers);
+            true
+        }
+        VK_DELETE => {
+            if edit.selection.is_empty() {
+                return false;
+            }
+            push_undo_snapshot(edit, cfg);
+            for id in edit.selection.ids().to_vec() {
+                let _ = ops::delete(cfg, id);
+            }
+            edit.selection.prune(&cfg.stickers);
+            resync_sprites(renderer, cfg, sprites);
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после удаления");
+            }
+            true
+        }
+        VK_D if modifiers.ctrl => {
+            if edit.selection.is_empty() {
+                return false;
+            }
+            push_undo_snapshot(edit, cfg);
+            let mut new_ids = Vec::new();
+            for id in edit.selection.ids().to_vec() {
+                if let Ok(new_id) = ops::duplicate(cfg, id) {
+                    new_ids.push(new_id);
+                }
+            }
+            resync_sprites(renderer, cfg, sprites);
+            edit.selection.clear();
+            for id in new_ids {
+                edit.selection.select(id);
+            }
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -479,26 +653,32 @@ fn handle_input(
                     edit.selection.click(Some(id));
                     let changed = before != edit.selection.ids();
                     if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                        let start = GestureStart {
+                            id,
+                            placement: sticker.placement.clone(),
+                            transform: sticker.transform,
+                        };
+                        let grab_dx = dip_x - sticker.placement.cx;
+                        let grab_dy = dip_y - sticker.placement.cy;
+                        push_undo_snapshot(edit, cfg);
                         edit.gesture = Some(Gesture::Drag {
-                            start: GestureStart {
-                                id,
-                                placement: sticker.placement.clone(),
-                                transform: sticker.transform,
-                            },
-                            grab_dx: dip_x - sticker.placement.cx,
-                            grab_dy: dip_y - sticker.placement.cy,
+                            start,
+                            grab_dx,
+                            grab_dy,
                         });
                     }
                     changed
                 }
                 Zone::ResizeHandle(id, handle) => {
                     if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                        let start = GestureStart {
+                            id,
+                            placement: sticker.placement.clone(),
+                            transform: sticker.transform,
+                        };
+                        push_undo_snapshot(edit, cfg);
                         edit.gesture = Some(Gesture::Resize {
-                            start: GestureStart {
-                                id,
-                                placement: sticker.placement.clone(),
-                                transform: sticker.transform,
-                            },
+                            start,
                             handle,
                             grab: (dip_x, dip_y),
                         });
@@ -507,12 +687,14 @@ fn handle_input(
                 }
                 Zone::Rotate(id, _corner) => {
                     if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                        let start = GestureStart {
+                            id,
+                            placement: sticker.placement.clone(),
+                            transform: sticker.transform,
+                        };
+                        push_undo_snapshot(edit, cfg);
                         edit.gesture = Some(Gesture::Rotate {
-                            start: GestureStart {
-                                id,
-                                placement: sticker.placement.clone(),
-                                transform: sticker.transform,
-                            },
+                            start,
                             grab: (dip_x, dip_y),
                         });
                     }
@@ -557,6 +739,9 @@ fn handle_input(
                         start.placement.clone(),
                         start.transform,
                     );
+                    // Жест не завершился — снимок, сделанный на MouseDown,
+                    // не понадобится (иначе Ctrl+Z отменял бы no-op).
+                    edit.undo_stack.pop();
                     true
                 }
                 None => false,
