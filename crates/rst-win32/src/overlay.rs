@@ -76,10 +76,15 @@ fn cursor_shape_from_wparam(wparam: WPARAM) -> Option<CursorShape> {
 /// Безопасное событие оверлей-окна для координатора (docs/M2_INTEGRATION_PLAN.md,
 /// раздел 1): мышь и клавиатура уже переведены из сырых Win32-сообщений,
 /// хоткей — это именно и только переключатель режима редактирования.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayEvent {
     /// Глобальный хоткей входа/выхода из режима редактирования нажат.
     ToggleEditMode,
+    /// Глобальный хоткей не удалось зарегистрировать: комбинация уже занята
+    /// другим приложением. Строка — каноничный вид комбинации из конфига
+    /// (ARCHITECTURE.md, раздел 5.1). Окно продолжает работать — недоступен
+    /// только вход в режим редактирования.
+    HotkeyConflict(String),
     /// Событие мыши в клиентской области ([`crate::input::InputEvent`]).
     Input(InputEvent),
     /// Клавиша нажата/отпущена, пока окно в фокусе (режим редактирования —
@@ -118,12 +123,11 @@ type ReadyResult = Result<(SendHwnd, (u32, u32)), Win32Error>;
 impl OverlayWindow {
     /// Создаёт оверлей-окно и запускает его цикл сообщений на отдельном
     /// потоке; регистрирует на этом же потоке глобальный хоткей `edit_hotkey`
-    /// входа/выхода из режима редактирования (конфликт — не паника, только
-    /// лог: `Win32Error::HotkeyConflict` из потока не всплывает наружу,
-    /// поведение окна от него не зависит). Возвращает управление, когда окно
-    /// гарантированно создано, и приёмник событий мыши/клавиатуры/хоткея —
-    /// координатор объединяет его со своим каналом команд
-    /// (docs/M2_INTEGRATION_PLAN.md, раздел 1).
+    /// входа/выхода из режима редактирования (конфликт — не паника: окно
+    /// работает, а наружу уходит событие [`OverlayEvent::HotkeyConflict`]).
+    /// Возвращает управление, когда окно гарантированно создано, и приёмник
+    /// событий мыши/клавиатуры/хоткея — координатор объединяет его со своим
+    /// каналом команд (docs/M2_INTEGRATION_PLAN.md, раздел 1).
     pub fn create(edit_hotkey: HotkeyCombo) -> Result<(Self, Receiver<OverlayEvent>), Win32Error> {
         let (ready_tx, ready_rx) = mpsc::channel::<ReadyResult>();
         let (event_tx, event_rx) = mpsc::channel::<OverlayEvent>();
@@ -231,6 +235,18 @@ struct WndState {
     tx: Sender<OverlayEvent>,
 }
 
+/// Смаппить ошибку регистрации хоткея на событие оверлея. Наружу уходит
+/// только пользовательский случай — [`Win32Error::HotkeyConflict`]: комбинация
+/// занята другим приложением, пользователя надо предупредить и предложить
+/// другую (M2b6). Прочие ошибки `RegisterHotKey` — редкие системные сбои,
+/// им достаточно warn-лога в `run_message_loop`.
+fn hotkey_conflict_event(err: &Win32Error) -> Option<OverlayEvent> {
+    match err {
+        Win32Error::HotkeyConflict(combo) => Some(OverlayEvent::HotkeyConflict(combo.clone())),
+        _ => None,
+    }
+}
+
 fn run_message_loop(
     ready_tx: Sender<ReadyResult>,
     event_tx: Sender<OverlayEvent>,
@@ -244,12 +260,17 @@ fn run_message_loop(
         }
     };
 
-    // Хоткей — на этом же потоке (тип `!Send`, ADR-009); конфликт логируется,
-    // но не мешает окну работать (ARCHITECTURE.md, раздел 5.1).
+    // Хоткей — на этом же потоке (тип `!Send`, ADR-009). Конфликт окно не
+    // ломает (ARCHITECTURE.md, раздел 5.1), но наружу уходит событием
+    // `OverlayEvent::HotkeyConflict`, чтобы координатор мог предупредить
+    // пользователя, а не только warn-лог в трассировке (M2b6).
     let _hotkey = match RegisteredHotkey::register(EDIT_HOTKEY_ID, edit_hotkey) {
         Ok(h) => Some(h),
         Err(e) => {
             tracing::warn!(error = %e, "не удалось зарегистрировать хоткей режима редактирования");
+            if let Some(event) = hotkey_conflict_event(&e) {
+                let _ = event_tx.send(event);
+            }
             None
         }
     };
@@ -489,6 +510,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
     fn test_hotkey() -> HotkeyCombo {
@@ -544,6 +566,46 @@ mod tests {
             "выход восстанавливает клик-прозрачность"
         );
         assert_ne!(restored & WS_EX_NOACTIVATE.0, 0);
+    }
+
+    #[test]
+    fn hotkey_conflict_maps_only_conflicts() {
+        // Конфликт → событие с той же каноничной комбинацией.
+        let conflict = Win32Error::HotkeyConflict("Ctrl+Alt+Shift+F22".to_string());
+        assert_eq!(
+            hotkey_conflict_event(&conflict),
+            Some(OverlayEvent::HotkeyConflict(
+                "Ctrl+Alt+Shift+F22".to_string()
+            ))
+        );
+        // Прочие ошибки регистрации события не порождают — им хватает warn-лога.
+        assert_eq!(
+            hotkey_conflict_event(&Win32Error::OverlayWindowCreateFailed),
+            None
+        );
+        assert_eq!(
+            hotkey_conflict_event(&Win32Error::InvalidHotkey("Ctrl".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn second_window_with_same_hotkey_reports_conflict() {
+        // Экзотическая комбинация — не конфликтует с реальными приложениями
+        // на машине разработчика/CI (F22 не используется другими тестами).
+        let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F22").expect("валидная комбинация");
+        let (_first, _first_events) = OverlayWindow::create(combo).expect("первое окно");
+        let (_second, second_events) = OverlayWindow::create(combo).expect("второе окно");
+
+        // Хоткей регистрируется на pump-потоке до сигнала готовности, поэтому
+        // к моменту возврата create() конфликт уже лежит в канале событий.
+        // Создание второго окна не провалилось — конфликт лишь событие, окно
+        // продолжает работать.
+        match second_events.recv_timeout(Duration::from_secs(5)) {
+            Ok(OverlayEvent::HotkeyConflict(s)) => assert_eq!(s, "Ctrl+Alt+Shift+F22"),
+            Ok(other) => panic!("ожидался HotkeyConflict, получено: {other:?}"),
+            Err(e) => panic!("второе окно не прислало HotkeyConflict: {e}"),
+        }
     }
 
     #[test]
