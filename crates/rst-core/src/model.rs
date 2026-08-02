@@ -135,6 +135,36 @@ impl Default for Sticker {
         }
     }
 }
+
+impl Sticker {
+    /// Новый стикер из файла, центрированный в точке `(cx, cy)` с размером
+    /// `(w, h)` (DIP), обычно — центр основного монитора и нативный размер
+    /// изображения (ROADMAP.md M1: «появление в центре основного монитора»).
+    /// `order` нормализуется при следующем `config::save` — здесь неважен.
+    pub fn new_file(
+        path: std::path::PathBuf,
+        media_type: MediaType,
+        monitor_id: MonitorId,
+        cx: f64,
+        cy: f64,
+        w: f64,
+        h: f64,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            source: StickerSource::File { path, media_type },
+            placement: Placement {
+                monitor_id,
+                cx,
+                cy,
+                w,
+                h,
+            },
+            ..Self::default()
+        }
+    }
+}
 /// Источник стикера (SPEC.md, раздел 2.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

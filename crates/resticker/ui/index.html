@@ -34,17 +34,39 @@
       section.active {
         display: block;
       }
+      button.action {
+        font: inherit;
+        padding: 0.5rem 1rem;
+        background: #ff8c00;
+        color: #1e1e28;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button.action:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+      #sticker-status {
+        margin-top: 0.75rem;
+        opacity: 0.75;
+        font-size: 0.9rem;
+      }
     </style>
   </head>
   <body>
-    <!-- M0: пустой каркас вкладок (SPEC.md, раздел 3). Наполнение — следующие вехи. -->
+    <!-- M0: пустой каркас вкладок (SPEC.md, раздел 3); M1 добавляет
+         единственное действие — добавить стикер. Остальное — следующие вехи. -->
     <nav id="tabs">
       <button data-tab="stickers" class="active">Стикеры</button>
       <button data-tab="presets">Пресеты</button>
       <button data-tab="control">Управление</button>
       <button data-tab="general">Общие</button>
     </nav>
-    <section id="stickers" class="active"></section>
+    <section id="stickers" class="active">
+      <button class="action" id="add-sticker">Добавить стикер…</button>
+      <div id="sticker-status"></div>
+    </section>
     <section id="presets"></section>
     <section id="control"></section>
     <section id="general"></section>
@@ -57,6 +79,30 @@
         }
         for (const s of document.querySelectorAll('section')) {
           s.classList.toggle('active', s.id === tab);
+        }
+      });
+
+      const addButton = document.getElementById('add-sticker');
+      const status = document.getElementById('sticker-status');
+      addButton.addEventListener('click', async () => {
+        const { open } = window.__TAURI__.dialog;
+        const { invoke } = window.__TAURI__.core;
+        addButton.disabled = true;
+        try {
+          const path = await open({
+            multiple: false,
+            filters: [
+              { name: 'Изображение', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp'] },
+            ],
+          });
+          if (path) {
+            await invoke('add_sticker', { path });
+            status.textContent = `Добавлено: ${path}`;
+          }
+        } catch (err) {
+          status.textContent = `Ошибка: ${err}`;
+        } finally {
+          addButton.disabled = false;
         }
       });
     </script>

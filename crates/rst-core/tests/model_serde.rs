@@ -165,3 +165,31 @@ fn missing_fields_defaulted() {
     let cfg: Config = serde_json::from_value(json!({})).unwrap();
     assert_eq!(cfg, Config::default());
 }
+
+#[test]
+fn new_file_sticker_is_centered_and_enabled() {
+    let sticker = Sticker::new_file(
+        "C:\\pics\\cat.png".into(),
+        MediaType::Image,
+        MonitorId("\\\\?\\DISPLAY#TEST".to_string()),
+        960.0,
+        540.0,
+        300.0,
+        200.0,
+    );
+    assert!(sticker.enabled);
+    assert!(sticker.visible);
+    assert_eq!(sticker.placement.cx, 960.0);
+    assert_eq!(sticker.placement.cy, 540.0);
+    assert_eq!(sticker.placement.w, 300.0);
+    assert_eq!(sticker.placement.h, 200.0);
+    assert_eq!(sticker.visibility.mode, VisibilityMode::Always);
+    assert!(sticker.origin.is_none());
+    match sticker.source {
+        StickerSource::File { path, media_type } => {
+            assert_eq!(path, std::path::PathBuf::from("C:\\pics\\cat.png"));
+            assert_eq!(media_type, MediaType::Image);
+        }
+        other => panic!("ожидался StickerSource::File, получено {other:?}"),
+    }
+}
