@@ -52,18 +52,7 @@ impl Texture {
         width: u32,
         height: u32,
     ) -> Result<Self, RenderError> {
-        if width == 0 || height == 0 {
-            return Err(RenderError::InvalidTextureData(
-                "нулевая ширина или высота".to_string(),
-            ));
-        }
-        let expected = width as usize * height as usize * 4;
-        if data.len() != expected {
-            return Err(RenderError::InvalidTextureData(format!(
-                "ожидалось {expected} байт RGBA, получено {}",
-                data.len()
-            )));
-        }
+        validate_texture_data(width, height, data.len())?;
         let mut data = data.to_vec();
         premultiply_rgba(&mut data);
 
@@ -132,6 +121,23 @@ impl Texture {
     }
 }
 
+/// Проверка входных данных текстуры. Вынесена из `from_rgba` отдельной
+/// функцией, чтобы её можно было юнит-тестировать без GPU-устройства.
+fn validate_texture_data(width: u32, height: u32, data_len: usize) -> Result<(), RenderError> {
+    if width == 0 || height == 0 {
+        return Err(RenderError::InvalidTextureData(
+            "нулевая ширина или высота".to_string(),
+        ));
+    }
+    let expected = width as usize * height as usize * 4;
+    if data_len != expected {
+        return Err(RenderError::InvalidTextureData(format!(
+            "ожидалось {expected} байт RGBA, получено {data_len}"
+        )));
+    }
+    Ok(())
+}
+
 /// Приведение straight alpha к premultiplied (требование
 /// DXGI_ALPHA_MODE_PREMULTIPLIED у композиционной цепочки).
 pub(crate) fn premultiply_rgba(data: &mut [u8]) {
@@ -145,7 +151,8 @@ pub(crate) fn premultiply_rgba(data: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::premultiply_rgba;
+    use super::{premultiply_rgba, validate_texture_data};
+    use crate::RenderError;
 
     #[test]
     fn premultiply_scales_rgb_keeps_alpha() {
@@ -169,5 +176,39 @@ mod tests {
         let mut data = [10u8, 20, 30, 255];
         premultiply_rgba(&mut data);
         assert_eq!(data, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn premultiply_leaves_trailing_partial_pixel_untouched() {
+        // chunks_exact_mut(4) обрабатывает только полные пиксели; «хвост»
+        // меньше 4 байт остаётся без изменений.
+        let mut data = [200u8, 150, 100, 0, 255];
+        premultiply_rgba(&mut data);
+        assert_eq!(data[..4], [0, 0, 0, 0]);
+        assert_eq!(data[4], 255);
+    }
+
+    #[test]
+    fn validate_rejects_zero_width() {
+        let err = validate_texture_data(0, 8, 0).unwrap_err();
+        assert!(matches!(err, RenderError::InvalidTextureData(_)));
+    }
+
+    #[test]
+    fn validate_rejects_zero_height() {
+        let err = validate_texture_data(8, 0, 0).unwrap_err();
+        assert!(matches!(err, RenderError::InvalidTextureData(_)));
+    }
+
+    #[test]
+    fn validate_rejects_wrong_data_len() {
+        let err = validate_texture_data(2, 2, 15).unwrap_err();
+        assert!(matches!(err, RenderError::InvalidTextureData(_)));
+        assert!(validate_texture_data(2, 2, 17).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_exact_data_len() {
+        assert!(validate_texture_data(2, 2, 16).is_ok());
     }
 }

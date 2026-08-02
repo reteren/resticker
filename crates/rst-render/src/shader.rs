@@ -94,3 +94,39 @@ pub(crate) fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
         std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{SPRITE_HLSL, blob_bytes, compile};
+    use windows::core::PCSTR;
+
+    /// Компиляция через D3DCompile требует d3dcompiler_47.dll — системный
+    /// компонент Windows 10/11; тест грузит его, как и боевой рендерер.
+    #[test]
+    fn sprite_shader_compiles_for_vs_and_ps() {
+        let vs = compile(
+            PCSTR::from_raw(c"mainVS".as_ptr().cast()),
+            PCSTR::from_raw(c"vs_5_0".as_ptr().cast()),
+        )
+        .expect("вершинный шейдер должен компилироваться");
+        let ps = compile(
+            PCSTR::from_raw(c"mainPS".as_ptr().cast()),
+            PCSTR::from_raw(c"ps_5_0".as_ptr().cast()),
+        )
+        .expect("пиксельный шейдер должен компилироваться");
+
+        assert!(!blob_bytes(&vs).is_empty(), "vs_5_0 должен дать байткод");
+        assert!(!blob_bytes(&ps).is_empty(), "ps_5_0 должен дать байткод");
+    }
+
+    /// Инварианты исходника HLSL, критичные для спрайтового рендера:
+    /// обе точки входа, константный буфер и premultiplied-умножение на opacity.
+    #[test]
+    fn sprite_hlsl_contract() {
+        assert!(SPRITE_HLSL.contains("mainVS"));
+        assert!(SPRITE_HLSL.contains("mainPS"));
+        assert!(SPRITE_HLSL.contains("cbuffer Cb"));
+        // Текстура уже premultiplied, поэтому rgb тоже умножается на opacity.
+        assert!(SPRITE_HLSL.contains("tex0.Sample(samp0, i.uv) * i.opacity"));
+    }
+}

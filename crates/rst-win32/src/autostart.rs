@@ -119,3 +119,33 @@ pub fn is_enabled() -> Result<bool, Win32Error> {
     }
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::to_wide;
+
+    #[test]
+    fn to_wide_is_nul_terminated_ascii() {
+        assert_eq!(
+            to_wide("resticker"),
+            [114, 101, 115, 116, 105, 99, 107, 101, 114, 0]
+        );
+    }
+
+    #[test]
+    fn to_wide_empty_is_single_nul() {
+        assert_eq!(to_wide(""), [0]);
+    }
+
+    #[test]
+    fn to_wide_encodes_non_ascii_as_utf16() {
+        let wide = to_wide("стикер");
+        assert_eq!(
+            wide.len(),
+            "стикер".chars().count() + 1,
+            "BMP-символы — по одному u16"
+        );
+        assert_eq!(wide[0], 0x0441, "«с» — U+0441");
+        assert_eq!(wide.last(), Some(&0));
+    }
+}
