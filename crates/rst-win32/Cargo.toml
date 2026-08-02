@@ -1,0 +1,21 @@
+[package]
+name = "rst-win32"
+description = "Safe Win32 wrappers for resticker: windows, WinEvent hooks, hotkeys, tray, DPI, monitors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+] }
+
+[lints]
+workspace = true

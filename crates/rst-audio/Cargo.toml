@@ -1,0 +1,12 @@
+[package]
+name = "rst-audio"
+description = "WASAPI audio mixer for resticker video sticker sound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

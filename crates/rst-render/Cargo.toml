@@ -1,0 +1,12 @@
+[package]
+name = "rst-render"
+description = "D3D11 + DirectComposition renderer: composition swapchains, shaders, overlap mask, editor UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

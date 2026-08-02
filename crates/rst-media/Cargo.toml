@@ -1,0 +1,12 @@
+[package]
+name = "rst-media"
+description = "Media loading for resticker: images, GIF/animation, FFmpeg video decode, downscale cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

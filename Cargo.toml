@@ -1,0 +1,50 @@
+# resticker — воркспейс. Структура крейтов: ARCHITECTURE.md, раздел 1.
+[workspace]
+resolver = "3"
+members = [
+    "crates/resticker",
+    "crates/rst-core",
+    "crates/rst-win32",
+    "crates/rst-render",
+    "crates/rst-media",
+    "crates/rst-audio",
+]
+# Спайк S0 — самостоятельный выбрасываемый крейт, в воркспейс не входит.
+exclude = ["spike"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+# rst-core платформенно-независим (CONTRIBUTING.md, «Правило зависимостей»).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+
+# Профили сборки — по CONTRIBUTING.md.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+strip = "debuginfo"
+
+# Профиль для профилирования (superluminal / WPA): оптимизация релиза + символы.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+
+# Дисциплина unsafe (CONTRIBUTING.md): unsafe_op_in_unsafe_fn — ошибка во всех крейтах.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+# Базовые clippy-линты; CI дополнительно превращает все предупреждения в ошибки.
+[workspace.lints.clippy]
+all = "warn"

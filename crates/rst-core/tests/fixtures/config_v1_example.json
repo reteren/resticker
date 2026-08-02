@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "settings": {
+    "autostart": true,
+    "silent_start": true,
+    "tray_icon": true,
+    "hide_from_capture": false,
+    "never_overlap_taskbar": false,
+    "skip_delete_confirmation": false,
+    "battery_fps_limit": 30,
+    "mute_invisible_stickers": true,
+    "language": "ru"
+  },
+  "hotkeys": {
+    "edit_mode": "Ctrl+Alt+S",
+    "toggle_all_stickers": "Ctrl+Alt+H",
+    "mute_all": "Ctrl+Alt+M"
+  },
+  "monitors": [
+    {
+      "id": "\\\\?\\DISPLAY#GSM5B09#5&1a2b3c4d&0&UID4353#{e6f07b5f-aaaa}",
+      "friendly_name": "LG ULTRAGEAR",
+      "last_seen": "2026-07-31T22:14:03Z",
+      "last_bounds": { "x": 0, "y": 0, "w": 2560, "h": 1440 },
+      "last_scale": 1.0,
+      "is_primary": true
+    }
+  ],
+  "stickers": [
+    {
+      "id": "0192f3a1-8c4e-7b21-9f03-6d5e4c3b2a10",
+      "enabled": true,
+      "visible": true,
+      "order": 3,
+      "created_at": "2026-07-29T05:59:58Z",
+      "source": {
+        "kind": "file",
+        "path": "D:\\refs\\pose_01.png",
+        "media_type": "image"
+      },
+      "placement": {
+        "monitor_id": "\\\\?\\DISPLAY#GSM5B09#5&1a2b3c4d&0&UID4353#{e6f07b5f-aaaa}",
+        "cx": 1280.0,
+        "cy": 720.0,
+        "w": 512.0,
+        "h": 384.0
+      },
+      "transform": { "rotation": 0.0, "opacity": 0.85, "flip_h": false, "flip_v": false },
+      "visibility": {
+        "mode": "overlap_allowlist",
+        "rules": [ { "process_name": "chrome.exe", "title_pattern": "*YouTube*" } ]
+      },
+      "playback": {
+        "volume": 0.8,
+        "speed": 1.0,
+        "loop_mode": "loop",
+        "audio_track": null,
+        "override_mute_when_invisible": false
+      }
+    },
+    {
+      "id": "0192f3a1-8c4e-7b21-9f03-6d5e4c3b2a11",
+      "enabled": true,
+      "visible": true,
+      "order": 7,
+      "created_at": "2026-07-30T10:00:00Z",
+      "source": {
+        "kind": "window",
+        "window": {
+          "process_name": "obs64.exe",
+          "title_pattern": "*OBS Studio*",
+          "pin_mode": "client_area"
+        }
+      },
+      "placement": {
+        "monitor_id": "\\\\?\\DISPLAY#GSM5B09#5&1a2b3c4d&0&UID4353#{e6f07b5f-aaaa}",
+        "cx": 400.0,
+        "cy": 300.0,
+        "w": 640.0,
+        "h": 360.0
+      },
+      "transform": { "rotation": 0.0, "opacity": 1.0, "flip_h": false, "flip_v": false },
+      "visibility": { "mode": "never_overlap", "rules": [] },
+      "playback": {
+        "volume": 0.5,
+        "speed": 1.0,
+        "loop_mode": "loop",
+        "audio_track": 1,
+        "override_mute_when_invisible": true
+      }
+    },
+    {
+      "id": "0192f3a1-8c4e-7b21-9f03-6d5e4c3b2a12",
+      "enabled": false,
+      "visible": false,
+      "order": 1,
+      "created_at": "2026-07-30T11:00:00Z",
+      "source": {
+        "kind": "pasted",
+        "path": "C:\\Users\\user\\AppData\\Roaming\\resticker\\pasted\\abc.png"
+      },
+      "placement": {
+        "monitor_id": "\\\\?\\DISPLAY#GSM5B09#5&1a2b3c4d&0&UID4353#{e6f07b5f-aaaa}",
+        "cx": 100.0,
+        "cy": 100.0,
+        "w": 200.0,
+        "h": 150.0
+      },
+      "transform": { "rotation": 15.0, "opacity": 1.0, "flip_h": true, "flip_v": false },
+      "visibility": { "mode": "desktop", "rules": [] },
+      "playback": {
+        "volume": 1.0,
+        "speed": 1.0,
+        "loop_mode": "once",
+        "audio_track": null,
+        "override_mute_when_invisible": false
+      },
+      "origin": {
+        "monitor_id": "\\\\?\\DISPLAY#DEL4321#bbbb",
+        "cx": 960.0,
+        "cy": 540.0,
+        "w": 200.0,
+        "h": 150.0,
+        "rotation": 15.0,
+        "migrated_at": "2026-07-31T18:00:00Z"
+      }
+    }
+  ]
+}
