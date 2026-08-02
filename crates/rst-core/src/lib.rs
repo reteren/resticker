@@ -10,6 +10,7 @@ mod error;
 pub mod hittest;
 pub mod model;
 pub mod ops;
+pub mod selection_set;
 pub mod snap;
 pub mod undo;
 

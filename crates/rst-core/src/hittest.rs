@@ -102,6 +102,128 @@ pub fn aabb(placement: &Placement, rotation: f64) -> DipRect {
     DipRect::from_center(placement.cx, placement.cy, hw * 2.0, hh * 2.0)
 }
 
+/// Одна из восьми ручек рамки выделения (ROADMAP.md M2: «Рамка выделения +
+/// 8 ручек»). Порядок вариантов — по часовой стрелке от северо-западной.
+///
+/// Единый тип для всех крейтов (docs/M2_INTEGRATION_REVIEW.md, §1): его
+/// переиспользуют рендерер (rst-render `selection`), зоны ввода и
+/// трансформации ([`crate::transform_ops`]). Новых копий не заводить.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleKind {
+    NorthWest,
+    North,
+    NorthEast,
+    East,
+    SouthEast,
+    South,
+    SouthWest,
+    West,
+}
+
+impl HandleKind {
+    /// Все ручки в порядке объявления (по часовой от северо-западной).
+    pub const ALL: [HandleKind; 8] = [
+        HandleKind::NorthWest,
+        HandleKind::North,
+        HandleKind::NorthEast,
+        HandleKind::East,
+        HandleKind::SouthEast,
+        HandleKind::South,
+        HandleKind::SouthWest,
+        HandleKind::West,
+    ];
+
+    /// Знаки смещения ручки от центра рамки в локальных осях стикера
+    /// (доли полуразмера): восток +1 по x, юг +1 по y.
+    pub const fn local_sign(self) -> (f64, f64) {
+        match self {
+            HandleKind::NorthWest => (-1.0, -1.0),
+            HandleKind::North => (0.0, -1.0),
+            HandleKind::NorthEast => (1.0, -1.0),
+            HandleKind::East => (1.0, 0.0),
+            HandleKind::SouthEast => (1.0, 1.0),
+            HandleKind::South => (0.0, 1.0),
+            HandleKind::SouthWest => (-1.0, 1.0),
+            HandleKind::West => (-1.0, 0.0),
+        }
+    }
+
+    /// Угловая ручка, если это угол: только у углов есть зона поворота
+    /// (SPEC 3.3).
+    pub const fn corner(self) -> Option<Corner> {
+        match self {
+            HandleKind::NorthWest => Some(Corner::NorthWest),
+            HandleKind::NorthEast => Some(Corner::NorthEast),
+            HandleKind::SouthEast => Some(Corner::SouthEast),
+            HandleKind::SouthWest => Some(Corner::SouthWest),
+            _ => None,
+        }
+    }
+
+    /// Угловая ли ручка.
+    pub const fn is_corner(self) -> bool {
+        matches!(
+            self,
+            HandleKind::NorthWest
+                | HandleKind::NorthEast
+                | HandleKind::SouthEast
+                | HandleKind::SouthWest
+        )
+    }
+}
+
+/// Угловая ручка рамки выделения. Порядок — по часовой от северо-западной,
+/// совпадает с порядком углов в [`corners`], поэтому [`Corner::index`]
+/// индексирует массив из [`corners`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corner {
+    NorthWest,
+    NorthEast,
+    SouthEast,
+    SouthWest,
+}
+
+impl Corner {
+    /// Все углы в порядке объявления.
+    pub const ALL: [Corner; 4] = [
+        Corner::NorthWest,
+        Corner::NorthEast,
+        Corner::SouthEast,
+        Corner::SouthWest,
+    ];
+
+    /// Индекс угла в массивах вида [`corners`] (NW, NE, SE, SW).
+    pub const fn index(self) -> usize {
+        match self {
+            Corner::NorthWest => 0,
+            Corner::NorthEast => 1,
+            Corner::SouthEast => 2,
+            Corner::SouthWest => 3,
+        }
+    }
+
+    /// Знаки смещения угла от центра рамки (доли полуразмера), как у
+    /// [`HandleKind::local_sign`].
+    pub const fn local_sign(self) -> (f64, f64) {
+        match self {
+            Corner::NorthWest => (-1.0, -1.0),
+            Corner::NorthEast => (1.0, -1.0),
+            Corner::SouthEast => (1.0, 1.0),
+            Corner::SouthWest => (-1.0, 1.0),
+        }
+    }
+
+    /// Соответствующая угловая ручка.
+    pub const fn handle(self) -> HandleKind {
+        match self {
+            Corner::NorthWest => HandleKind::NorthWest,
+            Corner::NorthEast => HandleKind::NorthEast,
+            Corner::SouthEast => HandleKind::SouthEast,
+            Corner::SouthWest => HandleKind::SouthWest,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +394,52 @@ mod tests {
         let r = aabb(&placement(0.0, 0.0, 10.0, 10.0), FRAC_PI_4);
         assert_close(r.w, 10.0 * SQRT_2);
         assert_close(r.h, 10.0 * SQRT_2);
+    }
+
+    #[test]
+    fn handle_local_sign_covers_all_handles() {
+        let expected = [
+            (HandleKind::NorthWest, (-1.0, -1.0)),
+            (HandleKind::North, (0.0, -1.0)),
+            (HandleKind::NorthEast, (1.0, -1.0)),
+            (HandleKind::East, (1.0, 0.0)),
+            (HandleKind::SouthEast, (1.0, 1.0)),
+            (HandleKind::South, (0.0, 1.0)),
+            (HandleKind::SouthWest, (-1.0, 1.0)),
+            (HandleKind::West, (-1.0, 0.0)),
+        ];
+        for (handle, sign) in expected {
+            assert_eq!(handle.local_sign(), sign, "{handle:?}");
+        }
+    }
+
+    #[test]
+    fn handle_corner_mapping() {
+        for handle in HandleKind::ALL {
+            match handle {
+                HandleKind::NorthWest => assert_eq!(handle.corner(), Some(Corner::NorthWest)),
+                HandleKind::NorthEast => assert_eq!(handle.corner(), Some(Corner::NorthEast)),
+                HandleKind::SouthEast => assert_eq!(handle.corner(), Some(Corner::SouthEast)),
+                HandleKind::SouthWest => assert_eq!(handle.corner(), Some(Corner::SouthWest)),
+                _ => assert_eq!(handle.corner(), None),
+            }
+            assert_eq!(handle.is_corner(), handle.corner().is_some(), "{handle:?}");
+        }
+        for corner in Corner::ALL {
+            assert_eq!(corner.handle().corner(), Some(corner), "{corner:?}");
+        }
+    }
+
+    #[test]
+    fn corner_index_matches_corners_array_order() {
+        let p = placement(10.0, 20.0, 4.0, 2.0);
+        let c = corners(&p, 0.0);
+        for corner in Corner::ALL {
+            let (sx, sy) = corner.local_sign();
+            // Угол по индексу обязан быть to_world от локальной точки (sx·hw, sy·hh).
+            let (wx, wy) = to_world(p.cx, p.cy, 0.0, sx * p.w / 2.0, sy * p.h / 2.0);
+            assert_close(c[corner.index()].0, wx);
+            assert_close(c[corner.index()].1, wy);
+        }
     }
 }

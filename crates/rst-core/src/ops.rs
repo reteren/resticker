@@ -1,5 +1,5 @@
-//! Операции над моделью: z-order, дублирование, удаление, переключение
-//! видимости (SPEC.md, раздел 3; ROADMAP.md M2 «Тулбар»).
+//! Операции над моделью: z-order, дублирование, удаление (и подтверждение
+//! удаления), переключение видимости (SPEC.md, раздел 3; ROADMAP.md M2 «Тулбар»).
 //!
 //! Все функции чистые: без ввода-вывода, только читают и мутируют переданный
 //! `Config` по правилам CONFIG.md («order»: больше — выше, кнопки выше/ниже
@@ -132,6 +132,19 @@ pub fn delete(config: &mut Config, id: Uuid) -> Result<(), OpError> {
     let i = index_of(config, id).ok_or(OpError::StickerNotFound(id))?;
     config.stickers.remove(i);
     Ok(())
+}
+
+/// Показывать ли диалог подтверждения удаления (SPEC.md, «Больше не
+/// спрашивать»): да, пока пользователь не отключил подтверждение.
+pub fn should_confirm_delete(config: &Config) -> bool {
+    !config.settings.skip_delete_confirmation
+}
+
+/// Отключить подтверждение удаления («Больше не спрашивать», SPEC.md).
+/// Сброс — прямым присваиванием `settings.skip_delete_confirmation = false`
+/// в настройках.
+pub fn suppress_delete_confirmation(config: &mut Config) {
+    config.settings.skip_delete_confirmation = true;
 }
 
 /// Переключить видимость стикера (кнопка «глаз», SPEC.md раздел 3.2).
@@ -423,6 +436,45 @@ mod tests {
         assert!(!get(&c, id).visible);
         toggle_visibility(&mut c, id).unwrap();
         assert!(get(&c, id).visible);
+    }
+
+    #[test]
+    fn delete_confirmation_on_by_default() {
+        let c = Config::default();
+        assert!(should_confirm_delete(&c));
+        assert!(!c.settings.skip_delete_confirmation);
+    }
+
+    #[test]
+    fn suppress_delete_confirmation_flips_flag() {
+        let mut c = Config::default();
+        suppress_delete_confirmation(&mut c);
+        assert!(!should_confirm_delete(&c));
+        assert!(c.settings.skip_delete_confirmation);
+    }
+
+    #[test]
+    fn reset_restores_confirmation() {
+        let mut c = Config::default();
+        suppress_delete_confirmation(&mut c);
+        c.settings.skip_delete_confirmation = false;
+        assert!(should_confirm_delete(&c));
+    }
+
+    #[test]
+    fn suppress_is_idempotent() {
+        let mut c = Config::default();
+        suppress_delete_confirmation(&mut c);
+        suppress_delete_confirmation(&mut c);
+        assert!(!should_confirm_delete(&c));
+    }
+
+    #[test]
+    fn should_confirm_delete_does_not_mutate() {
+        let c = Config::default();
+        let before = c.clone();
+        let _ = should_confirm_delete(&c);
+        assert_eq!(c, before);
     }
 
     #[test]

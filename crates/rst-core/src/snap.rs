@@ -1,5 +1,7 @@
-//! Магнит к краям, центрам и углам монитора при перемещении стикера
-//! (ROADMAP.md M2 «Магнит к краям и центрам монитора, Ctrl — отключить»).
+//! Геометрия перемещения стикера в режиме редактирования: магнит к краям,
+//! центрам и углам монитора (ROADMAP.md M2 «Магнит к краям и центрам
+//! монитора, Ctrl — отключить») и ограничение «минимум 10% видно с каждой
+//! стороны» (M2).
 //!
 //! Чистая логика: на вход — ось-выровненный bbox стикера и размер монитора
 //! в DIP (ADR-010), на выход — смещение и прилипшие направляющие для
@@ -169,6 +171,36 @@ fn snap_axis(points: [f64; 3], guides: [f64; 3], threshold: f64) -> (f64, Option
         Some((gi, delta, _)) => (delta, Some((gi, guides[gi]))),
         None => (0.0, None),
     }
+}
+
+/// Минимальная доля bbox стикера, которая обязана оставаться видимой
+/// с каждой стороны монитора (SPEC.md, раздел 1).
+pub const MIN_VISIBLE_FRACTION: f64 = 0.1;
+
+/// Ограничение «минимум 10% видно с каждой стороны» (ROADMAP.md M2):
+/// возвращает копию `placement` со скорректированным центром, при которой
+/// ось-выровненный bbox стикера (с учётом поворота, [`crate::hittest::aabb`])
+/// уходит за каждую сторону `monitor` не более чем на
+/// `1 - MIN_VISIBLE_FRACTION` своей ширины/высоты.
+///
+/// Позиция, уже удовлетворяющая ограничению, не меняется. Стикер
+/// с дегенеративным размером (нулевым, отрицательным или NaN) или монитор
+/// нулевого размера возвращаются как есть — ограничение для них не определено.
+pub fn clamp_min_visible(placement: &Placement, rotation: f64, monitor: DipRect) -> Placement {
+    let bbox = aabb(placement, rotation);
+    if !(bbox.w > 0.0 && bbox.h > 0.0 && monitor.w > 0.0 && monitor.h > 0.0) {
+        return placement.clone();
+    }
+    let min_x = monitor.x - (1.0 - MIN_VISIBLE_FRACTION) * bbox.w;
+    let max_x = monitor.x + monitor.w - MIN_VISIBLE_FRACTION * bbox.w;
+    let min_y = monitor.y - (1.0 - MIN_VISIBLE_FRACTION) * bbox.h;
+    let max_y = monitor.y + monitor.h - MIN_VISIBLE_FRACTION * bbox.h;
+    let dx = bbox.x.clamp(min_x, max_x) - bbox.x;
+    let dy = bbox.y.clamp(min_y, max_y) - bbox.y;
+    let mut clamped = placement.clone();
+    clamped.cx += dx;
+    clamped.cy += dy;
+    clamped
 }
 
 #[cfg(test)]
@@ -421,5 +453,133 @@ mod tests {
         let r = snap_placement(&p, FRAC_PI_2, MONITOR, &cfg, false);
         assert_close(r.dx, -5.0);
         assert_eq!(r.vline.map(|(g, _)| g), Some(VerticalLine::Left));
+    }
+
+    fn placement_at(cx: f64, cy: f64, w: f64, h: f64) -> Placement {
+        Placement {
+            cx,
+            cy,
+            w,
+            h,
+            ..Placement::default()
+        }
+    }
+
+    fn clamped(cx: f64, cy: f64, w: f64, h: f64) -> Placement {
+        clamp_min_visible(&placement_at(cx, cy, w, h), 0.0, MONITOR)
+    }
+
+    #[test]
+    fn inside_monitor_is_unchanged() {
+        let p = clamped(960.0, 540.0, 100.0, 50.0);
+        assert_close(p.cx, 960.0);
+        assert_close(p.cy, 540.0);
+    }
+
+    #[test]
+    fn partially_out_within_90_percent_is_unchanged() {
+        // bbox 100x50 уходит влево на 80% ширины — допустимо.
+        let p = clamped(-30.0, 540.0, 100.0, 50.0);
+        assert_close(p.cx, -30.0);
+        assert_close(p.cy, 540.0);
+    }
+
+    #[test]
+    fn far_left_clamps_to_10_percent_visible() {
+        let p = clamped(-5000.0, 540.0, 100.0, 50.0);
+        assert_close(p.cx, -40.0);
+        assert_close(p.cy, 540.0);
+    }
+
+    #[test]
+    fn far_right_clamps_to_10_percent_visible() {
+        let p = clamped(5000.0, 540.0, 100.0, 50.0);
+        assert_close(p.cx, 1960.0);
+        assert_close(p.cy, 540.0);
+    }
+
+    #[test]
+    fn far_top_clamps_to_10_percent_visible() {
+        let p = clamped(960.0, -5000.0, 100.0, 50.0);
+        assert_close(p.cx, 960.0);
+        assert_close(p.cy, -20.0);
+    }
+
+    #[test]
+    fn far_bottom_clamps_to_10_percent_visible() {
+        let p = clamped(960.0, 5000.0, 100.0, 50.0);
+        assert_close(p.cx, 960.0);
+        assert_close(p.cy, 1100.0);
+    }
+
+    #[test]
+    fn corner_clamps_both_axes() {
+        let p = clamped(-5000.0, -5000.0, 100.0, 50.0);
+        assert_close(p.cx, -40.0);
+        assert_close(p.cy, -20.0);
+    }
+
+    #[test]
+    fn exactly_at_ten_percent_is_unchanged() {
+        // bbox.x = -90 ровно: слева видно ровно 10% ширины.
+        let p = clamped(-40.0, 540.0, 100.0, 50.0);
+        assert_close(p.cx, -40.0);
+        assert_close(p.cy, 540.0);
+    }
+
+    #[test]
+    fn rotation_uses_aabb_dimensions() {
+        // 100x40 при повороте 90°: bbox 40x100 — ограничение по ширине 40.
+        let p = clamp_min_visible(
+            &placement_at(-5000.0, 540.0, 100.0, 40.0),
+            FRAC_PI_2,
+            MONITOR,
+        );
+        assert_close(p.cx, -16.0);
+        assert_close(p.cy, 540.0);
+    }
+
+    #[test]
+    fn offset_monitor_clamps_relatively() {
+        let m = DipRect::new(100.0, 200.0, 1920.0, 1080.0);
+        let p = clamp_min_visible(&placement_at(-5000.0, -5000.0, 100.0, 50.0), 0.0, m);
+        assert_close(p.cx, 60.0);
+        assert_close(p.cy, 180.0);
+    }
+
+    #[test]
+    fn sticker_wider_than_monitor_still_clamps() {
+        // bbox 2000x50 в мониторе 1920: уход влево ограничен 90% ширины.
+        let p = clamped(-5000.0, 540.0, 2000.0, 50.0);
+        assert_close(p.cx, -800.0);
+        assert_close(p.cy, 540.0);
+    }
+
+    #[test]
+    fn degenerate_sticker_is_unchanged() {
+        for (w, h) in [(0.0, 50.0), (-10.0, 50.0), (100.0, 0.0)] {
+            let p = clamp_min_visible(&placement_at(-5000.0, -5000.0, w, h), 0.0, MONITOR);
+            assert_close(p.cx, -5000.0);
+            assert_close(p.cy, -5000.0);
+        }
+    }
+
+    #[test]
+    fn nan_size_is_unchanged() {
+        let p = clamp_min_visible(
+            &placement_at(-5000.0, -5000.0, f64::NAN, 50.0),
+            0.0,
+            MONITOR,
+        );
+        assert_close(p.cx, -5000.0);
+        assert_close(p.cy, -5000.0);
+    }
+
+    #[test]
+    fn zero_size_monitor_is_unchanged() {
+        let zero = DipRect::new(0.0, 0.0, 0.0, 0.0);
+        let p = clamp_min_visible(&placement_at(-5000.0, -5000.0, 100.0, 50.0), 0.0, zero);
+        assert_close(p.cx, -5000.0);
+        assert_close(p.cy, -5000.0);
     }
 }
