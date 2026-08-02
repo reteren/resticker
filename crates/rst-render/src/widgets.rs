@@ -76,6 +76,28 @@ pub enum Icon {
     Exit,
 }
 
+impl Icon {
+    /// Все варианты в порядке объявления — для предварительной генерации
+    /// кэша иконок (текс-карта `HashMap<Icon, Texture>`, M2_WIRING_PLAN §3)
+    /// и тестов генератора `icon_rgba`.
+    pub const ALL: [Icon; 14] = [
+        Icon::Layers,
+        Icon::Eye,
+        Icon::EyeOff,
+        Icon::OrderUp,
+        Icon::OrderDown,
+        Icon::Duplicate,
+        Icon::Delete,
+        Icon::FileOpen,
+        Icon::ShowAll,
+        Icon::HideAll,
+        Icon::PresetSave,
+        Icon::PresetLoad,
+        Icon::Settings,
+        Icon::Exit,
+    ];
+}
+
 /// Примитив отрисовки (геометрия DIP). В спрайты превращает вызывающий слой.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Primitive {
