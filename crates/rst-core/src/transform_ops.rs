@@ -159,7 +159,10 @@ pub fn rotate(
     let mut out = TransformedState::new(placement, transform);
     let (gx, gy) = (grab.0 - placement.cx, grab.1 - placement.cy);
     let (px, py) = (current.0 - placement.cx, current.1 - placement.cy);
-    if ![gx, gy, px, py, transform.rotation].iter().all(|v| v.is_finite()) {
+    if ![gx, gy, px, py, transform.rotation]
+        .iter()
+        .all(|v| v.is_finite())
+    {
         return out;
     }
     // Угол между векторами со знаком: по часовой положительный (экранная
@@ -184,6 +187,468 @@ fn normalize_angle(angle: f64) -> f64 {
 /// Ограничить значение снизу по модулю, сохранив знак (знак несёт
 /// зеркалирование до сворачивания в flip-флаги).
 fn clamp_min_abs(v: f64, min_abs: f64) -> f64 {
-    if v < 0.0 { v.min(-min_abs) } else { v.max(min_abs) }
+    if v < 0.0 {
+        v.min(-min_abs)
+    } else {
+        v.max(min_abs)
+    }
 }
-// __CHUNK3__
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::MonitorId;
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+
+    fn placement(cx: f64, cy: f64, w: f64, h: f64) -> Placement {
+        Placement {
+            cx,
+            cy,
+            w,
+            h,
+            ..Placement::default()
+        }
+    }
+
+    fn transform(rotation: f64) -> Transform {
+        Transform {
+            rotation,
+            ..Transform::default()
+        }
+    }
+
+    fn mods(shift: bool, alt: bool) -> DragModifiers {
+        DragModifiers { shift, alt }
+    }
+
+    fn assert_close_ctx(actual: f64, expected: f64, ctx: &str) {
+        assert!(
+            (actual - expected).abs() <= 1e-9,
+            "{ctx}: ожидалось {expected}, получено {actual}"
+        );
+    }
+
+    fn assert_placement(out: &TransformedState, cx: f64, cy: f64, w: f64, h: f64, ctx: &str) {
+        assert_close_ctx(out.placement.cx, cx, ctx);
+        assert_close_ctx(out.placement.cy, cy, ctx);
+        assert_close_ctx(out.placement.w, w, ctx);
+        assert_close_ctx(out.placement.h, h, ctx);
+    }
+
+    #[test]
+    fn resize_axis_aligned_all_handles() {
+        // Старт (100, 50, 40, 20), дельта (10, 6): якорь — противоположная
+        // грань; N/NW/NE по вертикали упираются в минимум 16.
+        let cases: [(HandleKind, (f64, f64, f64, f64)); 8] = [
+            (HandleKind::NorthWest, (105.0, 52.0, 30.0, 16.0)),
+            (HandleKind::North, (100.0, 52.0, 40.0, 16.0)),
+            (HandleKind::NorthEast, (105.0, 52.0, 50.0, 16.0)),
+            (HandleKind::East, (105.0, 50.0, 50.0, 20.0)),
+            (HandleKind::SouthEast, (105.0, 53.0, 50.0, 26.0)),
+            (HandleKind::South, (100.0, 53.0, 40.0, 26.0)),
+            (HandleKind::SouthWest, (105.0, 53.0, 30.0, 26.0)),
+            (HandleKind::West, (105.0, 50.0, 30.0, 20.0)),
+        ];
+        for (handle, (cx, cy, w, h)) in cases {
+            let ctx = format!("{handle:?}");
+            let out = resize(
+                &placement(100.0, 50.0, 40.0, 20.0),
+                &transform(0.0),
+                handle,
+                (10.0, 6.0),
+                mods(false, false),
+            );
+            assert_placement(&out, cx, cy, w, h, &ctx);
+            assert!(!out.transform.flip_h && !out.transform.flip_v, "{ctx}");
+        }
+    }
+
+    #[test]
+    fn resize_rotated_90_east_and_west() {
+        // Поворот +90°: мировая дельта «вниз» — это локальный +x.
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(FRAC_PI_2),
+            HandleKind::East,
+            (0.0, 10.0),
+            mods(false, false),
+        );
+        assert_placement(&out, 100.0, 55.0, 50.0, 20.0, "East rot=+90");
+
+        // Поворот −90°: мировая дельта «вниз» — локальный −x (рост для West).
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(-FRAC_PI_2),
+            HandleKind::West,
+            (0.0, 10.0),
+            mods(false, false),
+        );
+        assert_placement(&out, 100.0, 55.0, 50.0, 20.0, "West rot=-90");
+    }
+
+    #[test]
+    fn resize_shift_keeps_proportions_table() {
+        // Угол SE: доминирует горизонталь (130/100 > 50/50) → 130x65.
+        let out = resize(
+            &placement(0.0, 0.0, 100.0, 50.0),
+            &transform(0.0),
+            HandleKind::SouthEast,
+            (30.0, 0.0),
+            mods(true, false),
+        );
+        assert_placement(&out, 15.0, 7.5, 130.0, 65.0, "SE, dx dominant");
+
+        // Угол SE: доминирует вертикаль (80/50 > 100/100) → 160x80.
+        let out = resize(
+            &placement(0.0, 0.0, 100.0, 50.0),
+            &transform(0.0),
+            HandleKind::SouthEast,
+            (0.0, 30.0),
+            mods(true, false),
+        );
+        assert_placement(&out, 30.0, 15.0, 160.0, 80.0, "SE, dy dominant");
+
+        // Боковая ручка E: ведущая ось — ширина, высота следует пропорции.
+        let out = resize(
+            &placement(0.0, 0.0, 100.0, 50.0),
+            &transform(0.0),
+            HandleKind::East,
+            (30.0, 999.0),
+            mods(true, false),
+        );
+        assert_placement(&out, 15.0, 0.0, 130.0, 65.0, "E side");
+
+        // Боковая ручка N: ведущая ось — высота (30/50 = 0.6), ширина следует.
+        let out = resize(
+            &placement(0.0, 0.0, 100.0, 50.0),
+            &transform(0.0),
+            HandleKind::North,
+            (999.0, 20.0),
+            mods(true, false),
+        );
+        assert_placement(&out, 0.0, 10.0, 60.0, 30.0, "N side");
+    }
+
+    #[test]
+    fn resize_alt_from_center() {
+        // Боковая ручка: дельта удваивается, центр не двигается.
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(0.0),
+            HandleKind::East,
+            (10.0, 0.0),
+            mods(false, true),
+        );
+        assert_placement(&out, 100.0, 50.0, 60.0, 20.0, "E alt");
+
+        // Угловая ручка: обе оси удваиваются.
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(0.0),
+            HandleKind::SouthEast,
+            (10.0, 10.0),
+            mods(false, true),
+        );
+        assert_placement(&out, 100.0, 50.0, 60.0, 40.0, "SE alt");
+
+        // Alt + Shift: пропорции от центра (доминирует ширина: 160/100).
+        let out = resize(
+            &placement(0.0, 0.0, 100.0, 50.0),
+            &transform(0.0),
+            HandleKind::SouthEast,
+            (30.0, 0.0),
+            mods(true, true),
+        );
+        assert_placement(&out, 0.0, 0.0, 160.0, 80.0, "SE alt+shift");
+    }
+
+    #[test]
+    fn resize_min_size_clamps() {
+        // Положительная сторона: 40 - 30 = 10 → 16; якорь (западный край) стоит.
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(0.0),
+            HandleKind::East,
+            (-30.0, 0.0),
+            mods(false, false),
+        );
+        assert_placement(&out, 88.0, 50.0, 16.0, 20.0, "positive clamp");
+    }
+
+    #[test]
+    fn resize_flip_through_anchor() {
+        // Ручку протащили через якорь: 40 - 70 = -30 → w=30, flip_h,
+        // прямоугольник [50, 80] — якорь (западный край, x=80) неподвижен.
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(0.0),
+            HandleKind::East,
+            (-70.0, 0.0),
+            mods(false, false),
+        );
+        assert_placement(&out, 65.0, 50.0, 30.0, 20.0, "flip");
+        assert!(out.transform.flip_h);
+        assert!(!out.transform.flip_v);
+
+        // Возврат за якорь обратно в рамках того же жеста (состояние
+        // считается от стартового снимка, а не инкрементально): flip_h
+        // не переключается.
+        let back = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(0.0),
+            HandleKind::East,
+            (10.0, 0.0),
+            mods(false, false),
+        );
+        assert!(!back.transform.flip_h);
+
+        // Следующий жест от зеркального результата: якорь не пересекается
+        // (30 + 70 > 0), поэтому flip_h сохраняется, меняется только размер.
+        let grown = resize(
+            &out.placement,
+            &out.transform,
+            HandleKind::East,
+            (70.0, 0.0),
+            mods(false, false),
+        );
+        assert_placement(&grown, 100.0, 50.0, 100.0, 20.0, "grow after flip");
+        assert!(grown.transform.flip_h);
+    }
+
+    #[test]
+    fn resize_flip_with_alt_keeps_center() {
+        // 40 + 2·(−70) = −100 → w=100, flip_h, центр на месте.
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(0.0),
+            HandleKind::East,
+            (-70.0, 0.0),
+            mods(false, true),
+        );
+        assert_placement(&out, 100.0, 50.0, 100.0, 20.0, "alt flip");
+        assert!(out.transform.flip_h);
+    }
+
+    #[test]
+    fn resize_flip_clamped_negative_side() {
+        // 40 - 50 = -10 → −16 по модулю: w=16, flip_h, прямоугольник [64, 80].
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(0.0),
+            HandleKind::East,
+            (-50.0, 0.0),
+            mods(false, false),
+        );
+        assert_placement(&out, 72.0, 50.0, 16.0, 20.0, "negative clamp");
+        assert!(out.transform.flip_h);
+    }
+
+    #[test]
+    fn resize_shift_flip_both_axes() {
+        // Shift: доминирует ширина (|−0.5 − 1| > |1 − 1|) → масштаб −0.5
+        // к обеим осям: зеркалирование по обоим, пропорции сохранены.
+        let out = resize(
+            &placement(0.0, 0.0, 100.0, 50.0),
+            &transform(0.0),
+            HandleKind::SouthEast,
+            (-150.0, 0.0),
+            mods(true, false),
+        );
+        assert_placement(&out, -75.0, -37.5, 50.0, 25.0, "shift flip");
+        assert!(out.transform.flip_h && out.transform.flip_v);
+    }
+
+    #[test]
+    fn resize_preserves_monitor_and_transform_fields() {
+        let p = Placement {
+            monitor_id: MonitorId("DISPLAY#TEST".to_string()),
+            ..placement(100.0, 50.0, 40.0, 20.0)
+        };
+        let t = Transform {
+            opacity: 0.5,
+            ..transform(0.0)
+        };
+        let out = resize(&p, &t, HandleKind::East, (10.0, 0.0), mods(false, false));
+        assert_eq!(out.placement.monitor_id, p.monitor_id);
+        assert_close_ctx(out.transform.opacity, 0.5, "opacity");
+        assert_close_ctx(out.transform.rotation, 0.0, "rotation");
+    }
+
+    #[test]
+    fn resize_rejects_garbage() {
+        let p = placement(100.0, 50.0, 40.0, 20.0);
+        let t = transform(0.0);
+        // NaN-дельта — состояние не меняется.
+        let out = resize(
+            &p,
+            &t,
+            HandleKind::East,
+            (f64::NAN, 0.0),
+            mods(false, false),
+        );
+        assert_eq!(out.placement, p);
+        assert_eq!(out.transform, t);
+        // Отрицательный стартовый размер (битый конфиг) — состояние не меняется.
+        let bad = placement(0.0, 0.0, -5.0, 20.0);
+        let out = resize(&bad, &t, HandleKind::East, (10.0, 0.0), mods(false, false));
+        assert_eq!(out.placement, bad);
+    }
+
+    #[test]
+    fn resize_degenerate_zero_size_no_nan() {
+        // Нулевая ширина: пропорции не определены (Shift пропускается),
+        // но функция обязана отработать без NaN.
+        let out = resize(
+            &placement(100.0, 50.0, 0.0, 20.0),
+            &transform(0.0),
+            HandleKind::East,
+            (10.0, 0.0),
+            mods(true, false),
+        );
+        assert!(out.placement.w.is_finite());
+        assert_close_ctx(out.placement.w, MIN_SIZE_DIP, "clamped from zero");
+    }
+
+    #[test]
+    fn anchor_stays_fixed_for_all_handles_and_rotations() {
+        for rotation in [0.0, FRAC_PI_4, FRAC_PI_2, -1.2] {
+            for handle in HandleKind::ALL {
+                let ctx = format!("{handle:?} rot={rotation}");
+                let p = placement(120.0, 80.0, 60.0, 30.0);
+                let t = transform(rotation);
+                let out = resize(&p, &t, handle, (14.0, -9.0), mods(false, false));
+                let (sx, sy) = handle.local_sign();
+                // Мировая позиция якоря (противоположной грани/угла) до и
+                // после ресайза обязана совпасть.
+                let before = to_world(p.cx, p.cy, rotation, -sx * p.w / 2.0, -sy * p.h / 2.0);
+                let after = to_world(
+                    out.placement.cx,
+                    out.placement.cy,
+                    rotation,
+                    -sx * out.placement.w / 2.0,
+                    -sy * out.placement.h / 2.0,
+                );
+                assert_close_ctx(after.0, before.0, &ctx);
+                assert_close_ctx(after.1, before.1, &ctx);
+            }
+        }
+    }
+
+    #[test]
+    fn shift_keeps_aspect_for_all_handles() {
+        for handle in HandleKind::ALL {
+            let out = resize(
+                &placement(0.0, 0.0, 100.0, 40.0),
+                &transform(0.0),
+                handle,
+                (25.0, 10.0),
+                mods(true, false),
+            );
+            assert_close_ctx(
+                out.placement.w / out.placement.h,
+                100.0 / 40.0,
+                &format!("{handle:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn rotate_clockwise_and_counterclockwise() {
+        let p = placement(100.0, 50.0, 40.0, 20.0);
+        // Захват справа от центра, курсор ушёл вниз: по часовой → +90°
+        // (конвенция шейдера: локальная точка (1,0) уходит в (0,1)).
+        let out = rotate(
+            &p,
+            &transform(0.0),
+            (200.0, 50.0),
+            (100.0, 150.0),
+            mods(false, false),
+        );
+        assert_close_ctx(out.transform.rotation, FRAC_PI_2, "clockwise");
+
+        // Курсор ушёл вверх: против часовой → −90°.
+        let out = rotate(
+            &p,
+            &transform(0.0),
+            (200.0, 50.0),
+            (100.0, -50.0),
+            mods(false, false),
+        );
+        assert_close_ctx(out.transform.rotation, -FRAC_PI_2, "counterclockwise");
+
+        // Дельта прибавляется к стартовому повороту.
+        let out = rotate(
+            &p,
+            &transform(0.3),
+            (200.0, 50.0),
+            (100.0, 150.0),
+            mods(false, false),
+        );
+        assert_close_ctx(out.transform.rotation, 0.3 + FRAC_PI_2, "from 0.3");
+    }
+
+    #[test]
+    fn rotate_shift_snaps_to_15_degrees() {
+        let p = placement(100.0, 50.0, 40.0, 20.0);
+        // 0.3 + 90° = 107.19° → ближайший шаг 15° — 105° = 7·π/12.
+        let out = rotate(
+            &p,
+            &transform(0.3),
+            (200.0, 50.0),
+            (100.0, 150.0),
+            mods(true, false),
+        );
+        assert_close_ctx(out.transform.rotation, 7.0 * PI / 12.0, "snap to 105°");
+
+        // Ровно 90° — кратно 15°, не меняется.
+        let out = rotate(
+            &p,
+            &transform(0.0),
+            (200.0, 50.0),
+            (100.0, 150.0),
+            mods(true, false),
+        );
+        assert_close_ctx(out.transform.rotation, FRAC_PI_2, "already multiple");
+    }
+
+    #[test]
+    fn rotate_normalizes_to_minus_pi_pi() {
+        let p = placement(100.0, 50.0, 40.0, 20.0);
+        // Курсор на +0.6 рад по часовой от захвата: 3.0 + 0.6 = 3.6 > π.
+        let current = (100.0 + 100.0 * 0.6_f64.cos(), 50.0 + 100.0 * 0.6_f64.sin());
+        let out = rotate(
+            &p,
+            &transform(3.0),
+            (200.0, 50.0),
+            current,
+            mods(false, false),
+        );
+        assert_close_ctx(out.transform.rotation, 3.6 - 2.0 * PI, "wrapped");
+    }
+
+    #[test]
+    fn rotate_grab_at_center_is_noop() {
+        let p = placement(100.0, 50.0, 40.0, 20.0);
+        // Нулевой вектор захвата: угол не определён, поворот не меняется.
+        let out = rotate(
+            &p,
+            &transform(0.7),
+            (100.0, 50.0),
+            (150.0, 90.0),
+            mods(false, false),
+        );
+        assert_close_ctx(out.transform.rotation, 0.7, "grab at center");
+    }
+
+    #[test]
+    fn rotate_rejects_nan() {
+        let p = placement(100.0, 50.0, 40.0, 20.0);
+        let t = Transform {
+            opacity: 0.5,
+            ..transform(0.3)
+        };
+        let out = rotate(&p, &t, (200.0, 50.0), (f64::NAN, 0.0), mods(false, false));
+        assert_eq!(out.placement, p);
+        assert_eq!(out.transform, t);
+    }
+}

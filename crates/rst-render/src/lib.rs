@@ -17,7 +17,9 @@ mod renderer;
 mod selection;
 mod shader;
 mod sprite;
+mod text;
 mod texture;
+mod widgets;
 
 pub use error::RenderError;
 pub use renderer::Renderer;
@@ -27,4 +29,9 @@ pub use selection::{
     checkerboard_tile, edit_overlay, solid_sprite,
 };
 pub use sprite::Sprite;
+pub use text::{Glyph, LINE_HEIGHT, glyph_for, rasterize, text_size, width_up_to};
 pub use texture::Texture;
+pub use widgets::{
+    Button, ButtonContent, EventResult, Icon, Key, NumericField, Panel, PointerEvent, Primitive,
+    Slider, Widget, WidgetId, box_contains, theme,
+};

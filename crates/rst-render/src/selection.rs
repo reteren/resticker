@@ -12,6 +12,10 @@ use rst_core::model::{MonitorId, Placement, Transform};
 use crate::sprite::Sprite;
 use crate::texture::Texture;
 
+// Единый тип ручек — в rst-core (docs/M2_INTEGRATION_REVIEW.md, §1);
+// реэкспорт сохраняет прежний путь `selection::HandleKind`.
+pub use rst_core::hittest::HandleKind;
+
 /// Толщина рамки выделения, DIP.
 pub const OUTLINE_THICKNESS_DIP: f64 = 2.0;
 
@@ -40,21 +44,6 @@ pub struct Box2D {
     pub rotation: f64,
 }
 
-/// Одна из восьми зон рамки выделения (ROADMAP.md M2: «Рамка выделения +
-/// 8 ручек, зоны курсора»). Порядок вариантов — по часовой стрелке от
-/// северо-западного угла.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandleKind {
-    NorthWest,
-    North,
-    NorthEast,
-    East,
-    SouthEast,
-    South,
-    SouthWest,
-    West,
-}
-
 /// Визуалы рамки выделения: четыре ребра и восемь ручек.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SelectionVisuals {
@@ -71,33 +60,6 @@ pub struct SelectionBox {
     center: (f64, f64),
     size: (f64, f64),
     rotation: f64,
-}
-
-/// Порядок ручек при отрисовке — по часовой стрелке от северо-западной.
-const HANDLE_ORDER: [HandleKind; 8] = [
-    HandleKind::NorthWest,
-    HandleKind::North,
-    HandleKind::NorthEast,
-    HandleKind::East,
-    HandleKind::SouthEast,
-    HandleKind::South,
-    HandleKind::SouthWest,
-    HandleKind::West,
-];
-
-/// Локальное смещение ручки от центра рамки (доли полуразмера).
-fn local_offset(kind: HandleKind, half: (f64, f64)) -> (f64, f64) {
-    let (sx, sy) = match kind {
-        HandleKind::NorthWest => (-1.0, -1.0),
-        HandleKind::North => (0.0, -1.0),
-        HandleKind::NorthEast => (1.0, -1.0),
-        HandleKind::East => (1.0, 0.0),
-        HandleKind::SouthEast => (1.0, 1.0),
-        HandleKind::South => (0.0, 1.0),
-        HandleKind::SouthWest => (-1.0, 1.0),
-        HandleKind::West => (-1.0, 0.0),
-    };
-    (sx * half.0, sy * half.1)
 }
 
 impl SelectionBox {
@@ -150,7 +112,8 @@ impl SelectionBox {
 
     /// Центр ручки `kind` в DIP.
     pub fn handle_center(&self, kind: HandleKind) -> (f64, f64) {
-        self.rotate(local_offset(kind, (self.size.0 / 2.0, self.size.1 / 2.0)))
+        let (sx, sy) = kind.local_sign();
+        self.rotate((sx * self.size.0 / 2.0, sy * self.size.1 / 2.0))
     }
 
     /// Четыре ребра рамки как тонкие прямоугольники толщиной `thickness`
@@ -172,7 +135,7 @@ impl SelectionBox {
     /// Восемь ручек: квадраты стороной `size` (DIP) по углам и серединам
     /// рёбер, ориентированные по осям экрана (не поворачиваются с рамкой).
     pub fn handle_rects(&self, size: f64) -> [(HandleKind, Box2D); 8] {
-        HANDLE_ORDER.map(|kind| {
+        HandleKind::ALL.map(|kind| {
             let (cx, cy) = self.handle_center(kind);
             (
                 kind,

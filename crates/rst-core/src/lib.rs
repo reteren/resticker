@@ -1,5 +1,6 @@
 //! resticker core: data model, application state, undo history, edit-mode
-//! geometry (hit-testing, snapping), configuration and schema migrations.
+//! geometry (hit-testing, snapping, transform gestures), configuration
+//! and schema migrations.
 //!
 //! Платформенно-независимый крейт (CONTRIBUTING.md, «Правило зависимостей»):
 //! никаких зависимостей от Windows или рендера, вся логика покрывается
@@ -12,6 +13,7 @@ pub mod model;
 pub mod ops;
 pub mod selection_set;
 pub mod snap;
+pub mod transform_ops;
 pub mod undo;
 
 pub use error::CoreError;
