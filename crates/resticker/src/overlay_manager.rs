@@ -5,22 +5,28 @@
 //! клавиатуры/хоткея — из потока оверлей-окна.
 //!
 //! M2 (срез 1): вход/выход из режима редактирования по хоткею, затемнение
-//! 50%, клик по стикеру/фону выбирает/снимает выделение, рамка с ручками
-//! рисуется для выделенного стикера, `Esc` выходит из режима. Перетаскивание/
-//! ресайз/поворот, undo/redo, буфер обмена и тулбар — следующий срез
-//! (docs/M2_INTEGRATION_PLAN.md, раздел 17, шаги 5–8).
+//! 50%, клик по стикеру/фону выбирает/снимает выделение, рамка с ручками.
+//! M2 (срез 2, этот файл): перемещение, ресайз за ручки (`Shift`/`Alt`),
+//! поворот за угловое кольцо (`Shift` — шаг 15°), магнит и ограничение
+//! видимости при перетаскивании, курсор по зоне. Undo/redo, клавиатурные
+//! команды (`Delete`/`Ctrl+D`/`Ctrl+Z`), `Ctrl+V` и тулбар — следующий срез
+//! (docs/M2_INTEGRATION_PLAN.md, раздел 17, шаги 6–8).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use rst_core::config;
-use rst_core::hittest;
-use rst_core::model::{Config, MediaType, MonitorId, Sticker, StickerSource};
+use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
+use rst_core::model::{Config, MediaType, MonitorId, Placement, Sticker, StickerSource, Transform};
 use rst_core::selection_set::SelectionSet;
-use rst_render::{Renderer, Sprite, edit_overlay, solid_sprite};
+use rst_core::snap::{self, SnapConfig};
+use rst_core::transform_ops::{self, DragModifiers};
+use rst_render::{Box2D, Renderer, SelectionBox, Sprite, Texture, edit_overlay, solid_sprite};
 use rst_win32::hotkey::HotkeyCombo;
-use rst_win32::input::InputEvent;
+use rst_win32::input::{
+    Corner as Win32Corner, CursorShape, CursorZone, Handle as Win32Handle, InputEvent, Modifiers,
+};
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
 use uuid::Uuid;
 
@@ -32,6 +38,11 @@ const DEFAULT_EDIT_HOTKEY: &str = "Ctrl+Alt+S";
 /// из режима редактирования. Константа, а не зависимость от `windows`: этот
 /// крейт не работает с Win32-типами напрямую (CONTRIBUTING.md).
 const VK_ESCAPE: u32 = 0x1B;
+
+/// Кольцо поворота — зона за угловой ручкой (SPEC 3.3): от `ROTATE_RING_MIN_DIP`
+/// (сразу за телом стикера) до `ROTATE_RING_MAX_DIP` от центра ручки.
+const ROTATE_RING_MIN_INFLATE_DIP: f64 = 6.0;
+const ROTATE_RING_MAX_DIP: f64 = 24.0;
 
 pub enum OverlayCommand {
     AddSticker(PathBuf),
@@ -83,11 +94,61 @@ pub fn start(config_path: PathBuf, cfg: Config) -> OverlayHandle {
     }
 }
 
+/// Стартовый снимок стикера на момент `MouseDown` — жест всегда считается
+/// от него (docs/M2_INTEGRATION_PLAN.md, раздел 8): не копится ошибка
+/// округления, и `CaptureLost` может откатить незавершённый жест.
+struct GestureStart {
+    id: Uuid,
+    placement: Placement,
+    transform: Transform,
+}
+
+/// Активный жест редактирования. Захватывается в `MouseDown`, применяется в
+/// `MouseMove`, завершается в `MouseUp` (или отменяется в `CaptureLost`).
+enum Gesture {
+    Drag {
+        start: GestureStart,
+        grab_dx: f64,
+        grab_dy: f64,
+    },
+    Resize {
+        start: GestureStart,
+        handle: HandleKind,
+        grab: (f64, f64),
+    },
+    Rotate {
+        start: GestureStart,
+        grab: (f64, f64),
+    },
+}
+
+impl Gesture {
+    fn start(&self) -> &GestureStart {
+        match self {
+            Gesture::Drag { start, .. } => start,
+            Gesture::Resize { start, .. } => start,
+            Gesture::Rotate { start, .. } => start,
+        }
+    }
+}
+
+/// Зона под курсором в режиме редактирования (docs/M2_INTEGRATION_PLAN.md,
+/// раздел 7): у выделенного стикера — кольцо поворота, ручки ресайза, тело;
+/// иначе — любой видимый стикер под курсором или фон.
+enum Zone {
+    Background,
+    StickerBody(Uuid),
+    ResizeHandle(Uuid, HandleKind),
+    Rotate(Uuid, CoreCorner),
+}
+
 /// Состояние режима редактирования (docs/M2_INTEGRATION_PLAN.md, раздел 2).
-/// Жесты (перетаскивание/ресайз/поворот) и undo — следующий срез.
+/// Undo — следующий срез.
 struct EditState {
     active: bool,
     selection: SelectionSet,
+    gesture: Option<Gesture>,
+    snap: SnapConfig,
 }
 
 fn run(
@@ -152,16 +213,17 @@ fn run(
     };
 
     // Восстановление между запусками: стикеры уже в cfg (загружены в main
-    // через rst_core::config::load до вызова start()).
-    let mut sprites: Vec<Sprite> = Vec::new();
+    // через rst_core::config::load до вызова start()). Спрайт хранится
+    // вместе с id стикера — жесты правят конкретный спрайт по id, порядок
+    // отрисовки берётся из cfg.stickers (по `order`) в `redraw`.
+    let mut sprites: Vec<(Uuid, Sprite)> = Vec::new();
     for sticker in &cfg.stickers {
         if let StickerSource::File { path, .. } = &sticker.source {
             match renderer.load_image(path) {
                 Ok(texture) => {
-                    sprites.push(Sprite::new(
-                        texture,
-                        sticker.placement.clone(),
-                        sticker.transform,
+                    sprites.push((
+                        sticker.id,
+                        Sprite::new(texture, sticker.placement.clone(), sticker.transform),
                     ));
                 }
                 Err(e) => {
@@ -174,6 +236,8 @@ fn run(
     let mut edit = EditState {
         active: false,
         selection: SelectionSet::new(),
+        gesture: None,
+        snap: SnapConfig::default(),
     };
 
     redraw(
@@ -189,6 +253,7 @@ fn run(
     );
 
     for msg in rx {
+        let mut need_redraw = false;
         match msg {
             OverlayMessage::Command(OverlayCommand::AddSticker(path)) => {
                 add_sticker(
@@ -199,32 +264,12 @@ fn run(
                     &mut sprites,
                     path,
                 );
-                redraw(
-                    &mut renderer,
-                    &sprites,
-                    &cfg,
-                    &edit,
-                    &white_tex,
-                    &black_tex,
-                    width,
-                    height,
-                    scale,
-                );
+                need_redraw = true;
             }
             OverlayMessage::Command(OverlayCommand::Shutdown) => break,
             OverlayMessage::Event(OverlayEvent::ToggleEditMode) => {
                 toggle_edit_mode(&overlay, &mut edit, &mut cfg, &config_path);
-                redraw(
-                    &mut renderer,
-                    &sprites,
-                    &cfg,
-                    &edit,
-                    &white_tex,
-                    &black_tex,
-                    width,
-                    height,
-                    scale,
-                );
+                need_redraw = true;
             }
             OverlayMessage::Event(OverlayEvent::Key {
                 vk: VK_ESCAPE,
@@ -232,38 +277,38 @@ fn run(
                 ..
             }) if edit.active => {
                 toggle_edit_mode(&overlay, &mut edit, &mut cfg, &config_path);
-                redraw(
-                    &mut renderer,
-                    &sprites,
-                    &cfg,
-                    &edit,
-                    &white_tex,
-                    &black_tex,
-                    width,
-                    height,
-                    scale,
-                );
+                need_redraw = true;
             }
             OverlayMessage::Event(OverlayEvent::Key { .. }) => {}
             OverlayMessage::Event(OverlayEvent::Input(event)) if edit.active => {
-                if handle_input(event, scale, &cfg, &mut edit) {
-                    redraw(
-                        &mut renderer,
-                        &sprites,
-                        &cfg,
-                        &edit,
-                        &white_tex,
-                        &black_tex,
-                        width,
-                        height,
-                        scale,
-                    );
-                }
+                need_redraw = handle_input(
+                    event,
+                    scale,
+                    &overlay,
+                    (width, height),
+                    &mut cfg,
+                    &config_path,
+                    &mut sprites,
+                    &mut edit,
+                );
             }
             OverlayMessage::Event(OverlayEvent::Input(_)) => {
                 // Вне режима редактирования окно клик-прозрачно — эти
                 // события приходить не должны, но игнорируем на всякий случай.
             }
+        }
+        if need_redraw {
+            redraw(
+                &mut renderer,
+                &sprites,
+                &cfg,
+                &edit,
+                &white_tex,
+                &black_tex,
+                width,
+                height,
+                scale,
+            );
         }
     }
     // renderer и overlay освобождаются здесь в обратном порядке объявления:
@@ -274,10 +319,11 @@ fn toggle_edit_mode(
     overlay: &OverlayWindow,
     edit: &mut EditState,
     cfg: &mut Config,
-    config_path: &std::path::Path,
+    config_path: &Path,
 ) {
     edit.active = !edit.active;
     overlay.set_click_through(!edit.active);
+    edit.gesture = None;
     if !edit.active {
         edit.selection.clear();
         if let Err(e) = config::save(cfg, config_path) {
@@ -286,25 +332,8 @@ fn toggle_edit_mode(
     }
 }
 
-/// Обработать событие мыши в режиме редактирования. Возвращает `true`, если
-/// нужна перерисовка. Перетаскивание/ресайз/поворот — следующий срез
-/// (docs/M2_INTEGRATION_PLAN.md, разделы 6, 8); здесь — только выбор/снятие
-/// выделения кликом (§6 «MouseDown»/«StickerBody»/«Background»).
-fn handle_input(event: InputEvent, scale: f32, cfg: &Config, edit: &mut EditState) -> bool {
-    match event {
-        InputEvent::MouseDown { pos, .. } => {
-            let dip_x = pos.x as f64 / scale as f64;
-            let dip_y = pos.y as f64 / scale as f64;
-            let hit = hit_sticker_at(cfg, dip_x, dip_y);
-            let before = edit.selection.ids().to_vec();
-            edit.selection.click(hit);
-            before != edit.selection.ids()
-        }
-        InputEvent::MouseMove { .. } | InputEvent::MouseUp { .. } | InputEvent::CaptureLost => {
-            // Жесты (перетаскивание/ресайз/поворот) — следующий срез.
-            false
-        }
-    }
+fn to_dip(pos: rst_win32::input::Point, scale: f32) -> (f64, f64) {
+    (pos.x as f64 / scale as f64, pos.y as f64 / scale as f64)
 }
 
 /// Верхний (по `order`) видимый стикер под точкой `(dip_x, dip_y)`, если есть.
@@ -316,18 +345,307 @@ fn hit_sticker_at(cfg: &Config, dip_x: f64, dip_y: f64) -> Option<Uuid> {
         .map(|s| s.id)
 }
 
+fn point_in_box2d(r: &Box2D, x: f64, y: f64) -> bool {
+    // Ручки ресайза не повёрнуты вместе с рамкой (selection.rs::handle_rects),
+    // поэтому простое осевое сравнение корректно.
+    (x - r.cx).abs() <= r.w / 2.0 && (y - r.cy).abs() <= r.h / 2.0
+}
+
+/// Разрешить зону под курсором (docs/M2_INTEGRATION_PLAN.md, раздел 7):
+/// порядок проверки — обратный порядку отрисовки. Ручки/кольцо поворота
+/// доступны только для одиночного выделения (мультивыделение — следующий
+/// срез).
+fn resolve_zone(cfg: &Config, selection: &SelectionSet, dip_x: f64, dip_y: f64) -> Zone {
+    if let [id] = selection.ids() {
+        if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) {
+            let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
+            let outside_body = !hittest::contains_inflated(
+                &sticker.placement,
+                &sticker.transform,
+                dip_x,
+                dip_y,
+                ROTATE_RING_MIN_INFLATE_DIP,
+            );
+            if outside_body {
+                for corner in CoreCorner::ALL {
+                    let (hx, hy) = sbox.handle_center(corner.handle());
+                    let dist = (dip_x - hx).hypot(dip_y - hy);
+                    if dist <= ROTATE_RING_MAX_DIP {
+                        return Zone::Rotate(*id, corner);
+                    }
+                }
+            }
+            for (kind, rect) in sbox.handle_rects(rst_render::HANDLE_SIZE_DIP) {
+                if point_in_box2d(&rect, dip_x, dip_y) {
+                    return Zone::ResizeHandle(*id, kind);
+                }
+            }
+            if hittest::contains(&sticker.placement, &sticker.transform, dip_x, dip_y) {
+                return Zone::StickerBody(*id);
+            }
+            return Zone::Background;
+        }
+    }
+    match hit_sticker_at(cfg, dip_x, dip_y) {
+        Some(id) => Zone::StickerBody(id),
+        None => Zone::Background,
+    }
+}
+
+fn to_win32_handle(kind: HandleKind) -> Win32Handle {
+    match kind {
+        HandleKind::North => Win32Handle::North,
+        HandleKind::NorthEast => Win32Handle::NorthEast,
+        HandleKind::East => Win32Handle::East,
+        HandleKind::SouthEast => Win32Handle::SouthEast,
+        HandleKind::South => Win32Handle::South,
+        HandleKind::SouthWest => Win32Handle::SouthWest,
+        HandleKind::West => Win32Handle::West,
+        HandleKind::NorthWest => Win32Handle::NorthWest,
+    }
+}
+
+fn to_win32_corner(corner: CoreCorner) -> Win32Corner {
+    match corner {
+        CoreCorner::NorthWest => Win32Corner::NorthWest,
+        CoreCorner::NorthEast => Win32Corner::NorthEast,
+        CoreCorner::SouthEast => Win32Corner::SouthEast,
+        CoreCorner::SouthWest => Win32Corner::SouthWest,
+    }
+}
+
+fn cursor_shape_for_zone(zone: &Zone) -> CursorShape {
+    match zone {
+        Zone::Background => CursorZone::Background.cursor_shape(),
+        Zone::StickerBody(_) => CursorZone::StickerBody.cursor_shape(),
+        Zone::ResizeHandle(_, kind) => {
+            CursorZone::ResizeHandle(to_win32_handle(*kind)).cursor_shape()
+        }
+        Zone::Rotate(_, corner) => CursorZone::RotateZone(to_win32_corner(*corner)).cursor_shape(),
+    }
+}
+
+/// Записать `placement`/`transform` и в модель (`cfg.stickers`), и в спрайт
+/// того же id — обе копии обязаны совпадать (модель — источник истины и то,
+/// что сохраняется, спрайт — то, что рисуется).
+fn apply_transform(
+    cfg: &mut Config,
+    sprites: &mut [(Uuid, Sprite)],
+    id: Uuid,
+    placement: Placement,
+    transform: Transform,
+) {
+    if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
+        sticker.placement = placement.clone();
+        sticker.transform = transform;
+    }
+    if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| *sid == id) {
+        sprite.placement = placement;
+        sprite.transform = transform;
+    }
+}
+
+/// Обработать событие мыши в режиме редактирования. Возвращает `true`, если
+/// нужна перерисовка (docs/M2_INTEGRATION_PLAN.md, раздел 6/8).
+#[allow(clippy::too_many_arguments)]
+fn handle_input(
+    event: InputEvent,
+    scale: f32,
+    overlay: &OverlayWindow,
+    overlay_size: (u32, u32),
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut [(Uuid, Sprite)],
+    edit: &mut EditState,
+) -> bool {
+    let monitor = DipRect::new(
+        0.0,
+        0.0,
+        overlay_size.0 as f64 / scale as f64,
+        overlay_size.1 as f64 / scale as f64,
+    );
+    match event {
+        InputEvent::MouseDown { pos, .. } => {
+            let (dip_x, dip_y) = to_dip(pos, scale);
+            let zone = resolve_zone(cfg, &edit.selection, dip_x, dip_y);
+            match zone {
+                Zone::Background => {
+                    let before = edit.selection.ids().to_vec();
+                    edit.selection.click(None);
+                    before != edit.selection.ids()
+                }
+                Zone::StickerBody(id) => {
+                    let before = edit.selection.ids().to_vec();
+                    edit.selection.click(Some(id));
+                    let changed = before != edit.selection.ids();
+                    if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                        edit.gesture = Some(Gesture::Drag {
+                            start: GestureStart {
+                                id,
+                                placement: sticker.placement.clone(),
+                                transform: sticker.transform,
+                            },
+                            grab_dx: dip_x - sticker.placement.cx,
+                            grab_dy: dip_y - sticker.placement.cy,
+                        });
+                    }
+                    changed
+                }
+                Zone::ResizeHandle(id, handle) => {
+                    if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                        edit.gesture = Some(Gesture::Resize {
+                            start: GestureStart {
+                                id,
+                                placement: sticker.placement.clone(),
+                                transform: sticker.transform,
+                            },
+                            handle,
+                            grab: (dip_x, dip_y),
+                        });
+                    }
+                    false
+                }
+                Zone::Rotate(id, _corner) => {
+                    if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                        edit.gesture = Some(Gesture::Rotate {
+                            start: GestureStart {
+                                id,
+                                placement: sticker.placement.clone(),
+                                transform: sticker.transform,
+                            },
+                            grab: (dip_x, dip_y),
+                        });
+                    }
+                    false
+                }
+            }
+        }
+        InputEvent::MouseMove {
+            pos,
+            modifiers,
+            dragging,
+        } => {
+            let (dip_x, dip_y) = to_dip(pos, scale);
+            if !dragging {
+                let zone = resolve_zone(cfg, &edit.selection, dip_x, dip_y);
+                overlay.post_cursor_shape(cursor_shape_for_zone(&zone));
+                return false;
+            }
+            apply_gesture(cfg, sprites, edit, (dip_x, dip_y), modifiers, monitor)
+        }
+        InputEvent::MouseUp { .. } => {
+            if edit.gesture.take().is_some() {
+                if let Err(e) = config::save(cfg, config_path) {
+                    tracing::warn!(error = %e, "не удалось сохранить config.json после жеста редактирования");
+                }
+                true
+            } else {
+                false
+            }
+        }
+        InputEvent::CaptureLost => {
+            // Отменить незавершённый жест без сохранения: откатить модель и
+            // спрайт к стартовому снимку (docs/M2_INTEGRATION_PLAN.md,
+            // раздел 6 — "CaptureLost -> отменить жест без push").
+            match edit.gesture.take() {
+                Some(gesture) => {
+                    let start = gesture.start();
+                    apply_transform(
+                        cfg,
+                        sprites,
+                        start.id,
+                        start.placement.clone(),
+                        start.transform,
+                    );
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+/// Применить активный жест к текущей мировой точке курсора (DIP). Возвращает
+/// `true`, если нужна перерисовка (жест активен и стикер найден).
+fn apply_gesture(
+    cfg: &mut Config,
+    sprites: &mut [(Uuid, Sprite)],
+    edit: &mut EditState,
+    (dip_x, dip_y): (f64, f64),
+    modifiers: Modifiers,
+    monitor: DipRect,
+) -> bool {
+    let Some(gesture) = &edit.gesture else {
+        return false;
+    };
+    match gesture {
+        Gesture::Drag {
+            start,
+            grab_dx,
+            grab_dy,
+        } => {
+            let id = start.id;
+            let rotation = start.transform.rotation;
+            let mut placement = start.placement.clone();
+            placement.cx = dip_x - grab_dx;
+            placement.cy = dip_y - grab_dy;
+            let snap_result =
+                snap::snap_placement(&placement, rotation, monitor, &edit.snap, modifiers.ctrl);
+            placement.cx += snap_result.dx;
+            placement.cy += snap_result.dy;
+            let placement = snap::clamp_min_visible(&placement, rotation, monitor);
+            apply_transform(cfg, sprites, id, placement, start.transform);
+            true
+        }
+        Gesture::Resize {
+            start,
+            handle,
+            grab,
+        } => {
+            let id = start.id;
+            let delta = (dip_x - grab.0, dip_y - grab.1);
+            let dm = DragModifiers {
+                shift: modifiers.shift,
+                alt: modifiers.alt,
+            };
+            let result =
+                transform_ops::resize(&start.placement, &start.transform, *handle, delta, dm);
+            let placement =
+                snap::clamp_min_visible(&result.placement, result.transform.rotation, monitor);
+            apply_transform(cfg, sprites, id, placement, result.transform);
+            true
+        }
+        Gesture::Rotate { start, grab } => {
+            let id = start.id;
+            let dm = DragModifiers {
+                shift: modifiers.shift,
+                alt: false,
+            };
+            let result = transform_ops::rotate(
+                &start.placement,
+                &start.transform,
+                *grab,
+                (dip_x, dip_y),
+                dm,
+            );
+            apply_transform(cfg, sprites, id, result.placement, result.transform);
+            true
+        }
+    }
+}
+
 /// Собрать и отрисовать кадр (ADR-006 — только по событию): затемнение (если
-/// активен режим редактирования), стикеры, затем рамка выделения поверх
-/// (docs/M2_INTEGRATION_PLAN.md, раздел 11 — тулбар и панель добавятся во
-/// втором срезе M2).
+/// активен режим редактирования), стикеры по `order` (снизу вверх), затем
+/// рамка выделения поверх (тулбар и панель у курсора — следующий срез,
+/// docs/M2_INTEGRATION_PLAN.md, раздел 11).
 #[allow(clippy::too_many_arguments)]
 fn redraw(
     renderer: &mut Renderer,
-    sprites: &[Sprite],
+    sprites: &[(Uuid, Sprite)],
     cfg: &Config,
     edit: &EditState,
-    white_tex: &rst_render::Texture,
-    black_tex: &rst_render::Texture,
+    white_tex: &Texture,
+    black_tex: &Texture,
     width_px: u32,
     height_px: u32,
     scale: f32,
@@ -346,15 +664,23 @@ fn redraw(
         ));
     }
 
-    frame.extend_from_slice(sprites);
+    // Порядок отрисовки стикеров — по `order` (больше — выше, CONFIG.md), а
+    // не по порядку загрузки: важно, как только доступен UI z-order (M2,
+    // следующий срез — тулбар).
+    let mut order: Vec<&Sticker> = cfg.stickers.iter().filter(|s| s.visible).collect();
+    order.sort_by_key(|s| s.order);
+    for sticker in order {
+        if let Some((_, sprite)) = sprites.iter().find(|(id, _)| *id == sticker.id) {
+            frame.push(sprite.clone());
+        }
+    }
 
     if edit.active {
         for id in edit.selection.ids() {
             let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) else {
                 continue;
             };
-            let selection_box =
-                rst_render::SelectionBox::new(&sticker.placement, &sticker.transform);
+            let selection_box = SelectionBox::new(&sticker.placement, &sticker.transform);
             for rect in selection_box.all_rects() {
                 frame.push(solid_sprite(white_tex, &monitor_id, &rect, 1.0));
             }
@@ -370,8 +696,8 @@ fn add_sticker(
     overlay: &OverlayWindow,
     renderer: &mut Renderer,
     cfg: &mut Config,
-    config_path: &std::path::Path,
-    sprites: &mut Vec<Sprite>,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
     path: PathBuf,
 ) {
     let texture = match renderer.load_image(&path) {
@@ -394,9 +720,10 @@ fn add_sticker(
         h as f64,
     );
     let sprite = Sprite::new(texture, sticker.placement.clone(), sticker.transform);
+    let id = sticker.id;
     cfg.stickers.push(sticker);
     if let Err(e) = config::save(cfg, config_path) {
         tracing::warn!(error = %e, "не удалось сохранить config.json после добавления стикера");
     }
-    sprites.push(sprite);
+    sprites.push((id, sprite));
 }

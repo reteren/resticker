@@ -23,16 +23,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA,
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, MSG, PostMessageW, PostQuitMessage,
     RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN,
-    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETCURSOR, WNDCLASSEXW,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    ShowWindow, TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_HOTKEY,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETCURSOR,
+    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::error::Win32Error;
 use crate::hotkey::{HotkeyCombo, RegisteredHotkey, message_hotkey_id};
-use crate::input::{CursorManager, InputEvent, Modifiers, MouseCapture};
+use crate::input::{CursorManager, CursorShape, InputEvent, Modifiers, MouseCapture};
 
 const CLASS_NAME: PCWSTR = w!("resticker_overlay");
 const WINDOW_TITLE: PCWSTR = w!("resticker_overlay_wnd");
@@ -40,6 +40,36 @@ const WINDOW_TITLE: PCWSTR = w!("resticker_overlay_wnd");
 /// Идентификатор глобального хоткея входа/выхода из режима редактирования —
 /// единственный хоткей, который регистрирует оверлей-окно (ROADMAP M2).
 const EDIT_HOTKEY_ID: i32 = 1;
+
+/// Координатор → поток оверлея: сменить форму курсора (зона под курсором
+/// меняется на его стороне, хит-тест — не Win32, ARCHITECTURE.md 5.3);
+/// `wParam` — форма, закодированная [`cursor_shape_to_wparam`].
+const WM_APP_EDIT_CURSOR: u32 = WM_APP + 1;
+
+fn cursor_shape_to_wparam(shape: CursorShape) -> WPARAM {
+    WPARAM(match shape {
+        CursorShape::Arrow => 0,
+        CursorShape::Move => 1,
+        CursorShape::SizeNS => 2,
+        CursorShape::SizeWE => 3,
+        CursorShape::SizeNESW => 4,
+        CursorShape::SizeNWSE => 5,
+        CursorShape::Rotate => 6,
+    })
+}
+
+fn cursor_shape_from_wparam(wparam: WPARAM) -> Option<CursorShape> {
+    Some(match wparam.0 {
+        0 => CursorShape::Arrow,
+        1 => CursorShape::Move,
+        2 => CursorShape::SizeNS,
+        3 => CursorShape::SizeWE,
+        4 => CursorShape::SizeNESW,
+        5 => CursorShape::SizeNWSE,
+        6 => CursorShape::Rotate,
+        _ => return None,
+    })
+}
 
 /// Безопасное событие оверлей-окна для координатора (docs/M2_INTEGRATION_PLAN.md,
 /// раздел 1): мышь и клавиатура уже переведены из сырых Win32-сообщений,
@@ -153,6 +183,20 @@ impl OverlayWindow {
             if !click_through {
                 let _ = SetForegroundWindow(self.hwnd);
             }
+        }
+    }
+
+    /// Попросить поток оверлея сменить форму курсора (зона под курсором
+    /// вычисляется координатором, не Win32-потоком, ARCHITECTURE.md 5.3).
+    pub fn post_cursor_shape(&self, shape: CursorShape) {
+        // SAFETY: hwnd — наше окно; PostMessage безопасен с любого потока.
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                WM_APP_EDIT_CURSOR,
+                cursor_shape_to_wparam(shape),
+                LPARAM(0),
+            );
         }
     }
 }
@@ -373,6 +417,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_APP_EDIT_CURSOR => {
+            if let Some(state) = unsafe { state_ptr.as_mut() } {
+                if let Some(shape) = cursor_shape_from_wparam(wparam) {
+                    state.cursor.set_shape(shape);
+                }
+            }
+            LRESULT(0)
         }
         WM_KEYDOWN | WM_KEYUP => {
             let vk = wparam.0 as u32;
