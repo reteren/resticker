@@ -14,6 +14,14 @@ pub enum Win32Error {
     OverlayWindowCreateFailed,
     #[error("поток оверлея завершился до инициализации")]
     OverlayThreadCrashed,
+    #[error("комбинация клавиш «{0}» уже занята другим приложением")]
+    HotkeyConflict(String),
+    #[error("некорректная комбинация клавиш: {0}")]
+    InvalidHotkey(String),
+    #[error("буфер обмена занят другим приложением")]
+    ClipboardBusy,
+    #[error("повреждённые данные в буфере обмена: {0}")]
+    ClipboardDataCorrupt(&'static str),
     #[error("реестр: {0}")]
     Registry(#[from] std::io::Error),
     #[error("Win32: {0}")]

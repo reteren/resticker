@@ -14,11 +14,17 @@
 
 mod error;
 mod renderer;
+mod selection;
 mod shader;
 mod sprite;
 mod texture;
 
 pub use error::RenderError;
 pub use renderer::Renderer;
+pub use selection::{
+    Box2D, CHECKER_BLACK, CHECKER_MAGENTA, CHECKERBOARD_HLSL, EDIT_OVERLAY_OPACITY,
+    HANDLE_SIZE_DIP, HandleKind, OUTLINE_THICKNESS_DIP, SelectionBox, SelectionVisuals,
+    checkerboard_tile, edit_overlay, solid_sprite,
+};
 pub use sprite::Sprite;
 pub use texture::Texture;
