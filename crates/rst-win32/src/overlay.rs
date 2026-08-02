@@ -4,11 +4,12 @@
 //! (D3D11 + DirectComposition) подключается снаружи через [`OverlayWindow::hwnd`]
 //! (ARCHITECTURE.md, раздел 2). Мультимонитор — M3, здесь ровно одно окно.
 //!
-//! M2: окно также владеет глобальным хоткеем входа/выхода из режима
-//! редактирования и мостом «сырые сообщения окна → безопасные события»
-//! (`OverlayEvent`), см. docs/M2_INTEGRATION_PLAN.md, раздел 1. Мышь и курсор
-//! обрабатываются здесь ([`crate::input`]); хит-тестинг и жесты — у вызывающего
-//! кода (ядро редактора платформенно-независимо).
+//! M2: окно также владеет глобальными хоткеями — входа/выхода из режима
+//! редактирования и «показать/скрыть все стикеры» — и мостом «сырые
+//! сообщения окна → безопасные события» (`OverlayEvent`), см.
+//! docs/M2_INTEGRATION_PLAN.md, раздел 1. Мышь и курсор обрабатываются здесь
+//! ([`crate::input`]); хит-тестинг и жесты — у вызывающего кода (ядро
+//! редактора платформенно-независимо).
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -39,9 +40,13 @@ use crate::input::{CursorManager, CursorShape, InputEvent, Modifiers, MouseCaptu
 const CLASS_NAME: PCWSTR = w!("resticker_overlay");
 const WINDOW_TITLE: PCWSTR = w!("resticker_overlay_wnd");
 
-/// Идентификатор глобального хоткея входа/выхода из режима редактирования —
-/// единственный хоткей, который регистрирует оверлей-окно (ROADMAP M2).
+/// Идентификатор глобального хоткея входа/выхода из режима редактирования
+/// (ROADMAP M2).
 const EDIT_HOTKEY_ID: i32 = 1;
+
+/// Идентификатор глобального хоткея «показать/скрыть все стикеры»
+/// (M2b7, `hotkeys.toggle_all_stickers` в конфиге).
+const TOGGLE_ALL_HOTKEY_ID: i32 = 2;
 
 /// Координатор → поток оверлея: сменить форму курсора (зона под курсором
 /// меняется на его стороне, хит-тест — не Win32, ARCHITECTURE.md 5.3);
@@ -75,15 +80,19 @@ fn cursor_shape_from_wparam(wparam: WPARAM) -> Option<CursorShape> {
 
 /// Безопасное событие оверлей-окна для координатора (docs/M2_INTEGRATION_PLAN.md,
 /// раздел 1): мышь и клавиатура уже переведены из сырых Win32-сообщений,
-/// хоткей — это именно и только переключатель режима редактирования.
+/// хоткеи — глобальные переключатели: вход/выход из режима редактирования
+/// ([`Self::ToggleEditMode`]) и «показать/скрыть все стикеры»
+/// ([`Self::ToggleAllStickers`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayEvent {
     /// Глобальный хоткей входа/выхода из режима редактирования нажат.
     ToggleEditMode,
+    /// Глобальный хоткей «показать/скрыть все стикеры» нажат (M2b7).
+    ToggleAllStickers,
     /// Глобальный хоткей не удалось зарегистрировать: комбинация уже занята
     /// другим приложением. Строка — каноничный вид комбинации из конфига
-    /// (ARCHITECTURE.md, раздел 5.1). Окно продолжает работать — недоступен
-    /// только вход в режим редактирования.
+    /// (ARCHITECTURE.md, раздел 5.1). Окно продолжает работать — недоступны
+    /// только хоткеи, которые не удалось зарегистрировать.
     HotkeyConflict(String),
     /// Событие мыши в клиентской области ([`crate::input::InputEvent`]).
     Input(InputEvent),
@@ -122,17 +131,26 @@ type ReadyResult = Result<(SendHwnd, (u32, u32)), Win32Error>;
 
 impl OverlayWindow {
     /// Создаёт оверлей-окно и запускает его цикл сообщений на отдельном
-    /// потоке; регистрирует на этом же потоке глобальный хоткей `edit_hotkey`
-    /// входа/выхода из режима редактирования (конфликт — не паника: окно
-    /// работает, а наружу уходит событие [`OverlayEvent::HotkeyConflict`]).
-    /// Возвращает управление, когда окно гарантированно создано, и приёмник
-    /// событий мыши/клавиатуры/хоткея — координатор объединяет его со своим
-    /// каналом команд (docs/M2_INTEGRATION_PLAN.md, раздел 1).
-    pub fn create(edit_hotkey: HotkeyCombo) -> Result<(Self, Receiver<OverlayEvent>), Win32Error> {
+    /// потоке; регистрирует на этом же потоке глобальные хоткеи: `edit_hotkey`
+    /// входа/выхода из режима редактирования и, если `toggle_all_hotkey` —
+    /// `Some`, хоткей «показать/скрыть все стикеры» (опциональный: `None`,
+    /// когда в конфиге пусто или комбинация не парсится — в отличие от
+    /// `edit_hotkey`, который обязателен). Конфликт регистрации — не паника:
+    /// окно работает, а наружу уходит событие
+    /// [`OverlayEvent::HotkeyConflict`]. Возвращает управление, когда окно
+    /// гарантированно создано, и приёмник событий мыши/клавиатуры/хоткеев —
+    /// координатор объединяет его со своим каналом команд
+    /// (docs/M2_INTEGRATION_PLAN.md, раздел 1).
+    pub fn create(
+        edit_hotkey: HotkeyCombo,
+        toggle_all_hotkey: Option<HotkeyCombo>,
+    ) -> Result<(Self, Receiver<OverlayEvent>), Win32Error> {
         let (ready_tx, ready_rx) = mpsc::channel::<ReadyResult>();
         let (event_tx, event_rx) = mpsc::channel::<OverlayEvent>();
 
-        let thread = thread::spawn(move || run_message_loop(ready_tx, event_tx, edit_hotkey));
+        let thread = thread::spawn(move || {
+            run_message_loop(ready_tx, event_tx, edit_hotkey, toggle_all_hotkey)
+        });
 
         let (hwnd, size) = ready_rx
             .recv()
@@ -251,6 +269,7 @@ fn run_message_loop(
     ready_tx: Sender<ReadyResult>,
     event_tx: Sender<OverlayEvent>,
     edit_hotkey: HotkeyCombo,
+    toggle_all_hotkey: Option<HotkeyCombo>,
 ) {
     let (hwnd, size) = match create_window() {
         Ok(v) => v,
@@ -260,7 +279,7 @@ fn run_message_loop(
         }
     };
 
-    // Хоткей — на этом же потоке (тип `!Send`, ADR-009). Конфликт окно не
+    // Хоткеи — на этом же потоке (тип `!Send`, ADR-009). Конфликт окно не
     // ломает (ARCHITECTURE.md, раздел 5.1), но наружу уходит событием
     // `OverlayEvent::HotkeyConflict`, чтобы координатор мог предупредить
     // пользователя, а не только warn-лог в трассировке (M2b6).
@@ -273,6 +292,24 @@ fn run_message_loop(
             }
             None
         }
+    };
+    // «Показать/скрыть все стикеры» — опциональный хоткей: при `None`
+    // (пусто/не парсится в конфиге) просто не регистрируется (M2b7).
+    let _toggle_all = match toggle_all_hotkey {
+        Some(combo) => match RegisteredHotkey::register(TOGGLE_ALL_HOTKEY_ID, combo) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "не удалось зарегистрировать хоткей «показать/скрыть все стикеры»"
+                );
+                if let Some(event) = hotkey_conflict_event(&e) {
+                    let _ = event_tx.send(event);
+                }
+                None
+            }
+        },
+        None => None,
     };
 
     // Клон для перехвата WM_HOTKEY прямо в цикле сообщений (см. ниже) —
@@ -312,8 +349,11 @@ fn run_message_loop(
         // wndproc (у NULL-окна его нет), поэтому перехватываем здесь
         // (docs/M2_INTEGRATION_REVIEW.md, раздел 4).
         if msg.message == WM_HOTKEY && msg.hwnd.0.is_null() {
-            if message_hotkey_id(msg.wParam) == EDIT_HOTKEY_ID {
+            let id = message_hotkey_id(msg.wParam);
+            if id == EDIT_HOTKEY_ID {
                 let _ = hotkey_tx.send(OverlayEvent::ToggleEditMode);
+            } else if id == TOGGLE_ALL_HOTKEY_ID {
+                let _ = hotkey_tx.send(OverlayEvent::ToggleAllStickers);
             }
             continue;
         }
@@ -521,7 +561,8 @@ mod tests {
 
     #[test]
     fn create_then_drop_destroys_window() {
-        let (overlay, _events) = OverlayWindow::create(test_hotkey()).expect("создание оверлея");
+        let (overlay, _events) =
+            OverlayWindow::create(test_hotkey(), None).expect("создание оверлея");
         let hwnd = overlay.hwnd();
         assert!(!hwnd.0.is_null());
 
@@ -540,7 +581,8 @@ mod tests {
 
     #[test]
     fn set_click_through_toggles_exstyle_bits() {
-        let (overlay, _events) = OverlayWindow::create(test_hotkey()).expect("создание оверлея");
+        let (overlay, _events) =
+            OverlayWindow::create(test_hotkey(), None).expect("создание оверлея");
         // SAFETY: чтение стиля своего же окна.
         let initial = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
         assert_ne!(
@@ -594,8 +636,8 @@ mod tests {
         // Экзотическая комбинация — не конфликтует с реальными приложениями
         // на машине разработчика/CI (F22 не используется другими тестами).
         let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F22").expect("валидная комбинация");
-        let (_first, _first_events) = OverlayWindow::create(combo).expect("первое окно");
-        let (_second, second_events) = OverlayWindow::create(combo).expect("второе окно");
+        let (_first, _first_events) = OverlayWindow::create(combo, None).expect("первое окно");
+        let (_second, second_events) = OverlayWindow::create(combo, None).expect("второе окно");
 
         // Хоткей регистрируется на pump-потоке до сигнала готовности, поэтому
         // к моменту возврата create() конфликт уже лежит в канале событий.
@@ -603,6 +645,28 @@ mod tests {
         // продолжает работать.
         match second_events.recv_timeout(Duration::from_secs(5)) {
             Ok(OverlayEvent::HotkeyConflict(s)) => assert_eq!(s, "Ctrl+Alt+Shift+F22"),
+            Ok(other) => panic!("ожидался HotkeyConflict, получено: {other:?}"),
+            Err(e) => panic!("второе окно не прислало HotkeyConflict: {e}"),
+        }
+    }
+
+    #[test]
+    fn second_window_with_same_toggle_all_hotkey_reports_conflict() {
+        // Экзотическая комбинация — не конфликтует с реальными приложениями
+        // и с другими тестами (F21; F22/F23/F24 заняты соседними тестами).
+        let toggle = HotkeyCombo::parse("Ctrl+Alt+Shift+F21").expect("валидная комбинация");
+        // У второго окна другой edit-хоткей (F20), чтобы конфликт пришёл
+        // именно от toggle_all, а не от режима редактирования.
+        let edit2 = HotkeyCombo::parse("Ctrl+Alt+Shift+F20").expect("валидная комбинация");
+        let (_first, _first_events) =
+            OverlayWindow::create(test_hotkey(), Some(toggle)).expect("первое окно");
+        let (_second, second_events) =
+            OverlayWindow::create(edit2, Some(toggle)).expect("второе окно");
+
+        // Тот же паттерн, что и для edit-хоткея: конфликт — событие, а не
+        // ошибка создания окна.
+        match second_events.recv_timeout(Duration::from_secs(5)) {
+            Ok(OverlayEvent::HotkeyConflict(s)) => assert_eq!(s, "Ctrl+Alt+Shift+F21"),
             Ok(other) => panic!("ожидался HotkeyConflict, получено: {other:?}"),
             Err(e) => panic!("второе окно не прислало HotkeyConflict: {e}"),
         }
