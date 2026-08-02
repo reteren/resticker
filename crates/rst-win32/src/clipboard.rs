@@ -1,7 +1,8 @@
-//! Вставка изображения из буфера обмена (`Ctrl+V` в режиме редактирования,
-//! SPEC.md, раздел 2.1). Приоритет форматов: `PNG` (зарегистрированный
-//! формат) → `CF_DIBV5` (с альфой) → `CF_DIB` → `CF_HDROP` (пути к файлам
-//! из проводника).
+//! Вставка из буфера обмена: изображения (`Ctrl+V` в режиме редактирования,
+//! SPEC.md, раздел 2.1) и текст (`Ctrl+V` в числовое поле тулбара,
+//! docs/M2_WIRING_PLAN.md, §9.А). Приоритет форматов для изображений: `PNG`
+//! (зарегистрированный формат) → `CF_DIBV5` (с альфой) → `CF_DIB` →
+//! `CF_HDROP` (пути к файлам из проводника).
 //!
 //! Наружу — сырые байты изображения (готовый PNG/BMP-файл) либо пути;
 //! материализация на диск (`%APPDATA%\resticker\pasted\<uuid>.png`) и
@@ -16,7 +17,7 @@ use windows::Win32::System::DataExchange::{
     RegisterClipboardFormatW,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
-use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP};
+use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::core::w;
 
@@ -67,6 +68,31 @@ pub fn read_image() -> Result<Option<ClipboardImage>, Win32Error> {
         }
     }
     Ok(None)
+}
+
+/// Прочитать текст из буфера обмена (`CF_UNICODETEXT` — нуль-терминированная
+/// UTF-16LE). `Ok(None)` — в буфере не текст, а что-то другое (это не ошибка).
+/// Вызывается на потоке, обрабатывающем `Ctrl+V` в сфокусированное числовое
+/// поле тулбара (docs/M2_WIRING_PLAN.md, §9.А; виджет сам отфильтрует цифры).
+pub fn read_text() -> Result<Option<String>, Win32Error> {
+    let _clipboard = Clipboard::open()?;
+    match clipboard_bytes(CF_UNICODETEXT.0 as u32)? {
+        Some(bytes) => Ok(Some(utf16z_from_bytes(&bytes))),
+        None => Ok(None),
+    }
+}
+
+/// Нуль-терминированная UTF-16LE (`CF_UNICODETEXT`) → String: обрезка по
+/// первому NUL; нечётный хвостовой байт (мусорный размер буфера) и байты
+/// за NUL отбрасываются. Для юнит-тестов вынесено из Win32-кода
+/// (по образцу `monitors::utf16z_to_string`).
+fn utf16z_from_bytes(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let end = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
 }
 
 /// RAII над парой `OpenClipboard`/`CloseClipboard`: пока живо значение,
@@ -277,6 +303,15 @@ mod tests {
         u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 байта"))
     }
 
+    /// Строка в UTF-16LE-байты без завершающего NUL (для сборки буферов).
+    fn utf16_bytes(s: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for u in s.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        bytes
+    }
+
     /// DIB 2×2, 24 bpp, заголовок BITMAPINFOHEADER, пиксели — мусор-маркер.
     fn test_dib_24bpp() -> Vec<u8> {
         let mut dib = vec![0u8; 40 + 16]; // заголовок + 2 строки по 8 байт
@@ -371,6 +406,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn utf16z_from_bytes_trims_at_first_nul() {
+        // Цифры из буфера; мусор за NUL (другая строка/формат поверх) отбрасывается.
+        let mut buf = utf16_bytes("42");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend(utf16_bytes("мусор за терминатором"));
+        assert_eq!(utf16z_from_bytes(&buf), "42");
+    }
+
+    #[test]
+    fn utf16z_from_bytes_empty_and_unterminated() {
+        assert_eq!(utf16z_from_bytes(&[]), "");
+        assert_eq!(utf16z_from_bytes(&[0, 0]), "");
+        // Без завершающего NUL — берём весь буфер целиком.
+        let buf = utf16_bytes("7 + 35");
+        assert_eq!(utf16z_from_bytes(&buf), "7 + 35");
+    }
+
+    #[test]
+    fn utf16z_from_bytes_odd_trailing_byte_is_dropped() {
+        // Нечётный хвостовой байт (мусорный размер буфера от владельца формата)
+        // не ломает декодирование — последняя пара просто пропускается.
+        let mut buf = utf16_bytes("123");
+        buf.push(0xAB);
+        assert_eq!(utf16z_from_bytes(&buf), "123");
+    }
+
+    #[test]
+    fn utf16z_from_bytes_lossy_surrogates() {
+        // Одиночный обрезанный суррогат — замена, остальное текст сохраняется.
+        let mut buf = utf16_bytes("9");
+        buf.extend_from_slice(&0xD800u16.to_le_bytes()); // старший суррогат без пары
+        assert_eq!(utf16z_from_bytes(&buf), "9\u{FFFD}");
+    }
+
     /// Положить набор форматов в буфер (содержимое предварительно очищается).
     fn set_clipboard_formats(items: &[(u32, Vec<u8>)]) {
         let _guard = Clipboard::open().expect("открыть буфер обмена");
@@ -421,6 +491,38 @@ mod tests {
         let _lock = CLIPBOARD_TEST_LOCK.lock().expect("мьютекс тестов");
         clear_clipboard();
         assert_eq!(read_image().expect("чтение буфера"), None);
+    }
+
+    #[test]
+    fn text_roundtrip() {
+        let _lock = CLIPBOARD_TEST_LOCK.lock().expect("мьютекс тестов");
+        let mut bytes = utf16_bytes("123 456");
+        bytes.extend_from_slice(&[0, 0]); // нуль-терминатор CF_UNICODETEXT
+        set_clipboard_formats(&[(CF_UNICODETEXT.0 as u32, bytes)]);
+
+        assert_eq!(
+            read_text().expect("чтение буфера"),
+            Some("123 456".to_string())
+        );
+        clear_clipboard();
+    }
+
+    #[test]
+    fn text_missing_yields_none() {
+        let _lock = CLIPBOARD_TEST_LOCK.lock().expect("мьютекс тестов");
+        clear_clipboard();
+        assert_eq!(read_text().expect("чтение буфера"), None);
+    }
+
+    #[test]
+    fn text_absent_with_image_in_buffer() {
+        let _lock = CLIPBOARD_TEST_LOCK.lock().expect("мьютекс тестов");
+        let format = png_format().expect("формат PNG должен зарегистрироваться");
+        set_clipboard_formats(&[(format, b"\x89PNG\r\n\x1a\nfake-png".to_vec())]);
+
+        // В буфере картинка, а не текст: None, а не ошибка (docs/M2_WIRING_PLAN.md, §9.А).
+        assert_eq!(read_text().expect("чтение буфера"), None);
+        clear_clipboard();
     }
 
     #[test]
