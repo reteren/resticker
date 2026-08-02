@@ -18,7 +18,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_ESCAPE, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA,
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, MSG, PostMessageW, PostQuitMessage,
@@ -302,16 +304,35 @@ fn run_message_loop(
     }
 }
 
+/// Бит 30 `lParam` клавиатурных сообщений: предыдущее состояние клавиши
+/// (1 — клавиша уже была нажата, т.е. сообщение — автоповтор удержания).
+const KEY_PREVIOUS_STATE_MASK: isize = 0x4000_0000;
+
+/// Решение по сырому клавиатурному сообщению: `Some(true)` — первое
+/// нажатие, `Some(false)` — отпускание, `None` — автоповтор `WM_KEYDOWN`
+/// (удержание клавиши), который наружу не уходит, иначе удержание
+/// Ctrl+D/Ctrl+Z срабатывало бы многократно (docs/M2_SLICE_REVIEW.md,
+/// раздел 9 «Автоповтор WM_KEYDOWN»). Чистая функция — тесты без реального
+/// окна.
+fn key_event_press(msg: u32, lparam: isize) -> Option<bool> {
+    match msg {
+        WM_KEYDOWN => (lparam & KEY_PREVIOUS_STATE_MASK == 0).then_some(true),
+        WM_KEYUP => Some(false),
+        _ => None,
+    }
+}
+
 /// Модификаторы клавиатуры вне мышиного сообщения (для `WM_KEYDOWN`/`WM_KEYUP`,
 /// у которых, в отличие от мышиных сообщений, нет битов `MK_*` в `wparam`).
 fn current_key_modifiers() -> Modifiers {
     // SAFETY: чтение состояния клавиш вызывающего потока — тот же паттерн,
-    // что и в `input::Modifiers::current`.
+    // что и в `input::Modifiers::current` (Alt читается так же, как там: в
+    // `MK_*` флага для него нет — docs/M2_SLICE_REVIEW.md, раздел 9).
     unsafe {
         Modifiers {
             shift: GetKeyState(VK_SHIFT.0 as i32) < 0,
             ctrl: GetKeyState(VK_CONTROL.0 as i32) < 0,
-            alt: false,
+            alt: GetKeyState(VK_MENU.0 as i32) < 0,
         }
     }
 }
@@ -428,12 +449,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN | WM_KEYUP => {
             let vk = wparam.0 as u32;
-            if let Some(state) = unsafe { state_ptr.as_mut() } {
-                let _ = state.tx.send(OverlayEvent::Key {
-                    vk,
-                    modifiers: current_key_modifiers(),
-                    pressed: msg == WM_KEYDOWN,
-                });
+            // Автоповтор нажатия (удержание) наружу не уходит: наружу — только
+            // первое нажатие и отпускание.
+            if let Some(pressed) = key_event_press(msg, lparam.0) {
+                if let Some(state) = unsafe { state_ptr.as_mut() } {
+                    let _ = state.tx.send(OverlayEvent::Key {
+                        vk,
+                        modifiers: current_key_modifiers(),
+                        pressed,
+                    });
+                }
             }
             if vk == VK_ESCAPE.0 as u32 {
                 LRESULT(0)
@@ -519,5 +544,25 @@ mod tests {
             "выход восстанавливает клик-прозрачность"
         );
         assert_ne!(restored & WS_EX_NOACTIVATE.0, 0);
+    }
+
+    #[test]
+    fn key_event_press_filters_autorepeat() {
+        // Первое нажатие: бит 30 == 0 (в младших битах — счётчик повторов 1).
+        assert_eq!(key_event_press(WM_KEYDOWN, 1), Some(true));
+        // Автоповтор удержания: бит 30 == 1 — наружу не уходит.
+        assert_eq!(
+            key_event_press(WM_KEYDOWN, KEY_PREVIOUS_STATE_MASK | 7),
+            None
+        );
+        // Отпускание — всегда pressed=false (у WM_KEYUP бит 30 тоже == 1,
+        // и это нормально: фильтр к нему не применяется).
+        assert_eq!(
+            key_event_press(WM_KEYUP, KEY_PREVIOUS_STATE_MASK | 1),
+            Some(false)
+        );
+        assert_eq!(key_event_press(WM_KEYUP, 0), Some(false));
+        // Прочие сообщения клавиатурных событий не порождают.
+        assert_eq!(key_event_press(WM_MOUSEMOVE, 0), None);
     }
 }

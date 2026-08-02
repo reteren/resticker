@@ -44,6 +44,24 @@ pub struct Box2D {
     pub rotation: f64,
 }
 
+impl Box2D {
+    /// Прямоугольник по центру и размеру, без поворота.
+    pub const fn from_center(cx: f64, cy: f64, w: f64, h: f64) -> Self {
+        Self {
+            cx,
+            cy,
+            w,
+            h,
+            rotation: 0.0,
+        }
+    }
+
+    /// Прямоугольник по левому верхнему углу и размеру, без поворота.
+    pub const fn from_top_left(x: f64, y: f64, w: f64, h: f64) -> Self {
+        Self::from_center(x + w / 2.0, y + h / 2.0, w, h)
+    }
+}
+
 /// Визуалы рамки выделения: четыре ребра и восемь ручек.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SelectionVisuals {

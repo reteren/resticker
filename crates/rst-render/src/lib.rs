@@ -13,6 +13,7 @@
 //! Маска перекрытия (ADR-004) в этот срез не входит — она веха M4.
 
 mod error;
+mod marquee;
 mod renderer;
 mod selection;
 mod shader;
@@ -22,6 +23,10 @@ mod texture;
 mod widgets;
 
 pub use error::RenderError;
+pub use marquee::{
+    MARQUEE_DASH_DIP, MARQUEE_FILL_OPACITY, MARQUEE_GAP_DIP, MARQUEE_STROKE_OPACITY,
+    MARQUEE_THICKNESS_DIP, MarqueeVisuals, marquee_visuals,
+};
 pub use renderer::Renderer;
 pub use selection::{
     Box2D, CHECKER_BLACK, CHECKER_MAGENTA, CHECKERBOARD_HLSL, EDIT_OVERLAY_OPACITY,
