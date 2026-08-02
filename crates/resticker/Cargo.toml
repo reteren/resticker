@@ -19,6 +19,7 @@ tauri = { version = "2" }
 tauri-plugin-dialog = "2"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

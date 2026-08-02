@@ -2497,6 +2497,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2559,6 +2560,7 @@ name = "rst-win32"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.19",
+ "tracing",
  "windows 0.62.2",
 ]
 
