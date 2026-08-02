@@ -167,6 +167,56 @@ fn missing_fields_defaulted() {
 }
 
 #[test]
+fn cursor_panel_offset_roundtrip_with_value() {
+    let config = Config {
+        settings: Settings {
+            cursor_panel_offset: Some((20.0, -8.0)),
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+
+    let json = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        json["settings"]["cursor_panel_offset"],
+        json!([20.0, -8.0]),
+        "кортеж сериализуется как JSON-массив [dx, dy]"
+    );
+
+    let back: Config = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        back.settings.cursor_panel_offset,
+        Some((20.0, -8.0)),
+        "поле переживает round-trip"
+    );
+}
+
+#[test]
+fn cursor_panel_offset_old_format_without_field() {
+    // Старый config.json (без поля) грузится без ошибок — дефолт None.
+    let cfg: Config = serde_json::from_value(json!({
+        "schema_version": 1,
+        "settings": { "language": "en" }
+    }))
+    .unwrap();
+
+    assert_eq!(cfg.settings.language, "en");
+    assert_eq!(
+        cfg.settings.cursor_panel_offset, None,
+        "отсутствующее поле достраивается дефолтом None"
+    );
+}
+
+#[test]
+fn cursor_panel_offset_default_is_none() {
+    assert_eq!(
+        Settings::default().cursor_panel_offset,
+        None,
+        "дефолтная настройка — дефолтное смещение панели у курсора"
+    );
+}
+
+#[test]
 fn new_file_sticker_is_centered_and_enabled() {
     let sticker = Sticker::new_file(
         "C:\\pics\\cat.png".into(),

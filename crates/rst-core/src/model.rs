@@ -26,6 +26,10 @@ pub struct Settings {
     pub skip_delete_confirmation: bool,
     pub battery_fps_limit: u32,
     pub mute_invisible_stickers: bool,
+    /// Смещение центра панели у курсора относительно курсора, DIP (SPEC 3.8:
+    /// позиция панели запоминается между входами в режим редактирования).
+    /// `None` — дефолтное смещение (12, 12).
+    pub cursor_panel_offset: Option<(f64, f64)>,
     pub language: String,
 }
 
@@ -40,6 +44,7 @@ impl Default for Settings {
             skip_delete_confirmation: false,
             battery_fps_limit: 30,
             mute_invisible_stickers: true,
+            cursor_panel_offset: None,
             language: "ru".to_string(),
         }
     }
