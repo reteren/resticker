@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rst-core = { path = "../rst-core" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 windows = { version = "0.62", features = [
@@ -21,7 +22,9 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_SystemServices",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_UI_HiDpi",
+    "Win32_System_Threading",
 ] }
 
 [lints]

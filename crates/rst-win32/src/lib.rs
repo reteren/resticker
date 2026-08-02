@@ -9,7 +9,9 @@ pub mod clipboard;
 mod error;
 pub mod hotkey;
 pub mod input;
+pub mod monitors;
 pub mod overlay;
 pub mod tray;
+pub mod window_enum;
 
 pub use error::Win32Error;

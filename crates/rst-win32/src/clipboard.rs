@@ -490,4 +490,112 @@ mod tests {
         assert_eq!(read_image().expect("чтение буфера"), None);
         clear_clipboard();
     }
+
+    #[test]
+    fn hdrop_zero_files_yields_none() {
+        let _lock = CLIPBOARD_TEST_LOCK.lock().expect("мьютекс тестов");
+        // CF_HDROP без единого файла (пустой DROPFILES: только заголовок и
+        // завершающий двойной нуль): не ошибка, а «изображения в буфере нет».
+        let bytes = dropfiles_bytes(&[]);
+        set_clipboard_formats(&[(CF_HDROP.0 as u32, bytes)]);
+
+        assert_eq!(read_image().expect("чтение буфера"), None);
+        clear_clipboard();
+    }
+
+    #[test]
+    fn hdrop_mixed_extensions_filters_to_supported() {
+        let _lock = CLIPBOARD_TEST_LOCK.lock().expect("мьютекс тестов");
+        // Смесь поддерживаемых и неподдерживаемых расширений (регистр не важен):
+        // остаются только изображения, в порядке появления в буфере.
+        let bytes = dropfiles_bytes(&[
+            "C:\\img\\cat.png",
+            "C:\\docs\\note.txt",
+            "D:\\anim.gif",
+            "E:\\pic.webp",
+            "F:\\photo.bmp",
+            "G:\\archive.zip",
+            "H:\\scan.JPEG",
+        ]);
+        set_clipboard_formats(&[(CF_HDROP.0 as u32, bytes)]);
+
+        let result = read_image().expect("чтение буфера");
+        assert_eq!(
+            result,
+            Some(ClipboardImage::Files(vec![
+                PathBuf::from("C:\\img\\cat.png"),
+                PathBuf::from("D:\\anim.gif"),
+                PathBuf::from("E:\\pic.webp"),
+                PathBuf::from("F:\\photo.bmp"),
+                PathBuf::from("H:\\scan.JPEG"),
+            ]))
+        );
+        clear_clipboard();
+    }
+
+    #[test]
+    fn dib_with_implausible_dimensions_passes_through() {
+        // 40-байтный BITMAPINFOHEADER с абсурдными шириной/высотой (i32::MAX).
+        // dib_to_bmp не доверяет этим полям для выделения памяти: размер вывода
+        // ограничен фактической длиной DIB (file_size = 14 + dib.len()), а не
+        // biWidth*biHeight, поэтому такой заголовок безопасно проходит сквозь
+        // без единой попытки аллокации гигантского буфера. Защита от доверия
+        // заголовку — именно это поведение, а не валидация размеров.
+        let mut dib = vec![0u8; 40 + 16];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        dib[4..8].copy_from_slice(&i32::MAX.to_le_bytes()); // biWidth
+        dib[8..12].copy_from_slice(&i32::MAX.to_le_bytes()); // biHeight
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib[14..16].copy_from_slice(&24u16.to_le_bytes()); // biBitCount
+        for (i, b) in dib[40..].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+
+        let bmp = dib_to_bmp(&dib).expect("абсурдные размеры не мешают пасскоду");
+        assert_eq!(&bmp[0..2], b"BM");
+        assert_eq!(le_u32(&bmp, 2), (14 + dib.len()) as u32); // bfSize
+        assert_eq!(le_u32(&bmp, 10), 54); // bfOffBits: 14 + 40, без масок/палитры
+        assert_eq!(&bmp[14..], &dib[..]); // DIB перенесён без изменений
+    }
+
+    #[test]
+    fn dib_truncated_color_mask_table_errors() {
+        // 40-байтный заголовок + BI_BITFIELDS: три маски (12 байт) лежат за
+        // заголовком. DIB, где есть только 4 байта масок, — таблица обрезана.
+        let mut dib = vec![0u8; 40 + 4];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&BI_BITFIELDS.to_le_bytes());
+        assert!(matches!(
+            dib_to_bmp(&dib),
+            Err(Win32Error::ClipboardDataCorrupt(_))
+        ));
+    }
+
+    #[test]
+    fn dib_truncated_alphabitfields_mask_table_errors() {
+        // BI_ALPHABITFIELDS (Adobe): четыре маски RGBA (16 байт) за заголовком.
+        // 40 + 12 байт (три маски вместо четырёх) — таблица обрезана.
+        let mut dib = vec![0u8; 40 + 12];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&BI_ALPHABITFIELDS.to_le_bytes());
+        assert!(matches!(
+            dib_to_bmp(&dib),
+            Err(Win32Error::ClipboardDataCorrupt(_))
+        ));
+    }
+
+    #[test]
+    fn dib_v5_truncated_header_errors() {
+        // V5-заголовок заявляет 124 байта, а сам DIB короче (70): обрезка
+        // происходит раньше, чем до масок внутри заголовка, — «короче своего
+        // заголовка», а не чтение из-за границы.
+        let mut dib = vec![0u8; 70];
+        dib[0..4].copy_from_slice(&124u32.to_le_bytes());
+        assert!(matches!(
+            dib_to_bmp(&dib),
+            Err(Win32Error::ClipboardDataCorrupt(_))
+        ));
+    }
 }
