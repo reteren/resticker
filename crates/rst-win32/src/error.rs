@@ -10,6 +10,10 @@ pub enum Win32Error {
     TrayThreadCrashed,
     #[error("Shell_NotifyIconW провалился")]
     TrayNotifyIconFailed,
+    #[error("не удалось создать оверлей-окно")]
+    OverlayWindowCreateFailed,
+    #[error("поток оверлея завершился до инициализации")]
+    OverlayThreadCrashed,
     #[error("реестр: {0}")]
     Registry(#[from] std::io::Error),
     #[error("Win32: {0}")]

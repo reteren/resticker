@@ -1,0 +1,173 @@
+//! GPU-текстура спрайта с мипмапами и приведение альфы к premultiplied.
+
+use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::core::Interface;
+
+use crate::RenderError;
+
+/// GPU-текстура спрайта (RGBA, premultiplied, полная цепочка мипмапов).
+///
+/// Владение: COM-указатели — умные указатели windows-rs, `Release` вызывается
+/// автоматически в `Drop`. `Clone` — это COM `AddRef`, то есть дешёвый.
+#[derive(Clone)]
+pub struct Texture {
+    srv: ID3D11ShaderResourceView,
+    // Держатель самой текстуры: не читается, но обязан жить, пока жив SRV.
+    _texture: ID3D11Texture2D,
+    width: u32,
+    height: u32,
+}
+
+impl std::fmt::Debug for Texture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Texture({}x{})", self.width, self.height)
+    }
+}
+
+impl Texture {
+    /// Ширина в пикселях.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Высота в пикселях.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// SRV для биндинга в пиксельный шейдер (только внутри крейта).
+    pub(crate) fn srv(&self) -> &ID3D11ShaderResourceView {
+        &self.srv
+    }
+
+    /// Загрузить RGBA-пиксели (straight alpha) в GPU: premultiply на CPU,
+    /// текстура с мипмапами (если формат поддерживает автогенерацию — она
+    /// поддерживается всеми практическими D3D11-устройствами; иначе одна
+    /// мип-степень, честно и без падения).
+    pub(crate) fn from_rgba(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RenderError> {
+        if width == 0 || height == 0 {
+            return Err(RenderError::InvalidTextureData(
+                "нулевая ширина или высота".to_string(),
+            ));
+        }
+        let expected = width as usize * height as usize * 4;
+        if data.len() != expected {
+            return Err(RenderError::InvalidTextureData(format!(
+                "ожидалось {expected} байт RGBA, получено {}",
+                data.len()
+            )));
+        }
+        let mut data = data.to_vec();
+        premultiply_rgba(&mut data);
+
+        // Проверяем поддержку автогенерации мипмапов форматом.
+        // SAFETY: вызов не трогает чужую память; устройство живо.
+        let support = unsafe { device.CheckFormatSupport(DXGI_FORMAT_R8G8B8A8_UNORM) }
+            .map_err(RenderError::Windows)?;
+        let autogen = support & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN.0 as u32 != 0;
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: if autogen { 0 } else { 1 },
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: if autogen {
+                (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32
+            } else {
+                D3D11_BIND_SHADER_RESOURCE.0 as u32
+            },
+            CPUAccessFlags: 0,
+            MiscFlags: if autogen {
+                D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32
+            } else {
+                0
+            },
+        };
+        // Начальных данных нет: с MipLevels=0 рантайм ожидал бы сразу ВСЕ
+        // мип-уровни и отвечал бы E_INVALIDARG на один сабресурс. Заливаем
+        // нулевой мип через UpdateSubresource, остальные достраивает GPU.
+        let mut texture: Option<ID3D11Texture2D> = None;
+        // SAFETY: desc валиден; out-параметр валиден.
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+            .map_err(RenderError::Windows)?;
+        let texture = texture.expect("CreateTexture2D без ошибки возвращает объект");
+
+        // SAFETY: `texture` — валидный ID3D11Resource устройства контекста;
+        // `data` живёт до конца вызова; UpdateSubresource копирует синхронно.
+        unsafe {
+            let tex_res: ID3D11Resource = texture.cast().map_err(RenderError::Windows)?;
+            context.UpdateSubresource(Some(&tex_res), 0, None, data.as_ptr().cast(), width * 4, 0);
+        }
+
+        let mut srv: Option<ID3D11ShaderResourceView> = None;
+        // SAFETY: `texture` — валидный ID3D11Resource; out-параметр валиден.
+        unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv)) }
+            .map_err(RenderError::Windows)?;
+        let srv = srv.expect("CreateShaderResourceView без ошибки возвращает объект");
+
+        if autogen {
+            // SAFETY: `srv` — валидное представление текстуры с флагом
+            // GENERATE_MIPS; контекст того же устройства.
+            unsafe { context.GenerateMips(Some(&srv)) };
+        }
+        Ok(Self {
+            srv,
+            _texture: texture,
+            width,
+            height,
+        })
+    }
+}
+
+/// Приведение straight alpha к premultiplied (требование
+/// DXGI_ALPHA_MODE_PREMULTIPLIED у композиционной цепочки).
+pub(crate) fn premultiply_rgba(data: &mut [u8]) {
+    for px in data.chunks_exact_mut(4) {
+        let a = u32::from(px[3]);
+        px[0] = ((u32::from(px[0]) * a + 127) / 255) as u8;
+        px[1] = ((u32::from(px[1]) * a + 127) / 255) as u8;
+        px[2] = ((u32::from(px[2]) * a + 127) / 255) as u8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::premultiply_rgba;
+
+    #[test]
+    fn premultiply_scales_rgb_keeps_alpha() {
+        let mut data = [255u8, 100, 50, 128];
+        premultiply_rgba(&mut data);
+        assert_eq!(data[0], 128); // (255*128+127)/255
+        assert_eq!(data[1], 50); // (100*128+127)/255
+        assert_eq!(data[2], 25); // (50*128+127)/255
+        assert_eq!(data[3], 128);
+    }
+
+    #[test]
+    fn premultiply_zero_alpha_zeroes_rgb() {
+        let mut data = [200u8, 150, 100, 0];
+        premultiply_rgba(&mut data);
+        assert_eq!(data, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn premultiply_opaque_is_identity() {
+        let mut data = [10u8, 20, 30, 255];
+        premultiply_rgba(&mut data);
+        assert_eq!(data, [10, 20, 30, 255]);
+    }
+}
