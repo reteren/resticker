@@ -110,6 +110,92 @@ pub fn step_down(config: &mut Config, id: Uuid) -> Result<(), OpError> {
     Ok(())
 }
 
+/// Поднять блок выделения на одну позицию по z-order как единое целое
+/// (docs/M2_MULTISELECT_TOOLBAR_NOTES.md, §3.3). По-элементный прогон
+/// [`step_up`] по выделению некорректен: соседние выбранные обменялись бы
+/// заказами между собой без видимого эффекта. Здесь весь диапазон
+/// `min(order выбранных)..=max(order выбранных)` сдвигается вверх на одну
+/// позицию; элемент, стоявший сразу над блоком, переезжает под него.
+/// No-op, если верхний выбранный уже на самом верху. Для одиночного id
+/// совпадает с [`step_up`].
+pub fn step_up_many(config: &mut Config, ids: &[Uuid]) -> Result<(), OpError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let (min, max) = selected_order_range(config, ids)?;
+    if max == config.stickers.len() - 1 {
+        return Ok(());
+    }
+    shift_block(config, min, max, 1);
+    Ok(())
+}
+
+/// Опустить блок выделения на одну позицию по z-order как единое целое
+/// (docs/M2_MULTISELECT_TOOLBAR_NOTES.md, §3.3) — зеркально [`step_up_many`]:
+/// весь диапазон `min..=max` сдвигается вниз, элемент сразу под блоком
+/// переезжает над ним. No-op, если нижний выбранный уже внизу. Для
+/// одиночного id совпадает с [`step_down`].
+pub fn step_down_many(config: &mut Config, ids: &[Uuid]) -> Result<(), OpError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let (min, max) = selected_order_range(config, ids)?;
+    if min == 0 {
+        return Ok(());
+    }
+    shift_block(config, min, max, -1);
+    Ok(())
+}
+
+/// Заказы нижней и верхней границы блока выделения: `(min, max)` — min и max
+/// `order` среди `ids` после нормализации (заказы 0..n-1, относительный
+/// порядок сохранён). Все id валидируются до мутации: при неизвестном id —
+/// [`OpError::StickerNotFound`], конфиг не тронут.
+fn selected_order_range(config: &mut Config, ids: &[Uuid]) -> Result<(usize, usize), OpError> {
+    for id in ids {
+        index_of(config, *id).ok_or(OpError::StickerNotFound(*id))?;
+    }
+    normalize_orders(config);
+    let mut min = usize::MAX;
+    let mut max = 0;
+    for id in ids {
+        let order = config
+            .stickers
+            .iter()
+            .find(|s| s.id == *id)
+            .map(|s| s.order as usize)
+            .expect("валидность всех id проверена выше");
+        min = min.min(order);
+        max = max.max(order);
+    }
+    Ok((min, max))
+}
+
+/// Сдвинуть блок заказов `[min..=max]` на `delta` (±1) как единое целое:
+/// каждый стикер блока получает `order + delta`, элемент сразу за границей
+/// блока занимает освободившуюся позицию. Заказы предполагаются
+/// нормализованными (`0..n-1`); результат остаётся нормализованным, поэтому
+/// повторная нормализация не нужна.
+fn shift_block(config: &mut Config, min: usize, max: usize, delta: i64) {
+    let neighbour_order = if delta > 0 {
+        max as i64 + 1
+    } else {
+        min as i64 - 1
+    };
+    let neighbour = config
+        .stickers
+        .iter()
+        .position(|s| s.order == neighbour_order)
+        .expect("после нормализации сосед блока существует");
+    let block = min as i64..=max as i64;
+    for s in &mut config.stickers {
+        if block.contains(&s.order) {
+            s.order += delta;
+        }
+    }
+    config.stickers[neighbour].order = if delta > 0 { min as i64 } else { max as i64 };
+}
+
 /// Дублировать стикер: копия со сдвигом позиции и новым id, помещается на
 /// передний план (CONFIG.md: новый стикер получает `max(order) + 1`).
 /// Возвращает id копии.
@@ -152,6 +238,19 @@ pub fn toggle_visibility(config: &mut Config, id: Uuid) -> Result<(), OpError> {
     let i = index_of(config, id).ok_or(OpError::StickerNotFound(id))?;
     config.stickers[i].visible = !config.stickers[i].visible;
     Ok(())
+}
+
+/// Выставить видимость группе стикеров ровно в `visible` (не тоггл) — батч
+/// для кнопки «глаз» при мультивыделении (docs/M2_MULTISELECT_TOOLBAR_NOTES.md,
+/// §3.2). Целевое состояние считает координатор
+/// (`target = !(все выбранные видимы)`) — здесь только применение решения
+/// батчем. Несуществующие id молча пропускаются.
+pub fn set_visible_many(config: &mut Config, ids: &[Uuid], visible: bool) {
+    for id in ids {
+        if let Some(sticker) = config.stickers.iter_mut().find(|s| s.id == *id) {
+            sticker.visible = visible;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +436,154 @@ mod tests {
     }
 
     #[test]
+    fn step_up_many_moves_adjacent_block_up_as_a_whole() {
+        let mut c = cfg(&[0, 1, 2, 3]);
+        let ids = ids(&c);
+        // Выделены соседние B (1) и C (2).
+        step_up_many(&mut c, &[ids[1], ids[2]]).unwrap();
+        // Блок [1..=2] сдвинут вверх: B→2, C→3; D (стоял над блоком) → 1.
+        assert_eq!(get(&c, ids[1]).order, 2);
+        assert_eq!(get(&c, ids[2]).order, 3);
+        assert_eq!(get(&c, ids[3]).order, 1);
+        assert_eq!(get(&c, ids[0]).order, 0);
+    }
+
+    #[test]
+    fn step_up_many_moves_disconnected_block_up_as_a_whole() {
+        let mut c = cfg(&[0, 1, 2, 3, 4]);
+        let ids = ids(&c);
+        // Выделены A (0) и D (3); между ними невыбранные B, C. Порядок id
+        // в списке не должен влиять на результат.
+        step_up_many(&mut c, &[ids[3], ids[0]]).unwrap();
+        // Блок [0..=3] сдвинут вверх: A→1, B→2, C→3, D→4; E (над блоком) → 0.
+        assert_eq!(get(&c, ids[0]).order, 1);
+        assert_eq!(get(&c, ids[1]).order, 2);
+        assert_eq!(get(&c, ids[2]).order, 3);
+        assert_eq!(get(&c, ids[3]).order, 4);
+        assert_eq!(get(&c, ids[4]).order, 0);
+    }
+
+    #[test]
+    fn step_up_many_noop_when_top_selected_on_top() {
+        let mut c = cfg(&[0, 1, 2]);
+        let ids = ids(&c);
+        // Выделены A и C — верхний выбранный уже наверху.
+        let before = c.clone();
+        step_up_many(&mut c, &[ids[0], ids[2]]).unwrap();
+        assert_stickers_equal(&c, &before);
+    }
+
+    #[test]
+    fn step_up_many_single_id_matches_step_up() {
+        for orders in [vec![0, 1, 2], vec![0, 1, 2, 3, 4]] {
+            let mut a = cfg(&orders);
+            let ids_a = ids(&a);
+            step_up(&mut a, ids_a[1]).unwrap();
+
+            let mut b = cfg(&orders);
+            let ids_b = ids(&b);
+            step_up_many(&mut b, &[ids_b[1]]).unwrap();
+
+            // id в a и b разные — сравниваем только порядок по позициям.
+            let a_orders: Vec<i64> = a.stickers.iter().map(|s| s.order).collect();
+            let b_orders: Vec<i64> = b.stickers.iter().map(|s| s.order).collect();
+            assert_eq!(a_orders, b_orders);
+        }
+    }
+
+    #[test]
+    fn step_down_many_moves_adjacent_block_down_as_a_whole() {
+        let mut c = cfg(&[0, 1, 2, 3]);
+        let ids = ids(&c);
+        // Выделены соседние B (1) и C (2).
+        step_down_many(&mut c, &[ids[1], ids[2]]).unwrap();
+        // Блок [1..=2] сдвинут вниз: B→0, C→1; A (под блоком) → 2.
+        assert_eq!(get(&c, ids[1]).order, 0);
+        assert_eq!(get(&c, ids[2]).order, 1);
+        assert_eq!(get(&c, ids[0]).order, 2);
+        assert_eq!(get(&c, ids[3]).order, 3);
+    }
+
+    #[test]
+    fn step_down_many_moves_disconnected_block_down_as_a_whole() {
+        let mut c = cfg(&[0, 1, 2, 3, 4]);
+        let ids = ids(&c);
+        // Выделены B (1) и E (4); между ними невыбранные C, D.
+        step_down_many(&mut c, &[ids[4], ids[1]]).unwrap();
+        // Блок [1..=4] сдвинут вниз: B→0, C→1, D→2, E→3; A (под блоком) → 4.
+        assert_eq!(get(&c, ids[0]).order, 4);
+        assert_eq!(get(&c, ids[1]).order, 0);
+        assert_eq!(get(&c, ids[2]).order, 1);
+        assert_eq!(get(&c, ids[3]).order, 2);
+        assert_eq!(get(&c, ids[4]).order, 3);
+    }
+
+    #[test]
+    fn step_down_many_noop_when_bottom_selected_on_bottom() {
+        let mut c = cfg(&[0, 1, 2]);
+        let ids = ids(&c);
+        // Выделены A и C — нижний выбранный уже внизу.
+        let before = c.clone();
+        step_down_many(&mut c, &[ids[0], ids[2]]).unwrap();
+        assert_stickers_equal(&c, &before);
+    }
+
+    #[test]
+    fn step_down_many_single_id_matches_step_down() {
+        for orders in [vec![0, 1, 2], vec![0, 1, 2, 3, 4]] {
+            let mut a = cfg(&orders);
+            let ids_a = ids(&a);
+            step_down(&mut a, ids_a[1]).unwrap();
+
+            let mut b = cfg(&orders);
+            let ids_b = ids(&b);
+            step_down_many(&mut b, &[ids_b[1]]).unwrap();
+
+            // id в a и b разные — сравниваем только порядок по позициям.
+            let a_orders: Vec<i64> = a.stickers.iter().map(|s| s.order).collect();
+            let b_orders: Vec<i64> = b.stickers.iter().map(|s| s.order).collect();
+            assert_eq!(a_orders, b_orders);
+        }
+    }
+
+    #[test]
+    fn step_many_empty_selection_is_noop() {
+        let mut c = cfg(&[0, 1, 2]);
+        let before = c.clone();
+        step_up_many(&mut c, &[]).unwrap();
+        step_down_many(&mut c, &[]).unwrap();
+        assert_stickers_equal(&c, &before);
+    }
+
+    #[test]
+    fn step_many_unknown_id_errors_without_mutation() {
+        let mut c = cfg(&[0, 1]);
+        let ids = ids(&c);
+        let unknown = Uuid::new_v4();
+        assert_eq!(
+            step_up_many(&mut c, &[ids[0], unknown]),
+            Err(OpError::StickerNotFound(unknown))
+        );
+        assert_eq!(get(&c, ids[0]).order, 0);
+        assert_eq!(get(&c, ids[1]).order, 1);
+    }
+
+    #[test]
+    fn step_many_handles_tied_orders() {
+        let mut c = Config {
+            stickers: vec![sticker(5), sticker(5), sticker(5), sticker(5)],
+            ..Default::default()
+        };
+        let sticker_ids = ids(&c);
+        // После нормализации — [0, 1, 2, 3]; выделены второй и третий.
+        step_up_many(&mut c, &[sticker_ids[1], sticker_ids[2]]).unwrap();
+        assert_eq!(get(&c, sticker_ids[1]).order, 2);
+        assert_eq!(get(&c, sticker_ids[2]).order, 3);
+        assert_eq!(get(&c, sticker_ids[3]).order, 1);
+        assert_eq!(get(&c, sticker_ids[0]).order, 0);
+    }
+
+    #[test]
     fn z_ops_handle_tied_orders() {
         let mut c = Config {
             stickers: vec![sticker(5), sticker(5), sticker(5)],
@@ -485,6 +732,52 @@ mod tests {
             toggle_visibility(&mut c, unknown),
             Err(OpError::StickerNotFound(unknown))
         );
+    }
+
+    #[test]
+    fn set_visible_many_sets_exact_value_on_mixed_group() {
+        let mut c = cfg(&[0, 1, 2, 3]);
+        let ids = ids(&c);
+        // Смешанная группа: два видимы, два скрыты.
+        toggle_visibility(&mut c, ids[0]).unwrap();
+        toggle_visibility(&mut c, ids[2]).unwrap();
+        assert!(!get(&c, ids[0]).visible && !get(&c, ids[2]).visible);
+        assert!(get(&c, ids[1]).visible && get(&c, ids[3]).visible);
+
+        set_visible_many(&mut c, &ids, true);
+        assert!(ids.iter().all(|id| get(&c, *id).visible));
+
+        set_visible_many(&mut c, &ids, false);
+        assert!(ids.iter().all(|id| !get(&c, *id).visible));
+    }
+
+    #[test]
+    fn set_visible_many_does_not_touch_unlisted_stickers() {
+        let mut c = cfg(&[0, 1, 2]);
+        let ids = ids(&c);
+        toggle_visibility(&mut c, ids[2]).unwrap();
+        set_visible_many(&mut c, &ids[0..1], false);
+        assert!(!get(&c, ids[0]).visible);
+        assert!(get(&c, ids[1]).visible, "не в списке — не тронут");
+        assert!(!get(&c, ids[2]).visible, "не в списке — не тронут");
+    }
+
+    #[test]
+    fn set_visible_many_ignores_unknown_ids() {
+        let mut c = cfg(&[0, 1]);
+        let ids = ids(&c);
+        let unknown = Uuid::new_v4();
+        set_visible_many(&mut c, &[ids[0], unknown], false);
+        assert!(!get(&c, ids[0]).visible);
+        assert!(get(&c, ids[1]).visible);
+    }
+
+    #[test]
+    fn set_visible_many_on_empty_selection_is_noop() {
+        let mut c = cfg(&[0, 1]);
+        let before = c.clone();
+        set_visible_many(&mut c, &[], false);
+        assert_stickers_equal(&c, &before);
     }
 
     #[test]
