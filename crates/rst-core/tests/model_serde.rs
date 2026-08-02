@@ -243,3 +243,31 @@ fn new_file_sticker_is_centered_and_enabled() {
         other => panic!("ожидался StickerSource::File, получено {other:?}"),
     }
 }
+
+#[test]
+fn new_pasted_sticker_uses_pasted_source() {
+    let sticker = Sticker::new_pasted(
+        "C:\\Users\\u\\AppData\\Roaming\\resticker\\pasted\\abc.png".into(),
+        MonitorId("\\\\?\\DISPLAY#TEST".to_string()),
+        960.0,
+        540.0,
+        300.0,
+        200.0,
+    );
+    assert!(sticker.enabled);
+    assert!(sticker.visible);
+    match &sticker.source {
+        StickerSource::Pasted { path } => {
+            assert_eq!(
+                path,
+                &std::path::PathBuf::from(
+                    "C:\\Users\\u\\AppData\\Roaming\\resticker\\pasted\\abc.png"
+                )
+            );
+        }
+        other => panic!("ожидался StickerSource::Pasted, получено {other:?}"),
+    }
+
+    let json = serde_json::to_value(&sticker).unwrap();
+    assert_eq!(json["source"]["kind"], "pasted");
+}

@@ -169,6 +169,34 @@ impl Sticker {
             ..Self::default()
         }
     }
+
+    /// Новый стикер из изображения, материализованного из буфера обмена в
+    /// `pasted/<uuid>.png` (SPEC 2.1/2.5, `Ctrl+V`). В отличие от
+    /// [`Sticker::new_file`] источник — [`StickerSource::Pasted`]: удаление
+    /// такого стикера обязано удалить и файл (координатор), не только запись
+    /// в конфиге.
+    pub fn new_pasted(
+        path: std::path::PathBuf,
+        monitor_id: MonitorId,
+        cx: f64,
+        cy: f64,
+        w: f64,
+        h: f64,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            source: StickerSource::Pasted { path },
+            placement: Placement {
+                monitor_id,
+                cx,
+                cy,
+                w,
+                h,
+            },
+            ..Self::default()
+        }
+    }
 }
 /// Источник стикера (SPEC.md, раздел 2.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
