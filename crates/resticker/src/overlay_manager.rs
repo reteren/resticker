@@ -18,6 +18,7 @@
 //! раздел 17, шаги 7–8). `Delete` пока без диалога подтверждения — удаляет
 //! сразу (страхуется через `Ctrl+Z`); диалог — часть тулбара/панели.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -29,13 +30,18 @@ use rst_core::ops;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
-use rst_render::{Box2D, Renderer, SelectionBox, Sprite, Texture, edit_overlay, solid_sprite};
+use rst_render::{
+    Box2D, Button, Panel, PointerEvent, Primitive, Renderer, SelectionBox, Sprite, Texture,
+    edit_overlay, marquee_visuals, rasterize, solid_sprite, theme,
+};
 use rst_win32::hotkey::HotkeyCombo;
 use rst_win32::input::{
     Corner as Win32Corner, CursorShape, CursorZone, Handle as Win32Handle, InputEvent, Modifiers,
 };
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
 use uuid::Uuid;
+
+use crate::confirm_dialog;
 
 /// Хоткей входа/выхода из режима редактирования по умолчанию (CONFIG.md),
 /// если в конфиге он не задан или не парсится.
@@ -136,17 +142,29 @@ enum Gesture {
         start: GestureStart,
         grab: (f64, f64),
     },
+    /// Протяжка рамки мультивыделения по фону (SPEC 3.2). Не мутирует
+    /// `Config` — только `edit.selection`/`edit.marquee` — поэтому не несёт
+    /// `GestureStart` и не откатывается через `apply_transform`.
+    Marquee { anchor: (f64, f64) },
 }
 
 impl Gesture {
-    fn start(&self) -> &GestureStart {
+    /// `None` для [`Gesture::Marquee`] — ей нечего откатывать в модели
+    /// (docs/M2_WIRING_PLAN.md, раздел 8).
+    fn start(&self) -> Option<&GestureStart> {
         match self {
-            Gesture::Drag { start, .. } => start,
-            Gesture::Resize { start, .. } => start,
-            Gesture::Rotate { start, .. } => start,
+            Gesture::Drag { start, .. } => Some(start),
+            Gesture::Resize { start, .. } => Some(start),
+            Gesture::Rotate { start, .. } => Some(start),
+            Gesture::Marquee { .. } => None,
         }
     }
 }
+
+/// Минимальная протяжка (DIP), после которой клик по фону считается началом
+/// марки, а не простым кликом со снятием выделения (docs/M2_WIRING_PLAN.md,
+/// раздел 8).
+const MARQUEE_THRESHOLD_DIP: f64 = 4.0;
 
 /// Зона под курсором в режиме редактирования (docs/M2_INTEGRATION_PLAN.md,
 /// раздел 7): у выделенного стикера — кольцо поворота, ручки ресайза, тело;
@@ -175,6 +193,128 @@ struct EditState {
     /// изменилось — иначе клик без движения тратил бы шаг истории
     /// (docs/M2_SLICE_REVIEW.md, пункт 1).
     pending_snapshot: Option<Config>,
+    /// Открытый модал подтверждения удаления (`begin_delete`); пока `Some`,
+    /// модал блокирует и сцену, и историю (docs/M2_WIRING_PLAN.md, раздел 7).
+    confirm: Option<ConfirmState>,
+    /// Текущая рамка марки для отрисовки (`anchor_x, anchor_y, cur_x, cur_y`,
+    /// DIP) — `None`, если марка не тянется в этот момент.
+    marquee: Option<(f64, f64, f64, f64)>,
+    /// Протяжка марки превысила порог (`MARQUEE_THRESHOLD_DIP`) — отличает
+    /// «клик по фону» (снимает выделение на `MouseUp`) от настоящей марки.
+    marquee_started: bool,
+}
+
+/// Открытый модал подтверждения удаления (docs/M2_WIRING_PLAN.md, раздел 6/7).
+struct ConfirmState {
+    /// Снимок `Config` на момент открытия модала — именно он уйдёт в undo по
+    /// «Удалить», а не текущий `cfg` (выделение не меняется, пока модал
+    /// открыт, но так инвариант проще и не зависит от этого факта).
+    snapshot: Config,
+    /// Id стикеров к удалению, зафиксированные на момент открытия.
+    ids: Vec<Uuid>,
+    panel: Panel,
+}
+
+/// Кэш 1×1 текстур заливки и текстур растрированного текста для перевода
+/// `Primitive` (immediate-mode виджетов) в `Sprite` (docs/M2_WIRING_PLAN.md,
+/// раздел 2–3). Живёт на весь сеанс редактирования в `run()`, не в
+/// `EditState` — это деталь рендера, а не состояние редактирования.
+struct UiTextureCache {
+    fills: HashMap<[u8; 3], Texture>,
+    texts: HashMap<(String, [u8; 3]), Texture>,
+}
+
+impl UiTextureCache {
+    fn new() -> Self {
+        Self {
+            fills: HashMap::new(),
+            texts: HashMap::new(),
+        }
+    }
+
+    fn fill_texture(&mut self, renderer: &Renderer, color: [u8; 3]) -> Option<Texture> {
+        if let Some(t) = self.fills.get(&color) {
+            return Some(t.clone());
+        }
+        match renderer.create_texture_from_rgba(&[color[0], color[1], color[2], 0xff], 1, 1) {
+            Ok(t) => {
+                self.fills.insert(color, t.clone());
+                Some(t)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "не удалось создать текстуру заливки UI");
+                None
+            }
+        }
+    }
+
+    fn text_texture(
+        &mut self,
+        renderer: &Renderer,
+        text: &str,
+        color: [u8; 3],
+        scale: u32,
+    ) -> Option<Texture> {
+        let key = (text.to_string(), color);
+        if let Some(t) = self.texts.get(&key) {
+            return Some(t.clone());
+        }
+        let (rgba, w, h) = rasterize(text, color, scale);
+        match renderer.create_texture_from_rgba(&rgba, w.max(1), h.max(1)) {
+            Ok(t) => {
+                self.texts.insert(key, t.clone());
+                Some(t)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, text, "не удалось создать текстуру текста UI");
+                None
+            }
+        }
+    }
+}
+
+/// Перевести примитивы панели (`Panel::draw`) в спрайты кадра, используя кэш
+/// текстур (docs/M2_WIRING_PLAN.md, раздел 3). Иконок-ассетов в этом срезе
+/// нет — плейсхолдер заливкой `theme::BUTTON_BG` (раздел 14).
+fn primitives_to_sprites(
+    prims: &[Primitive],
+    cache: &mut UiTextureCache,
+    renderer: &Renderer,
+    monitor_id: &MonitorId,
+    text_scale: u32,
+    out: &mut Vec<Sprite>,
+) {
+    for prim in prims {
+        match prim {
+            Primitive::Fill {
+                rect,
+                color,
+                opacity,
+            } => {
+                if let Some(tex) = cache.fill_texture(renderer, *color) {
+                    out.push(solid_sprite(&tex, monitor_id, rect, *opacity));
+                }
+            }
+            Primitive::Text {
+                rect,
+                text,
+                color,
+                opacity,
+            } => {
+                if text.is_empty() {
+                    continue;
+                }
+                if let Some(tex) = cache.text_texture(renderer, text, *color, text_scale) {
+                    out.push(solid_sprite(&tex, monitor_id, rect, *opacity));
+                }
+            }
+            Primitive::Icon { rect, opacity, .. } => {
+                if let Some(tex) = cache.fill_texture(renderer, theme::BUTTON_BG) {
+                    out.push(solid_sprite(&tex, monitor_id, rect, *opacity));
+                }
+            }
+        }
+    }
 }
 
 fn run(
@@ -267,7 +407,11 @@ fn run(
         undo_stack: Vec::new(),
         redo_stack: Vec::new(),
         pending_snapshot: None,
+        confirm: None,
+        marquee: None,
+        marquee_started: false,
     };
+    let mut ui_cache = UiTextureCache::new();
 
     redraw(
         &mut renderer,
@@ -276,6 +420,7 @@ fn run(
         &edit,
         &white_tex,
         &black_tex,
+        &mut ui_cache,
         width,
         height,
         scale,
@@ -314,6 +459,8 @@ fn run(
                     &config_path,
                     &mut sprites,
                     &mut edit,
+                    (width, height),
+                    scale,
                 );
             }
             OverlayMessage::Event(OverlayEvent::Key { .. }) => {}
@@ -322,6 +469,7 @@ fn run(
                     event,
                     scale,
                     &overlay,
+                    &renderer,
                     (width, height),
                     &mut cfg,
                     &config_path,
@@ -342,6 +490,7 @@ fn run(
                 &edit,
                 &white_tex,
                 &black_tex,
+                &mut ui_cache,
                 width,
                 height,
                 scale,
@@ -363,16 +512,22 @@ fn toggle_edit_mode(
     // CaptureLost, а не коммитит середину перетаскивания (docs/M2_SLICE_REVIEW.md,
     // пункт 4: раньше это было асимметрично).
     if let Some(gesture) = edit.gesture.take() {
-        let start = gesture.start();
-        apply_transform(
-            cfg,
-            sprites,
-            start.id,
-            start.placement.clone(),
-            start.transform,
-        );
+        if let Some(start) = gesture.start() {
+            apply_transform(
+                cfg,
+                sprites,
+                start.id,
+                start.placement.clone(),
+                start.transform,
+            );
+        }
     }
     edit.pending_snapshot = None;
+    edit.marquee = None;
+    edit.marquee_started = false;
+    // Открытый модал не переживает выход из режима — как и незавершённый
+    // жест выше, он относится к сеансу редактирования, а не к самому кадру.
+    edit.confirm = None;
     edit.active = !edit.active;
     overlay.set_click_through(!edit.active);
     if !edit.active {
@@ -469,6 +624,44 @@ fn perform_redo(
     true
 }
 
+/// Начать удаление выделенного: если подтверждение не подавлено
+/// (`ops::should_confirm_delete`) — открыть модал (`edit.confirm`), иначе
+/// удалить сразу тем же путём, что и раньше (docs/M2_WIRING_PLAN.md, раздел
+/// 7). Общая точка входа для `Delete` и (позже) кнопки тулбара — диалог не
+/// должен зависеть от того, чем вызван. Возвращает `false` только если
+/// выделение пусто (нечего удалять — не открывать модал впустую).
+#[allow(clippy::too_many_arguments)]
+fn begin_delete(
+    edit: &mut EditState,
+    renderer: &Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    center: (f64, f64),
+) -> bool {
+    if edit.selection.is_empty() {
+        return false;
+    }
+    if ops::should_confirm_delete(cfg) {
+        edit.confirm = Some(ConfirmState {
+            snapshot: cfg.clone(),
+            ids: edit.selection.ids().to_vec(),
+            panel: confirm_dialog::build(edit.selection.ids().len() as u32, center),
+        });
+    } else {
+        commit_undo_snapshot(edit, cfg.clone());
+        for id in edit.selection.ids().to_vec() {
+            let _ = ops::delete(cfg, id);
+        }
+        edit.selection.prune(&cfg.stickers);
+        resync_sprites(renderer, cfg, sprites);
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после удаления");
+        }
+    }
+    true
+}
+
 /// Клавиатурные команды режима редактирования (docs/M2_INTEGRATION_PLAN.md,
 /// раздел 12): `Esc` — выход, `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y` — отмена/повтор,
 /// `Ctrl+A` — выделить всё, `Delete` — удалить выделенное (без диалога
@@ -483,6 +676,8 @@ fn handle_key(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
+    overlay_size: (u32, u32),
+    scale: f32,
 ) -> bool {
     // История/удаление/дублирование во время активного жеста мутировали бы
     // cfg из-под него — жест продолжал бы считать от своего старого
@@ -491,6 +686,18 @@ fn handle_key(
     // незавершённый жест перед выходом.
     if edit.gesture.is_some() && vk != VK_ESCAPE {
         return false;
+    }
+    // Модал подтверждения блокирует всё, кроме своей отмены по Esc — как и
+    // жест выше, но отдельной веткой: гостевой жест здесь всегда `None`
+    // (модал открывается только когда жеста нет), поэтому порядок с
+    // предыдущей проверкой не важен (docs/M2_WIRING_PLAN.md, раздел 10).
+    if edit.confirm.is_some() {
+        return if vk == VK_ESCAPE {
+            edit.confirm = None;
+            true
+        } else {
+            false
+        };
     }
     match vk {
         VK_ESCAPE => {
@@ -507,19 +714,15 @@ fn handle_key(
             true
         }
         VK_DELETE => {
-            if edit.selection.is_empty() {
-                return false;
-            }
-            commit_undo_snapshot(edit, cfg.clone());
-            for id in edit.selection.ids().to_vec() {
-                let _ = ops::delete(cfg, id);
-            }
-            edit.selection.prune(&cfg.stickers);
-            resync_sprites(renderer, cfg, sprites);
-            if let Err(e) = config::save(cfg, config_path) {
-                tracing::warn!(error = %e, "не удалось сохранить config.json после удаления");
-            }
-            true
+            let center = edit
+                .selection
+                .bounds(&cfg.stickers)
+                .map(|r| (r.x + r.w / 2.0, r.y + r.h / 2.0))
+                .unwrap_or((
+                    overlay_size.0 as f64 / 2.0 / scale as f64,
+                    overlay_size.1 as f64 / 2.0 / scale as f64,
+                ));
+            begin_delete(edit, renderer, cfg, config_path, sprites, center)
         }
         VK_D if modifiers.ctrl => {
             if edit.selection.is_empty() {
@@ -663,10 +866,11 @@ fn handle_input(
     event: InputEvent,
     scale: f32,
     overlay: &OverlayWindow,
+    renderer: &Renderer,
     overlay_size: (u32, u32),
     cfg: &mut Config,
     config_path: &Path,
-    sprites: &mut [(Uuid, Sprite)],
+    sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
 ) -> bool {
     let monitor = DipRect::new(
@@ -678,12 +882,26 @@ fn handle_input(
     match event {
         InputEvent::MouseDown { pos, .. } => {
             let (dip_x, dip_y) = to_dip(pos, scale);
+            // Модал модален: пока открыт, клики в сцену не уходят вообще —
+            // ни по кнопкам модала, ни мимо него (docs/M2_WIRING_PLAN.md,
+            // раздел 5, п.1).
+            if let Some(confirm) = &mut edit.confirm {
+                confirm.panel.pointer_event(PointerEvent::Down {
+                    pos: (dip_x, dip_y),
+                });
+                return true;
+            }
             let zone = resolve_zone(cfg, &edit.selection, dip_x, dip_y);
             match zone {
                 Zone::Background => {
-                    let before = edit.selection.ids().to_vec();
-                    edit.selection.click(None);
-                    before != edit.selection.ids()
+                    // Решение «клик или марка» откладывается до `MouseUp`/
+                    // порога протяжки (docs/M2_WIRING_PLAN.md, раздел 8) —
+                    // выделение здесь ещё не трогаем.
+                    edit.gesture = Some(Gesture::Marquee {
+                        anchor: (dip_x, dip_y),
+                    });
+                    edit.marquee_started = false;
+                    false
                 }
                 Zone::StickerBody(id) => {
                     let before = edit.selection.ids().to_vec();
@@ -745,6 +963,12 @@ fn handle_input(
             dragging,
         } => {
             let (dip_x, dip_y) = to_dip(pos, scale);
+            if let Some(confirm) = &mut edit.confirm {
+                confirm.panel.pointer_event(PointerEvent::Move {
+                    pos: (dip_x, dip_y),
+                });
+                return true;
+            }
             if !dragging {
                 let zone = resolve_zone(cfg, &edit.selection, dip_x, dip_y);
                 overlay.post_cursor_shape(cursor_shape_for_zone(&zone));
@@ -752,7 +976,62 @@ fn handle_input(
             }
             apply_gesture(cfg, sprites, edit, (dip_x, dip_y), modifiers, monitor)
         }
-        InputEvent::MouseUp { .. } => {
+        InputEvent::MouseUp { pos, .. } => {
+            let (dip_x, dip_y) = to_dip(pos, scale);
+            if edit.confirm.is_some() {
+                // Забрать модал по значению — дальше нужен `&mut edit` для
+                // `commit_undo_snapshot`, а он не может сосуществовать с
+                // заимствованием `edit.confirm` (docs/M2_WIRING_PLAN.md,
+                // раздел 6, таблица «Модал»).
+                let mut confirm = edit.confirm.take().expect("проверено выше");
+                confirm.panel.pointer_event(PointerEvent::Up {
+                    pos: (dip_x, dip_y),
+                });
+                if confirm
+                    .panel
+                    .widget_mut::<Button>(confirm_dialog::ID_DELETE)
+                    .expect("ID_DELETE собран в confirm_dialog::build")
+                    .take_click()
+                {
+                    commit_undo_snapshot(edit, confirm.snapshot);
+                    for id in &confirm.ids {
+                        let _ = ops::delete(cfg, *id);
+                    }
+                    edit.selection.prune(&cfg.stickers);
+                    resync_sprites(renderer, cfg, sprites);
+                    if let Err(e) = config::save(cfg, config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить config.json после удаления через диалог");
+                    }
+                } else if confirm
+                    .panel
+                    .widget_mut::<Button>(confirm_dialog::ID_DONT_ASK)
+                    .expect("ID_DONT_ASK собран в confirm_dialog::build")
+                    .take_click()
+                {
+                    // Тумблер не закрывает модал — пользователь ещё должен
+                    // подтвердить (или отменить) само удаление (раздел 6).
+                    ops::suppress_delete_confirmation(cfg);
+                    if let Err(e) = config::save(cfg, config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить config.json после переключения подтверждения удаления");
+                    }
+                    edit.confirm = Some(confirm);
+                }
+                // `ID_CANCEL`, клик по сообщению или мимо модала: закрыть без
+                // изменений — снимок не коммитился, отбрасываем вместе с `confirm`.
+                return true;
+            }
+            if let Some(Gesture::Marquee { .. }) = &edit.gesture {
+                let started = edit.marquee_started;
+                edit.gesture = None;
+                edit.marquee = None;
+                edit.marquee_started = false;
+                if !started {
+                    // Клик по фону без протяжки — снять выделение только
+                    // сейчас (docs/M2_WIRING_PLAN.md, раздел 8).
+                    edit.selection.click(None);
+                }
+                return true;
+            }
             if edit.gesture.take().is_some() {
                 // Снимок кладём в историю только сейчас, и только если жест
                 // реально что-то изменил — клик без движения не тратит шаг
@@ -773,17 +1052,22 @@ fn handle_input(
         InputEvent::CaptureLost => {
             // Отменить незавершённый жест без сохранения: откатить модель и
             // спрайт к стартовому снимку (docs/M2_INTEGRATION_PLAN.md,
-            // раздел 6 — "CaptureLost -> отменить жест без push").
+            // раздел 6 — "CaptureLost -> отменить жест без push"). У марки
+            // (`Gesture::start() == None`) откатывать в модели нечего —
+            // только сбросить визуал (docs/M2_WIRING_PLAN.md, раздел 8).
             match edit.gesture.take() {
                 Some(gesture) => {
-                    let start = gesture.start();
-                    apply_transform(
-                        cfg,
-                        sprites,
-                        start.id,
-                        start.placement.clone(),
-                        start.transform,
-                    );
+                    if let Some(start) = gesture.start() {
+                        apply_transform(
+                            cfg,
+                            sprites,
+                            start.id,
+                            start.placement.clone(),
+                            start.transform,
+                        );
+                    }
+                    edit.marquee = None;
+                    edit.marquee_started = false;
                     // Жест не завершился — отложенный снимок не понадобился,
                     // он ещё не попал в undo_stack (pending_snapshot).
                     edit.pending_snapshot = None;
@@ -805,6 +1089,16 @@ fn apply_gesture(
     modifiers: Modifiers,
     monitor: DipRect,
 ) -> bool {
+    if let Some(Gesture::Marquee { anchor }) = &edit.gesture {
+        let anchor = *anchor;
+        let rect = DipRect::new(anchor.0, anchor.1, dip_x - anchor.0, dip_y - anchor.1);
+        if rect.w.abs() >= MARQUEE_THRESHOLD_DIP || rect.h.abs() >= MARQUEE_THRESHOLD_DIP {
+            edit.marquee_started = true;
+            edit.marquee = Some((anchor.0, anchor.1, dip_x, dip_y));
+            edit.selection.rubber_band(&cfg.stickers, &rect);
+        }
+        return true;
+    }
     let Some(gesture) = &edit.gesture else {
         return false;
     };
@@ -861,6 +1155,7 @@ fn apply_gesture(
             apply_transform(cfg, sprites, id, result.placement, result.transform);
             true
         }
+        Gesture::Marquee { .. } => unreachable!("обработано в раннем возврате выше"),
     }
 }
 
@@ -876,12 +1171,16 @@ fn redraw(
     edit: &EditState,
     white_tex: &Texture,
     black_tex: &Texture,
+    ui_cache: &mut UiTextureCache,
     width_px: u32,
     height_px: u32,
     scale: f32,
 ) {
     let mut frame: Vec<Sprite> = Vec::with_capacity(sprites.len() + 1 + 12);
     let monitor_id = MonitorId::default();
+    // Растровый шрифт — целочисленный пиксельный масштаб; `scale` (DPI/96)
+    // округляем, а не берём как есть (text::rasterize ждёт `u32`).
+    let text_scale = scale.round().max(1.0) as u32;
 
     if edit.active {
         let w_dip = width_px as f64 / scale as f64;
@@ -905,6 +1204,30 @@ fn redraw(
         }
     }
 
+    // Марка — под рамками выделения, только пока реально тянется (порог
+    // протяжки, docs/M2_WIRING_PLAN.md, раздел 8/11).
+    if let Some((ax, ay, cx, cy)) = edit.marquee {
+        let visuals = marquee_visuals((ax, ay), (cx, cy));
+        if let Some(tex) = ui_cache.fill_texture(renderer, theme::SLIDER_FILL) {
+            if let Some(fill_rect) = &visuals.fill {
+                frame.push(solid_sprite(
+                    &tex,
+                    &monitor_id,
+                    fill_rect,
+                    rst_render::MARQUEE_FILL_OPACITY,
+                ));
+            }
+            for dash in &visuals.dashes {
+                frame.push(solid_sprite(
+                    &tex,
+                    &monitor_id,
+                    dash,
+                    rst_render::MARQUEE_STROKE_OPACITY,
+                ));
+            }
+        }
+    }
+
     if edit.active {
         for id in edit.selection.ids() {
             let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) else {
@@ -915,6 +1238,20 @@ fn redraw(
                 frame.push(solid_sprite(white_tex, &monitor_id, &rect, 1.0));
             }
         }
+    }
+
+    // Модал подтверждения — самый верх (раздел 11).
+    if let Some(confirm) = &edit.confirm {
+        let mut prims = Vec::new();
+        confirm.panel.draw(&mut prims);
+        primitives_to_sprites(
+            &prims,
+            ui_cache,
+            renderer,
+            &monitor_id,
+            text_scale,
+            &mut frame,
+        );
     }
 
     if let Err(e) = renderer.draw(&frame) {
