@@ -1675,7 +1675,19 @@ fn handle_input(
                     return true;
                 }
                 PointerOwner::Scene if dragging => {
-                    return apply_gesture(cfg, sprites, edit, (dip_x, dip_y), modifiers, monitor);
+                    let need_redraw =
+                        apply_gesture(cfg, sprites, edit, (dip_x, dip_y), modifiers, monitor);
+                    if need_redraw {
+                        // Драг/ресайз/поворот меняют placement/opacity живо —
+                        // тулбар должен следовать за стикером в том же кадре
+                        // (docs/M2_WIRING_PLAN.md, раздел 4: «едет за
+                        // выделением»). Марка тоже проходит через эту ветку,
+                        // но `rebuild_toolbar` сам держит его скрытым, пока
+                        // `edit.marquee.is_some()` — вызов безопасен для обоих
+                        // случаев.
+                        rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+                    }
+                    return need_redraw;
                 }
                 PointerOwner::Scene | PointerOwner::None => {}
             }
