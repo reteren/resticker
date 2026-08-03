@@ -549,7 +549,9 @@ fn run(
     // `Device` — один на процесс (M3 step 2, ARCHITECTURE.md раздел 1):
     // текстуры (заливки, спрайты стикеров) грузятся здесь один раз и
     // рисуются на цели любого монитора без перезаливки на GPU.
-    let device = match Device::new() {
+    // `mut`: пересоздаётся целиком при потере устройства (`recover_device`,
+    // ARCHITECTURE.md раздел 11) — не только на старте.
+    let mut device = match Device::new() {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(error = %e, "не удалось создать D3D11-устройство");
@@ -559,15 +561,16 @@ fn run(
 
     // Заливки для рамки выделения (белая) и затемнения режима (чёрная) —
     // 1×1 текстуры, растягиваются рендерером как обычные спрайты; общие на
-    // процесс, как и любая другая текстура на `device`.
-    let white_tex = match device.create_texture_from_rgba(&[0xff, 0xff, 0xff, 0xff], 1, 1) {
+    // процесс, как и любая другая текстура на `device`. `mut` — пересоздаются
+    // вместе с устройством при потере.
+    let mut white_tex = match device.create_texture_from_rgba(&[0xff, 0xff, 0xff, 0xff], 1, 1) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "не удалось создать текстуру рамки выделения");
             return;
         }
     };
-    let black_tex = match device.create_texture_from_rgba(&[0x00, 0x00, 0x00, 0xff], 1, 1) {
+    let mut black_tex = match device.create_texture_from_rgba(&[0x00, 0x00, 0x00, 0xff], 1, 1) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "не удалось создать текстуру затемнения");
@@ -719,23 +722,33 @@ fn run(
     };
     let mut ui_cache = UiTextureCache::new();
 
-    for (monitor_id, ms) in monitors_map.iter_mut() {
-        let mut renderer = Renderer {
-            device: &device,
-            target: &mut ms.target,
-        };
-        redraw(
-            &mut renderer,
+    if redraw_all(
+        &device,
+        &mut monitors_map,
+        &sprites,
+        &cfg,
+        &edit,
+        &white_tex,
+        &black_tex,
+        &mut ui_cache,
+    ) && recover_device(
+        &mut device,
+        &mut monitors_map,
+        &mut white_tex,
+        &mut black_tex,
+        &mut sprites,
+        &cfg,
+        &mut ui_cache,
+    ) {
+        redraw_all(
+            &device,
+            &mut monitors_map,
             &sprites,
             &cfg,
             &edit,
             &white_tex,
             &black_tex,
             &mut ui_cache,
-            ms.width,
-            ms.height,
-            ms.scale,
-            monitor_id,
         );
     }
 
@@ -950,26 +963,37 @@ fn run(
                 // события приходить не должны, но игнорируем на всякий случай.
             }
         }
-        if need_redraw {
-            for (monitor_id, ms) in monitors_map.iter_mut() {
-                let mut renderer = Renderer {
-                    device: &device,
-                    target: &mut ms.target,
-                };
-                redraw(
-                    &mut renderer,
-                    &sprites,
-                    &cfg,
-                    &edit,
-                    &white_tex,
-                    &black_tex,
-                    &mut ui_cache,
-                    ms.width,
-                    ms.height,
-                    ms.scale,
-                    monitor_id,
-                );
-            }
+        if need_redraw
+            && redraw_all(
+                &device,
+                &mut monitors_map,
+                &sprites,
+                &cfg,
+                &edit,
+                &white_tex,
+                &black_tex,
+                &mut ui_cache,
+            )
+            && recover_device(
+                &mut device,
+                &mut monitors_map,
+                &mut white_tex,
+                &mut black_tex,
+                &mut sprites,
+                &cfg,
+                &mut ui_cache,
+            )
+        {
+            redraw_all(
+                &device,
+                &mut monitors_map,
+                &sprites,
+                &cfg,
+                &edit,
+                &white_tex,
+                &black_tex,
+                &mut ui_cache,
+            );
         }
     }
     // monitors_map (Device+WindowTarget-обёртки внутри Renderer конструируются
@@ -2744,17 +2768,22 @@ fn apply_gesture(
 
 /// Собрать и отрисовать кадр (ADR-006 — только по событию): затемнение (если
 /// активен режим редактирования), стикеры по `order` (снизу вверх), затем
-/// рамка выделения поверх (тулбар и панель у курсора — следующий срез,
-/// docs/M2_INTEGRATION_PLAN.md, раздел 11).
+/// рамка выделения поверх, тулбар/панель у курсора/модал.
 ///
-/// Собрать и отрисовать кадр ровно для одного монитора (`monitor_id`) — M3:
-/// каждое окно получает свой кадр, отфильтрованный по `placement.monitor_id`
-/// (M3_PREP_NOTES.md, раздел 5.2). Затемнение режима редактирования рисуется
-/// на **каждом** мониторе безусловно (единый режим на весь десктоп,
-/// M3_PREP_NOTES.md §5.1); тулбар/панель у курсора/марка/модал — только на
-/// том мониторе, к которому они сейчас относятся (выделенный стикер, позиция
-/// курсора, монитор, открывший диалог — соответственно), иначе один и тот же
-/// UI-элемент нарисовался бы на всех окнах сразу.
+/// M3: кадр ровно для одного монитора (`monitor_id`) — каждое окно получает
+/// свой, отфильтрованный по `placement.monitor_id` (M3_PREP_NOTES.md, раздел
+/// 5.2). Затемнение режима редактирования рисуется на **каждом** мониторе
+/// безусловно (единый режим на весь десктоп, M3_PREP_NOTES.md §5.1);
+/// тулбар/панель у курсора/марка/модал — только на том мониторе, к которому
+/// они сейчас относятся (выделенный стикер, позиция курсора, монитор,
+/// открывший диалог — соответственно), иначе один и тот же UI-элемент
+/// нарисовался бы на всех окнах сразу.
+///
+/// Возвращает `true`, если устройство D3D потеряно (`RenderError::DeviceLost`
+/// — сон, смена драйвера, TDR, ARCHITECTURE.md раздел 11): вызывающий код
+/// должен остановить перебор остальных мониторов (то же мёртвое устройство)
+/// и вызвать восстановление (`recover_device`), а не продолжать рисовать
+/// кадры мёртвым устройством.
 #[allow(clippy::too_many_arguments)]
 fn redraw(
     renderer: &mut Renderer,
@@ -2768,7 +2797,7 @@ fn redraw(
     height_px: u32,
     scale: f32,
     monitor_id: &MonitorId,
-) {
+) -> bool {
     let mut frame: Vec<Sprite> = Vec::with_capacity(sprites.len() + 1 + 12);
     // Растровый шрифт — целочисленный пиксельный масштаб; `scale` (DPI/96)
     // округляем, а не берём как есть (text::rasterize ждёт `u32`).
@@ -2909,8 +2938,117 @@ fn redraw(
     }
 
     if let Err(e) = renderer.draw(&frame) {
-        tracing::warn!(error = %e, "не удалось отрисовать кадр");
+        let device_lost = matches!(e, RenderError::DeviceLost(_));
+        tracing::warn!(error = %e, device_lost, "не удалось отрисовать кадр");
+        return device_lost;
     }
+    false
+}
+
+/// Отрисовать кадр на всех мониторах. Устройство общее — если оно потеряно
+/// (`RenderError::DeviceLost`), это верно для всех целей сразу, поэтому при
+/// первом же таком сигнале перебор останавливается (дорисовывать остальные
+/// мониторы мёртвым устройством бессмысленно) и вызывающему сообщается, что
+/// нужно восстановление (`recover_device`).
+#[allow(clippy::too_many_arguments)]
+fn redraw_all(
+    device: &Device,
+    monitors_map: &mut HashMap<MonitorId, MonitorState>,
+    sprites: &[(Uuid, Sprite)],
+    cfg: &Config,
+    edit: &EditState,
+    white_tex: &Texture,
+    black_tex: &Texture,
+    ui_cache: &mut UiTextureCache,
+) -> bool {
+    for (monitor_id, ms) in monitors_map.iter_mut() {
+        let mut renderer = Renderer {
+            device,
+            target: &mut ms.target,
+        };
+        let device_lost = redraw(
+            &mut renderer,
+            sprites,
+            cfg,
+            edit,
+            white_tex,
+            black_tex,
+            ui_cache,
+            ms.width,
+            ms.height,
+            ms.scale,
+            monitor_id,
+        );
+        if device_lost {
+            return true;
+        }
+    }
+    false
+}
+
+/// Восстановить D3D11-устройство и все его GPU-ресурсы после потери
+/// (`RenderError::DeviceLost` — сон, смена драйвера, TDR; ARCHITECTURE.md
+/// раздел 11): без этого оверлей молча оставался бы чёрным/замороженным
+/// навсегда — устройство никогда не пересоздавалось, а `redraw` логировал бы
+/// одну и ту же ошибку на каждый кадр. Пересоздаёт устройство, цель каждого
+/// монитора на нём же (сохраняя её DPI-масштаб), заливки и текстуры всех
+/// стикеров — старые GPU-ресурсы принадлежали уничтоженному устройству и уже
+/// недействительны; UI-кэш растров тоже сбрасывается по той же причине.
+/// Возвращает `false`, если пересоздать само устройство не удалось — тогда
+/// рисовать больше нечем, и это уже логируется как ошибка внутри.
+#[allow(clippy::too_many_arguments)]
+fn recover_device(
+    device: &mut Device,
+    monitors_map: &mut HashMap<MonitorId, MonitorState>,
+    white_tex: &mut Texture,
+    black_tex: &mut Texture,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    cfg: &Config,
+    ui_cache: &mut UiTextureCache,
+) -> bool {
+    tracing::warn!("D3D-устройство потеряно — пересоздаю устройство и все GPU-ресурсы");
+    let new_device = match Device::new() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "не удалось пересоздать D3D11-устройство после потери");
+            return false;
+        }
+    };
+    for (id, ms) in monitors_map.iter_mut() {
+        match WindowTarget::new(&new_device, ms.overlay.hwnd(), ms.width, ms.height) {
+            Ok(target) => ms.target = target,
+            Err(e) => {
+                tracing::error!(error = %e, monitor = %id.0, "не удалось пересоздать цель рендера монитора после потери устройства");
+                continue;
+            }
+        }
+        ms.target.set_dpi_scale(ms.scale);
+    }
+    match new_device.create_texture_from_rgba(&[0xff, 0xff, 0xff, 0xff], 1, 1) {
+        Ok(t) => *white_tex = t,
+        Err(e) => tracing::error!(error = %e, "не удалось пересоздать текстуру рамки выделения"),
+    }
+    match new_device.create_texture_from_rgba(&[0x00, 0x00, 0x00, 0xff], 1, 1) {
+        Ok(t) => *black_tex = t,
+        Err(e) => tracing::error!(error = %e, "не удалось пересоздать текстуру затемнения"),
+    }
+    sprites.clear();
+    for sticker in &cfg.stickers {
+        if let Some(path) = sticker_image_path(&sticker.source) {
+            match new_device.load_image(path) {
+                Ok(texture) => sprites.push((
+                    sticker.id,
+                    Sprite::new(texture, sticker.placement.clone(), sticker.transform),
+                )),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "не удалось перезагрузить стикер после потери устройства");
+                }
+            }
+        }
+    }
+    *ui_cache = UiTextureCache::new();
+    *device = new_device;
+    true
 }
 
 /// Добавить стикер из файла на диске. `pasted` — источник
