@@ -345,8 +345,13 @@ struct ConfirmState {
 /// `EditState` — это деталь рендера, а не состояние редактирования.
 struct UiTextureCache {
     fills: HashMap<[u8; 3], Texture>,
-    texts: HashMap<(String, [u8; 3]), Texture>,
-    icons: HashMap<Icon, Texture>,
+    // Масштаб (`text_scale`/`size_px`) — часть ключа: после `WM_DPICHANGED`
+    // те же текст/иконка растрируются в другой плотности, старый растр в
+    // новом масштабе даёт размытие/неверный размер, а не просто устаревший
+    // пиксель (docs/M3_STEP2_3_REVIEW.md, пункт 2.1). `fills` (1×1,
+    // растягиваются как обычные спрайты) масштабонезависимы — не трогаем.
+    texts: HashMap<(String, [u8; 3], u32), Texture>,
+    icons: HashMap<(Icon, u32), Texture>,
 }
 
 impl UiTextureCache {
@@ -381,7 +386,7 @@ impl UiTextureCache {
         color: [u8; 3],
         scale: u32,
     ) -> Option<Texture> {
-        let key = (text.to_string(), color);
+        let key = (text.to_string(), color, scale);
         if let Some(t) = self.texts.get(&key) {
             return Some(t.clone());
         }
@@ -399,16 +404,18 @@ impl UiTextureCache {
     }
 
     /// Текстура иконки `icon` — генерируется один раз (`rst_render::icon_rgba`)
-    /// и кэшируется по варианту; `size_px` берётся из первого запроса
-    /// (все иконки квадратные и одного размера — `theme::BUTTON_SIZE`).
+    /// и кэшируется по варианту и `size_px` (масштаб — часть ключа: после
+    /// смены DPI тот же вариант рисуется в другом физическом размере,
+    /// docs/M3_STEP2_3_REVIEW.md, пункт 2.1).
     fn icon_texture(&mut self, renderer: &Renderer, icon: Icon, size_px: u32) -> Option<Texture> {
-        if let Some(t) = self.icons.get(&icon) {
+        let key = (icon, size_px);
+        if let Some(t) = self.icons.get(&key) {
             return Some(t.clone());
         }
         let rgba = rst_render::icon_rgba(icon, size_px);
         match renderer.create_texture_from_rgba(&rgba, size_px, size_px) {
             Ok(t) => {
-                self.icons.insert(icon, t.clone());
+                self.icons.insert(key, t.clone());
                 Some(t)
             }
             Err(e) => {
@@ -614,6 +621,7 @@ fn run(
                     &mut sprites,
                     path,
                     false,
+                    scale,
                 );
                 need_redraw = true;
             }
@@ -652,6 +660,7 @@ fn run(
                 // рендер: пересоздать цепочку под новый размер, обновить
                 // масштаб DIP→физика и геометрию тулбара/панели у курсора,
                 // которая от него зависит (docs/M3_PREP_NOTES.md, раздел 3.6).
+                let old_scale = scale;
                 width = size.0;
                 height = size.1;
                 scale = dpi as f32 / 96.0;
@@ -659,6 +668,17 @@ fn run(
                 if let Err(e) = renderer.resize(width, height) {
                     tracing::error!(error = %e, "не удалось пересоздать цепочку рендера после смены DPI");
                 }
+                // `cursor_pos` — DIP от старого масштаба; физическая позиция
+                // курсора смена DPI не меняет, поэтому пересчёт — просто
+                // домножение на отношение масштабов, а не ожидание следующего
+                // MouseMove (который без этого не пересобрал бы панель вовсе
+                // — hover-ветка обновляет только состояние существующей панели,
+                // docs/M3_STEP2_3_REVIEW.md, пункт 2.2).
+                let ratio = old_scale / scale;
+                edit.cursor_pos = (
+                    edit.cursor_pos.0 * ratio as f64,
+                    edit.cursor_pos.1 * ratio as f64,
+                );
                 rebuild_ui_panels(&mut edit, &cfg, (width, height), scale);
                 need_redraw = true;
             }
@@ -1126,7 +1146,7 @@ fn handle_key(
             true
         }
         VK_V if modifiers.ctrl => {
-            paste_from_clipboard(overlay, renderer, cfg, config_path, sprites, edit)
+            paste_from_clipboard(overlay, renderer, cfg, config_path, sprites, edit, scale)
         }
         _ => false,
     }
@@ -1163,6 +1183,7 @@ fn paste_from_clipboard(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
+    scale: f32,
 ) -> bool {
     let image = match clipboard::read_image() {
         Ok(Some(image)) => image,
@@ -1189,7 +1210,16 @@ fn paste_from_clipboard(
             let before = cfg.clone();
             let mut added = false;
             for path in supported {
-                if add_sticker(overlay, renderer, cfg, config_path, sprites, path, false) {
+                if add_sticker(
+                    overlay,
+                    renderer,
+                    cfg,
+                    config_path,
+                    sprites,
+                    path,
+                    false,
+                    scale,
+                ) {
                     added = true;
                 }
             }
@@ -1213,6 +1243,7 @@ fn paste_from_clipboard(
                         sprites,
                         path.clone(),
                         true,
+                        scale,
                     ) {
                         commit_undo_snapshot(edit, before);
                         true
@@ -1619,11 +1650,21 @@ fn add_sticker_from_dialog(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
+    scale: f32,
 ) {
     match file_dialog::pick_image_file(overlay.hwnd()) {
         Ok(Some(path)) => {
             let before = cfg.clone();
-            if add_sticker(overlay, renderer, cfg, config_path, sprites, path, false) {
+            if add_sticker(
+                overlay,
+                renderer,
+                cfg,
+                config_path,
+                sprites,
+                path,
+                false,
+                scale,
+            ) {
                 commit_undo_snapshot(edit, before);
             }
         }
@@ -1657,7 +1698,7 @@ fn handle_cursor_panel_up(
     };
 
     if clicked(edit, cursor_panel::BTN_LOAD_FILE) {
-        add_sticker_from_dialog(overlay, renderer, cfg, config_path, sprites, edit);
+        add_sticker_from_dialog(overlay, renderer, cfg, config_path, sprites, edit, scale);
         let screen = screen_dip_rect(overlay_size, scale);
         rebuild_cursor_panel(edit, cfg, &screen);
         return true;
@@ -2405,6 +2446,7 @@ fn redraw(
 /// Возвращает `true`, если стикер реально добавлен — вызывающий код решает
 /// по этому флагу, стоит ли коммитить снимок undo (docs/M2_SLICE4_REVIEW.md,
 /// пункт 7: неудачная загрузка не должна создавать пустой шаг истории).
+#[allow(clippy::too_many_arguments)]
 fn add_sticker(
     overlay: &OverlayWindow,
     renderer: &mut Renderer,
@@ -2413,6 +2455,7 @@ fn add_sticker(
     sprites: &mut Vec<(Uuid, Sprite)>,
     path: PathBuf,
     pasted: bool,
+    scale: f32,
 ) -> bool {
     let texture = match renderer.load_image(&path) {
         Ok(t) => t,
@@ -2422,14 +2465,22 @@ fn add_sticker(
         }
     };
     let (w, h) = (texture.width(), texture.height());
+    // `placement` — DIP, а `overlay.size()` — физические пиксели живого
+    // GetWindowRect (M3): нужно делить на масштаб, иначе на не-100% DPI
+    // центр вставки уходит от реального центра экрана
+    // (docs/M3_STEP2_3_REVIEW.md, пункт 2.3).
     let (screen_w, screen_h) = overlay.size();
+    let (center_x, center_y) = (
+        screen_w as f64 / scale as f64 / 2.0,
+        screen_h as f64 / scale as f64 / 2.0,
+    );
     // M3: реальный device interface path монитора; M1 — один монитор, заглушка.
     let sticker = if pasted {
         Sticker::new_pasted(
             path,
             MonitorId::default(),
-            screen_w as f64 / 2.0,
-            screen_h as f64 / 2.0,
+            center_x,
+            center_y,
             w as f64,
             h as f64,
         )
@@ -2438,8 +2489,8 @@ fn add_sticker(
             path,
             MediaType::Image,
             MonitorId::default(),
-            screen_w as f64 / 2.0,
-            screen_h as f64 / 2.0,
+            center_x,
+            center_y,
             w as f64,
             h as f64,
         )
