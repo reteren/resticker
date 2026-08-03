@@ -32,6 +32,7 @@ use std::thread::{self, JoinHandle};
 use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{Config, MediaType, MonitorId, Placement, Sticker, StickerSource, Transform};
+use rst_core::monitor_rebind::{self, MonitorBounds};
 use rst_core::ops;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
@@ -668,12 +669,33 @@ fn run(
     // геометрии своего «домашнего» монитора, который может отличаться от
     // монитора текущего события (тулбар — по монитору стикера, панель у
     // курсора — по `cursor_monitor`, docs/M3_STEP4_REVIEW.md, пункт 2.2).
-    // `HashMap` не даёt держать `&mut MonitorState` одного монитора (через
+    // `HashMap` не даёт держать `&mut MonitorState` одного монитора (через
     // `Renderer`) и `&monitors_map` для поиска геометрии другого одновременно
     // — отдельная лёгкая копия `(width, height, scale)` снимает конфликт.
     let mut monitor_geometry: HashMap<MonitorId, (u32, u32, f32)> = monitors_map
         .iter()
         .map(|(id, ms)| (id.clone(), (ms.width, ms.height, ms.scale)))
+        .collect();
+
+    // Границы мониторов в физических пикселях виртуального десктопа + масштаб
+    // — вход для перепривязки стикера по центру bbox при перетаскивании между
+    // мониторами (M3 step 7, `rst_core::monitor_rebind`). Позиция (`x`/`y`) не
+    // меняется сменой DPI (только размер/масштаб монитора) — обновляется
+    // только `w`/`h`/`scale` в ветке `DpiChanged`, отдельно от `monitors_map`
+    // по той же причине, что и `monitor_geometry`.
+    let mut monitor_bounds: HashMap<MonitorId, MonitorBounds> = monitor_infos
+        .iter()
+        .filter_map(|info| {
+            let ms = monitors_map.get(&info.id)?;
+            Some((
+                info.id.clone(),
+                MonitorBounds {
+                    id: info.id.clone(),
+                    bounds_px: info.bounds_px,
+                    scale: ms.scale as f64,
+                },
+            ))
+        })
         .collect();
 
     let mut edit = EditState {
@@ -830,6 +852,11 @@ fn run(
                     );
                 }
                 monitor_geometry.insert(monitor_id.clone(), (ms.width, ms.height, ms.scale));
+                if let Some(bounds) = monitor_bounds.get_mut(&monitor_id) {
+                    bounds.bounds_px.w = ms.width;
+                    bounds.bounds_px.h = ms.height;
+                    bounds.scale = ms.scale as f64;
+                }
                 rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
                 need_redraw = true;
             }
@@ -915,6 +942,7 @@ fn run(
                     &mut edit,
                     &monitor_id,
                     &monitor_geometry,
+                    &monitor_bounds,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
@@ -2060,6 +2088,7 @@ fn handle_input(
     edit: &mut EditState,
     monitor_id: &MonitorId,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
 ) -> bool {
     let monitor = DipRect::new(
         0.0,
@@ -2430,10 +2459,50 @@ fn handle_input(
                 rebuild_ui_panels(edit, cfg, monitor_geometry);
                 return true;
             }
+            // Перепривязка стикера к другому монитору по центру bbox
+            // (M3 step 7, «простой» вариант из M3_PREP_NOTES.md §5.4): драг
+            // зажат своим монитором на всё время жеста (мышь захвачена этим
+            // окном), а на завершении — если центр ушёл за границу — рибайнд
+            // на монитор, который теперь его накрывает, с сохранением точной
+            // физической позиции на экране. Только `Drag` — `Resize`/`Rotate`
+            // не двигают центр стикера настолько, чтобы это было нужно (их
+            // клампит `clamp_min_visible` в границах своего монитора).
+            if let Some(Gesture::Drag { start, .. }) = &edit.gesture {
+                let id = start.id;
+                let placement = cfg
+                    .stickers
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| s.placement.clone());
+                if let (Some(source), Some(placement)) = (monitor_bounds.get(monitor_id), placement)
+                {
+                    let others: Vec<MonitorBounds> = monitor_bounds
+                        .iter()
+                        .filter(|(other_id, _)| *other_id != monitor_id)
+                        .map(|(_, b)| b.clone())
+                        .collect();
+                    let rebound =
+                        monitor_rebind::rebind_monitor_by_center(&placement, source, &others);
+                    if rebound.monitor_id != placement.monitor_id {
+                        if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
+                            sticker.placement = rebound.clone();
+                        }
+                        if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| *sid == id) {
+                            sprite.placement = rebound;
+                        }
+                        // Тулбар стикера теперь на другом мониторе — переехать
+                        // сразу, не дожидаясь несвязанного триггера пересборки.
+                        rebuild_ui_panels(edit, cfg, monitor_geometry);
+                    }
+                }
+            }
             if edit.gesture.take().is_some() {
                 // Снимок кладём в историю только сейчас, и только если жест
                 // реально что-то изменил — клик без движения не тратит шаг
-                // истории (docs/M2_SLICE_REVIEW.md, пункт 1).
+                // истории (docs/M2_SLICE_REVIEW.md, пункт 1). Перепривязка
+                // монитора выше (если случилась) уже отражена в `cfg` — она
+                // войдёт в тот же снимок, что и сам драг, а не отдельным
+                // шагом истории.
                 if let Some(before) = edit.pending_snapshot.take() {
                     if before != *cfg {
                         commit_undo_snapshot(edit, before);
