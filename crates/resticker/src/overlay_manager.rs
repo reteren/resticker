@@ -35,10 +35,12 @@ use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::paste;
 use rst_render::{
-    Box2D, Button, Panel, PointerEvent, Primitive, Renderer, SelectionBox, Sprite, Texture,
-    edit_overlay, marquee_visuals, rasterize, solid_sprite, theme,
+    Box2D, Button, Icon, NumericField, Panel, PointerEvent, Primitive, Renderer, SelectionBox,
+    Slider, Sprite, Texture, WidgetId, edit_overlay, marquee_visuals, rasterize, solid_sprite,
+    theme,
 };
 use rst_win32::clipboard::{self, ClipboardImage};
+use rst_win32::file_dialog;
 use rst_win32::hotkey::HotkeyCombo;
 use rst_win32::input::{
     Corner as Win32Corner, CursorShape, CursorZone, Handle as Win32Handle, InputEvent, Modifiers,
@@ -46,7 +48,7 @@ use rst_win32::input::{
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
 use uuid::Uuid;
 
-use crate::confirm_dialog;
+use crate::{confirm_dialog, cursor_panel, toolbar};
 
 /// Хоткей входа/выхода из режима редактирования по умолчанию (CONFIG.md),
 /// если в конфиге он не задан или не парсится.
@@ -215,6 +217,36 @@ struct EditState {
     /// Протяжка марки превысила порог (`MARQUEE_THRESHOLD_DIP`) — отличает
     /// «клик по фону» (снимает выделение на `MouseUp`) от настоящей марки.
     marquee_started: bool,
+    /// Тулбар выделенного стикера — есть, когда `active && selection.len() ==
+    /// 1 && marquee.is_none()` (docs/M2_WIRING_PLAN.md, раздел 4). Мультивыделение
+    /// (`docs/M2_MULTISELECT_TOOLBAR_NOTES.md`) — следующий срез: билдер уже
+    /// поддерживает `opacity: None`, но действия батчем сюда не подключены.
+    toolbar: Option<Panel>,
+    /// Панель у курсора — есть, пока `active` (раздел 4).
+    cursor_panel: Option<Panel>,
+    /// Кто держит текущий указательный жест начиная с `MouseDown` (раздел 5).
+    /// Модал сюда не входит — он перехватывается раньше отдельной веткой.
+    pointer_owner: PointerOwner,
+    /// `Config` на момент первого изменения ползунка прозрачности тулбара —
+    /// аналог `pending_snapshot` для UI-жеста (не для жеста сцены), раздел 6.
+    ui_pending_snapshot: Option<Config>,
+    /// Последняя известная позиция курсора, DIP — источник позиции для
+    /// `cursor_panel` при пересборках, не вызванных `MouseMove` (Ctrl+D,
+    /// undo/redo и т.п., где курсор не двигался, но панель должна остаться
+    /// там же). Обновляется на каждом `MouseMove`.
+    cursor_pos: (f64, f64),
+}
+
+/// Кто получает события указателя после `MouseDown` (docs/M2_WIRING_PLAN.md,
+/// раздел 5): решение фиксируется на `MouseDown` и не меняется до `MouseUp`/
+/// `CaptureLost` — `dragging` больше не определяет маршрут (и ползунок, и
+/// жест сцены держат Win32-захват одинаково).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerOwner {
+    None,
+    Toolbar,
+    CursorPanel,
+    Scene,
 }
 
 /// Открытый модал подтверждения удаления (docs/M2_WIRING_PLAN.md, раздел 6/7).
@@ -235,6 +267,7 @@ struct ConfirmState {
 struct UiTextureCache {
     fills: HashMap<[u8; 3], Texture>,
     texts: HashMap<(String, [u8; 3]), Texture>,
+    icons: HashMap<Icon, Texture>,
 }
 
 impl UiTextureCache {
@@ -242,6 +275,7 @@ impl UiTextureCache {
         Self {
             fills: HashMap::new(),
             texts: HashMap::new(),
+            icons: HashMap::new(),
         }
     }
 
@@ -284,11 +318,30 @@ impl UiTextureCache {
             }
         }
     }
+
+    /// Текстура иконки `icon` — генерируется один раз (`rst_render::icon_rgba`)
+    /// и кэшируется по варианту; `size_px` берётся из первого запроса
+    /// (все иконки квадратные и одного размера — `theme::BUTTON_SIZE`).
+    fn icon_texture(&mut self, renderer: &Renderer, icon: Icon, size_px: u32) -> Option<Texture> {
+        if let Some(t) = self.icons.get(&icon) {
+            return Some(t.clone());
+        }
+        let rgba = rst_render::icon_rgba(icon, size_px);
+        match renderer.create_texture_from_rgba(&rgba, size_px, size_px) {
+            Ok(t) => {
+                self.icons.insert(icon, t.clone());
+                Some(t)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, ?icon, "не удалось создать текстуру иконки UI");
+                None
+            }
+        }
+    }
 }
 
 /// Перевести примитивы панели (`Panel::draw`) в спрайты кадра, используя кэш
-/// текстур (docs/M2_WIRING_PLAN.md, раздел 3). Иконок-ассетов в этом срезе
-/// нет — плейсхолдер заливкой `theme::BUTTON_BG` (раздел 14).
+/// текстур (docs/M2_WIRING_PLAN.md, раздел 3).
 fn primitives_to_sprites(
     prims: &[Primitive],
     cache: &mut UiTextureCache,
@@ -321,8 +374,17 @@ fn primitives_to_sprites(
                     out.push(solid_sprite(&tex, monitor_id, rect, *opacity));
                 }
             }
-            Primitive::Icon { rect, opacity, .. } => {
-                if let Some(tex) = cache.fill_texture(renderer, theme::BUTTON_BG) {
+            Primitive::Icon {
+                rect,
+                icon,
+                opacity,
+            } => {
+                // Иконки квадратные (theme::BUTTON_SIZE в DIP); растрируем в
+                // физические пиксели тем же масштабом, что и текст.
+                let size_px = (rect.w.max(rect.h) * f64::from(text_scale))
+                    .round()
+                    .max(1.0) as u32;
+                if let Some(tex) = cache.icon_texture(renderer, *icon, size_px) {
                     out.push(solid_sprite(&tex, monitor_id, rect, *opacity));
                 }
             }
@@ -430,6 +492,11 @@ fn run(
         confirm: None,
         marquee: None,
         marquee_started: false,
+        toolbar: None,
+        cursor_panel: None,
+        pointer_owner: PointerOwner::None,
+        ui_pending_snapshot: None,
+        cursor_pos: (0.0, 0.0),
     };
     let mut ui_cache = UiTextureCache::new();
 
@@ -463,30 +530,29 @@ fn run(
             }
             OverlayMessage::Command(OverlayCommand::Shutdown) => break,
             OverlayMessage::Event(OverlayEvent::ToggleEditMode) => {
-                toggle_edit_mode(&overlay, &mut edit, &mut cfg, &mut sprites, &config_path);
+                toggle_edit_mode(
+                    &overlay,
+                    &mut edit,
+                    &mut cfg,
+                    &mut sprites,
+                    &config_path,
+                    (width, height),
+                    scale,
+                );
                 need_redraw = true;
             }
             OverlayMessage::Event(OverlayEvent::ToggleAllStickers) => {
                 // Глобальный хоткей работает независимо от режима
-                // редактирования (M2b7) — сходится к однородному состоянию,
-                // как и «глаз» на тулбаре (docs/M2_MULTISELECT_TOOLBAR_NOTES.md,
-                // раздел 3.2): если хоть один скрыт — показать всех, иначе
-                // скрыть всех.
-                let target_visible = !cfg.stickers.iter().all(|s| s.visible);
-                let ids: Vec<Uuid> = cfg
-                    .stickers
-                    .iter()
-                    .filter(|s| s.visible != target_visible)
-                    .map(|s| s.id)
-                    .collect();
-                if !ids.is_empty() {
-                    commit_undo_snapshot(&mut edit, cfg.clone());
-                    for id in ids {
-                        let _ = ops::toggle_visibility(&mut cfg, id);
-                    }
+                // редактирования (M2b7) — та же логика, что у BTN_TOGGLE_ALL
+                // на панели у курсора (docs/M2_WIRING_PLAN.md, раздел 6).
+                let before = cfg.clone();
+                if converge_all_stickers_visibility(&mut cfg) {
+                    commit_undo_snapshot(&mut edit, before);
                     if let Err(e) = config::save(&cfg, &config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить config.json после «показать/скрыть все»");
                     }
+                    let screen = screen_dip_rect((width, height), scale);
+                    rebuild_cursor_panel(&mut edit, &cfg, &screen);
                     need_redraw = true;
                 }
             }
@@ -521,7 +587,7 @@ fn run(
                     event,
                     scale,
                     &overlay,
-                    &renderer,
+                    &mut renderer,
                     (width, height),
                     &mut cfg,
                     &config_path,
@@ -553,12 +619,15 @@ fn run(
     // сначала renderer (COM/DComp), затем overlay (окно) — корректный порядок.
 }
 
+#[allow(clippy::too_many_arguments)]
 fn toggle_edit_mode(
     overlay: &OverlayWindow,
     edit: &mut EditState,
     cfg: &mut Config,
     sprites: &mut [(Uuid, Sprite)],
     config_path: &Path,
+    overlay_size: (u32, u32),
+    scale: f32,
 ) {
     // Выход во время незавершённого жеста откатывает его — так же, как
     // CaptureLost, а не коммитит середину перетаскивания (docs/M2_SLICE_REVIEW.md,
@@ -588,6 +657,9 @@ fn toggle_edit_mode(
             tracing::warn!(error = %e, "не удалось сохранить config.json при выходе из режима редактирования");
         }
     }
+    let screen = screen_dip_rect(overlay_size, scale);
+    rebuild_toolbar(edit, cfg, screen.h);
+    rebuild_cursor_panel(edit, cfg, &screen);
 }
 
 /// Положить готовый снимок `Config` в историю undo и очистить историю redo —
@@ -649,10 +721,23 @@ fn cleanup_pasted_file(cfg: &Config, id: Uuid) {
     let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) else {
         return;
     };
-    if let StickerSource::Pasted { path } = &sticker.source {
-        if let Err(e) = std::fs::remove_file(path) {
-            tracing::warn!(path = %path.display(), error = %e, "не удалось удалить файл вставленного стикера");
-        }
+    let StickerSource::Pasted { path } = &sticker.source else {
+        return;
+    };
+    // `ops::duplicate` клонирует `source` целиком — копия вставленного
+    // стикера ссылается на тот же файл, что и оригинал (docs/M2_SLICE5_REVIEW.md,
+    // пункт 3.1). Удалять файл можно только когда удаляется последний
+    // стикер, который на него ссылается — иначе удаление одного из пары
+    // ломает другого.
+    let still_referenced = cfg
+        .stickers
+        .iter()
+        .any(|s| s.id != id && matches!(&s.source, StickerSource::Pasted { path: p } if p == path));
+    if still_referenced {
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(path) {
+        tracing::warn!(path = %path.display(), error = %e, "не удалось удалить файл вставленного стикера");
     }
 }
 
@@ -718,6 +803,8 @@ fn begin_delete(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     center: (f64, f64),
+    overlay_size: (u32, u32),
+    scale: f32,
 ) -> bool {
     if edit.selection.is_empty() {
         return false;
@@ -739,6 +826,7 @@ fn begin_delete(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после удаления");
         }
+        rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
     }
     true
 }
@@ -782,28 +870,49 @@ fn handle_key(
     }
     match vk {
         VK_ESCAPE => {
-            toggle_edit_mode(overlay, edit, cfg, sprites, config_path);
+            toggle_edit_mode(
+                overlay,
+                edit,
+                cfg,
+                sprites,
+                config_path,
+                overlay_size,
+                scale,
+            );
             true
         }
         VK_Z if modifiers.ctrl && modifiers.shift => {
-            perform_redo(renderer, cfg, config_path, sprites, edit)
+            let did = perform_redo(renderer, cfg, config_path, sprites, edit);
+            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+            did
         }
-        VK_Z if modifiers.ctrl => perform_undo(renderer, cfg, config_path, sprites, edit),
-        VK_Y if modifiers.ctrl => perform_redo(renderer, cfg, config_path, sprites, edit),
+        VK_Z if modifiers.ctrl => {
+            let did = perform_undo(renderer, cfg, config_path, sprites, edit);
+            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+            did
+        }
+        VK_Y if modifiers.ctrl => {
+            let did = perform_redo(renderer, cfg, config_path, sprites, edit);
+            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+            did
+        }
         VK_A if modifiers.ctrl => {
             edit.selection.select_all(&cfg.stickers);
+            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
             true
         }
         VK_DELETE => {
-            let center = edit
-                .selection
-                .bounds(&cfg.stickers)
-                .map(|r| (r.x + r.w / 2.0, r.y + r.h / 2.0))
-                .unwrap_or((
-                    overlay_size.0 as f64 / 2.0 / scale as f64,
-                    overlay_size.1 as f64 / 2.0 / scale as f64,
-                ));
-            begin_delete(edit, renderer, cfg, config_path, sprites, center)
+            let center = selection_center_or_screen(edit, cfg, overlay_size, scale);
+            begin_delete(
+                edit,
+                renderer,
+                cfg,
+                config_path,
+                sprites,
+                center,
+                overlay_size,
+                scale,
+            )
         }
         VK_D if modifiers.ctrl => {
             if edit.selection.is_empty() {
@@ -824,6 +933,7 @@ fn handle_key(
             if let Err(e) = config::save(cfg, config_path) {
                 tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
             }
+            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
             true
         }
         VK_V if modifiers.ctrl => {
@@ -886,10 +996,25 @@ fn paste_from_clipboard(
             match paste::materialize(&png_or_bmp, target_dir) {
                 Ok(path) => {
                     let before = cfg.clone();
-                    if add_sticker(overlay, renderer, cfg, config_path, sprites, path, true) {
+                    if add_sticker(
+                        overlay,
+                        renderer,
+                        cfg,
+                        config_path,
+                        sprites,
+                        path.clone(),
+                        true,
+                    ) {
                         commit_undo_snapshot(edit, before);
                         true
                     } else {
+                        // add_sticker не смог декодировать только что
+                        // материализованный файл — без стикера в конфиге
+                        // чистить его больше некому (docs/M2_SLICE5_REVIEW.md,
+                        // пункт 3.3): убрать сироту сразу.
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            tracing::warn!(path = %path.display(), error = %e, "не удалось удалить файл после неудачной вставки");
+                        }
                         false
                     }
                 }
@@ -1012,6 +1137,372 @@ fn apply_transform(
     }
 }
 
+/// Id единственного выделенного стикера — тулбар в этом срезе показывается
+/// только для одиночного выделения (docs/M2_WIRING_PLAN.md, раздел 4;
+/// мультивыделение — `docs/M2_MULTISELECT_TOOLBAR_NOTES.md`, следующий срез).
+fn single_selected_id(selection: &SelectionSet) -> Option<Uuid> {
+    match selection.ids() {
+        [id] => Some(*id),
+        _ => None,
+    }
+}
+
+/// Применить прозрачность `percent` (0..=100, зеркалирует модель ползунка) к
+/// стикеру `id`: конвертация в `0.0..=1.0` и запись через `apply_transform`
+/// (позиция/поворот не меняются — только `transform.opacity`, раздел 6).
+fn apply_opacity(cfg: &mut Config, sprites: &mut [(Uuid, Sprite)], id: Uuid, percent: u32) {
+    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) else {
+        return;
+    };
+    let placement = sticker.placement.clone();
+    let transform = Transform {
+        opacity: f64::from(percent.min(100)) / 100.0,
+        ..sticker.transform
+    };
+    apply_transform(cfg, sprites, id, placement, transform);
+}
+
+/// Границы монитора в DIP — общий вход для позиционирования UI-панелей
+/// (тулбар/панель у курсора).
+fn screen_dip_rect(overlay_size: (u32, u32), scale: f32) -> DipRect {
+    DipRect::new(
+        0.0,
+        0.0,
+        overlay_size.0 as f64 / scale as f64,
+        overlay_size.1 as f64 / scale as f64,
+    )
+}
+
+/// Пересобрать тулбар по текущему выделению (docs/M2_WIRING_PLAN.md,
+/// раздел 4): есть, когда режим активен, выделен ровно один стикер и марка
+/// не тянется; иначе — `None`. Билдер дёшев, но пересборка сбрасывает
+/// hover-подсветку кнопок — приемлемо для этого среза (docs/M2_WIRING_PLAN.md
+/// отмечает то же самое про пересборку по смене выделения).
+fn rebuild_toolbar(edit: &mut EditState, cfg: &Config, screen_h: f64) {
+    if !edit.active || edit.marquee.is_some() {
+        edit.toolbar = None;
+        return;
+    }
+    let Some(id) = single_selected_id(&edit.selection) else {
+        edit.toolbar = None;
+        return;
+    };
+    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) else {
+        edit.toolbar = None;
+        return;
+    };
+    let bounds = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+    edit.toolbar = Some(toolbar::build_toolbar(
+        &bounds,
+        Some(sticker.transform.opacity),
+        screen_h,
+    ));
+}
+
+/// Пересобрать панель у курсора (раздел 4): есть, пока режим активен, на
+/// позиции `edit.cursor_pos`. Пересобирается (не `translate`) на каждом
+/// вызове — упрощение этого среза: `translate`-оптимизация из плана бережёт
+/// hover при движении мыши поверх самой панели, здесь это не реализовано
+/// (известный компромисс, а не забытый шаг).
+fn rebuild_cursor_panel(edit: &mut EditState, cfg: &Config, screen: &DipRect) {
+    if !edit.active {
+        edit.cursor_panel = None;
+        return;
+    }
+    let all_visible = cfg.stickers.iter().all(|s| s.visible);
+    edit.cursor_panel = Some(cursor_panel::build_cursor_panel(
+        edit.cursor_pos,
+        screen,
+        all_visible,
+    ));
+}
+
+/// Решить целевую видимость и применить её всем стикерам батчем (общая
+/// логика хоткея `toggle_all_stickers` и кнопки `BTN_TOGGLE_ALL`,
+/// docs/M2_WIRING_PLAN.md, раздел 6 «Панель у курсора»): сходится к
+/// однородному состоянию — есть скрытый → показать всех, иначе скрыть всех.
+/// Возвращает `true`, если хоть один стикер реально изменился (пустой список
+/// стикеров или уже однородное состояние без реальной работы — `false`, шаг
+/// истории не тратится).
+fn converge_all_stickers_visibility(cfg: &mut Config) -> bool {
+    if cfg.stickers.is_empty() {
+        return false;
+    }
+    let target_visible = !cfg.stickers.iter().all(|s| s.visible);
+    let ids: Vec<Uuid> = cfg
+        .stickers
+        .iter()
+        .filter(|s| s.visible != target_visible)
+        .map(|s| s.id)
+        .collect();
+    if ids.is_empty() {
+        return false;
+    }
+    for id in ids {
+        let _ = ops::toggle_visibility(cfg, id);
+    }
+    true
+}
+
+/// Центр текущего выделения (для позиционирования модала удаления) или
+/// центр экрана, если выделение пусто/вырождено (общий вход для `VK_DELETE`
+/// и `TB_DELETE`, docs/M2_WIRING_PLAN.md, раздел 7).
+fn selection_center_or_screen(
+    edit: &EditState,
+    cfg: &Config,
+    overlay_size: (u32, u32),
+    scale: f32,
+) -> (f64, f64) {
+    edit.selection
+        .bounds(&cfg.stickers)
+        .map(|r| (r.x + r.w / 2.0, r.y + r.h / 2.0))
+        .unwrap_or((
+            overlay_size.0 as f64 / 2.0 / scale as f64,
+            overlay_size.1 as f64 / 2.0 / scale as f64,
+        ))
+}
+
+/// Опросить действия тулбара после `Up` (одиночное выделение,
+/// docs/M2_WIRING_PLAN.md, раздел 6): опрос ползунка/поля/пяти кнопок,
+/// каждая — свой снимок undo. Мультивыделение — следующий срез (билдер уже
+/// поддерживает `opacity: None`, но действия батчем сюда не подключены).
+#[allow(clippy::too_many_arguments)]
+fn handle_toolbar_up(
+    edit: &mut EditState,
+    renderer: &Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    pos: (f64, f64),
+    overlay_size: (u32, u32),
+    scale: f32,
+) -> bool {
+    if let Some(panel) = &mut edit.toolbar {
+        panel.pointer_event(PointerEvent::Up { pos });
+    }
+    let Some(id) = single_selected_id(&edit.selection) else {
+        return true;
+    };
+
+    // Коммит живого opacity-жеста ползунка, если он был (раздел 6: «на
+    // MouseUp... если cfg != before — commit, иначе отбросить»).
+    if let Some(before) = edit.ui_pending_snapshot.take() {
+        if before != *cfg {
+            commit_undo_snapshot(edit, before);
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после изменения прозрачности");
+            }
+        }
+    }
+
+    let screen_h = || screen_dip_rect(overlay_size, scale).h;
+
+    if let Some(value) = edit
+        .toolbar
+        .as_mut()
+        .and_then(|p| p.widget_mut::<NumericField>(toolbar::TB_FIELD))
+        .and_then(NumericField::take_submitted)
+    {
+        commit_undo_snapshot(edit, cfg.clone());
+        apply_opacity(cfg, sprites, id, value);
+        if let Some(slider) = edit
+            .toolbar
+            .as_mut()
+            .and_then(|p| p.widget_mut::<Slider>(toolbar::TB_SLIDER))
+        {
+            slider.set_value(value);
+        }
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после изменения прозрачности");
+        }
+        rebuild_toolbar(edit, cfg, screen_h());
+        return true;
+    }
+
+    let clicked = |edit: &mut EditState, id_widget: WidgetId| -> bool {
+        edit.toolbar
+            .as_mut()
+            .and_then(|p| p.widget_mut::<Button>(id_widget))
+            .is_some_and(Button::take_click)
+    };
+
+    if clicked(edit, toolbar::TB_EYE) {
+        commit_undo_snapshot(edit, cfg.clone());
+        let _ = ops::toggle_visibility(cfg, id);
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после переключения видимости");
+        }
+        rebuild_toolbar(edit, cfg, screen_h());
+        return true;
+    }
+    if clicked(edit, toolbar::TB_ORDER_UP) {
+        commit_undo_snapshot(edit, cfg.clone());
+        let _ = ops::step_up(cfg, id);
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после изменения порядка");
+        }
+        return true;
+    }
+    if clicked(edit, toolbar::TB_ORDER_DOWN) {
+        commit_undo_snapshot(edit, cfg.clone());
+        let _ = ops::step_down(cfg, id);
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после изменения порядка");
+        }
+        return true;
+    }
+    if clicked(edit, toolbar::TB_DUPLICATE) {
+        commit_undo_snapshot(edit, cfg.clone());
+        if let Ok(new_id) = ops::duplicate(cfg, id) {
+            resync_sprites(renderer, cfg, sprites);
+            edit.selection.click(Some(new_id));
+        }
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
+        }
+        rebuild_toolbar(edit, cfg, screen_h());
+        return true;
+    }
+    if clicked(edit, toolbar::TB_DELETE) {
+        let center = selection_center_or_screen(edit, cfg, overlay_size, scale);
+        return begin_delete(
+            edit,
+            renderer,
+            cfg,
+            config_path,
+            sprites,
+            center,
+            overlay_size,
+            scale,
+        );
+    }
+    true
+}
+
+/// Опросить действия панели у курсора после `Up` (docs/M2_WIRING_PLAN.md,
+/// раздел 6): `BTN_LOAD_FILE` вызывает системный диалог напрямую (COM,
+/// `rst_win32::file_dialog` — не нужен round-trip на главный поток из §12,
+/// диалог сам инициализирует COM на вызывающем потоке), `BTN_SETTINGS` пока
+/// не подключён (нужен round-trip к Tauri-окну настроек — следующий срез).
+#[allow(clippy::too_many_arguments)]
+fn add_sticker_from_dialog(
+    overlay: &OverlayWindow,
+    renderer: &mut Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    edit: &mut EditState,
+) {
+    match file_dialog::pick_image_file(overlay.hwnd()) {
+        Ok(Some(path)) => {
+            let before = cfg.clone();
+            if add_sticker(overlay, renderer, cfg, config_path, sprites, path, false) {
+                commit_undo_snapshot(edit, before);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "не удалось открыть системный диалог выбора файла");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_cursor_panel_up(
+    edit: &mut EditState,
+    overlay: &OverlayWindow,
+    renderer: &mut Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    pos: (f64, f64),
+    overlay_size: (u32, u32),
+    scale: f32,
+) -> bool {
+    if let Some(panel) = &mut edit.cursor_panel {
+        panel.pointer_event(PointerEvent::Up { pos });
+    }
+    let clicked = |edit: &mut EditState, id_widget: WidgetId| -> bool {
+        edit.cursor_panel
+            .as_mut()
+            .and_then(|p| p.widget_mut::<Button>(id_widget))
+            .is_some_and(Button::take_click)
+    };
+
+    if clicked(edit, cursor_panel::BTN_LOAD_FILE) {
+        add_sticker_from_dialog(overlay, renderer, cfg, config_path, sprites, edit);
+        let screen = screen_dip_rect(overlay_size, scale);
+        rebuild_cursor_panel(edit, cfg, &screen);
+        return true;
+    }
+    if clicked(edit, cursor_panel::BTN_TOGGLE_ALL) {
+        let before = cfg.clone();
+        if converge_all_stickers_visibility(cfg) {
+            commit_undo_snapshot(edit, before);
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после «показать/скрыть все»");
+            }
+        }
+        let screen = screen_dip_rect(overlay_size, scale);
+        rebuild_cursor_panel(edit, cfg, &screen);
+        return true;
+    }
+    if clicked(edit, cursor_panel::BTN_SETTINGS) {
+        // Нужен round-trip к главному потоку Tauri (docs/M2_WIRING_PLAN.md,
+        // §12) — не подключено в этом срезе.
+        tracing::info!("«Настройки» с панели у курсора: пока не подключено");
+        return true;
+    }
+    if clicked(edit, cursor_panel::BTN_EXIT) {
+        toggle_edit_mode(
+            overlay,
+            edit,
+            cfg,
+            sprites,
+            config_path,
+            overlay_size,
+            scale,
+        );
+        return true;
+    }
+    true
+}
+
+/// Опросить ползунок прозрачности тулбара на каждом `MouseMove`, пока
+/// перетаскивание держит его (`pointer_owner == Toolbar`): применяет живо,
+/// первый снимок откладывается до `MouseUp` (docs/M2_WIRING_PLAN.md,
+/// раздел 6 — «при первом изменении»). Числовое поле зеркалит новое значение.
+fn poll_toolbar_opacity_live(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    sprites: &mut [(Uuid, Sprite)],
+) {
+    let Some(id) = single_selected_id(&edit.selection) else {
+        return;
+    };
+    let value = {
+        let Some(panel) = &mut edit.toolbar else {
+            return;
+        };
+        let Some(slider) = panel.widget_mut::<Slider>(toolbar::TB_SLIDER) else {
+            return;
+        };
+        let Some(v) = slider.take_changed() else {
+            return;
+        };
+        v
+    };
+    if edit.ui_pending_snapshot.is_none() {
+        edit.ui_pending_snapshot = Some(cfg.clone());
+    }
+    apply_opacity(cfg, sprites, id, value);
+    if let Some(panel) = &mut edit.toolbar {
+        if let Some(field) = panel.widget_mut::<NumericField>(toolbar::TB_FIELD) {
+            field.set_value(value);
+        }
+    }
+}
+
 /// Обработать событие мыши в режиме редактирования. Возвращает `true`, если
 /// нужна перерисовка (docs/M2_INTEGRATION_PLAN.md, раздел 6/8).
 #[allow(clippy::too_many_arguments)]
@@ -1019,7 +1510,7 @@ fn handle_input(
     event: InputEvent,
     scale: f32,
     overlay: &OverlayWindow,
-    renderer: &Renderer,
+    renderer: &mut Renderer,
     overlay_size: (u32, u32),
     cfg: &mut Config,
     config_path: &Path,
@@ -1044,6 +1535,32 @@ fn handle_input(
                 });
                 return true;
             }
+            // Приоритет top-down по z-order: панель у курсора выше тулбара
+            // на экране (redraw рисует её позже), поэтому и в хит-тесте она
+            // первая (docs/M2_WIRING_PLAN.md, раздел 5).
+            if let Some(panel) = &mut edit.cursor_panel {
+                if panel
+                    .pointer_event(PointerEvent::Down {
+                        pos: (dip_x, dip_y),
+                    })
+                    .consumed
+                {
+                    edit.pointer_owner = PointerOwner::CursorPanel;
+                    return true;
+                }
+            }
+            if let Some(panel) = &mut edit.toolbar {
+                if panel
+                    .pointer_event(PointerEvent::Down {
+                        pos: (dip_x, dip_y),
+                    })
+                    .consumed
+                {
+                    edit.pointer_owner = PointerOwner::Toolbar;
+                    return true;
+                }
+            }
+            edit.pointer_owner = PointerOwner::Scene;
             let zone = resolve_zone(cfg, &edit.selection, dip_x, dip_y);
             match zone {
                 Zone::Background => {
@@ -1065,10 +1582,17 @@ fn handle_input(
                         // начинаем: мульти-драг ещё не реализован
                         // (docs/M2_MULTISELECT_TOOLBAR_NOTES.md, раздел 4).
                         edit.selection.shift_click(id);
-                        return before != edit.selection.ids();
+                        let changed = before != edit.selection.ids();
+                        if changed {
+                            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+                        }
+                        return changed;
                     }
                     edit.selection.click(Some(id));
                     let changed = before != edit.selection.ids();
+                    if changed {
+                        rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+                    }
                     if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
                         let start = GestureStart {
                             id,
@@ -1125,18 +1649,70 @@ fn handle_input(
             dragging,
         } => {
             let (dip_x, dip_y) = to_dip(pos, scale);
+            edit.cursor_pos = (dip_x, dip_y);
             if let Some(confirm) = &mut edit.confirm {
                 confirm.panel.pointer_event(PointerEvent::Move {
                     pos: (dip_x, dip_y),
                 });
                 return true;
             }
-            if !dragging {
+            match edit.pointer_owner {
+                PointerOwner::CursorPanel => {
+                    if let Some(panel) = &mut edit.cursor_panel {
+                        panel.pointer_event(PointerEvent::Move {
+                            pos: (dip_x, dip_y),
+                        });
+                    }
+                    return true;
+                }
+                PointerOwner::Toolbar => {
+                    if let Some(panel) = &mut edit.toolbar {
+                        panel.pointer_event(PointerEvent::Move {
+                            pos: (dip_x, dip_y),
+                        });
+                    }
+                    poll_toolbar_opacity_live(edit, cfg, sprites);
+                    return true;
+                }
+                PointerOwner::Scene if dragging => {
+                    return apply_gesture(cfg, sprites, edit, (dip_x, dip_y), modifiers, monitor);
+                }
+                PointerOwner::Scene | PointerOwner::None => {}
+            }
+            // Hover: панели top-down для подсветки, затем зона сцены и курсор
+            // (docs/M2_WIRING_PLAN.md, раздел 5, п.3). Пересборка вместо
+            // `translate` — известное упрощение этого среза (см.
+            // rebuild_cursor_panel).
+            let mut need_redraw = false;
+            if let Some(panel) = &mut edit.cursor_panel {
+                need_redraw |= panel
+                    .pointer_event(PointerEvent::Move {
+                        pos: (dip_x, dip_y),
+                    })
+                    .redraw;
+            }
+            if let Some(panel) = &mut edit.toolbar {
+                need_redraw |= panel
+                    .pointer_event(PointerEvent::Move {
+                        pos: (dip_x, dip_y),
+                    })
+                    .redraw;
+            }
+            let over_panel = edit
+                .cursor_panel
+                .as_ref()
+                .is_some_and(|p| p.hit_test((dip_x, dip_y)))
+                || edit
+                    .toolbar
+                    .as_ref()
+                    .is_some_and(|p| p.hit_test((dip_x, dip_y)));
+            if over_panel {
+                overlay.post_cursor_shape(CursorShape::Arrow);
+            } else {
                 let zone = resolve_zone(cfg, &edit.selection, dip_x, dip_y);
                 overlay.post_cursor_shape(cursor_shape_for_zone(&zone));
-                return false;
             }
-            apply_gesture(cfg, sprites, edit, (dip_x, dip_y), modifiers, monitor)
+            need_redraw
         }
         InputEvent::MouseUp { pos, .. } => {
             let (dip_x, dip_y) = to_dip(pos, scale);
@@ -1174,6 +1750,7 @@ fn handle_input(
                     if let Err(e) = config::save(cfg, config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить config.json после удаления через диалог");
                     }
+                    rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
                 } else if confirm
                     .panel
                     .widget_mut::<Button>(confirm_dialog::ID_DONT_ASK)
@@ -1205,6 +1782,37 @@ fn handle_input(
                 }
                 return true;
             }
+            match edit.pointer_owner {
+                PointerOwner::CursorPanel => {
+                    edit.pointer_owner = PointerOwner::None;
+                    return handle_cursor_panel_up(
+                        edit,
+                        overlay,
+                        renderer,
+                        cfg,
+                        config_path,
+                        sprites,
+                        (dip_x, dip_y),
+                        overlay_size,
+                        scale,
+                    );
+                }
+                PointerOwner::Toolbar => {
+                    edit.pointer_owner = PointerOwner::None;
+                    return handle_toolbar_up(
+                        edit,
+                        renderer,
+                        cfg,
+                        config_path,
+                        sprites,
+                        (dip_x, dip_y),
+                        overlay_size,
+                        scale,
+                    );
+                }
+                PointerOwner::Scene | PointerOwner::None => {}
+            }
+            edit.pointer_owner = PointerOwner::None;
             if let Some(Gesture::Marquee { .. }) = &edit.gesture {
                 let started = edit.marquee_started;
                 edit.gesture = None;
@@ -1215,6 +1823,7 @@ fn handle_input(
                     // сейчас (docs/M2_WIRING_PLAN.md, раздел 8).
                     edit.selection.click(None);
                 }
+                rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
                 return true;
             }
             if edit.gesture.take().is_some() {
@@ -1235,6 +1844,19 @@ fn handle_input(
             }
         }
         InputEvent::CaptureLost => {
+            // Панель держала указатель (например, ползунок прозрачности) —
+            // отбросить накопленный снимок, не коммитить середину драга
+            // (docs/M2_WIRING_PLAN.md, раздел 5: «CaptureLost -> pointer_owner
+            // = None»).
+            if matches!(
+                edit.pointer_owner,
+                PointerOwner::Toolbar | PointerOwner::CursorPanel
+            ) {
+                edit.pointer_owner = PointerOwner::None;
+                edit.ui_pending_snapshot = None;
+                return true;
+            }
+            edit.pointer_owner = PointerOwner::None;
             // Отменить незавершённый жест без сохранения: откатить модель и
             // спрайт к стартовому снимку (docs/M2_INTEGRATION_PLAN.md,
             // раздел 6 — "CaptureLost -> отменить жест без push"). У марки
@@ -1444,6 +2066,33 @@ fn redraw(
                 frame.push(solid_sprite(white_tex, &monitor_id, &rect, 1.0));
             }
         }
+    }
+
+    // Тулбар и панель у курсора — над рамками выделения, под модалом
+    // (раздел 11).
+    if let Some(toolbar) = &edit.toolbar {
+        let mut prims = Vec::new();
+        toolbar.draw(&mut prims);
+        primitives_to_sprites(
+            &prims,
+            ui_cache,
+            renderer,
+            &monitor_id,
+            text_scale,
+            &mut frame,
+        );
+    }
+    if let Some(cursor_panel) = &edit.cursor_panel {
+        let mut prims = Vec::new();
+        cursor_panel.draw(&mut prims);
+        primitives_to_sprites(
+            &prims,
+            ui_cache,
+            renderer,
+            &monitor_id,
+            text_scale,
+            &mut frame,
+        );
     }
 
     // Модал подтверждения — самый верх (раздел 11).
