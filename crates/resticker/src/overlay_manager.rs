@@ -38,9 +38,9 @@ use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::paste;
 use rst_render::{
-    Box2D, Button, Icon, Key, NumericField, Panel, PointerEvent, Primitive, Renderer, SelectionBox,
-    Slider, Sprite, Texture, WidgetId, edit_overlay, marquee_visuals, rasterize, solid_sprite,
-    theme,
+    Box2D, Button, Device, Icon, Key, NumericField, Panel, PointerEvent, Primitive, RenderError,
+    SelectionBox, Slider, Sprite, Texture, WidgetId, WindowTarget, edit_overlay, marquee_visuals,
+    rasterize, solid_sprite, theme,
 };
 use rst_win32::clipboard::{self, ClipboardImage};
 use rst_win32::file_dialog;
@@ -52,6 +52,53 @@ use rst_win32::overlay::{OverlayEvent, OverlayWindow};
 use uuid::Uuid;
 
 use crate::{confirm_dialog, cursor_panel, toolbar};
+
+/// Оверлей на один процесс сегодня — одно окно на основном мониторе, поэтому
+/// `Device` (процесс-wide, ARCHITECTURE.md раздел 1) и его единственный
+/// `WindowTarget` (окно/монитор, M3_PREP_NOTES.md §4.2) держатся вместе за
+/// одним именем — как раньше `rst_render::Renderer`, до его разделения на
+/// M3 step 2. Настоящий per-monitor рантайм (несколько `WindowTarget` на
+/// общем `Device`, таблица по `MonitorId`) — отдельный шаг M3 (раздел 5),
+/// этот тип — временный мост, чтобы существующий M1/M2-код компилировался
+/// без изменений сигнатур. Конструктор — на месте вызова (`start()`), не
+/// ассоциированная функция: `WindowTarget::new` берёт `HWND` от `windows`,
+/// а этот крейт (`resticker`, «склейка потоков», CONTRIBUTING.md) намеренно
+/// не зависит от `windows` напрямую — только через `rst-win32`/`rst-render`.
+struct Renderer {
+    device: Device,
+    target: WindowTarget,
+}
+
+impl Renderer {
+    fn set_dpi_scale(&mut self, scale: f32) {
+        self.target.set_dpi_scale(scale);
+    }
+
+    fn dpi_scale(&self) -> f32 {
+        self.target.dpi_scale()
+    }
+
+    fn create_texture_from_rgba(
+        &self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Texture, RenderError> {
+        self.device.create_texture_from_rgba(data, width, height)
+    }
+
+    fn load_image(&self, path: &Path) -> Result<Texture, RenderError> {
+        self.device.load_image(path)
+    }
+
+    fn draw(&self, sprites: &[Sprite]) -> Result<(), RenderError> {
+        self.device.draw(&self.target, sprites)
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), RenderError> {
+        self.target.resize(&self.device, width, height)
+    }
+}
 
 /// Хоткей входа/выхода из режима редактирования по умолчанию (CONFIG.md),
 /// если в конфиге он не задан или не парсится.
@@ -464,17 +511,25 @@ fn run(
         }
     });
 
-    let (width, height) = overlay.size();
-    let mut renderer = match Renderer::new(overlay.hwnd(), width, height) {
-        Ok(r) => r,
+    let (mut width, mut height) = overlay.size();
+    let device = match Device::new() {
+        Ok(d) => d,
         Err(e) => {
-            tracing::error!(error = %e, "не удалось создать рендерер");
+            tracing::error!(error = %e, "не удалось создать D3D11-устройство");
             return;
         }
     };
+    let target = match WindowTarget::new(&device, overlay.hwnd(), width, height) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error = %e, "не удалось создать цель рендера для оверлей-окна");
+            return;
+        }
+    };
+    let mut renderer = Renderer { device, target };
     let dpi = overlay.dpi();
     renderer.set_dpi_scale(dpi as f32 / 96.0);
-    let scale = renderer.dpi_scale();
+    let mut scale = renderer.dpi_scale();
 
     // Заливки для рамки выделения (белая) и затемнения режима (чёрная) —
     // 1×1 текстуры, растягиваются рендерером как обычные спрайты.
@@ -590,6 +645,22 @@ fn run(
                     rebuild_cursor_panel(&mut edit, &cfg, &screen);
                     need_redraw = true;
                 }
+            }
+            OverlayMessage::Event(OverlayEvent::DpiChanged { dpi, size }) => {
+                // Окно уже переехало на рекомендованный прямоугольник
+                // (rst_win32::overlay::handle_dpi_changed) — здесь досчитываем
+                // рендер: пересоздать цепочку под новый размер, обновить
+                // масштаб DIP→физика и геометрию тулбара/панели у курсора,
+                // которая от него зависит (docs/M3_PREP_NOTES.md, раздел 3.6).
+                width = size.0;
+                height = size.1;
+                scale = dpi as f32 / 96.0;
+                renderer.set_dpi_scale(scale);
+                if let Err(e) = renderer.resize(width, height) {
+                    tracing::error!(error = %e, "не удалось пересоздать цепочку рендера после смены DPI");
+                }
+                rebuild_ui_panels(&mut edit, &cfg, (width, height), scale);
+                need_redraw = true;
             }
             OverlayMessage::Event(OverlayEvent::HotkeyConflict(combo)) => {
                 // Окно продолжает работать без входа в режим редактирования;
