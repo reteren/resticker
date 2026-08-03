@@ -9,6 +9,7 @@
 pub mod config;
 mod error;
 pub mod hittest;
+pub mod migration;
 pub mod model;
 pub mod ops;
 pub mod selection_set;
