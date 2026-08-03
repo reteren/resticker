@@ -181,6 +181,10 @@ impl Gesture {
 /// раздел 8).
 const MARQUEE_THRESHOLD_DIP: f64 = 4.0;
 
+/// Размер клетки шахматки скрытых стикеров, DIP (SPEC.md 3.7: «клетка 16×16
+/// логических пикселей»).
+const CHECKERBOARD_CELL_DIP: f64 = 16.0;
+
 /// Зона под курсором в режиме редактирования (docs/M2_INTEGRATION_PLAN.md,
 /// раздел 7): у выделенного стикера — кольцо поворота, ручки ресайза, тело;
 /// иначе — любой видимый стикер под курсором или фон.
@@ -1032,10 +1036,16 @@ fn to_dip(pos: rst_win32::input::Point, scale: f32) -> (f64, f64) {
 }
 
 /// Верхний (по `order`) видимый стикер под точкой `(dip_x, dip_y)`, если есть.
+/// Верхний (по `order`) стикер под точкой `(dip_x, dip_y)`, если есть —
+/// вызывается только в режиме редактирования, где скрытые стикеры рисуются
+/// шахматкой и **полностью интерактивны** (SPEC.md 3.7: «можно двигать,
+/// скейлить и вернуть кнопкой «глаз»»), поэтому `visible` здесь не
+/// фильтруется — в отличие от `redraw`, где скрытые вне режима редактирования
+/// не рисуются вообще.
 fn hit_sticker_at(cfg: &Config, dip_x: f64, dip_y: f64) -> Option<Uuid> {
     cfg.stickers
         .iter()
-        .filter(|s| s.visible && hittest::contains(&s.placement, &s.transform, dip_x, dip_y))
+        .filter(|s| hittest::contains(&s.placement, &s.transform, dip_x, dip_y))
         .max_by_key(|s| s.order)
         .map(|s| s.id)
 }
@@ -2033,14 +2043,46 @@ fn redraw(
         ));
     }
 
-    // Порядок отрисовки стикеров — по `order` (больше — выше, CONFIG.md), а
-    // не по порядку загрузки: важно, как только доступен UI z-order (M2,
-    // следующий срез — тулбар).
-    let mut order: Vec<&Sticker> = cfg.stickers.iter().filter(|s| s.visible).collect();
+    // Порядок отрисовки стикеров — по `order` (больше — выше, CONFIG.md).
+    // Скрытые рисуются только в режиме редактирования — чёрно-розовой
+    // шахматкой по форме AABB вместо реального содержимого (SPEC.md 3.7):
+    // стикер остаётся полностью интерактивным (см. `hit_sticker_at`), просто
+    // не видно, что под ней.
+    let mut order: Vec<&Sticker> = cfg
+        .stickers
+        .iter()
+        .filter(|s| s.visible || edit.active)
+        .collect();
     order.sort_by_key(|s| s.order);
     for sticker in order {
-        if let Some((_, sprite)) = sprites.iter().find(|(id, _)| *id == sticker.id) {
-            frame.push(sprite.clone());
+        if sticker.visible {
+            if let Some((_, sprite)) = sprites.iter().find(|(id, _)| *id == sticker.id) {
+                frame.push(sprite.clone());
+            }
+            continue;
+        }
+        let bounds = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+        let cell_px = (CHECKERBOARD_CELL_DIP * f64::from(scale)).round().max(1.0) as u32;
+        let w_px = (bounds.w * f64::from(scale)).round().max(1.0) as u32;
+        let h_px = (bounds.h * f64::from(scale)).round().max(1.0) as u32;
+        let rgba = rst_render::checkerboard_tile(cell_px, w_px, h_px);
+        match renderer.create_texture_from_rgba(&rgba, w_px, h_px) {
+            Ok(tex) => {
+                let rect = Box2D {
+                    cx: bounds.x + bounds.w / 2.0,
+                    cy: bounds.y + bounds.h / 2.0,
+                    w: bounds.w,
+                    h: bounds.h,
+                    rotation: 0.0,
+                };
+                // Полная непрозрачность независимо от собственной opacity
+                // стикера — шахматка должна быть чётко видна, а не выцветать
+                // вместе со скрытым содержимым под ней.
+                frame.push(solid_sprite(&tex, &monitor_id, &rect, 1.0));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "не удалось создать текстуру шахматки для скрытого стикера");
+            }
         }
     }
 
