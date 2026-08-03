@@ -12,11 +12,12 @@ mod overlay_manager;
 mod toolbar;
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use anyhow::Context;
 use tauri::{Manager, WindowEvent};
 
-use overlay_manager::{OverlayCommand, OverlayHandle};
+use overlay_manager::{CoordinatorRequest, OverlayCommand, OverlayHandle};
 use rst_win32::tray::{self, MenuItem, TrayEvent, TrayIcon};
 
 const MENU_OPEN_SETTINGS: u32 = 1;
@@ -77,7 +78,11 @@ fn main() -> anyhow::Result<()> {
     .context("инициализация иконки трея")?;
 
     let silent_start = cfg.settings.silent_start;
-    let overlay_handle = overlay_manager::start(cfg_path, cfg);
+    // Обратный канал координатор → main (docs/M2_WIRING_PLAN.md, раздел 12):
+    // `Sender` уходит в координатор (оверлей-поток), `Receiver` читает поток
+    // из `setup` ниже.
+    let (coordinator_tx, coordinator_rx) = mpsc::channel::<CoordinatorRequest>();
+    let overlay_handle = overlay_manager::start(cfg_path, cfg, coordinator_tx);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -108,6 +113,23 @@ fn main() -> anyhow::Result<()> {
                         }
                         TrayEvent::MenuItem(MENU_EXIT) => handle.exit(0),
                         TrayEvent::MenuItem(_) => {}
+                    }
+                }
+            });
+
+            // Запросы координатора, которым нужен Tauri (docs/M2_WIRING_PLAN.md,
+            // раздел 12): окна живут на главном потоке, оверлей-поток их
+            // трогать не может. Обработка — та же, что у пункта трея.
+            let coordinator_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                for request in coordinator_rx {
+                    match request {
+                        CoordinatorRequest::OpenSettings => {
+                            if let Some(w) = coordinator_handle.get_webview_window("settings") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
                     }
                 }
             });

@@ -16,10 +16,13 @@
 //! `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y`, `Ctrl+A`, `Delete`, `Ctrl+D`.
 //! M2 (срез 4, этот файл): марка мультивыделения протяжкой по фону, диалог
 //! подтверждения удаления (`Delete`/кнопка тулбара — общий `begin_delete`),
-//! `Ctrl+V` из буфера (картинка/файлы; вставка в поле числа — когда появится
-//! само поле). Тулбар, панель у курсора и связанный с ними round-trip на
-//! главный поток (файл-диалог/настройки) — следующий срез
-//! (docs/M2_WIRING_PLAN.md, раздел 13, шаги 3/7).
+//! `Ctrl+V` из буфера (картинка/файлы; вставка в поле числа пока не
+//! подключена — блокируется тем же пробелом, что и клавиатура поля ниже).
+//! M2 (срез 5/6, этот файл): тулбар и панель у курсора как immediate-mode
+//! виджеты (`rst_render::widgets`), числовое поле принимает клавиатуру
+//! (`Panel::key_event`, docs/M2_SLICE6_REVIEW.md, пункт 2.3), `BTN_SETTINGS`
+//! уходит по `coordinator_tx` на поток Tauri (докс §12) — M2 закрыт
+//! полностью (ROADMAP.md).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,7 +38,7 @@ use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::paste;
 use rst_render::{
-    Box2D, Button, Icon, NumericField, Panel, PointerEvent, Primitive, Renderer, SelectionBox,
+    Box2D, Button, Icon, Key, NumericField, Panel, PointerEvent, Primitive, Renderer, SelectionBox,
     Slider, Sprite, Texture, WidgetId, edit_overlay, marquee_visuals, rasterize, solid_sprite,
     theme,
 };
@@ -58,6 +61,10 @@ const DEFAULT_EDIT_HOTKEY: &str = "Ctrl+Alt+S";
 /// из режима редактирования. Константа, а не зависимость от `windows`: этот
 /// крейт не работает с Win32-типами напрямую (CONTRIBUTING.md).
 const VK_ESCAPE: u32 = 0x1B;
+const VK_BACK: u32 = 0x08;
+const VK_RETURN: u32 = 0x0D;
+const VK_LEFT: u32 = 0x25;
+const VK_RIGHT: u32 = 0x27;
 const VK_DELETE: u32 = 0x2E;
 const VK_A: u32 = 0x41;
 const VK_D: u32 = 0x44;
@@ -77,6 +84,15 @@ const ROTATE_RING_MAX_DIP: f64 = 24.0;
 pub enum OverlayCommand {
     AddSticker(PathBuf),
     Shutdown,
+}
+
+/// Запрос координатора к главному потоку Tauri — обратный существующему
+/// `OverlayCommand` канал (docs/M2_WIRING_PLAN.md, раздел 12): сообщения,
+/// которым нужен Tauri/окно, а не чистый `Config`. Читается отдельной
+/// задачей в `main::setup`, `Sender` держит координатор в `EditState`.
+pub enum CoordinatorRequest {
+    /// Открыть окно настроек (кнопка `BTN_SETTINGS` панели у курсора).
+    OpenSettings,
 }
 
 /// Сообщение объединённого канала координатора: команда от Tauri или
@@ -112,11 +128,18 @@ impl Drop for OverlayHandle {
 /// Запустить оверлей-окно + рендерер на отдельном потоке. `cfg` передаётся
 /// по значению — существующие стикеры (сохранение/восстановление между
 /// запусками, ROADMAP.md M1) загружаются сразу в первый кадр.
-pub fn start(config_path: PathBuf, cfg: Config) -> OverlayHandle {
+/// `coordinator_tx` — канал запросов координатора к главному потоку Tauri
+/// (docs/M2_WIRING_PLAN.md, раздел 12): `Receiver` остаётся в `main` и
+/// читается задачей из `setup`.
+pub fn start(
+    config_path: PathBuf,
+    cfg: Config,
+    coordinator_tx: Sender<CoordinatorRequest>,
+) -> OverlayHandle {
     let (tx, rx) = mpsc::channel::<OverlayMessage>();
     let thread = thread::spawn({
         let tx = tx.clone();
-        move || run(config_path, cfg, tx, rx)
+        move || run(config_path, cfg, tx, rx, coordinator_tx)
     });
     OverlayHandle {
         tx,
@@ -239,6 +262,11 @@ struct EditState {
     /// undo/redo и т.п., где курсор не двигался, но панель должна остаться
     /// там же). Обновляется на каждом `MouseMove`.
     cursor_pos: (f64, f64),
+    /// Канал запросов координатора к главному потоку Tauri (`BTN_SETTINGS`,
+    /// docs/M2_WIRING_PLAN.md, раздел 12). Здесь, а не отдельным параметром
+    /// `handle_cursor_panel_up`, — чтобы обработчики UI могли слать запрос
+    /// через `edit`.
+    coordinator_tx: Sender<CoordinatorRequest>,
 }
 
 /// Кто получает события указателя после `MouseDown` (docs/M2_WIRING_PLAN.md,
@@ -401,6 +429,7 @@ fn run(
     mut cfg: Config,
     tx: Sender<OverlayMessage>,
     rx: Receiver<OverlayMessage>,
+    coordinator_tx: Sender<CoordinatorRequest>,
 ) {
     let hotkey = cfg
         .hotkeys
@@ -501,6 +530,7 @@ fn run(
         pointer_owner: PointerOwner::None,
         ui_pending_snapshot: None,
         cursor_pos: (0.0, 0.0),
+        coordinator_tx,
     };
     let mut ui_cache = UiTextureCache::new();
 
@@ -539,6 +569,7 @@ fn run(
                     &mut edit,
                     &mut cfg,
                     &mut sprites,
+                    &renderer,
                     &config_path,
                     (width, height),
                     scale,
@@ -628,7 +659,8 @@ fn toggle_edit_mode(
     overlay: &OverlayWindow,
     edit: &mut EditState,
     cfg: &mut Config,
-    sprites: &mut [(Uuid, Sprite)],
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    renderer: &Renderer,
     config_path: &Path,
     overlay_size: (u32, u32),
     scale: f32,
@@ -650,6 +682,14 @@ fn toggle_edit_mode(
     edit.pending_snapshot = None;
     edit.marquee = None;
     edit.marquee_started = false;
+    // Незавершённый драг ползунка прозрачности — тот же принцип: откатить,
+    // а не коммитить и не оставлять снимок висеть до случайного коммита на
+    // следующем клике тулбара (docs/M2_SLICE6_REVIEW.md, пункт 2.1).
+    if let Some(before) = edit.ui_pending_snapshot.take() {
+        *cfg = before;
+        resync_sprites(renderer, cfg, sprites);
+    }
+    edit.pointer_owner = PointerOwner::None;
     // Открытый модал не переживает выход из режима — как и незавершённый
     // жест выше, он относится к сеансу редактирования, а не к самому кадру.
     edit.confirm = None;
@@ -661,9 +701,7 @@ fn toggle_edit_mode(
             tracing::warn!(error = %e, "не удалось сохранить config.json при выходе из режима редактирования");
         }
     }
-    let screen = screen_dip_rect(overlay_size, scale);
-    rebuild_toolbar(edit, cfg, screen.h);
-    rebuild_cursor_panel(edit, cfg, &screen);
+    rebuild_ui_panels(edit, cfg, overlay_size, scale);
 }
 
 /// Положить готовый снимок `Config` в историю undo и очистить историю redo —
@@ -755,11 +793,15 @@ fn perform_undo(
     let Some(prev) = edit.undo_stack.pop() else {
         return false;
     };
-    // Жест не мог быть активен здесь (Ctrl+Z игнорируется, пока
-    // `edit.gesture.is_some()`, см. `handle_key`), но снимаем защитно —
-    // docs/M2_SLICE_REVIEW.md, пункт 5.
+    // Жест/UI-драг не могли быть активны здесь (Ctrl+Z игнорируется, пока
+    // `edit.gesture.is_some()` или `pointer_owner` — панель, см. `handle_key`),
+    // но снимаем защитно — docs/M2_SLICE_REVIEW.md, пункт 5;
+    // docs/M2_SLICE6_REVIEW.md, пункт 2.1 (иначе повисший снимок ползунка
+    // коммитится позже относительно уже откаченного cfg).
     edit.gesture = None;
     edit.pending_snapshot = None;
+    edit.ui_pending_snapshot = None;
+    edit.pointer_owner = PointerOwner::None;
     edit.redo_stack.push(std::mem::replace(cfg, prev));
     resync_sprites(renderer, cfg, sprites);
     edit.selection.prune(&cfg.stickers);
@@ -781,6 +823,8 @@ fn perform_redo(
     };
     edit.gesture = None;
     edit.pending_snapshot = None;
+    edit.ui_pending_snapshot = None;
+    edit.pointer_owner = PointerOwner::None;
     if edit.undo_stack.len() == UNDO_CAPACITY {
         edit.undo_stack.remove(0);
     }
@@ -830,7 +874,7 @@ fn begin_delete(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после удаления");
         }
-        rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+        rebuild_ui_panels(edit, cfg, overlay_size, scale);
     }
     true
 }
@@ -852,12 +896,18 @@ fn handle_key(
     overlay_size: (u32, u32),
     scale: f32,
 ) -> bool {
-    // История/удаление/дублирование во время активного жеста мутировали бы
+    // История/удаление/дублирование во время активного жеста (сцены или
+    // панели — ползунок прозрачности тоже держит указатель) мутировали бы
     // cfg из-под него — жест продолжал бы считать от своего старого
-    // GestureStart поверх уже изменённого состояния (docs/M2_SLICE_REVIEW.md,
-    // пункт 2). Esc — исключение: toggle_edit_mode сам корректно откатывает
-    // незавершённый жест перед выходом.
-    if edit.gesture.is_some() && vk != VK_ESCAPE {
+    // состояния поверх уже изменённого (docs/M2_SLICE_REVIEW.md, пункт 2;
+    // docs/M2_SLICE6_REVIEW.md, пункт 2.4 — тот же класс бага для панели).
+    // Esc — исключение: toggle_edit_mode сам корректно откатывает
+    // незавершённый жест/драг перед выходом.
+    let pointer_busy = matches!(
+        edit.pointer_owner,
+        PointerOwner::Toolbar | PointerOwner::CursorPanel
+    );
+    if (edit.gesture.is_some() || pointer_busy) && vk != VK_ESCAPE {
         return false;
     }
     // Модал подтверждения блокирует всё, кроме своей отмены по Esc — как и
@@ -872,6 +922,47 @@ fn handle_key(
             false
         };
     }
+    // Числовое поле тулбара: пока оно в фокусе, клавиатура — его, а не
+    // хоткеи ядра ниже (в т.ч. `Enter`/`Esc`, которые иначе перехватил бы
+    // `match`). Раньше `Panel::key_event` не вызывался вообще, поле было
+    // полностью глухо к клавиатуре (docs/M2_SLICE6_REVIEW.md, пункт 2.3).
+    // Без фокуса `key_event` возвращает `consumed: false` и здесь ничего не
+    // происходит — обычные хоткеи идут дальше как раньше.
+    if let Some(key) = widget_key(vk, modifiers) {
+        let result = edit
+            .toolbar
+            .as_mut()
+            .map(|p| p.key_event(key))
+            .unwrap_or_default();
+        if result.consumed {
+            // Коммитим сразу по `Enter`, а не откладываем до следующего
+            // `MouseUp` на тулбаре — иначе значение зависло бы до
+            // случайного клика где-то ещё и закоммитилось бы не в том
+            // месте истории (docs/M2_SLICE6_REVIEW.md, пункт 1.2).
+            if let Some(value) = edit
+                .toolbar
+                .as_mut()
+                .and_then(|p| p.widget_mut::<NumericField>(toolbar::TB_FIELD))
+                .and_then(NumericField::take_submitted)
+            {
+                if let Some(id) = single_selected_id(&edit.selection) {
+                    commit_undo_snapshot(edit, cfg.clone());
+                    apply_opacity(cfg, sprites, id, value);
+                    if let Some(slider) = edit
+                        .toolbar
+                        .as_mut()
+                        .and_then(|p| p.widget_mut::<Slider>(toolbar::TB_SLIDER))
+                    {
+                        slider.set_value(value);
+                    }
+                    if let Err(e) = config::save(cfg, config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить config.json после изменения прозрачности");
+                    }
+                }
+            }
+            return result.redraw;
+        }
+    }
     match vk {
         VK_ESCAPE => {
             toggle_edit_mode(
@@ -879,6 +970,7 @@ fn handle_key(
                 edit,
                 cfg,
                 sprites,
+                renderer,
                 config_path,
                 overlay_size,
                 scale,
@@ -887,22 +979,22 @@ fn handle_key(
         }
         VK_Z if modifiers.ctrl && modifiers.shift => {
             let did = perform_redo(renderer, cfg, config_path, sprites, edit);
-            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+            rebuild_ui_panels(edit, cfg, overlay_size, scale);
             did
         }
         VK_Z if modifiers.ctrl => {
             let did = perform_undo(renderer, cfg, config_path, sprites, edit);
-            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+            rebuild_ui_panels(edit, cfg, overlay_size, scale);
             did
         }
         VK_Y if modifiers.ctrl => {
             let did = perform_redo(renderer, cfg, config_path, sprites, edit);
-            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+            rebuild_ui_panels(edit, cfg, overlay_size, scale);
             did
         }
         VK_A if modifiers.ctrl => {
             edit.selection.select_all(&cfg.stickers);
-            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+            rebuild_ui_panels(edit, cfg, overlay_size, scale);
             true
         }
         VK_DELETE => {
@@ -937,7 +1029,7 @@ fn handle_key(
             if let Err(e) = config::save(cfg, config_path) {
                 tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
             }
-            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+            rebuild_ui_panels(edit, cfg, overlay_size, scale);
             true
         }
         VK_V if modifiers.ctrl => {
@@ -947,10 +1039,30 @@ fn handle_key(
     }
 }
 
+/// Перевод кода `WM_KEYDOWN` в клавишу для виджетов (числовое поле тулбара).
+/// `Ctrl`-комбинации сюда не доходят: `Ctrl+что-угодно` — хоткей ядра, а не
+/// ввод в поле (M2_UI_NOTES §9), поэтому при `modifiers.ctrl` всегда `None`.
+fn widget_key(vk: u32, modifiers: Modifiers) -> Option<Key> {
+    if modifiers.ctrl {
+        return None;
+    }
+    match vk {
+        0x30..=0x39 => Some(Key::Digit((vk - 0x30) as u8)),
+        VK_BACK => Some(Key::Backspace),
+        VK_RETURN => Some(Key::Enter),
+        VK_ESCAPE => Some(Key::Escape),
+        VK_LEFT => Some(Key::ArrowLeft),
+        VK_RIGHT => Some(Key::ArrowRight),
+        _ => None,
+    }
+}
+
 /// `Ctrl+V`: вставить изображение из буфера обмена как новый стикер
-/// (docs/M2_WIRING_PLAN.md, раздел 9Б — вариант «числовое поле в фокусе»,
-/// раздел 9А, ещё не подключён: тулбара с полем пока нет). Отсутствие
-/// изображения в буфере — не ошибка, просто `false` (нет перерисовки).
+/// (docs/M2_WIRING_PLAN.md, раздел 9Б). Вариант «числовое поле в фокусе»
+/// (раздел 9А, `Widget::paste`) сюда не попадает — `Ctrl`-комбинации не
+/// доходят до виджетов (`widget_key` возвращает `None`), и это отдельный,
+/// пока не подключённый срез. Отсутствие изображения в буфере — не ошибка,
+/// просто `false` (нет перерисовки).
 fn paste_from_clipboard(
     overlay: &OverlayWindow,
     renderer: &mut Renderer,
@@ -1227,6 +1339,19 @@ fn rebuild_cursor_panel(edit: &mut EditState, cfg: &Config, screen: &DipRect) {
     ));
 }
 
+/// Пересобрать и тулбар, и панель у курсора вместе — единая точка вызова
+/// после любого изменения, которое может повлиять хоть на одну из панелей
+/// (смена выделения, undo/redo, видимость). Раздельные вызовы
+/// `rebuild_toolbar`/`rebuild_cursor_panel` по разным подмножествам точек
+/// разошлись и оставляли панель у курсора с устаревшей иконкой «показать/
+/// скрыть все» после undo/redo и массовых операций
+/// (docs/M2_SLICE6_REVIEW.md, пункты 2.5/2.6).
+fn rebuild_ui_panels(edit: &mut EditState, cfg: &Config, overlay_size: (u32, u32), scale: f32) {
+    let screen = screen_dip_rect(overlay_size, scale);
+    rebuild_toolbar(edit, cfg, screen.h);
+    rebuild_cursor_panel(edit, cfg, &screen);
+}
+
 /// Решить целевую видимость и применить её всем стикерам батчем (общая
 /// логика хоткея `toggle_all_stickers` и кнопки `BTN_TOGGLE_ALL`,
 /// docs/M2_WIRING_PLAN.md, раздел 6 «Панель у курсора»): сходится к
@@ -1305,8 +1430,6 @@ fn handle_toolbar_up(
         }
     }
 
-    let screen_h = || screen_dip_rect(overlay_size, scale).h;
-
     if let Some(value) = edit
         .toolbar
         .as_mut()
@@ -1325,7 +1448,7 @@ fn handle_toolbar_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после изменения прозрачности");
         }
-        rebuild_toolbar(edit, cfg, screen_h());
+        rebuild_ui_panels(edit, cfg, overlay_size, scale);
         return true;
     }
 
@@ -1342,7 +1465,7 @@ fn handle_toolbar_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения видимости");
         }
-        rebuild_toolbar(edit, cfg, screen_h());
+        rebuild_ui_panels(edit, cfg, overlay_size, scale);
         return true;
     }
     if clicked(edit, toolbar::TB_ORDER_UP) {
@@ -1370,7 +1493,7 @@ fn handle_toolbar_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
         }
-        rebuild_toolbar(edit, cfg, screen_h());
+        rebuild_ui_panels(edit, cfg, overlay_size, scale);
         return true;
     }
     if clicked(edit, toolbar::TB_DELETE) {
@@ -1392,8 +1515,9 @@ fn handle_toolbar_up(
 /// Опросить действия панели у курсора после `Up` (docs/M2_WIRING_PLAN.md,
 /// раздел 6): `BTN_LOAD_FILE` вызывает системный диалог напрямую (COM,
 /// `rst_win32::file_dialog` — не нужен round-trip на главный поток из §12,
-/// диалог сам инициализирует COM на вызывающем потоке), `BTN_SETTINGS` пока
-/// не подключён (нужен round-trip к Tauri-окну настроек — следующий срез).
+/// диалог сам инициализирует COM на вызывающем потоке), `BTN_SETTINGS`
+/// уходит через `coordinator_tx` — окно настроек живёт на потоке Tauri, а
+/// не оверлея, показать/сфокусировать его отсюда напрямую нельзя.
 #[allow(clippy::too_many_arguments)]
 fn add_sticker_from_dialog(
     overlay: &OverlayWindow,
@@ -1458,9 +1582,9 @@ fn handle_cursor_panel_up(
         return true;
     }
     if clicked(edit, cursor_panel::BTN_SETTINGS) {
-        // Нужен round-trip к главному потоку Tauri (docs/M2_WIRING_PLAN.md,
-        // §12) — не подключено в этом срезе.
-        tracing::info!("«Настройки» с панели у курсора: пока не подключено");
+        // Round-trip к главному потоку Tauri (docs/M2_WIRING_PLAN.md, §12) —
+        // окна настроек нет на оверлей-потоке, main::setup читает канал.
+        let _ = edit.coordinator_tx.send(CoordinatorRequest::OpenSettings);
         return true;
     }
     if clicked(edit, cursor_panel::BTN_EXIT) {
@@ -1469,6 +1593,7 @@ fn handle_cursor_panel_up(
             edit,
             cfg,
             sprites,
+            renderer,
             config_path,
             overlay_size,
             scale,
@@ -1594,14 +1719,14 @@ fn handle_input(
                         edit.selection.shift_click(id);
                         let changed = before != edit.selection.ids();
                         if changed {
-                            rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+                            rebuild_ui_panels(edit, cfg, overlay_size, scale);
                         }
                         return changed;
                     }
                     edit.selection.click(Some(id));
                     let changed = before != edit.selection.ids();
                     if changed {
-                        rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+                        rebuild_ui_panels(edit, cfg, overlay_size, scale);
                     }
                     if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
                         let start = GestureStart {
@@ -1691,11 +1816,14 @@ fn handle_input(
                         // Драг/ресайз/поворот меняют placement/opacity живо —
                         // тулбар должен следовать за стикером в том же кадре
                         // (docs/M2_WIRING_PLAN.md, раздел 4: «едет за
-                        // выделением»). Марка тоже проходит через эту ветку,
-                        // но `rebuild_toolbar` сам держит его скрытым, пока
-                        // `edit.marquee.is_some()` — вызов безопасен для обоих
-                        // случаев.
-                        rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+                        // выделением»); панель у курсора раньше «замирала» на
+                        // пред-драговой позиции до MouseUp
+                        // (docs/M2_SLICE6_REVIEW.md, пункт 2.6) —
+                        // `rebuild_ui_panels` чинит обе разом. Марка тоже
+                        // проходит через эту ветку, но `rebuild_toolbar` сам
+                        // держит его скрытым, пока `edit.marquee.is_some()` —
+                        // вызов безопасен для обоих случаев.
+                        rebuild_ui_panels(edit, cfg, overlay_size, scale);
                     }
                     return need_redraw;
                 }
@@ -1772,7 +1900,7 @@ fn handle_input(
                     if let Err(e) = config::save(cfg, config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить config.json после удаления через диалог");
                     }
-                    rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+                    rebuild_ui_panels(edit, cfg, overlay_size, scale);
                 } else if confirm
                     .panel
                     .widget_mut::<Button>(confirm_dialog::ID_DONT_ASK)
@@ -1845,7 +1973,7 @@ fn handle_input(
                     // сейчас (docs/M2_WIRING_PLAN.md, раздел 8).
                     edit.selection.click(None);
                 }
-                rebuild_toolbar(edit, cfg, screen_dip_rect(overlay_size, scale).h);
+                rebuild_ui_panels(edit, cfg, overlay_size, scale);
                 return true;
             }
             if edit.gesture.take().is_some() {
@@ -1867,15 +1995,24 @@ fn handle_input(
         }
         InputEvent::CaptureLost => {
             // Панель держала указатель (например, ползунок прозрачности) —
-            // отбросить накопленный снимок, не коммитить середину драга
-            // (docs/M2_WIRING_PLAN.md, раздел 5: «CaptureLost -> pointer_owner
-            // = None»).
+            // откатить модель к снимку до начала драга, а не отбросить его
+            // молча: иначе `cfg`/`sprites` остаются на середине изменения
+            // прозрачности, хотя ползунок его больше не отражает
+            // (docs/M2_SLICE6_REVIEW.md, пункт 2.2). Заодно пересобрать сами
+            // панели — `Panel`/`Slider` держат внутри `capture`/`dragging`,
+            // которые `PointerEvent::Up`/`CaptureLost` в виджет не доходят;
+            // самый безопасный способ снять их — построить панель заново, а
+            // не синтезировать `Up`, который может засчитаться как клик.
             if matches!(
                 edit.pointer_owner,
                 PointerOwner::Toolbar | PointerOwner::CursorPanel
             ) {
+                if let Some(before) = edit.ui_pending_snapshot.take() {
+                    *cfg = before;
+                    resync_sprites(renderer, cfg, sprites);
+                }
                 edit.pointer_owner = PointerOwner::None;
-                edit.ui_pending_snapshot = None;
+                rebuild_ui_panels(edit, cfg, overlay_size, scale);
                 return true;
             }
             edit.pointer_owner = PointerOwner::None;
