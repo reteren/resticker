@@ -277,8 +277,36 @@ impl OverlayWindow {
     /// `true` — вне режима редактирования, окно снова полностью
     /// клик-прозрачно и не берёт фокус; `false` — вход в режим
     /// редактирования, окно принимает мышь/клавиатуру на всей площади
-    /// монитора и забирает фокус (`SetForegroundWindow`).
+    /// монитора и забирает фокус (`SetForegroundWindow`). На процесс с
+    /// несколькими мониторами (M3) фокус имеет смысл забирать только у
+    /// **одного** окна — того, что инициировало вход/выход (обычно то, что
+    /// владеет глобальным хоткеем); остальные снимают клик-прозрачность без
+    /// перетягивания фокуса через [`Self::set_interactive`], иначе несколько
+    /// `SetForegroundWindow` подряд боролись бы друг с другом за фокус
+    /// (M3_PREP_NOTES.md, раздел 3.5).
     pub fn set_click_through(&self, click_through: bool) {
+        self.set_exstyle_bits(click_through);
+        if !click_through {
+            // SAFETY: hwnd — наше живое окно; вызов безопасен с любого потока.
+            unsafe {
+                let _ = SetForegroundWindow(self.hwnd);
+            }
+        }
+    }
+
+    /// То же переключение `WS_EX_TRANSPARENT|WS_EX_NOACTIVATE`, что и
+    /// [`Self::set_click_through`], но без `SetForegroundWindow` — для окон
+    /// других мониторов при входе/выходе из режима редактирования (M3):
+    /// клик-прозрачность должна сняться у всех окон сразу (иначе мышь
+    /// проваливалась бы сквозь режим на них), а фокус — только у окна,
+    /// которое инициировало переключение.
+    pub fn set_interactive(&self, interactive: bool) {
+        self.set_exstyle_bits(!interactive);
+    }
+
+    /// Общая часть `set_click_through`/`set_interactive`: переключить
+    /// `WS_EX_TRANSPARENT|WS_EX_NOACTIVATE` без побочных эффектов на фокус.
+    fn set_exstyle_bits(&self, click_through: bool) {
         // SAFETY: hwnd — наше живое окно; смена GWL_EXSTYLE безопасна с
         // любого потока (в отличие от владения самим HWND).
         unsafe {
@@ -290,9 +318,6 @@ impl OverlayWindow {
                 ex &= !bits;
             }
             SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex as isize);
-            if !click_through {
-                let _ = SetForegroundWindow(self.hwnd);
-            }
         }
     }
 
@@ -874,6 +899,33 @@ mod tests {
             restored & WS_EX_TRANSPARENT.0,
             0,
             "выход восстанавливает клик-прозрачность"
+        );
+        assert_ne!(restored & WS_EX_NOACTIVATE.0, 0);
+    }
+
+    #[test]
+    fn set_interactive_toggles_same_bits_as_click_through() {
+        // M3: окна других мониторов используют set_interactive, а не
+        // set_click_through, чтобы не бороться за фокус — но сами биты
+        // WS_EX_TRANSPARENT|WS_EX_NOACTIVATE переключаются одинаково.
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+
+        overlay.set_interactive(true);
+        let editing = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
+        assert_eq!(
+            editing & WS_EX_TRANSPARENT.0,
+            0,
+            "интерактивно — не клик-прозрачно"
+        );
+        assert_eq!(editing & WS_EX_NOACTIVATE.0, 0);
+
+        overlay.set_interactive(false);
+        let restored = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
+        assert_ne!(
+            restored & WS_EX_TRANSPARENT.0,
+            0,
+            "не интерактивно — клик-прозрачно"
         );
         assert_ne!(restored & WS_EX_NOACTIVATE.0, 0);
     }

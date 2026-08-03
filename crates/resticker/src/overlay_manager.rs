@@ -746,10 +746,13 @@ fn run(
                 // только с того, что владеет хоткеем — иначе мышь на других
                 // мониторах проваливалась бы сквозь режим редактирования
                 // (M3_PREP_NOTES.md, раздел 3.5). `toggle_edit_mode` уже
-                // применил её к окну-инициатору.
+                // применил её к окну-инициатору через `set_click_through`
+                // (там же — забирает фокус); остальные — через
+                // `set_interactive`, без повторного `SetForegroundWindow`,
+                // иначе несколько окон боролись бы за фокус друг с другом.
                 for (other_id, other_ms) in monitors_map.iter() {
                     if *other_id != monitor_id {
-                        other_ms.overlay.set_click_through(!edit.active);
+                        other_ms.overlay.set_interactive(edit.active);
                     }
                 }
                 need_redraw = true;
