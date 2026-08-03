@@ -669,6 +669,28 @@ fn run(
                 // а не тихая потеря события.
                 tracing::warn!(combo = %combo, "хоткей режима редактирования уже занят другим приложением");
             }
+            OverlayMessage::Event(OverlayEvent::MonitorsChanged(monitors)) => {
+                // Диффинг «старое ↔ новое» по device interface path, снос
+                // окна пропавшего монитора, таймер ADR-011 — отдельная,
+                // ещё не подключённая работа (docs/M3_PREP_NOTES.md,
+                // разделы 2.3, 5.3); пока — хотя бы в лог, а не молча.
+                tracing::info!(
+                    count = monitors.len(),
+                    "конфигурация мониторов изменилась (WM_DISPLAYCHANGE)"
+                );
+            }
+            OverlayMessage::Event(OverlayEvent::SessionLocked) => {
+                tracing::info!("сессия Windows заблокирована");
+            }
+            OverlayMessage::Event(OverlayEvent::SessionUnlocked) => {
+                tracing::info!("сессия Windows разблокирована");
+            }
+            OverlayMessage::Event(OverlayEvent::SystemSuspending) => {
+                tracing::info!("система уходит в сон");
+            }
+            OverlayMessage::Event(OverlayEvent::SystemResumed) => {
+                tracing::info!("система вышла из сна");
+            }
             OverlayMessage::Event(OverlayEvent::Key {
                 vk,
                 modifiers,
