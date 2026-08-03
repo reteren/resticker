@@ -11,7 +11,10 @@
 //! сообщения окна → безопасные события» (`OverlayEvent`), см.
 //! docs/M2_INTEGRATION_PLAN.md, раздел 1. M3: глобальный хоткей
 //! регистрирует ровно одно окно на процесс (docs/M3_PREP_NOTES.md,
-//! раздел 3.3) — остальные создаются с `None`. Мышь и курсор обрабатываются
+//! раздел 3.3) — остальные создаются с `None`; системные изменения
+//! (`WM_DISPLAYCHANGE`, блокировка/сон сессии) уходят событиями
+//! (`MonitorsChanged`/`SessionLocked`/`SystemSuspending` и др., раздел 3.6).
+//! Мышь и курсор обрабатываются
 //! здесь ([`crate::input`]); хит-тестинг и жесты — у вызывающего кода (ядро
 //! редактора платформенно-независимо).
 
@@ -22,19 +25,24 @@ use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::{
+    NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA,
-    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_HOTKEY,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETCURSOR,
-    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, MSG, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK,
+    WTS_SESSION_UNLOCK,
 };
 use windows::core::{PCWSTR, w};
 
@@ -43,6 +51,7 @@ use rst_core::model::Rect;
 use crate::error::Win32Error;
 use crate::hotkey::{HotkeyCombo, RegisteredHotkey, message_hotkey_id};
 use crate::input::{CursorManager, CursorShape, InputEvent, Modifiers, MouseCapture};
+use crate::monitors::{self, MonitorInfo};
 
 const CLASS_NAME: PCWSTR = w!("resticker_overlay");
 const WINDOW_TITLE: PCWSTR = w!("resticker_overlay_wnd");
@@ -115,6 +124,20 @@ pub enum OverlayEvent {
         modifiers: Modifiers,
         pressed: bool,
     },
+    /// Конфигурация мониторов изменилась (`WM_DISPLAYCHANGE`): свежий снапшот
+    /// [`crate::monitors::enumerate`] целиком — сравнение «старое ↔ новое» по
+    /// device interface path делает координатор (docs/M3_PREP_NOTES.md,
+    /// разделы 2.3 и 3.6; здесь diff не выполняется).
+    MonitorsChanged(Vec<MonitorInfo>),
+    /// Сессия Windows заблокирована (`WM_WTSSESSION_CHANGE`, `WTS_SESSION_LOCK`).
+    SessionLocked,
+    /// Сессия Windows разблокирована (`WM_WTSSESSION_CHANGE`,
+    /// `WTS_SESSION_UNLOCK`).
+    SessionUnlocked,
+    /// Система уходит в сон/гибернацию (`WM_POWERBROADCAST`, `PBT_APMSUSPEND`).
+    SystemSuspending,
+    /// Система вышла из сна (`PBT_APMRESUMESUSPEND` / `PBT_APMRESUMEAUTOMATIC`).
+    SystemResumed,
 }
 
 /// Оверлей-окно на один монитор и его поток сообщений.
@@ -541,6 +564,16 @@ fn create_window(bounds_px: Rect) -> Result<HWND, Win32Error> {
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
 
+    // Сессионные события (блокировка/разблокировка, сон/пробуждение) —
+    // окно регистрируется получателем WM_WTSSESSION_CHANGE
+    // (docs/M3_PREP_NOTES.md, раздел 3.6); снятие — в WM_DESTROY.
+    // Отказ регистрации окно не ломает: без событий сессии оно продолжает
+    // работать (warn-лог вместо ошибки создания).
+    // SAFETY: hwnd — действительное окно этого потока, живёт до WM_DESTROY.
+    if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) }.is_err() {
+        tracing::warn!("WTSRegisterSessionNotification не удалась; события сессии недоступны");
+    }
+
     Ok(hwnd)
 }
 
@@ -579,6 +612,45 @@ fn handle_dpi_changed(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<Over
             (rect.bottom - rect.top).max(0) as u32,
         ),
     })
+}
+
+/// Реакция на `WM_DISPLAYCHANGE` (docs/M3_PREP_NOTES.md, раздел 2.3):
+/// переперечисление мониторов и свежий снапшот наружу событием
+/// [`OverlayEvent::MonitorsChanged`]; сопоставление старого и нового
+/// снапшотов — на стороне координатора (только по device interface path).
+/// Ошибка перечисления — warn-лог и `None`: событие не уходит, следующий
+/// `WM_DISPLAYCHANGE` повторит попытку.
+fn handle_display_change() -> Option<OverlayEvent> {
+    match monitors::enumerate() {
+        Ok(snapshot) => Some(OverlayEvent::MonitorsChanged(snapshot)),
+        Err(e) => {
+            tracing::warn!(error = %e, "WM_DISPLAYCHANGE: перечисление мониторов не удалось");
+            None
+        }
+    }
+}
+
+/// Разбор `wParam` из `WM_WTSSESSION_CHANGE`: блокировка/разблокировка
+/// сессии → событие. Прочие события сессии (вход/выход пользователя,
+/// переключение консоли и т.п.) оверлею не нужны. Чистая функция — тесты
+/// без реального окна.
+fn session_change_event(wparam: WPARAM) -> Option<OverlayEvent> {
+    match wparam.0 as u32 {
+        WTS_SESSION_LOCK => Some(OverlayEvent::SessionLocked),
+        WTS_SESSION_UNLOCK => Some(OverlayEvent::SessionUnlocked),
+        _ => None,
+    }
+}
+
+/// Разбор `wParam` из `WM_POWERBROADCAST`: уход в сон и пробуждение →
+/// события. Прочие `PBT_*` (запросы приостановки, «питание почти
+/// кончилось» и т.п.) не эмитим. Чистая функция — тесты без реального окна.
+fn power_broadcast_event(wparam: WPARAM) -> Option<OverlayEvent> {
+    match wparam.0 as u32 {
+        PBT_APMSUSPEND => Some(OverlayEvent::SystemSuspending),
+        PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC => Some(OverlayEvent::SystemResumed),
+        _ => None,
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -626,6 +698,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        WM_DISPLAYCHANGE => {
+            // Конфигурация мониторов сменилась: переперечисление и свежий
+            // снапшот наружу — окно на пропавшем мониторе уничтожит
+            // координатор, реагируя на событие (docs/M3_PREP_NOTES.md,
+            // раздел 2.3 и 3.6); diff по device interface path — не здесь.
+            if let Some(event) = handle_display_change() {
+                if let Some(state) = unsafe { state_ptr.as_mut() } {
+                    let _ = state.tx.send(event);
+                }
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_WTSSESSION_CHANGE => {
+            // Блокировка/разблокировка сессии (окно зарегистрировано в
+            // create_window): событие координатору. Прочие события сессии
+            // игнорируем — системному обработчику.
+            if let Some(event) = session_change_event(wparam) {
+                if let Some(state) = unsafe { state_ptr.as_mut() } {
+                    let _ = state.tx.send(event);
+                }
+                LRESULT(1)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_POWERBROADCAST => {
+            // Уход в сон/пробуждение: событие координатору. TRUE в ответ —
+            // «сообщение обработано»; для PBT_APMSUSPEND это заодно
+            // «приложение готово к приостановке» (MSDN, WM_POWERBROADCAST).
+            if let Some(event) = power_broadcast_event(wparam) {
+                if let Some(state) = unsafe { state_ptr.as_mut() } {
+                    let _ = state.tx.send(event);
+                }
+                LRESULT(1)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_KEYDOWN | WM_KEYUP => {
             let vk = wparam.0 as u32;
             // Автоповтор нажатия (удержание) наружу не уходит: наружу — только
@@ -656,6 +767,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_DESTROY => {
+            // Снять регистрацию сессионных уведомлений (парно к регистрации
+            // в create_window); окно в WM_DESTROY ещё валидно, ошибка
+            // игнорируется — окно и так уничтожается.
+            // SAFETY: hwnd валиден в WM_DESTROY.
+            let _ = unsafe { WTSUnRegisterSessionNotification(hwnd) };
             // SAFETY: стандартный вызов из обработчика WM_DESTROY.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
@@ -935,5 +1051,97 @@ mod tests {
         assert_eq!(key_event_press(WM_KEYUP, 0), Some(false));
         // Прочие сообщения клавиатурных событий не порождают.
         assert_eq!(key_event_press(WM_MOUSEMOVE, 0), None);
+    }
+
+    #[test]
+    fn session_change_maps_lock_and_unlock_only() {
+        assert_eq!(
+            session_change_event(WPARAM(WTS_SESSION_LOCK as usize)),
+            Some(OverlayEvent::SessionLocked)
+        );
+        assert_eq!(
+            session_change_event(WPARAM(WTS_SESSION_UNLOCK as usize)),
+            Some(OverlayEvent::SessionUnlocked)
+        );
+        // Прочие события сессии (логин/логаут, переключение консоли и т.п.)
+        // оверлею не нужны.
+        assert_eq!(session_change_event(WPARAM(0)), None);
+        assert_eq!(session_change_event(WPARAM(0x1)), None); // WTS_SESSION_LOGON
+    }
+
+    #[test]
+    fn power_broadcast_maps_suspend_and_resume() {
+        assert_eq!(
+            power_broadcast_event(WPARAM(PBT_APMSUSPEND as usize)),
+            Some(OverlayEvent::SystemSuspending)
+        );
+        // Пробуждение приходит двумя разными PBT_* — оба → SystemResumed.
+        assert_eq!(
+            power_broadcast_event(WPARAM(PBT_APMRESUMESUSPEND as usize)),
+            Some(OverlayEvent::SystemResumed)
+        );
+        assert_eq!(
+            power_broadcast_event(WPARAM(PBT_APMRESUMEAUTOMATIC as usize)),
+            Some(OverlayEvent::SystemResumed)
+        );
+        // Запросы приостановки наружу не уходят — оверлей только докладывает
+        // о фактическом уходе в сон и пробуждении.
+        assert_eq!(power_broadcast_event(WPARAM(0)), None); // PBT_APMQUERYSUSPEND
+        assert_eq!(power_broadcast_event(WPARAM(0x9)), None); // PBT_APMBATTERYLOW
+    }
+
+    #[test]
+    fn system_and_session_events_reach_the_channel() {
+        // Сообщения шлём реальному окну вручную — диспетчеризация от wndproc
+        // до канала событий проверяется целиком; системная регистрация
+        // (WTSRegisterSessionNotification) здесь не участвует.
+        let (overlay, events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+        // SAFETY: hwnd — наше живое окно; порядок сообщений в очереди окна
+        // гарантируется (FIFO), значит и порядок событий в канале.
+        unsafe {
+            PostMessageW(
+                Some(overlay.hwnd()),
+                WM_POWERBROADCAST,
+                WPARAM(PBT_APMSUSPEND as usize),
+                LPARAM(0),
+            )
+            .expect("PostMessageW");
+            PostMessageW(
+                Some(overlay.hwnd()),
+                WM_WTSSESSION_CHANGE,
+                WPARAM(WTS_SESSION_UNLOCK as usize),
+                LPARAM(0),
+            )
+            .expect("PostMessageW");
+        }
+        match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(OverlayEvent::SystemSuspending) => {}
+            Ok(other) => panic!("ожидался SystemSuspending, получено: {other:?}"),
+            Err(e) => panic!("SystemSuspending не пришёл: {e}"),
+        }
+        match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(OverlayEvent::SessionUnlocked) => {}
+            Ok(other) => panic!("ожидался SessionUnlocked, получено: {other:?}"),
+            Err(e) => panic!("SessionUnlocked не пришёл: {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "требует реальное железо; запуск вручную: cargo test -p rst-win32 overlay -- --ignored"]
+    fn display_change_returns_fresh_snapshot() {
+        let event = handle_display_change().expect("перечисление мониторов");
+        let OverlayEvent::MonitorsChanged(monitors) = event else {
+            panic!("ожидался MonitorsChanged, получено: {event:?}");
+        };
+        assert!(!monitors.is_empty(), "хотя бы один монитор подключён");
+        assert_eq!(
+            monitors.iter().filter(|m| m.is_primary).count(),
+            1,
+            "ровно один основной"
+        );
+        for m in &monitors {
+            assert!(m.id.0.starts_with("\\\\?\\DISPLAY#"), "id: {}", m.id.0);
+        }
     }
 }
