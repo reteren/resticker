@@ -95,9 +95,16 @@ impl Renderer<'_> {
 /// грузятся один раз и рисуются на любой цели). Ключ таблицы `run()`
 /// (`HashMap<MonitorId, MonitorState>`) — `MonitorId` из перечисления
 /// (`rst_win32::monitors::enumerate`), совпадает с `Placement::monitor_id`.
+///
+/// Порядок полей важен: Rust дропает поля структур в порядке объявления,
+/// поэтому `target` (DComp-цепочка/RTV на этом HWND) объявлен раньше
+/// `overlay` (само окно) — иначе на шатдауне окно уничтожилось бы
+/// (`WM_CLOSE` + join потока, `OverlayWindow::drop`) раньше, чем
+/// освободится DComp-цепочка, построенная на его HWND
+/// (docs/M3_STEP4_REVIEW.md, пункт 2.3).
 struct MonitorState {
-    overlay: OverlayWindow,
     target: WindowTarget,
+    overlay: OverlayWindow,
     width: u32,
     height: u32,
     scale: f32,
@@ -657,6 +664,18 @@ fn run(
         return;
     }
 
+    // Отдельный от `monitors_map` снимок геометрии: панели строятся по
+    // геометрии своего «домашнего» монитора, который может отличаться от
+    // монитора текущего события (тулбар — по монитору стикера, панель у
+    // курсора — по `cursor_monitor`, docs/M3_STEP4_REVIEW.md, пункт 2.2).
+    // `HashMap` не даёt держать `&mut MonitorState` одного монитора (через
+    // `Renderer`) и `&monitors_map` для поиска геометрии другого одновременно
+    // — отдельная лёгкая копия `(width, height, scale)` снимает конфликт.
+    let mut monitor_geometry: HashMap<MonitorId, (u32, u32, f32)> = monitors_map
+        .iter()
+        .map(|(id, ms)| (id.clone(), (ms.width, ms.height, ms.scale)))
+        .collect();
+
     let mut edit = EditState {
         active: false,
         selection: SelectionSet::new(),
@@ -739,8 +758,7 @@ fn run(
                     &mut sprites,
                     &renderer,
                     &config_path,
-                    (ms.width, ms.height),
-                    ms.scale,
+                    &monitor_geometry,
                 );
                 // Клик-прозрачность снимается со ВСЕХ окон одновременно, не
                 // только с того, что владеет хоткеем — иначе мышь на других
@@ -757,7 +775,7 @@ fn run(
                 }
                 need_redraw = true;
             }
-            OverlayMessage::Event(monitor_id, OverlayEvent::ToggleAllStickers) => {
+            OverlayMessage::Event(_, OverlayEvent::ToggleAllStickers) => {
                 // Глобальный хоткей работает независимо от режима
                 // редактирования (M2b7) — та же логика, что у BTN_TOGGLE_ALL
                 // на панели у курсора (docs/M2_WIRING_PLAN.md, раздел 6).
@@ -767,8 +785,12 @@ fn run(
                     if let Err(e) = config::save(&cfg, &config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить config.json после «показать/скрыть все»");
                     }
-                    if let Some(ms) = monitors_map.get(&monitor_id) {
-                        let screen = screen_dip_rect((ms.width, ms.height), ms.scale);
+                    // Панель у курсора живёт на `cursor_monitor`, а не
+                    // обязательно на мониторе, приславшем этот хоткей (он
+                    // зарегистрирован только на основном, M3, см.
+                    // docs/M3_STEP4_REVIEW.md, пункт 2.2).
+                    if let Some(&(w, h, s)) = monitor_geometry.get(&edit.cursor_monitor) {
+                        let screen = screen_dip_rect((w, h), s);
                         rebuild_cursor_panel(&mut edit, &cfg, &screen);
                     }
                     need_redraw = true;
@@ -807,7 +829,8 @@ fn run(
                         edit.cursor_pos.1 * ratio as f64,
                     );
                 }
-                rebuild_ui_panels(&mut edit, &cfg, (ms.width, ms.height), ms.scale);
+                monitor_geometry.insert(monitor_id.clone(), (ms.width, ms.height, ms.scale));
+                rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
                 need_redraw = true;
             }
             OverlayMessage::Event(_, OverlayEvent::HotkeyConflict(combo)) => {
@@ -868,6 +891,7 @@ fn run(
                     (ms.width, ms.height),
                     ms.scale,
                     &monitor_id,
+                    &monitor_geometry,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Key { .. }) => {}
@@ -890,6 +914,7 @@ fn run(
                     &mut sprites,
                     &mut edit,
                     &monitor_id,
+                    &monitor_geometry,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
@@ -934,8 +959,7 @@ fn toggle_edit_mode(
     sprites: &mut Vec<(Uuid, Sprite)>,
     renderer: &Renderer,
     config_path: &Path,
-    overlay_size: (u32, u32),
-    scale: f32,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
 ) {
     // Выход во время незавершённого жеста откатывает его — так же, как
     // CaptureLost, а не коммитит середину перетаскивания (docs/M2_SLICE_REVIEW.md,
@@ -973,7 +997,7 @@ fn toggle_edit_mode(
             tracing::warn!(error = %e, "не удалось сохранить config.json при выходе из режима редактирования");
         }
     }
-    rebuild_ui_panels(edit, cfg, overlay_size, scale);
+    rebuild_ui_panels(edit, cfg, monitor_geometry);
 }
 
 /// Положить готовый снимок `Config` в историю undo и очистить историю redo —
@@ -1123,8 +1147,7 @@ fn begin_delete(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     center: (f64, f64),
-    overlay_size: (u32, u32),
-    scale: f32,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
     monitor_id: &MonitorId,
 ) -> bool {
     if edit.selection.is_empty() {
@@ -1148,7 +1171,7 @@ fn begin_delete(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после удаления");
         }
-        rebuild_ui_panels(edit, cfg, overlay_size, scale);
+        rebuild_ui_panels(edit, cfg, monitor_geometry);
     }
     true
 }
@@ -1170,6 +1193,7 @@ fn handle_key(
     overlay_size: (u32, u32),
     scale: f32,
     monitor_id: &MonitorId,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
 ) -> bool {
     // История/удаление/дублирование во время активного жеста (сцены или
     // панели — ползунок прозрачности тоже держит указатель) мутировали бы
@@ -1247,33 +1271,32 @@ fn handle_key(
                 sprites,
                 renderer,
                 config_path,
-                overlay_size,
-                scale,
+                monitor_geometry,
             );
             true
         }
         VK_Z if modifiers.ctrl && modifiers.shift => {
             let did = perform_redo(renderer, cfg, config_path, sprites, edit);
-            rebuild_ui_panels(edit, cfg, overlay_size, scale);
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
         }
         VK_Z if modifiers.ctrl => {
             let did = perform_undo(renderer, cfg, config_path, sprites, edit);
-            rebuild_ui_panels(edit, cfg, overlay_size, scale);
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
         }
         VK_Y if modifiers.ctrl => {
             let did = perform_redo(renderer, cfg, config_path, sprites, edit);
-            rebuild_ui_panels(edit, cfg, overlay_size, scale);
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
         }
         VK_A if modifiers.ctrl => {
             edit.selection.select_all(&cfg.stickers);
-            rebuild_ui_panels(edit, cfg, overlay_size, scale);
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
             true
         }
         VK_DELETE => {
-            let center = selection_center_or_screen(edit, cfg, overlay_size, scale);
+            let center = selection_center_or_screen(edit, cfg, overlay_size, scale, monitor_id);
             begin_delete(
                 edit,
                 renderer,
@@ -1281,8 +1304,7 @@ fn handle_key(
                 config_path,
                 sprites,
                 center,
-                overlay_size,
-                scale,
+                monitor_geometry,
                 monitor_id,
             )
         }
@@ -1305,7 +1327,7 @@ fn handle_key(
             if let Err(e) = config::save(cfg, config_path) {
                 tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
             }
-            rebuild_ui_panels(edit, cfg, overlay_size, scale);
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
             true
         }
         VK_V if modifiers.ctrl => paste_from_clipboard(
@@ -1578,6 +1600,19 @@ fn single_selected_id(selection: &SelectionSet) -> Option<Uuid> {
     }
 }
 
+/// Монитор, на котором «живёт» тулбар — монитор единственного выделенного
+/// стикера (тулбара нет, если выделение не одиночное). Общая точка для двух
+/// решений, которые обязаны совпадать (M3, docs/M3_STEP4_REVIEW.md, пункт
+/// 2.1): рисовать ли тулбар в кадре этого монитора (`redraw`) и адресован ли
+/// клик тулбару (`handle_input`) — иначе клик с чужого монитора по локальным
+/// DIP-координатам, совпавшим с тулбаром, «поглощался» бы невидимой там
+/// панелью (вплоть до срабатывания её кнопок на чужом стикере).
+fn toolbar_monitor<'a>(selection: &SelectionSet, cfg: &'a Config) -> Option<&'a MonitorId> {
+    single_selected_id(selection)
+        .and_then(|id| cfg.stickers.iter().find(|s| s.id == id))
+        .map(|s| &s.placement.monitor_id)
+}
+
 /// Применить прозрачность `percent` (0..=100, зеркалирует модель ползунка) к
 /// стикеру `id`: конвертация в `0.0..=1.0` и запись через `apply_transform`
 /// (позиция/поворот не меняются — только `transform.opacity`, раздел 6).
@@ -1655,10 +1690,35 @@ fn rebuild_cursor_panel(edit: &mut EditState, cfg: &Config, screen: &DipRect) {
 /// разошлись и оставляли панель у курсора с устаревшей иконкой «показать/
 /// скрыть все» после undo/redo и массовых операций
 /// (docs/M2_SLICE6_REVIEW.md, пункты 2.5/2.6).
-fn rebuild_ui_panels(edit: &mut EditState, cfg: &Config, overlay_size: (u32, u32), scale: f32) {
-    let screen = screen_dip_rect(overlay_size, scale);
-    rebuild_toolbar(edit, cfg, screen.h);
-    rebuild_cursor_panel(edit, cfg, &screen);
+///
+/// M3: каждая панель строится по геометрии **своего домашнего** монитора, а
+/// не монитора, приславшего текущее событие — тулбар и панель у курсора
+/// вполне могут жить на разных мониторах с разными DIP-размерами
+/// (docs/M3_STEP4_REVIEW.md, пункт 2.2). `monitor_geometry` — снимок
+/// `(width_px, height_px, scale)` по всем мониторам, отдельный от
+/// `monitors_map`: без него пришлось бы одновременно держать `&mut
+/// MonitorState` текущего монитора (внутри `Renderer`) и `&monitors_map` для
+/// поиска геометрии другого монитора, а `HashMap` не даёт занять их
+/// одновременно даже по разным ключам.
+fn rebuild_ui_panels(
+    edit: &mut EditState,
+    cfg: &Config,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) {
+    match toolbar_monitor(&edit.selection, cfg).and_then(|id| monitor_geometry.get(id)) {
+        Some(&(w, h, scale)) => {
+            let screen = screen_dip_rect((w, h), scale);
+            rebuild_toolbar(edit, cfg, screen.h);
+        }
+        None => edit.toolbar = None,
+    }
+    match monitor_geometry.get(&edit.cursor_monitor) {
+        Some(&(w, h, scale)) => {
+            let screen = screen_dip_rect((w, h), scale);
+            rebuild_cursor_panel(edit, cfg, &screen);
+        }
+        None => edit.cursor_panel = None,
+    }
 }
 
 /// Решить целевую видимость и применить её всем стикерам батчем (общая
@@ -1691,14 +1751,28 @@ fn converge_all_stickers_visibility(cfg: &mut Config) -> bool {
 /// Центр текущего выделения (для позиционирования модала удаления) или
 /// центр экрана, если выделение пусто/вырождено (общий вход для `VK_DELETE`
 /// и `TB_DELETE`, docs/M2_WIRING_PLAN.md, раздел 7).
+/// Центр выделения на мониторе `monitor_id` (для позиционирования модала
+/// удаления, который всегда рисуется на этом мониторе) или центр его экрана,
+/// если на нём нет выделенных стикеров. Union bbox по стикерам **другого**
+/// монитора не годится — их координаты локальны для своего монитора
+/// (ADR-010) и не образуют осмысленной точки в системе координат монитора
+/// модала (M3, docs/M3_STEP4_REVIEW.md, пункт 2.4); стикеры вне
+/// `monitor_id` просто не участвуют в объединении.
 fn selection_center_or_screen(
     edit: &EditState,
     cfg: &Config,
     overlay_size: (u32, u32),
     scale: f32,
+    monitor_id: &MonitorId,
 ) -> (f64, f64) {
+    let same_monitor: Vec<Sticker> = cfg
+        .stickers
+        .iter()
+        .filter(|s| s.placement.monitor_id == *monitor_id)
+        .cloned()
+        .collect();
     edit.selection
-        .bounds(&cfg.stickers)
+        .bounds(&same_monitor)
         .map(|r| (r.x + r.w / 2.0, r.y + r.h / 2.0))
         .unwrap_or((
             overlay_size.0 as f64 / 2.0 / scale as f64,
@@ -1721,6 +1795,7 @@ fn handle_toolbar_up(
     overlay_size: (u32, u32),
     scale: f32,
     monitor_id: &MonitorId,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
 ) -> bool {
     if let Some(panel) = &mut edit.toolbar {
         panel.pointer_event(PointerEvent::Up { pos });
@@ -1758,7 +1833,7 @@ fn handle_toolbar_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после изменения прозрачности");
         }
-        rebuild_ui_panels(edit, cfg, overlay_size, scale);
+        rebuild_ui_panels(edit, cfg, monitor_geometry);
         return true;
     }
 
@@ -1775,7 +1850,7 @@ fn handle_toolbar_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения видимости");
         }
-        rebuild_ui_panels(edit, cfg, overlay_size, scale);
+        rebuild_ui_panels(edit, cfg, monitor_geometry);
         return true;
     }
     if clicked(edit, toolbar::TB_ORDER_UP) {
@@ -1803,11 +1878,11 @@ fn handle_toolbar_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
         }
-        rebuild_ui_panels(edit, cfg, overlay_size, scale);
+        rebuild_ui_panels(edit, cfg, monitor_geometry);
         return true;
     }
     if clicked(edit, toolbar::TB_DELETE) {
-        let center = selection_center_or_screen(edit, cfg, overlay_size, scale);
+        let center = selection_center_or_screen(edit, cfg, overlay_size, scale, monitor_id);
         return begin_delete(
             edit,
             renderer,
@@ -1815,8 +1890,7 @@ fn handle_toolbar_up(
             config_path,
             sprites,
             center,
-            overlay_size,
-            scale,
+            monitor_geometry,
             monitor_id,
         );
     }
@@ -1876,6 +1950,7 @@ fn handle_cursor_panel_up(
     overlay_size: (u32, u32),
     scale: f32,
     monitor_id: &MonitorId,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
 ) -> bool {
     if let Some(panel) = &mut edit.cursor_panel {
         panel.pointer_event(PointerEvent::Up { pos });
@@ -1928,8 +2003,7 @@ fn handle_cursor_panel_up(
             sprites,
             renderer,
             config_path,
-            overlay_size,
-            scale,
+            monitor_geometry,
         );
         return true;
     }
@@ -1985,6 +2059,7 @@ fn handle_input(
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
     monitor_id: &MonitorId,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
 ) -> bool {
     let monitor = DipRect::new(
         0.0,
@@ -1997,36 +2072,50 @@ fn handle_input(
             let (dip_x, dip_y) = to_dip(pos, scale);
             // Модал модален: пока открыт, клики в сцену не уходят вообще —
             // ни по кнопкам модала, ни мимо него (docs/M2_WIRING_PLAN.md,
-            // раздел 5, п.1).
+            // раздел 5, п.1) — с ЛЮБОГО монитора, десктоп целиком заблокирован
+            // модалом. Но в сам виджет клик роутится, только если он пришёл с
+            // монитора модала — иначе локальные DIP-координаты чужого
+            // монитора могли бы случайно совпасть с кнопкой «Удалить»
+            // (docs/M3_STEP4_REVIEW.md, пункт 2.1).
             if let Some(confirm) = &mut edit.confirm {
-                confirm.panel.pointer_event(PointerEvent::Down {
-                    pos: (dip_x, dip_y),
-                });
+                if confirm.monitor_id == *monitor_id {
+                    confirm.panel.pointer_event(PointerEvent::Down {
+                        pos: (dip_x, dip_y),
+                    });
+                }
                 return true;
             }
             // Приоритет top-down по z-order: панель у курсора выше тулбара
             // на экране (redraw рисует её позже), поэтому и в хит-тесте она
-            // первая (docs/M2_WIRING_PLAN.md, раздел 5).
-            if let Some(panel) = &mut edit.cursor_panel {
-                if panel
-                    .pointer_event(PointerEvent::Down {
-                        pos: (dip_x, dip_y),
-                    })
-                    .consumed
-                {
-                    edit.pointer_owner = PointerOwner::CursorPanel;
-                    return true;
+            // первая (docs/M2_WIRING_PLAN.md, раздел 5). Обе панели
+            // хит-тестятся только на своём «домашнем» мониторе (M3,
+            // docs/M3_STEP4_REVIEW.md, пункт 2.1) — иначе клик по пустому
+            // месту монитора A, чьи локальные DIP-координаты совпали с
+            // панелью на мониторе B, «поглощался» бы невидимой там панелью.
+            if edit.cursor_monitor == *monitor_id {
+                if let Some(panel) = &mut edit.cursor_panel {
+                    if panel
+                        .pointer_event(PointerEvent::Down {
+                            pos: (dip_x, dip_y),
+                        })
+                        .consumed
+                    {
+                        edit.pointer_owner = PointerOwner::CursorPanel;
+                        return true;
+                    }
                 }
             }
-            if let Some(panel) = &mut edit.toolbar {
-                if panel
-                    .pointer_event(PointerEvent::Down {
-                        pos: (dip_x, dip_y),
-                    })
-                    .consumed
-                {
-                    edit.pointer_owner = PointerOwner::Toolbar;
-                    return true;
+            if toolbar_monitor(&edit.selection, cfg) == Some(monitor_id) {
+                if let Some(panel) = &mut edit.toolbar {
+                    if panel
+                        .pointer_event(PointerEvent::Down {
+                            pos: (dip_x, dip_y),
+                        })
+                        .consumed
+                    {
+                        edit.pointer_owner = PointerOwner::Toolbar;
+                        return true;
+                    }
                 }
             }
             edit.pointer_owner = PointerOwner::Scene;
@@ -2053,14 +2142,14 @@ fn handle_input(
                         edit.selection.shift_click(id);
                         let changed = before != edit.selection.ids();
                         if changed {
-                            rebuild_ui_panels(edit, cfg, overlay_size, scale);
+                            rebuild_ui_panels(edit, cfg, monitor_geometry);
                         }
                         return changed;
                     }
                     edit.selection.click(Some(id));
                     let changed = before != edit.selection.ids();
                     if changed {
-                        rebuild_ui_panels(edit, cfg, overlay_size, scale);
+                        rebuild_ui_panels(edit, cfg, monitor_geometry);
                     }
                     if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
                         let start = GestureStart {
@@ -2121,9 +2210,14 @@ fn handle_input(
             edit.cursor_pos = (dip_x, dip_y);
             edit.cursor_monitor = monitor_id.clone();
             if let Some(confirm) = &mut edit.confirm {
-                confirm.panel.pointer_event(PointerEvent::Move {
-                    pos: (dip_x, dip_y),
-                });
+                // Модал блокирует всю сцену на любом мониторе (см. MouseDown),
+                // но hover-состояние его виджетов трогаем только своим
+                // движением мыши (M3, docs/M3_STEP4_REVIEW.md, пункт 2.1).
+                if confirm.monitor_id == *monitor_id {
+                    confirm.panel.pointer_event(PointerEvent::Move {
+                        pos: (dip_x, dip_y),
+                    });
+                }
                 return true;
             }
             match edit.pointer_owner {
@@ -2165,7 +2259,7 @@ fn handle_input(
                         // проходит через эту ветку, но `rebuild_toolbar` сам
                         // держит его скрытым, пока `edit.marquee.is_some()` —
                         // вызов безопасен для обоих случаев.
-                        rebuild_ui_panels(edit, cfg, overlay_size, scale);
+                        rebuild_ui_panels(edit, cfg, monitor_geometry);
                     }
                     return need_redraw;
                 }
@@ -2183,21 +2277,25 @@ fn handle_input(
                     })
                     .redraw;
             }
-            if let Some(panel) = &mut edit.toolbar {
-                need_redraw |= panel
-                    .pointer_event(PointerEvent::Move {
-                        pos: (dip_x, dip_y),
-                    })
-                    .redraw;
+            let toolbar_here = toolbar_monitor(&edit.selection, cfg) == Some(monitor_id);
+            if toolbar_here {
+                if let Some(panel) = &mut edit.toolbar {
+                    need_redraw |= panel
+                        .pointer_event(PointerEvent::Move {
+                            pos: (dip_x, dip_y),
+                        })
+                        .redraw;
+                }
             }
             let over_panel = edit
                 .cursor_panel
                 .as_ref()
                 .is_some_and(|p| p.hit_test((dip_x, dip_y)))
-                || edit
-                    .toolbar
-                    .as_ref()
-                    .is_some_and(|p| p.hit_test((dip_x, dip_y)));
+                || (toolbar_here
+                    && edit
+                        .toolbar
+                        .as_ref()
+                        .is_some_and(|p| p.hit_test((dip_x, dip_y))));
             if over_panel {
                 overlay.post_cursor_shape(CursorShape::Arrow);
             } else {
@@ -2214,6 +2312,16 @@ fn handle_input(
                 // заимствованием `edit.confirm` (docs/M2_WIRING_PLAN.md,
                 // раздел 6, таблица «Модал»).
                 let mut confirm = edit.confirm.take().expect("проверено выше");
+                // Модал блокирует весь десктоп (клик с любого монитора не
+                // уходит в сцену), но в его кнопки клик роутится только со
+                // своего монитора — иначе локальные DIP-координаты чужого
+                // монитора могли бы случайно совпасть с «Удалить» и стереть
+                // выделение (M3, docs/M3_STEP4_REVIEW.md, пункт 2.1). Клик с
+                // чужого монитора — тот же путь, что и «мимо модала» ниже.
+                if confirm.monitor_id != *monitor_id {
+                    edit.confirm = Some(confirm);
+                    return true;
+                }
                 confirm.panel.pointer_event(PointerEvent::Up {
                     pos: (dip_x, dip_y),
                 });
@@ -2242,7 +2350,7 @@ fn handle_input(
                     if let Err(e) = config::save(cfg, config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить config.json после удаления через диалог");
                     }
-                    rebuild_ui_panels(edit, cfg, overlay_size, scale);
+                    rebuild_ui_panels(edit, cfg, monitor_geometry);
                 } else if confirm
                     .panel
                     .widget_mut::<Button>(confirm_dialog::ID_DONT_ASK)
@@ -2288,6 +2396,7 @@ fn handle_input(
                         overlay_size,
                         scale,
                         monitor_id,
+                        monitor_geometry,
                     );
                 }
                 PointerOwner::Toolbar => {
@@ -2302,6 +2411,7 @@ fn handle_input(
                         overlay_size,
                         scale,
                         monitor_id,
+                        monitor_geometry,
                     );
                 }
                 PointerOwner::Scene | PointerOwner::None => {}
@@ -2317,7 +2427,7 @@ fn handle_input(
                     // сейчас (docs/M2_WIRING_PLAN.md, раздел 8).
                     edit.selection.click(None);
                 }
-                rebuild_ui_panels(edit, cfg, overlay_size, scale);
+                rebuild_ui_panels(edit, cfg, monitor_geometry);
                 return true;
             }
             if edit.gesture.take().is_some() {
@@ -2356,7 +2466,7 @@ fn handle_input(
                     resync_sprites(renderer, cfg, sprites);
                 }
                 edit.pointer_owner = PointerOwner::None;
-                rebuild_ui_panels(edit, cfg, overlay_size, scale);
+                rebuild_ui_panels(edit, cfg, monitor_geometry);
                 return true;
             }
             edit.pointer_owner = PointerOwner::None;
@@ -2640,11 +2750,8 @@ fn redraw(
     // Тулбар и панель у курсора — над рамками выделения, под модалом
     // (раздел 11). Тулбар следует за монитором выделенного стикера; панель
     // у курсора и марка — за `edit.cursor_monitor` (M3, см. выше).
-    let toolbar_monitor = single_selected_id(&edit.selection)
-        .and_then(|id| cfg.stickers.iter().find(|s| s.id == id))
-        .map(|s| &s.placement.monitor_id);
     if let Some(toolbar) = &edit.toolbar {
-        if toolbar_monitor == Some(monitor_id) {
+        if toolbar_monitor(&edit.selection, cfg) == Some(monitor_id) {
             let mut prims = Vec::new();
             toolbar.draw(&mut prims);
             primitives_to_sprites(
