@@ -4,21 +4,21 @@
 //! текстуру, фабрика (GPU) не вызывается.
 //!
 //! Текстуры создаются через [`TextureFactory`], чтобы модуль не зависел от
-//! конкретного рендерера: реальная фабрика — [`crate::Renderer`], в тестах —
+//! конкретного устройства: реальная фабрика — [`crate::Device`], в тестах —
 //! мок без D3D11-устройства.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use crate::text;
-use crate::{RenderError, Renderer, Texture};
+use crate::{Device, RenderError, Texture};
 
 /// Фабрика GPU-текстур для [`UiTextures`]: единственная операция — залить
 /// RGBA-пиксели (straight alpha, premultiply делает загрузчик текстуры)
-/// в текстуру. Реальная реализация — [`crate::Renderer`]; в тестах
+/// в текстуру. Реальная реализация — [`crate::Device`]; в тестах
 /// подставляется мок, считающий вызовы.
 pub trait TextureFactory {
-    /// Тип текстуры фабрики (у `Renderer` — [`Texture`]).
+    /// Тип текстуры фабрики (у `Device` — [`Texture`]).
     type Texture: Clone;
 
     /// Залить `data` (RGBA `width`×`height`, straight alpha) в текстуру.
@@ -30,7 +30,7 @@ pub trait TextureFactory {
     ) -> Result<Self::Texture, RenderError>;
 }
 
-impl TextureFactory for Renderer {
+impl TextureFactory for Device {
     type Texture = Texture;
 
     fn create_texture_from_rgba(
@@ -39,14 +39,14 @@ impl TextureFactory for Renderer {
         width: u32,
         height: u32,
     ) -> Result<Self::Texture, RenderError> {
-        Renderer::create_texture_from_rgba(self, data, width, height)
+        Device::create_texture_from_rgba(self, data, width, height)
     }
 }
 
 /// Кэш текстур UI редактора (docs/M2_WIRING_PLAN.md, §2–3): 1×1 пиксель цвета
 /// под `Primitive::Fill` и растр строки под `Primitive::Text`.
 ///
-/// `T` — тип текстуры фабрики (у боевого рендерера — [`Texture`], в тестах —
+/// `T` — тип текстуры фабрики (у боевого устройства — [`Texture`], в тестах —
 /// фейк). Параметризация по типу нужна, чтобы юнит-тесты обходились без GPU.
 pub struct UiTextures<T> {
     /// Целочисленный масштаб растеризации текста (1 для 100% DPI, 2 для 200%;

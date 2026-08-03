@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use rst_core::model::{MonitorId, Placement, Transform};
-use rst_render::{Renderer, Sprite};
+use rst_render::{Device, Sprite, WindowTarget};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -73,9 +73,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("overlay_demo: окно создано");
-    let mut renderer = Renderer::new(hwnd, sw, sh)?;
-    println!("overlay_demo: рендерер создан");
-    let tex = renderer.load_image(&png_path)?;
+    let device = Device::new()?;
+    let target = WindowTarget::new(&device, hwnd, sw, sh)?;
+    println!("overlay_demo: устройство и цель созданы");
+    let tex = device.load_image(&png_path)?;
     println!(
         "overlay_demo: текстура загружена {}x{}",
         tex.width(),
@@ -106,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sprite(1440.0, 540.0, 256.0, 0.0, 0.5), // полупрозрачный
         sprite(960.0, 220.0, 64.0, 0.0, 1.0),   // уменьшенный (мипмапы)
     ];
-    renderer.draw(&sprites)?;
+    device.draw(&target, &sprites)?;
     println!("overlay_demo: кадр представлен; окно закроется через 4 с");
 
     // Кадр уже представлен; просто держим окно 4 секунды.

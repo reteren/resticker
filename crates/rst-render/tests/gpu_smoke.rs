@@ -1,9 +1,10 @@
-//! GPU smoke-тест: создание рендерера на реальном окне, текстура, resize,
-//! представление кадра. Требует GPU и дисплей — по умолчанию пропускается:
+//! GPU smoke-тест: создание устройства и цели рендера на реальном окне,
+//! текстура, resize, представление кадра. Требует GPU и дисплей — по
+//! умолчанию пропускается:
 //!   cargo test -p rst-render --test gpu_smoke -- --ignored
 
 use rst_core::model::{MonitorId, Placement, Transform};
-use rst_render::{Renderer, Sprite};
+use rst_render::{Device, Sprite, WindowTarget};
 use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -34,8 +35,10 @@ fn renderer_creates_draws_and_resizes_on_a_real_window() {
     };
     let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
 
-    let mut renderer = Renderer::new(hwnd, 320, 240).expect("рендерер создаётся на GPU");
-    let tex = renderer
+    let device = Device::new().expect("устройство создаётся на GPU");
+    let mut target =
+        WindowTarget::new(&device, hwnd, 320, 240).expect("цель рендера создаётся на GPU");
+    let tex = device
         .create_texture_from_rgba(&[255, 128, 0, 255], 1, 1)
         .expect("текстура создаётся");
     assert_eq!((tex.width(), tex.height()), (1, 1));
@@ -51,18 +54,22 @@ fn renderer_creates_draws_and_resizes_on_a_real_window() {
         },
         Transform::default(),
     );
-    renderer.draw(&[sprite]).expect("кадр представлен");
+    device.draw(&target, &[sprite]).expect("кадр представлен");
 
-    renderer.resize(640, 480).expect("resize не падает");
-    assert_eq!(renderer.size(), (640, 480));
-    renderer.draw(&[]).expect("пустой кадр после resize — ок");
+    target.resize(&device, 640, 480).expect("resize не падает");
+    assert_eq!(target.size(), (640, 480));
+    device
+        .draw(&target, &[])
+        .expect("пустой кадр после resize — ок");
 
-    renderer.resize(0, 0).expect("нулевой размер — не ошибка");
-    renderer
-        .draw(&[])
+    target
+        .resize(&device, 0, 0)
+        .expect("нулевой размер — не ошибка");
+    device
+        .draw(&target, &[])
         .expect("кадр на нулевом размере пропускается");
 
-    // SAFETY: окно больше не нужно; рендерер уничтожается после окна — для
+    // SAFETY: окно больше не нужно; цель уничтожается после окна — для
     // smoke-теста порядок некритичен, окно всё равно умирает с процессом теста.
     unsafe { DestroyWindow(hwnd) }.unwrap();
 }

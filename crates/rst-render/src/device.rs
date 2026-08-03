@@ -1,25 +1,26 @@
-//! Рендерер: D3D11-устройство + DirectComposition-цепочка на окно,
-//! отрисовка списка спрайтов строго по требованию (ADR-006).
+//! Процесс-wide D3D11-устройство (ARCHITECTURE.md, раздел 1: «Один D3D11-девайс
+//! на процесс»; M3_PREP_NOTES.md, §4.2). Владеет устройством и контекстом,
+//! скомпилированными шейдерами, сэмплером, blend-состоянием и константным
+//! буфером; текстуры грузятся здесь — один раз на процесс — и рисуются на
+//! любом [`crate::WindowTarget`] (любом мониторе) без перезаливки на GPU.
 
 use std::path::Path;
 
 use rst_core::model::Placement;
-use windows::Win32::Foundation::{HMODULE, HWND};
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::DirectComposition::{
-    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice, IDCompositionDevice};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIDevice, IDXGIFactory2,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-};
-use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, PCSTR};
 
 use crate::sprite::Sprite;
 use crate::texture::Texture;
+use crate::window_target::WindowTarget;
 use crate::{RenderError, shader};
 
 /// Константный буфер шейдера спрайта: строго три float4 под HLSL-упаковку
@@ -44,40 +45,33 @@ fn placement_to_physical(p: &Placement, scale: f32) -> [f32; 4] {
     ]
 }
 
-/// D3D11 + DirectComposition рендерер на одно окно.
+/// D3D11-устройство процесса: один экземпляр на процесс, любое число
+/// [`WindowTarget`] на его базе.
 ///
 /// Владение: все COM-объекты — умные указатели windows-rs, `Release` вызывается
-/// автоматически в `Drop`; сырой хендл окна рендереру не принадлежит — окно
-/// (из rst-win32) обязано пережить рендерер. M3 позже: сейчас один рендерер =
-/// одно устройство; на процесс с несколькими мониторами устройство будет
-/// общим (ARCHITECTURE.md, раздел 1).
-pub struct Renderer {
+/// автоматически в `Drop`. Текстуры живут на устройстве: после потери D3D
+/// (`DEVICE_REMOVED`) пересоздаётся устройство целиком, затем — все цели и
+/// текстуры (ARCHITECTURE.md, раздел 11; M3_PREP_NOTES.md, §4.3).
+pub struct Device {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    // Держатели композиционного дерева: читаются не будут, но обязаны жить,
-    // пока жив рендерер — drop сносит визуальное дерево окна.
-    _dcomp_device: IDCompositionDevice,
-    _dcomp_target: IDCompositionTarget,
-    _dcomp_visual: IDCompositionVisual,
-    swapchain: IDXGISwapChain1,
-    rtv: Option<ID3D11RenderTargetView>,
+    /// DXGI-фабрика под композиционные цепочки целей (одна на устройство).
+    factory: IDXGIFactory2,
+    /// DirectComposition-устройство: общее, цели создаются на конкретный HWND.
+    dcomp_device: IDCompositionDevice,
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     cb: ID3D11Buffer,
     sampler: ID3D11SamplerState,
     blend: ID3D11BlendState,
-    size: (u32, u32),
-    scale: f32,
 }
 
-impl Renderer {
-    /// Создать рендерер на окно `hwnd` размером `width`×`height` физических
-    /// пикселей: D3D11-устройство, DirectComposition-цепочка с premultiplied
-    /// alpha, шейдер спрайта. Проверено спайком S0 (ADR-003).
-    ///
-    /// Окно должно иметь `WS_EX_NOREDIRECTIONBITMAP`: содержимое показывается
-    /// только через DirectComposition, обычный Present на HWND невозможен.
-    pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self, RenderError> {
+impl Device {
+    /// Создать D3D11-устройство процесса с BGRA-поддержкой (нужна
+    /// композиционным цепочкам), DXGI-фабрикой, DirectComposition-устройством
+    /// и шейдером спрайта. Проверено спайком S0 (ADR-003). GPU-текстур не
+    /// создаёт — их грузят по требованию (`create_texture_from_rgba`).
+    pub fn new() -> Result<Self, RenderError> {
         // --- D3D11-устройство (BGRA нужен композиционным цепочкам) ---
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
@@ -99,53 +93,18 @@ impl Renderer {
         let device = device.expect("D3D11CreateDevice без ошибки возвращает устройство");
         let context = context.expect("D3D11CreateDevice без ошибки возвращает контекст");
 
-        // --- DirectComposition: device -> target(hwnd, topmost) -> visual ---
+        // --- DXGI-фабрика под композиционные цепочки целей ---
+        // SAFETY: вызов без параметров-указателей; возвращённая фабрика наша.
+        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
+            .map_err(RenderError::Windows)?;
+
+        // --- DirectComposition: общее устройство, цели создаёт WindowTarget ---
         // Interface::cast — безопасный QueryInterface: для D3D11-устройства
         // IDXGIDevice гарантирован.
         let dxgi_dev: IDXGIDevice = device.cast().map_err(RenderError::Windows)?;
         // SAFETY: `dxgi_dev` — валидный DXGI-устройство того же адаптера.
         let dcomp_device: IDCompositionDevice =
             unsafe { DCompositionCreateDevice(&dxgi_dev) }.map_err(RenderError::Windows)?;
-        // SAFETY: `hwnd` принадлежит вызывающей стороне и жив дольше рендерера.
-        let dcomp_target = unsafe { dcomp_device.CreateTargetForHwnd(hwnd, true) }
-            .map_err(RenderError::Windows)?;
-        // SAFETY: dcomp_device жив; visual — новый, владеем им мы.
-        let dcomp_visual = unsafe { dcomp_device.CreateVisual() }.map_err(RenderError::Windows)?;
-        // SAFETY: target и visual живы и принадлежат нам.
-        unsafe { dcomp_target.SetRoot(Some(&dcomp_visual)) }.map_err(RenderError::Windows)?;
-
-        // --- Композиционная цепочка с premultiplied alpha ---
-        let size = (width, height);
-        let desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: width.max(1),
-            Height: height.max(1),
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            Stereo: false.into(),
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
-            Scaling: DXGI_SCALING_STRETCH,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-            AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-            Flags: 0,
-        };
-        // SAFETY: вызов без параметров-указателей; возвращённая фабрика наша.
-        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
-            .map_err(RenderError::Windows)?;
-        // SAFETY: `device` жив; desc валиден; цепочка для композиции, а не HWND.
-        let swapchain = unsafe { factory.CreateSwapChainForComposition(&device, &desc, None) }
-            .map_err(RenderError::Windows)?;
-        // SAFETY: visual и swapchain живы и принадлежат нам.
-        unsafe { dcomp_visual.SetContent(&swapchain) }.map_err(RenderError::Windows)?;
-        // SAFETY: dcomp_device жив; Commit фиксирует дерево композиции.
-        unsafe { dcomp_device.Commit() }.map_err(RenderError::Windows)?;
-
-        let rtv = (width > 0 && height > 0)
-            .then(|| create_rtv(&device, &swapchain))
-            .transpose()?;
 
         // --- Шейдер спрайта ---
         // SAFETY: литералы с NUL на конце живут в статике.
@@ -220,65 +179,14 @@ impl Renderer {
         Ok(Self {
             device,
             context,
-            _dcomp_device: dcomp_device,
-            _dcomp_target: dcomp_target,
-            _dcomp_visual: dcomp_visual,
-            swapchain,
-            rtv,
+            factory,
+            dcomp_device,
             vs,
             ps,
             cb,
             sampler,
             blend,
-            size,
-            scale: 1.0,
         })
-    }
-
-    /// Текущий размер цепочки в физических пикселях.
-    pub fn size(&self) -> (u32, u32) {
-        self.size
-    }
-
-    /// Масштаб DIP → физические пиксели (dpi/96). M1: задаётся один раз;
-    /// полноценный смешанный DPI и WM_DPICHANGED — веха M3.
-    pub fn set_dpi_scale(&mut self, scale: f32) {
-        self.scale = if scale > 0.0 { scale } else { 1.0 };
-    }
-
-    /// Текущий масштаб DIP → физические пиксели — нужен вызывающему коду
-    /// (M2: перевод координат мыши из физических пикселей в DIP перед
-    /// хит-тестом, docs/M2_INTEGRATION_REVIEW.md, раздел 2).
-    pub fn dpi_scale(&self) -> f32 {
-        self.scale
-    }
-
-    /// Сообщить рендереру новый размер окна (физические пиксели).
-    /// Нулевой размер (свёрнуто/скрыто) — не ошибка: кадры просто пропускаются.
-    /// Полноценная мультимониторная пересборка — веха M3.
-    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), RenderError> {
-        if (width, height) == self.size {
-            return Ok(());
-        }
-        self.size = (width, height);
-        // Все ссылки на backbuffer обязаны быть отпущены до ResizeBuffers.
-        self.rtv = None;
-        if width == 0 || height == 0 {
-            return Ok(());
-        }
-        // SAFETY: ссылки на backbuffer отпущены выше; размеры ненулевые.
-        unsafe {
-            self.swapchain.ResizeBuffers(
-                2,
-                width,
-                height,
-                DXGI_FORMAT_B8G8R8A8_UNORM,
-                DXGI_SWAP_CHAIN_FLAG(0),
-            )
-        }
-        .map_err(RenderError::Windows)?;
-        self.rtv = Some(create_rtv(&self.device, &self.swapchain)?);
-        Ok(())
     }
 
     /// Загрузить изображение из файла (PNG/JPEG/WebP/BMP) в GPU-текстуру
@@ -294,6 +202,8 @@ impl Renderer {
     }
 
     /// Загрузить RGBA-пиксели (straight alpha) в GPU-текстуру с мипмапами.
+    /// Текстура принадлежит устройству и рисуется на любой [`WindowTarget`] —
+    /// перетаскивание стикера между мониторами не перезаливает её на GPU.
     pub fn create_texture_from_rgba(
         &self,
         data: &[u8],
@@ -303,13 +213,14 @@ impl Renderer {
         Texture::from_rgba(&self.device, &self.context, data, width, height)
     }
 
-    /// Отрисовать список спрайтов (порядок списка = порядок отрисовки,
-    /// первый — нижний) и представить кадр. Вызывается строго по требованию
-    /// (ADR-006): внутреннего цикла и таймеров нет, ноль вызовов = ноль
-    /// кадров в покое.
-    pub fn draw(&mut self, sprites: &[Sprite]) -> Result<(), RenderError> {
-        let (w, h) = self.size;
-        let Some(rtv) = self.rtv.clone() else {
+    /// Отрисовать список спрайтов в цель `target` (порядок списка = порядок
+    /// отрисовки, первый — нижний) и представить кадр. Вызывается строго по
+    /// требованию (ADR-006): внутреннего цикла и таймеров нет, ноль вызовов =
+    /// ноль кадров в покое. Мутация — только состояние GPU-контекста, поэтому
+    /// метод берёт `&self`: один и тот же кадр можно отдать на все цели.
+    pub fn draw(&self, target: &WindowTarget, sprites: &[Sprite]) -> Result<(), RenderError> {
+        let (w, h) = target.size();
+        let Some(rtv) = target.rtv() else {
             return Ok(()); // окно с нулевым размером: рисовать некуда
         };
         if w == 0 || h == 0 {
@@ -317,8 +228,8 @@ impl Renderer {
         }
 
         // SAFETY: все COM-объекты живы и принадлежат self; контекст
-        // используется только с потока-владельца рендерера (Renderer
-        // намеренно не Send/Sync). Указатели на массивы валидны на время вызова.
+        // используется только с потока-владельца (Device намеренно не
+        // Send/Sync). Указатели на массивы валидны на время вызова.
         unsafe {
             let clear = [0.0f32; 4]; // полностью прозрачный фон
             self.context.ClearRenderTargetView(&rtv, &clear);
@@ -350,11 +261,12 @@ impl Renderer {
         // между Map и Unmap; SpriteParams — repr(C) и помещается в буфер.
         unsafe {
             let cb_res: ID3D11Resource = self.cb.cast().map_err(RenderError::Windows)?;
+            let scale = target.dpi_scale();
             for sprite in sprites {
                 if sprite.placement.w <= 0.0 || sprite.placement.h <= 0.0 {
                     continue;
                 }
-                let [cx, cy, sw, sh] = placement_to_physical(&sprite.placement, self.scale);
+                let [cx, cy, sw, sh] = placement_to_physical(&sprite.placement, scale);
                 let (sin, cos) = (sprite.transform.rotation as f32).sin_cos();
                 let params = SpriteParams {
                     tr: [cx, cy, sw, sh],
@@ -388,38 +300,23 @@ impl Renderer {
                 self.context.Draw(6, 0);
             }
         }
-        self.present()
+        target.present()
     }
 
-    /// Представить кадр (vsync). Потеря устройства возвращается отдельным
-    /// вариантом ошибки: рендерер надо пересоздать (ARCHITECTURE.md, раздел 11).
-    fn present(&self) -> Result<(), RenderError> {
-        // SAFETY: swapchain жив и принадлежит self.
-        let hr = unsafe { self.swapchain.Present(1, DXGI_PRESENT(0)) };
-        hr.ok().map_err(|e| {
-            let code = e.code();
-            if code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET {
-                RenderError::DeviceLost(code)
-            } else {
-                RenderError::Windows(e)
-            }
-        })
+    /// Доступ к D3D11-устройству для целей рендера (RTV, swapchain).
+    pub(crate) fn d3d_device(&self) -> &ID3D11Device {
+        &self.device
     }
-}
 
-/// Создать RTV на backbuffer цепочки (общий код `new` и `resize`).
-fn create_rtv(
-    device: &ID3D11Device,
-    swapchain: &IDXGISwapChain1,
-) -> Result<ID3D11RenderTargetView, RenderError> {
-    // SAFETY: цепочка жива; буфер 0 существует (BufferCount = 2).
-    let back: ID3D11Texture2D = unsafe { swapchain.GetBuffer(0) }.map_err(RenderError::Windows)?;
-    let mut rtv: Option<ID3D11RenderTargetView> = None;
-    // SAFETY: `back` — валидный ID3D11Resource и отпускается сразу после;
-    // out-параметр валиден.
-    unsafe { device.CreateRenderTargetView(&back, None, Some(&mut rtv)) }
-        .map_err(RenderError::Windows)?;
-    Ok(rtv.expect("CreateRenderTargetView без ошибки возвращает объект"))
+    /// Общее DirectComposition-устройство (цели создаются на конкретный HWND).
+    pub(crate) fn dcomp_device(&self) -> &IDCompositionDevice {
+        &self.dcomp_device
+    }
+
+    /// DXGI-фабрика под композиционные цепочки целей.
+    pub(crate) fn factory(&self) -> &IDXGIFactory2 {
+        &self.factory
+    }
 }
 
 #[cfg(test)]
