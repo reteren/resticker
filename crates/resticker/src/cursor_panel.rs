@@ -7,11 +7,6 @@
 //! кнопок — зона координатора: ему доступны [`Panel::translate`] и
 //! [`Button::take_click`] по идентификаторам ниже.
 
-// Публичный API модуля подключается координатором следующим срезом
-// интеграции (docs/M2_INTEGRATION_PLAN.md, §11); до тех пор bin-крейт
-// считал бы его мёртвым кодом.
-#![allow(dead_code)]
-
 use rst_core::hittest::DipRect;
 use rst_render::{Box2D, Button, Icon, Panel, WidgetId, theme};
 

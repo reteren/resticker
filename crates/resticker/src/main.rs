@@ -5,14 +5,10 @@
 //! (`overlay_manager`), добавление стикера из настроек, восстановление
 //! между запусками. Остальное — следующие вехи (ROADMAP.md).
 
+mod confirm_dialog;
 mod cursor_panel;
 mod logging;
 mod overlay_manager;
-// Модал подтверждения удаления и тулбар — модули собираются и тестируются,
-// но вызов build() добавит координатор (вёрстка в срез 4); до этого items мертвы.
-#[allow(dead_code)]
-mod confirm_dialog;
-#[allow(dead_code)]
 mod toolbar;
 
 use std::path::PathBuf;
