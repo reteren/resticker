@@ -1667,6 +1667,31 @@ fn screen_dip_rect(overlay_size: (u32, u32), scale: f32) -> DipRect {
     )
 }
 
+/// Сдвинуть центр так, чтобы AABB стикера целиком помещался в `screen` (не
+/// только центр, как `snap::clamp_min_visible`, который специально разрешает
+/// уходить за край во время самого драга) — используется сразу после
+/// перепривязки на другой монитор: без этого часть bbox остаётся физически
+/// над монитором-источником, а хит-тест по `monitor_id` её не видит
+/// (docs/M3_STEP7_REVIEW.md, пункт 2.2). Сжатия по осям независимы; для
+/// стикера крупнее `screen` по одной из осей — лучшее доступное (прижат к
+/// обеим границам разом не будет, но это вырожденный случай вне охвата
+/// среза, как и у `clamp_min_visible`).
+fn clamp_fully_within_monitor(placement: &Placement, rotation: f64, screen: &DipRect) -> Placement {
+    let bounds = hittest::aabb(placement, rotation);
+    let mut p = placement.clone();
+    if bounds.x < screen.x {
+        p.cx += screen.x - bounds.x;
+    } else if bounds.x + bounds.w > screen.x + screen.w {
+        p.cx -= (bounds.x + bounds.w) - (screen.x + screen.w);
+    }
+    if bounds.y < screen.y {
+        p.cy += screen.y - bounds.y;
+    } else if bounds.y + bounds.h > screen.y + screen.h {
+        p.cy -= (bounds.y + bounds.h) - (screen.y + screen.h);
+    }
+    p
+}
+
 /// Пересобрать тулбар по текущему выделению (docs/M2_WIRING_PLAN.md,
 /// раздел 4): есть, когда режим активен, выделен ровно один стикер и марка
 /// не тянется; иначе — `None`. Билдер дёшев, но пересборка сбрасывает
@@ -2459,40 +2484,73 @@ fn handle_input(
                 rebuild_ui_panels(edit, cfg, monitor_geometry);
                 return true;
             }
-            // Перепривязка стикера к другому монитору по центру bbox
-            // (M3 step 7, «простой» вариант из M3_PREP_NOTES.md §5.4): драг
-            // зажат своим монитором на всё время жеста (мышь захвачена этим
-            // окном), а на завершении — если центр ушёл за границу — рибайнд
-            // на монитор, который теперь его накрывает, с сохранением точной
-            // физической позиции на экране. Только `Drag` — `Resize`/`Rotate`
-            // не двигают центр стикера настолько, чтобы это было нужно (их
-            // клампит `clamp_min_visible` в границах своего монитора).
-            if let Some(Gesture::Drag { start, .. }) = &edit.gesture {
+            // Перепривязка стикера к другому монитору по центру bbox (M3
+            // step 7, «простой» вариант из M3_PREP_NOTES.md §5.4). И `Drag`,
+            // и `Resize` без `Alt` (якорь неподвижен — центр смещается на
+            // половину дельты, до 0.4·w за край источника) могут увести
+            // центр стикера за границу монитора — исходная версия этого
+            // блока ошибочно считала, что это бывает только у `Drag`
+            // (docs/M3_STEP7_REVIEW.md, пункт 2.1). `Rotate` безопасен (центр
+            // не двигается) и гейт по реальному движению ниже естественно
+            // его пропускает — как и клик без единого движения, который
+            // иначе мог бы молча перепривязать стикер и сжечь шаг истории,
+            // если центр уже был за краем до этого клика (пункт 2.3).
+            if let Some(start) = edit.gesture.as_ref().and_then(Gesture::start) {
                 let id = start.id;
-                let placement = cfg
+                let start_placement = start.placement.clone();
+                let current = cfg
                     .stickers
                     .iter()
                     .find(|s| s.id == id)
-                    .map(|s| s.placement.clone());
-                if let (Some(source), Some(placement)) = (monitor_bounds.get(monitor_id), placement)
-                {
-                    let others: Vec<MonitorBounds> = monitor_bounds
-                        .iter()
-                        .filter(|(other_id, _)| *other_id != monitor_id)
-                        .map(|(_, b)| b.clone())
-                        .collect();
-                    let rebound =
-                        monitor_rebind::rebind_monitor_by_center(&placement, source, &others);
-                    if rebound.monitor_id != placement.monitor_id {
-                        if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
-                            sticker.placement = rebound.clone();
+                    .map(|s| (s.placement.clone(), s.transform.rotation));
+                if let Some((placement, rotation)) = current {
+                    if placement != start_placement {
+                        if let Some(source) = monitor_bounds.get(monitor_id) {
+                            // Порядок — по id, а не порядок обхода HashMap:
+                            // rebind_monitor_by_center документирует тай-брейк
+                            // «первый в списке побеждает» как ответственность
+                            // вызывающего кода (docs/M3_STEP7_REVIEW.md, пункт
+                            // 2.5) — без сортировки выбор между клонированными
+                            // мониторами был бы недетерминирован.
+                            let mut others: Vec<MonitorBounds> = monitor_bounds
+                                .iter()
+                                .filter(|(other_id, _)| *other_id != monitor_id)
+                                .map(|(_, b)| b.clone())
+                                .collect();
+                            others.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+                            let rebound = monitor_rebind::rebind_monitor_by_center(
+                                &placement, source, &others,
+                            );
+                            if rebound.monitor_id != placement.monitor_id {
+                                // Дожать bbox целиком на новый монитор — без
+                                // этого видимая часть стикера, оставшаяся
+                                // физически над монитором-источником, была бы
+                                // мертва для ввода: хит-тест фильтрует по
+                                // monitor_id, а не по факту перекрытия
+                                // (docs/M3_STEP7_REVIEW.md, пункт 2.2).
+                                let rebound = match monitor_geometry.get(&rebound.monitor_id) {
+                                    Some(&(w, h, s)) => clamp_fully_within_monitor(
+                                        &rebound,
+                                        rotation,
+                                        &screen_dip_rect((w, h), s),
+                                    ),
+                                    None => rebound,
+                                };
+                                if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id)
+                                {
+                                    sticker.placement = rebound.clone();
+                                }
+                                if let Some((_, sprite)) =
+                                    sprites.iter_mut().find(|(sid, _)| *sid == id)
+                                {
+                                    sprite.placement = rebound;
+                                }
+                                // Тулбар стикера теперь на другом мониторе —
+                                // переехать сразу, не дожидаясь несвязанного
+                                // триггера пересборки.
+                                rebuild_ui_panels(edit, cfg, monitor_geometry);
+                            }
                         }
-                        if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| *sid == id) {
-                            sprite.placement = rebound;
-                        }
-                        // Тулбар стикера теперь на другом мониторе — переехать
-                        // сразу, не дожидаясь несвязанного триггера пересборки.
-                        rebuild_ui_panels(edit, cfg, monitor_geometry);
                     }
                 }
             }
