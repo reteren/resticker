@@ -1,21 +1,25 @@
-//! Оверлей-окно: прозрачное, «клик-прозрачное», поверх всех окон, на весь
-//! основной монитор. Живёт на собственном потоке со своим циклом сообщений
-//! (ADR-013 — тот же паттерн, что у трея). Здесь только окно и pump: рендер
-//! (D3D11 + DirectComposition) подключается снаружи через [`OverlayWindow::hwnd`]
-//! (ARCHITECTURE.md, раздел 2). Мультимонитор — M3, здесь ровно одно окно.
+//! Оверлей-окно: прозрачное, «клик-прозрачное», поверх всех окон, на
+//! границы одного монитора (M3: окно на монитор — позиция и размер
+//! передаются при создании, например из [`crate::monitors::MonitorInfo`]).
+//! Живёт на собственном потоке со своим циклом сообщений (ADR-013 — тот же
+//! паттерн, что у трея). Здесь только окно и pump: рендер (D3D11 +
+//! DirectComposition) подключается снаружи через [`OverlayWindow::hwnd`]
+//! (ARCHITECTURE.md, раздел 2).
 //!
 //! M2: окно также владеет глобальными хоткеями — входа/выхода из режима
 //! редактирования и «показать/скрыть все стикеры» — и мостом «сырые
 //! сообщения окна → безопасные события» (`OverlayEvent`), см.
-//! docs/M2_INTEGRATION_PLAN.md, раздел 1. Мышь и курсор обрабатываются здесь
-//! ([`crate::input`]); хит-тестинг и жесты — у вызывающего кода (ядро
+//! docs/M2_INTEGRATION_PLAN.md, раздел 1. M3: глобальный хоткей
+//! регистрирует ровно одно окно на процесс (docs/M3_PREP_NOTES.md,
+//! раздел 3.3) — остальные создаются с `None`. Мышь и курсор обрабатываются
+//! здесь ([`crate::input`]); хит-тестинг и жесты — у вызывающего кода (ядро
 //! редактора платформенно-независимо).
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -24,14 +28,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA,
-    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_HOTKEY,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_HOTKEY,
     WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETCURSOR,
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
+
+use rst_core::model::Rect;
 
 use crate::error::Win32Error;
 use crate::hotkey::{HotkeyCombo, RegisteredHotkey, message_hotkey_id};
@@ -94,6 +101,11 @@ pub enum OverlayEvent {
     /// (ARCHITECTURE.md, раздел 5.1). Окно продолжает работать — недоступны
     /// только хоткеи, которые не удалось зарегистрировать.
     HotkeyConflict(String),
+    /// Масштаб монитора сменился (`WM_DPICHANGED`): окно уже применило
+    /// рекомендованный прямоугольник (`SetWindowPos`), `dpi` — новый DPI
+    /// монитора (младшее слово `wParam`), `size` — новый размер окна в
+    /// физических пикселях (docs/M3_PREP_NOTES.md, раздел 3.6).
+    DpiChanged { dpi: u32, size: (u32, u32) },
     /// Событие мыши в клиентской области ([`crate::input::InputEvent`]).
     Input(InputEvent),
     /// Клавиша нажата/отпущена, пока окно в фокусе (режим редактирования —
@@ -105,11 +117,10 @@ pub enum OverlayEvent {
     },
 }
 
-/// Оверлей-окно на основной монитор и его поток сообщений.
+/// Оверлей-окно на один монитор и его поток сообщений.
 /// `Drop` уничтожает окно и останавливает поток.
 pub struct OverlayWindow {
     hwnd: HWND,
-    size: (u32, u32),
     thread: Option<JoinHandle<()>>,
 }
 
@@ -126,44 +137,82 @@ unsafe impl Sync for OverlayWindow {}
 struct SendHwnd(HWND);
 unsafe impl Send for SendHwnd {}
 
-/// Результат инициализации потока оверлея: хэндл окна и его размер.
-type ReadyResult = Result<(SendHwnd, (u32, u32)), Win32Error>;
+/// Результат инициализации потока оверлея: хэндл окна.
+type ReadyResult = Result<SendHwnd, Win32Error>;
 
 impl OverlayWindow {
-    /// Создаёт оверлей-окно и запускает его цикл сообщений на отдельном
-    /// потоке; регистрирует на этом же потоке глобальные хоткеи: `edit_hotkey`
-    /// входа/выхода из режима редактирования и, если `toggle_all_hotkey` —
-    /// `Some`, хоткей «показать/скрыть все стикеры» (опциональный: `None`,
-    /// когда в конфиге пусто или комбинация не парсится — в отличие от
-    /// `edit_hotkey`, который обязателен). Конфликт регистрации — не паника:
+    /// Создаёт оверлей-окно на границы монитора `bounds_px` (физические
+    /// пиксели виртуального десктопа, docs/M3_PREP_NOTES.md, раздел 3.1 —
+    /// обычно `crate::monitors::MonitorInfo::bounds_px`) и запускает его
+    /// цикл сообщений на отдельном потоке. На процесс может быть несколько
+    /// окон (M3: окно на монитор).
+    ///
+    /// Глобальный хоткей входа/выхода из режима редактирования
+    /// регистрируется **ровно один раз на процесс** (M3, раздел 3.3):
+    /// `edit_hotkey = Some(combo)` — для окна, владеющего хоткеем (логично
+    /// — окно основного монитора), `None` — для остальных, они создаются
+    /// без регистрации и без конфликтов. `toggle_all_hotkey` — опциональный
+    /// хоткей «показать/скрыть все стикеры» (M2b7): `None`, когда в конфиге
+    /// пусто или комбинация не парсится. Конфликт регистрации — не паника:
     /// окно работает, а наружу уходит событие
     /// [`OverlayEvent::HotkeyConflict`]. Возвращает управление, когда окно
     /// гарантированно создано, и приёмник событий мыши/клавиатуры/хоткеев —
     /// координатор объединяет его со своим каналом команд
     /// (docs/M2_INTEGRATION_PLAN.md, раздел 1).
-    pub fn create(
-        edit_hotkey: HotkeyCombo,
+    pub fn create_on_monitor(
+        bounds_px: Rect,
+        edit_hotkey: Option<HotkeyCombo>,
         toggle_all_hotkey: Option<HotkeyCombo>,
     ) -> Result<(Self, Receiver<OverlayEvent>), Win32Error> {
         let (ready_tx, ready_rx) = mpsc::channel::<ReadyResult>();
         let (event_tx, event_rx) = mpsc::channel::<OverlayEvent>();
 
         let thread = thread::spawn(move || {
-            run_message_loop(ready_tx, event_tx, edit_hotkey, toggle_all_hotkey)
+            run_message_loop(
+                ready_tx,
+                event_tx,
+                bounds_px,
+                edit_hotkey,
+                toggle_all_hotkey,
+            )
         });
 
-        let (hwnd, size) = ready_rx
+        let hwnd = ready_rx
             .recv()
             .map_err(|_| Win32Error::OverlayThreadCrashed)??;
 
         Ok((
             Self {
                 hwnd: hwnd.0,
-                size,
                 thread: Some(thread),
             },
             event_rx,
         ))
+    }
+
+    /// Совместимость с единственным текущим вызывающим кодом
+    /// (`overlay_manager.rs` — до подключения per-monitor создания в M3):
+    /// окно на основной монитор с геометрией системного экрана
+    /// (`GetSystemMetrics`), хоткей режима редактирования регистрируется
+    /// безусловно. При миграции координатора на [`Self::create_on_monitor`]
+    /// метод удаляется.
+    pub fn create(
+        edit_hotkey: HotkeyCombo,
+        toggle_all_hotkey: Option<HotkeyCombo>,
+    ) -> Result<(Self, Receiver<OverlayEvent>), Win32Error> {
+        // SAFETY: GetSystemMetrics безопасен с любого потока, аргумент — константа.
+        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        Self::create_on_monitor(
+            Rect {
+                x: 0,
+                y: 0,
+                w: width.max(0) as u32,
+                h: height.max(0) as u32,
+            },
+            Some(edit_hotkey),
+            toggle_all_hotkey,
+        )
     }
 
     /// Сырой `HWND` для передачи в `rst-render::Renderer::new(hwnd, width, height)`.
@@ -172,16 +221,30 @@ impl OverlayWindow {
         self.hwnd
     }
 
-    /// Размер окна в физических пикселях на момент создания
-    /// (процесс PerMonitorV2, см. манифест).
+    /// Текущий размер окна в физических пикселях. Живое значение
+    /// (`GetWindowRect`, процесс PerMonitorV2 — без растяжения ОС): меняется
+    /// после `WM_DPICHANGED`/`SetWindowPos`, а не фиксируется на момент
+    /// создания.
     pub fn size(&self) -> (u32, u32) {
-        self.size
+        let mut rect = RECT::default();
+        // SAFETY: hwnd — наше живое окно, уничтожается только в `Drop`;
+        // GetWindowRect допустим с любого потока.
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+        }
+        (
+            (rect.right - rect.left).max(0) as u32,
+            (rect.bottom - rect.top).max(0) as u32,
+        )
     }
 
-    /// DPI монитора, на котором создано окно (96 = 100%). Используется для
-    /// `Renderer::set_dpi_scale` и перевода координат мыши физика→DIP (M2,
-    /// docs/M2_INTEGRATION_REVIEW.md, раздел 2). Полноценная реакция на
-    /// `WM_DPICHANGED` при смене монитора/масштаба — M3.
+    /// Текущий DPI монитора, на котором находится окно (96 = 100%).
+    /// Используется для `Renderer::set_dpi_scale` и перевода координат мыши
+    /// физика→DIP (M2, docs/M2_INTEGRATION_REVIEW.md, раздел 2). Живое
+    /// значение (`GetDpiForWindow`): при `WM_DPICHANGED` окно переезжает на
+    /// рекомендованный прямоугольник, и геттер сразу возвращает новый DPI;
+    /// то же значение координатор получает заранее событием
+    /// [`OverlayEvent::DpiChanged`] (M3, раздел 3.6).
     pub fn dpi(&self) -> u32 {
         // SAFETY: hwnd — наше живое окно.
         unsafe { GetDpiForWindow(self.hwnd) }
@@ -268,10 +331,11 @@ fn hotkey_conflict_event(err: &Win32Error) -> Option<OverlayEvent> {
 fn run_message_loop(
     ready_tx: Sender<ReadyResult>,
     event_tx: Sender<OverlayEvent>,
-    edit_hotkey: HotkeyCombo,
+    bounds_px: Rect,
+    edit_hotkey: Option<HotkeyCombo>,
     toggle_all_hotkey: Option<HotkeyCombo>,
 ) {
-    let (hwnd, size) = match create_window() {
+    let hwnd = match create_window(bounds_px) {
         Ok(v) => v,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -283,15 +347,20 @@ fn run_message_loop(
     // ломает (ARCHITECTURE.md, раздел 5.1), но наружу уходит событием
     // `OverlayEvent::HotkeyConflict`, чтобы координатор мог предупредить
     // пользователя, а не только warn-лог в трассировке (M2b6).
-    let _hotkey = match RegisteredHotkey::register(EDIT_HOTKEY_ID, edit_hotkey) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            tracing::warn!(error = %e, "не удалось зарегистрировать хоткей режима редактирования");
-            if let Some(event) = hotkey_conflict_event(&e) {
-                let _ = event_tx.send(event);
+    let _hotkey = match edit_hotkey {
+        Some(combo) => match RegisteredHotkey::register(EDIT_HOTKEY_ID, combo) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(error = %e, "не удалось зарегистрировать хоткей режима редактирования");
+                if let Some(event) = hotkey_conflict_event(&e) {
+                    let _ = event_tx.send(event);
+                }
+                None
             }
-            None
-        }
+        },
+        // M3: глобальный хоткей регистрирует ровно одно окно на процесс
+        // (docs/M3_PREP_NOTES.md, раздел 3.3); остальные создаются без него.
+        None => None,
     };
     // «Показать/скрыть все стикеры» — опциональный хоткей: при `None`
     // (пусто/не парсится в конфиге) просто не регистрируется (M2b7).
@@ -327,7 +396,7 @@ fn run_message_loop(
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
     }
 
-    if ready_tx.send(Ok((SendHwnd(hwnd), size))).is_err() {
+    if ready_tx.send(Ok(SendHwnd(hwnd))).is_err() {
         // Получатель уже отброшен (конструктор вернул ошибку раньше) —
         // корректно свернуться, не оставляя окно висеть.
         // SAFETY: hwnd действительно и ещё не уничтожено.
@@ -398,7 +467,7 @@ fn current_key_modifiers() -> Modifiers {
     }
 }
 
-fn create_window() -> Result<(HWND, (u32, u32)), Win32Error> {
+fn create_window(bounds_px: Rect) -> Result<HWND, Win32Error> {
     // SAFETY: GetModuleHandleW(None) возвращает хэндл текущего модуля.
     let hinstance = unsafe { GetModuleHandleW(None) }
         .map(Into::into)
@@ -424,10 +493,10 @@ fn create_window() -> Result<(HWND, (u32, u32)), Win32Error> {
         }
     }
 
-    // SAFETY: GetSystemMetrics безопасен с любого потока, аргумент — константа.
-    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    if width <= 0 || height <= 0 {
+    // Границы монитора — из аргумента (M3, docs/M3_PREP_NOTES.md, раздел 3.1):
+    // позиция rcMonitor.left/top виртуального десктопа (у неосновных может
+    // быть отрицательной) и размер в физических пикселях.
+    if bounds_px.w == 0 || bounds_px.h == 0 {
         return Err(Win32Error::OverlayWindowCreateFailed);
     }
 
@@ -438,7 +507,7 @@ fn create_window() -> Result<(HWND, (u32, u32)), Win32Error> {
     // флага (NOACTIVATE, TRANSPARENT) снимаются на время режима
     // редактирования через `set_click_through` (M2).
     // SAFETY: все аргументы — валидные константы и только что
-    // зарегистрированный класс.
+    // зарегистрированный класс; размеры окон реальных мониторов влезают в i32.
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOPMOST
@@ -449,10 +518,10 @@ fn create_window() -> Result<(HWND, (u32, u32)), Win32Error> {
             CLASS_NAME,
             WINDOW_TITLE,
             WS_POPUP,
-            0,
-            0,
-            width,
-            height,
+            bounds_px.x,
+            bounds_px.y,
+            bounds_px.w as i32,
+            bounds_px.h as i32,
             None,
             None,
             Some(hinstance),
@@ -472,7 +541,44 @@ fn create_window() -> Result<(HWND, (u32, u32)), Win32Error> {
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
 
-    Ok((hwnd, (width as u32, height as u32)))
+    Ok(hwnd)
+}
+
+/// Обработка `WM_DPICHANGED` (docs/M3_PREP_NOTES.md, раздел 3.6):
+/// `wParam` — новый DPI (младшее слово — dpiX), `lParam` — рекомендованный
+/// прямоугольник. Применяет прямоугольник через `SetWindowPos` (z-order
+/// и фокус не трогаем) и возвращает событие с новым DPI и размером окна;
+/// `None` — сообщение с нулевым DPI (быть не должно): окно не трогаем.
+/// Чистая по отношению к wndproc часть логики — тестируется напрямую.
+fn handle_dpi_changed(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<OverlayEvent> {
+    let dpi = (wparam.0 & 0xFFFF) as u32;
+    if dpi == 0 {
+        return None;
+    }
+    // SAFETY: lParam WM_DPICHANGED всегда указывает на действительный RECT
+    // (документировано Windows); читается только в течение этого вызова.
+    let rect = unsafe { &*(lparam.0 as *const RECT) };
+    // SAFETY: hwnd — наше живое окно; SWP_NOZORDER сохраняет позицию в
+    // z-order (WS_EX_TOPMOST не слетает), SWP_NOACTIVATE — фокус не трогает.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .ok()?;
+    }
+    Some(OverlayEvent::DpiChanged {
+        dpi,
+        size: (
+            (rect.right - rect.left).max(0) as u32,
+            (rect.bottom - rect.top).max(0) as u32,
+        ),
+    })
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -507,6 +613,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // Масштаб монитора сменился: применяем рекомендованный
+            // прямоугольник и сообщаем координатору новый DPI/размер
+            // (docs/M3_PREP_NOTES.md, раздел 3.6).
+            if let Some(event) = handle_dpi_changed(hwnd, wparam, lparam) {
+                if let Some(state) = unsafe { state_ptr.as_mut() } {
+                    let _ = state.tx.send(event);
+                }
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_KEYDOWN | WM_KEYUP => {
             let vk = wparam.0 as u32;
@@ -550,6 +668,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
@@ -559,15 +678,27 @@ mod tests {
         HotkeyCombo::parse("Ctrl+Alt+Shift+F23").expect("валидная комбинация")
     }
 
+    /// Границы «второго» монитора справа от основного — геометрия, которую
+    /// захардкоженный основной экран дать не мог: ненулевая позиция.
+    fn test_bounds() -> Rect {
+        Rect {
+            x: 1920,
+            y: 120,
+            w: 1280,
+            h: 1024,
+        }
+    }
+
     #[test]
     fn create_then_drop_destroys_window() {
         let (overlay, _events) =
-            OverlayWindow::create(test_hotkey(), None).expect("создание оверлея");
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None)
+                .expect("создание оверлея");
         let hwnd = overlay.hwnd();
         assert!(!hwnd.0.is_null());
 
-        let (w, h) = overlay.size();
-        assert!(w > 0 && h > 0);
+        // Размер — из границ монитора, переданных при создании.
+        assert_eq!(overlay.size(), (1280, 1024));
 
         // SAFETY: hwnd — наше живое окно, создание выше проверено.
         assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
@@ -580,9 +711,30 @@ mod tests {
     }
 
     #[test]
+    fn window_uses_given_bounds() {
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+
+        // Позиция и размер окна — ровно границы монитора, не (0, 0) и не
+        // системный экран (docs/M3_PREP_NOTES.md, раздел 3.1).
+        let mut rect = RECT::default();
+        // SAFETY: hwnd — наше живое окно.
+        unsafe {
+            GetWindowRect(overlay.hwnd(), &mut rect).expect("GetWindowRect");
+        }
+        assert_eq!((rect.left, rect.top), (1920, 120));
+        assert_eq!(
+            (rect.right - rect.left, rect.bottom - rect.top),
+            (1280, 1024)
+        );
+        assert_eq!(overlay.size(), (1280, 1024));
+    }
+
+    #[test]
     fn set_click_through_toggles_exstyle_bits() {
         let (overlay, _events) =
-            OverlayWindow::create(test_hotkey(), None).expect("создание оверлея");
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None)
+                .expect("создание оверлея");
         // SAFETY: чтение стиля своего же окна.
         let initial = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
         assert_ne!(
@@ -611,6 +763,17 @@ mod tests {
     }
 
     #[test]
+    fn create_covers_system_screen() {
+        // Совместимость с текущим единственным вызывающим кодом: окно на
+        // основной монитор, размер — системный экран.
+        let (overlay, _events) =
+            OverlayWindow::create(test_hotkey(), None).expect("создание оверлея");
+        // SAFETY: GetSystemMetrics безопасен с любого потока.
+        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        assert_eq!(overlay.size(), (w.max(0) as u32, h.max(0) as u32));
+    }
+
+    #[test]
     fn hotkey_conflict_maps_only_conflicts() {
         // Конфликт → событие с той же каноничной комбинацией.
         let conflict = Win32Error::HotkeyConflict("Ctrl+Alt+Shift+F22".to_string());
@@ -636,8 +799,12 @@ mod tests {
         // Экзотическая комбинация — не конфликтует с реальными приложениями
         // на машине разработчика/CI (F22 не используется другими тестами).
         let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F22").expect("валидная комбинация");
-        let (_first, _first_events) = OverlayWindow::create(combo, None).expect("первое окно");
-        let (_second, second_events) = OverlayWindow::create(combo, None).expect("второе окно");
+        let (_first, _first_events) =
+            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None)
+                .expect("первое окно");
+        let (_second, second_events) =
+            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None)
+                .expect("второе окно");
 
         // Хоткей регистрируется на pump-потоке до сигнала готовности, поэтому
         // к моменту возврата create() конфликт уже лежит в канале событий.
@@ -651,25 +818,103 @@ mod tests {
     }
 
     #[test]
+    fn window_without_hotkey_does_not_conflict() {
+        // M3: глобальный хоткей — ровно один на процесс (docs/M3_PREP_NOTES.md,
+        // раздел 3.3). Первое окно регистрирует комбинацию, второе создаётся
+        // с `None` — без регистрации и без события HotkeyConflict.
+        let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F21").expect("валидная комбинация");
+        let (_first, _first_events) =
+            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None)
+                .expect("первое окно");
+        let (_second, second_events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("второе окно");
+
+        match second_events.recv_timeout(Duration::from_millis(300)) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(event) => panic!("окно без хоткея не должно слать событий, получено: {event:?}"),
+            Err(e) => panic!("канал событий второго окна закрылся: {e}"),
+        }
+    }
+
+    #[test]
     fn second_window_with_same_toggle_all_hotkey_reports_conflict() {
         // Экзотическая комбинация — не конфликтует с реальными приложениями
-        // и с другими тестами (F21; F22/F23/F24 заняты соседними тестами).
-        let toggle = HotkeyCombo::parse("Ctrl+Alt+Shift+F21").expect("валидная комбинация");
-        // У второго окна другой edit-хоткей (F20), чтобы конфликт пришёл
+        // и с другими тестами (F20; F21/F22/F23/F24 заняты соседними тестами).
+        let toggle = HotkeyCombo::parse("Ctrl+Alt+Shift+F20").expect("валидная комбинация");
+        // У второго окна другой edit-хоткей (F19), чтобы конфликт пришёл
         // именно от toggle_all, а не от режима редактирования.
-        let edit2 = HotkeyCombo::parse("Ctrl+Alt+Shift+F20").expect("валидная комбинация");
+        let edit2 = HotkeyCombo::parse("Ctrl+Alt+Shift+F19").expect("валидная комбинация");
         let (_first, _first_events) =
-            OverlayWindow::create(test_hotkey(), Some(toggle)).expect("первое окно");
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), Some(toggle))
+                .expect("первое окно");
         let (_second, second_events) =
-            OverlayWindow::create(edit2, Some(toggle)).expect("второе окно");
+            OverlayWindow::create_on_monitor(test_bounds(), Some(edit2), Some(toggle))
+                .expect("второе окно");
 
         // Тот же паттерн, что и для edit-хоткея: конфликт — событие, а не
         // ошибка создания окна.
         match second_events.recv_timeout(Duration::from_secs(5)) {
-            Ok(OverlayEvent::HotkeyConflict(s)) => assert_eq!(s, "Ctrl+Alt+Shift+F21"),
+            Ok(OverlayEvent::HotkeyConflict(s)) => assert_eq!(s, "Ctrl+Alt+Shift+F20"),
             Ok(other) => panic!("ожидался HotkeyConflict, получено: {other:?}"),
             Err(e) => panic!("второе окно не прислало HotkeyConflict: {e}"),
         }
+    }
+
+    #[test]
+    fn dpi_changed_applies_recommended_rect_and_reports_event() {
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+
+        // Как в настоящем WM_DPICHANGED: wParam — новый DPI (младшее слово —
+        // dpiX, старшее — dpiY, тут мусор, чтобы проверить что берём LOWORD),
+        // lParam — рекомендованный прямоугольник.
+        let rect = RECT {
+            left: 100,
+            top: 200,
+            right: 700,
+            bottom: 500,
+        };
+        let event = handle_dpi_changed(
+            overlay.hwnd(),
+            WPARAM(0x0001_00B0),
+            LPARAM(&raw const rect as isize),
+        )
+        .expect("должно вернуться событие DpiChanged");
+        assert_eq!(
+            event,
+            OverlayEvent::DpiChanged {
+                dpi: 0xB0,
+                size: (600, 300)
+            }
+        );
+
+        // Окно переехало ровно на рекомендованный прямоугольник; геттеры
+        // сразу отдают свежие значения (docs/M3_PREP_NOTES.md, раздел 3.6).
+        let mut actual = RECT::default();
+        // SAFETY: hwnd — наше живое окно.
+        unsafe {
+            GetWindowRect(overlay.hwnd(), &mut actual).expect("GetWindowRect");
+        }
+        assert_eq!((actual.left, actual.top), (100, 200));
+        assert_eq!(
+            (actual.right - actual.left, actual.bottom - actual.top),
+            (600, 300)
+        );
+        assert_eq!(overlay.size(), (600, 300));
+    }
+
+    #[test]
+    fn dpi_changed_with_zero_dpi_is_ignored() {
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+        let before = overlay.size();
+        // Нулевой DPI в wParam быть не должен; окно не трогаем (и lParam
+        // с нулевым указателем не читаем).
+        assert_eq!(
+            handle_dpi_changed(overlay.hwnd(), WPARAM(0), LPARAM(0)),
+            None
+        );
+        assert_eq!(overlay.size(), before, "окно не тронуто");
     }
 
     #[test]
