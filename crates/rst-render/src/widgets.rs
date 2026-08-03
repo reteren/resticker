@@ -43,8 +43,9 @@ pub fn box_contains(r: &Box2D, pos: Point) -> bool {
 }
 
 /// Иконка кнопки (идентификация; текстуры из `assets/` — у вызывающего
-/// слоя). Набор — по SPEC 3.6 (тулбар) и 3.8 (панель у курсора).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// слоя). Набор — по SPEC 3.6 (тулбар) и 3.8 (панель у курсора). `Hash` —
+/// для кэша текстур по варианту иконки (`icon_rgba`, координатор).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Icon {
     /// «Слои видимости» — панель выбора окон (SPEC 3.6, п. 3).
     Layers,
