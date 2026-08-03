@@ -11,6 +11,7 @@ mod error;
 pub mod hittest;
 pub mod migration;
 pub mod model;
+pub mod monitor_rebind;
 pub mod ops;
 pub mod selection_set;
 pub mod snap;
