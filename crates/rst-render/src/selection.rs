@@ -201,15 +201,16 @@ pub fn edit_overlay(screen_w_dip: f64, screen_h_dip: f64) -> Box2D {
 }
 
 /// Сгенерировать RGBA-пиксели шахматки (straight alpha) для текстуры
-/// `size`×`size` с клетками `cell` пикселей: фуксия [`CHECKER_MAGENTA`] и
+/// `width`×`height` с клетками `cell` пикселей: фуксия [`CHECKER_MAGENTA`] и
 /// чёрный [`CHECKER_BLACK`], левый верхний угол — фуксия. Массив подаётся в
 /// `Renderer::create_texture_from_rgba` и рисуется поверх скрытого стикера
-/// (ROADMAP.md M2: «Шахматка для скрытых стикеров»).
-pub fn checkerboard_tile(cell: u32, size: u32) -> Vec<u8> {
+/// (ROADMAP.md M2: «Шахматка для скрытых стикеров»; SPEC.md 3.7 — по форме
+/// ограничивающего прямоугольника стикера, обычно не квадрат).
+pub fn checkerboard_tile(cell: u32, width: u32, height: u32) -> Vec<u8> {
     assert!(cell > 0, "размер клетки шахматки должен быть больше нуля");
-    let mut out = Vec::with_capacity(size as usize * size as usize * 4);
-    for y in 0..size {
-        for x in 0..size {
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
             let color = if (x / cell + y / cell) % 2 == 0 {
                 CHECKER_MAGENTA
             } else {
@@ -476,7 +477,7 @@ mod tests {
 
     #[test]
     fn checkerboard_tile_two_pixel_cells() {
-        let tile = checkerboard_tile(2, 4);
+        let tile = checkerboard_tile(2, 4, 4);
         assert_eq!(tile.len(), 4 * 4 * 4);
         let px = |x: u32, y: u32| -> [u8; 4] {
             let i = ((y * 4 + x) * 4) as usize;
@@ -493,7 +494,7 @@ mod tests {
 
     #[test]
     fn checkerboard_tile_single_pixel_cells() {
-        let tile = checkerboard_tile(1, 2);
+        let tile = checkerboard_tile(1, 2, 2);
         assert_eq!(
             tile,
             vec![
@@ -503,9 +504,26 @@ mod tests {
     }
 
     #[test]
+    fn checkerboard_tile_non_square() {
+        // Стикеры обычно не квадратные (SPEC 3.7) — ширина и высота texture
+        // независимы.
+        let tile = checkerboard_tile(1, 3, 2);
+        assert_eq!(tile.len(), 3 * 2 * 4);
+        let px = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * 3 + x) * 4) as usize;
+            [tile[i], tile[i + 1], tile[i + 2], tile[i + 3]]
+        };
+        assert_eq!(px(0, 0), [255, 0, 255, 255]);
+        assert_eq!(px(1, 0), [0, 0, 0, 255]);
+        assert_eq!(px(2, 0), [255, 0, 255, 255]);
+        assert_eq!(px(0, 1), [0, 0, 0, 255]);
+        assert_eq!(px(2, 1), [0, 0, 0, 255]);
+    }
+
+    #[test]
     #[should_panic(expected = "больше нуля")]
     fn checkerboard_tile_rejects_zero_cell() {
-        checkerboard_tile(0, 4);
+        checkerboard_tile(0, 4, 4);
     }
 
     #[test]
