@@ -48,36 +48,29 @@ use rst_win32::hotkey::HotkeyCombo;
 use rst_win32::input::{
     Corner as Win32Corner, CursorShape, CursorZone, Handle as Win32Handle, InputEvent, Modifiers,
 };
+use rst_win32::monitors;
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
 use uuid::Uuid;
 
 use crate::{confirm_dialog, cursor_panel, toolbar};
 
-/// Оверлей на один процесс сегодня — одно окно на основном мониторе, поэтому
-/// `Device` (процесс-wide, ARCHITECTURE.md раздел 1) и его единственный
-/// `WindowTarget` (окно/монитор, M3_PREP_NOTES.md §4.2) держатся вместе за
-/// одним именем — как раньше `rst_render::Renderer`, до его разделения на
-/// M3 step 2. Настоящий per-monitor рантайм (несколько `WindowTarget` на
-/// общем `Device`, таблица по `MonitorId`) — отдельный шаг M3 (раздел 5),
-/// этот тип — временный мост, чтобы существующий M1/M2-код компилировался
-/// без изменений сигнатур. Конструктор — на месте вызова (`start()`), не
-/// ассоциированная функция: `WindowTarget::new` берёт `HWND` от `windows`,
-/// а этот крейт (`resticker`, «склейка потоков», CONTRIBUTING.md) намеренно
-/// не зависит от `windows` напрямую — только через `rst-win32`/`rst-render`.
-struct Renderer {
-    device: Device,
-    target: WindowTarget,
+/// Мост к `Device`/`WindowTarget` (M3 step 2 разделил `rst_render::Renderer`
+/// на процесс-wide устройство и цель на монитор, M3_PREP_NOTES.md §4.2).
+/// Держит ссылки, а не владеет: `device` общий на весь процесс, `target` —
+/// цели ровно одного монитора из [`MonitorState`]; конструируется заново на
+/// каждую точку диспетчеризации в `run()` (раздел 5 — per-monitor рантайм),
+/// так что существующий M1/M2-код (`create_texture_from_rgba`/`load_image`/
+/// `draw`) не менял сигнатур при переходе с владеющей версии на ссылочную.
+/// DPI/масштаб и ресайз цепочки — не через эту обёртку: `run()` держит их
+/// как поля [`MonitorState`] и вызывает `WindowTarget` напрямую, поскольку
+/// они переживают конкретный `Renderer` (тот живёт только на один вызов
+/// обработчика, а масштаб монитора — весь его жизненный цикл).
+struct Renderer<'a> {
+    device: &'a Device,
+    target: &'a mut WindowTarget,
 }
 
-impl Renderer {
-    fn set_dpi_scale(&mut self, scale: f32) {
-        self.target.set_dpi_scale(scale);
-    }
-
-    fn dpi_scale(&self) -> f32 {
-        self.target.dpi_scale()
-    }
-
+impl Renderer<'_> {
     fn create_texture_from_rgba(
         &self,
         data: &[u8],
@@ -92,12 +85,22 @@ impl Renderer {
     }
 
     fn draw(&self, sprites: &[Sprite]) -> Result<(), RenderError> {
-        self.device.draw(&self.target, sprites)
+        self.device.draw(&*self.target, sprites)
     }
+}
 
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), RenderError> {
-        self.target.resize(&self.device, width, height)
-    }
+/// Рантайм одного монитора (M3 step 4, M3_PREP_NOTES.md раздел 5.2): своё
+/// окно, своя цель рендера, свои живые размер/масштаб. `Device` — общий на
+/// процесс и живёт отдельно в `run()`, не здесь (раздел 4.2 — текстуры
+/// грузятся один раз и рисуются на любой цели). Ключ таблицы `run()`
+/// (`HashMap<MonitorId, MonitorState>`) — `MonitorId` из перечисления
+/// (`rst_win32::monitors::enumerate`), совпадает с `Placement::monitor_id`.
+struct MonitorState {
+    overlay: OverlayWindow,
+    target: WindowTarget,
+    width: u32,
+    height: u32,
+    scale: f32,
 }
 
 /// Хоткей входа/выхода из режима редактирования по умолчанию (CONFIG.md),
@@ -143,10 +146,12 @@ pub enum CoordinatorRequest {
 }
 
 /// Сообщение объединённого канала координатора: команда от Tauri или
-/// событие от потока оверлей-окна.
+/// событие от потока оверлей-окна конкретного монитора (M3: несколько окон
+/// на процесс — событие несёт `MonitorId`, чтобы координатор не спутал
+/// координаты/геометрию одного монитора с другим, M3_PREP_NOTES.md §3.4).
 enum OverlayMessage {
     Command(OverlayCommand),
-    Event(OverlayEvent),
+    Event(MonitorId, OverlayEvent),
 }
 
 /// Ручка для отправки команд оверлей-потоку; `Drop` останавливает поток.
@@ -304,11 +309,16 @@ struct EditState {
     /// `Config` на момент первого изменения ползунка прозрачности тулбара —
     /// аналог `pending_snapshot` для UI-жеста (не для жеста сцены), раздел 6.
     ui_pending_snapshot: Option<Config>,
-    /// Последняя известная позиция курсора, DIP — источник позиции для
-    /// `cursor_panel` при пересборках, не вызванных `MouseMove` (Ctrl+D,
-    /// undo/redo и т.п., где курсор не двигался, но панель должна остаться
-    /// там же). Обновляется на каждом `MouseMove`.
+    /// Последняя известная позиция курсора, DIP относительно `cursor_monitor`
+    /// — источник позиции для `cursor_panel` при пересборках, не вызванных
+    /// `MouseMove` (Ctrl+D, undo/redo и т.п., где курсор не двигался, но
+    /// панель должна остаться там же). Обновляется на каждом `MouseMove`.
     cursor_pos: (f64, f64),
+    /// Монитор, к которому относится `cursor_pos` (M3): какое окно последним
+    /// прислало `MouseMove`. `redraw` рисует панель у курсора и марку только
+    /// на этом мониторе — оба гарантированно принадлежат ровно одному окну
+    /// на время жеста (мышь захвачена этим окном, M3_PREP_NOTES.md §3.4/3.5).
+    cursor_monitor: MonitorId,
     /// Канал запросов координатора к главному потоку Tauri (`BTN_SETTINGS`,
     /// docs/M2_WIRING_PLAN.md, раздел 12). Здесь, а не отдельным параметром
     /// `handle_cursor_panel_up`, — чтобы обработчики UI могли слать запрос
@@ -337,6 +347,10 @@ struct ConfirmState {
     /// Id стикеров к удалению, зафиксированные на момент открытия.
     ids: Vec<Uuid>,
     panel: Panel,
+    /// Монитор, вызвавший удаление (M3) — модал рисуется только в кадре
+    /// этого монитора; остальные стикеры к удалению могут жить на других
+    /// мониторах, это не меняет, где показывается сам диалог.
+    monitor_id: MonitorId,
 }
 
 /// Кэш 1×1 текстур заливки и текстур растрированного текста для перевода
@@ -500,25 +514,33 @@ fn run(
         .as_deref()
         .and_then(|s| HotkeyCombo::parse(s).ok());
 
-    let (overlay, events) = match OverlayWindow::create(hotkey, toggle_all_hotkey) {
-        Ok(v) => v,
+    // M3: окно на каждый подключённый монитор, а не один захардкоженный
+    // основной (M3_PREP_NOTES.md, раздел 5). Перечисление — при старте;
+    // переперечисление на `WM_DISPLAYCHANGE` (`OverlayEvent::MonitorsChanged`)
+    // пока только логируется — динамическое добавление/снятие окон при
+    // hot-plug и таймер ADR-011 (`monitor_loss::MonitorLossTracker`,
+    // уже готов) — отдельный, следующий срез.
+    let monitor_infos = match monitors::enumerate() {
+        Ok(list) if !list.is_empty() => list,
+        Ok(_) => {
+            tracing::error!("перечисление мониторов вернуло пустой список");
+            return;
+        }
         Err(e) => {
-            tracing::error!(error = %e, "не удалось создать оверлей-окно");
+            tracing::error!(error = %e, "не удалось перечислить мониторы");
             return;
         }
     };
-    // Мост «события окна → общий канал координатора» — один поток-цикл
-    // читает и команды Tauri, и события мыши/клавиатуры/хоткея
-    // (docs/M2_INTEGRATION_PLAN.md, раздел 1).
-    thread::spawn(move || {
-        for event in events {
-            if tx.send(OverlayMessage::Event(event)).is_err() {
-                break;
-            }
-        }
-    });
+    let primary_id = monitor_infos
+        .iter()
+        .find(|m| m.is_primary)
+        .unwrap_or(&monitor_infos[0])
+        .id
+        .clone();
 
-    let (mut width, mut height) = overlay.size();
+    // `Device` — один на процесс (M3 step 2, ARCHITECTURE.md раздел 1):
+    // текстуры (заливки, спрайты стикеров) грузятся здесь один раз и
+    // рисуются на цели любого монитора без перезаливки на GPU.
     let device = match Device::new() {
         Ok(d) => d,
         Err(e) => {
@@ -526,28 +548,18 @@ fn run(
             return;
         }
     };
-    let target = match WindowTarget::new(&device, overlay.hwnd(), width, height) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(error = %e, "не удалось создать цель рендера для оверлей-окна");
-            return;
-        }
-    };
-    let mut renderer = Renderer { device, target };
-    let dpi = overlay.dpi();
-    renderer.set_dpi_scale(dpi as f32 / 96.0);
-    let mut scale = renderer.dpi_scale();
 
     // Заливки для рамки выделения (белая) и затемнения режима (чёрная) —
-    // 1×1 текстуры, растягиваются рендерером как обычные спрайты.
-    let white_tex = match renderer.create_texture_from_rgba(&[0xff, 0xff, 0xff, 0xff], 1, 1) {
+    // 1×1 текстуры, растягиваются рендерером как обычные спрайты; общие на
+    // процесс, как и любая другая текстура на `device`.
+    let white_tex = match device.create_texture_from_rgba(&[0xff, 0xff, 0xff, 0xff], 1, 1) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "не удалось создать текстуру рамки выделения");
             return;
         }
     };
-    let black_tex = match renderer.create_texture_from_rgba(&[0x00, 0x00, 0x00, 0xff], 1, 1) {
+    let black_tex = match device.create_texture_from_rgba(&[0x00, 0x00, 0x00, 0xff], 1, 1) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "не удалось создать текстуру затемнения");
@@ -558,11 +570,13 @@ fn run(
     // Восстановление между запусками: стикеры уже в cfg (загружены в main
     // через rst_core::config::load до вызова start()). Спрайт хранится
     // вместе с id стикера — жесты правят конкретный спрайт по id, порядок
-    // отрисовки берётся из cfg.stickers (по `order`) в `redraw`.
+    // отрисовки берётся из cfg.stickers (по `order`) в `redraw`, а
+    // видимость на конкретном мониторе — фильтром по `placement.monitor_id`
+    // (М3, там же).
     let mut sprites: Vec<(Uuid, Sprite)> = Vec::new();
     for sticker in &cfg.stickers {
         if let Some(path) = sticker_image_path(&sticker.source) {
-            match renderer.load_image(path) {
+            match device.load_image(path) {
                 Ok(texture) => {
                     sprites.push((
                         sticker.id,
@@ -574,6 +588,73 @@ fn run(
                 }
             }
         }
+    }
+
+    // Окно + цель рендера на каждый монитор; глобальный хоткей режима
+    // регистрирует ровно одно окно — основного монитора (M3_PREP_NOTES.md,
+    // раздел 3.3), остальные создаются без него, чтобы не конфликтовать.
+    let mut monitors_map: HashMap<MonitorId, MonitorState> = HashMap::new();
+    for info in &monitor_infos {
+        let (edit_hotkey, this_toggle_all) = if info.id == primary_id {
+            (Some(hotkey), toggle_all_hotkey)
+        } else {
+            (None, None)
+        };
+        let (overlay, events) = match OverlayWindow::create_on_monitor(
+            info.bounds_px,
+            edit_hotkey,
+            this_toggle_all,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, monitor = %info.id.0, "не удалось создать оверлей-окно монитора");
+                continue;
+            }
+        };
+        let (width, height) = overlay.size();
+        let mut target = match WindowTarget::new(&device, overlay.hwnd(), width, height) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, monitor = %info.id.0, "не удалось создать цель рендера монитора");
+                continue;
+            }
+        };
+        let dpi = overlay.dpi();
+        target.set_dpi_scale(dpi as f32 / 96.0);
+        let scale = target.dpi_scale();
+
+        // Мост «события окна → общий канал координатора», по одному на
+        // монитор — каждый помечает свои события своим `MonitorId`, чтобы
+        // координатор не спутал координаты/геометрию разных окон
+        // (M3_PREP_NOTES.md, раздел 3.4).
+        let monitor_id = info.id.clone();
+        let tx_for_events = tx.clone();
+        thread::spawn(move || {
+            for event in events {
+                if tx_for_events
+                    .send(OverlayMessage::Event(monitor_id.clone(), event))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        monitors_map.insert(
+            info.id.clone(),
+            MonitorState {
+                overlay,
+                target,
+                width,
+                height,
+                scale,
+            },
+        );
+    }
+
+    if monitors_map.is_empty() {
+        tracing::error!("не удалось создать ни одного оверлей-окна");
+        return;
     }
 
     let mut edit = EditState {
@@ -592,54 +673,88 @@ fn run(
         pointer_owner: PointerOwner::None,
         ui_pending_snapshot: None,
         cursor_pos: (0.0, 0.0),
+        cursor_monitor: primary_id.clone(),
         coordinator_tx,
     };
     let mut ui_cache = UiTextureCache::new();
 
-    redraw(
-        &mut renderer,
-        &sprites,
-        &cfg,
-        &edit,
-        &white_tex,
-        &black_tex,
-        &mut ui_cache,
-        width,
-        height,
-        scale,
-    );
+    for (monitor_id, ms) in monitors_map.iter_mut() {
+        let mut renderer = Renderer {
+            device: &device,
+            target: &mut ms.target,
+        };
+        redraw(
+            &mut renderer,
+            &sprites,
+            &cfg,
+            &edit,
+            &white_tex,
+            &black_tex,
+            &mut ui_cache,
+            ms.width,
+            ms.height,
+            ms.scale,
+            monitor_id,
+        );
+    }
 
     for msg in rx {
         let mut need_redraw = false;
         match msg {
             OverlayMessage::Command(OverlayCommand::AddSticker(path)) => {
-                add_sticker(
-                    &overlay,
-                    &mut renderer,
-                    &mut cfg,
-                    &config_path,
-                    &mut sprites,
-                    path,
-                    false,
-                    scale,
-                );
+                // Команда от Tauri не несёт «текущий монитор» — добавляем на
+                // основной, как и раньше в однооконном мире.
+                if let Some(ms) = monitors_map.get_mut(&primary_id) {
+                    let mut renderer = Renderer {
+                        device: &device,
+                        target: &mut ms.target,
+                    };
+                    add_sticker(
+                        &ms.overlay,
+                        &mut renderer,
+                        &mut cfg,
+                        &config_path,
+                        &mut sprites,
+                        path,
+                        false,
+                        ms.scale,
+                        &primary_id,
+                    );
+                }
                 need_redraw = true;
             }
             OverlayMessage::Command(OverlayCommand::Shutdown) => break,
-            OverlayMessage::Event(OverlayEvent::ToggleEditMode) => {
+            OverlayMessage::Event(monitor_id, OverlayEvent::ToggleEditMode) => {
+                let Some(ms) = monitors_map.get_mut(&monitor_id) else {
+                    continue;
+                };
+                let renderer = Renderer {
+                    device: &device,
+                    target: &mut ms.target,
+                };
                 toggle_edit_mode(
-                    &overlay,
+                    &ms.overlay,
                     &mut edit,
                     &mut cfg,
                     &mut sprites,
                     &renderer,
                     &config_path,
-                    (width, height),
-                    scale,
+                    (ms.width, ms.height),
+                    ms.scale,
                 );
+                // Клик-прозрачность снимается со ВСЕХ окон одновременно, не
+                // только с того, что владеет хоткеем — иначе мышь на других
+                // мониторах проваливалась бы сквозь режим редактирования
+                // (M3_PREP_NOTES.md, раздел 3.5). `toggle_edit_mode` уже
+                // применил её к окну-инициатору.
+                for (other_id, other_ms) in monitors_map.iter() {
+                    if *other_id != monitor_id {
+                        other_ms.overlay.set_click_through(!edit.active);
+                    }
+                }
                 need_redraw = true;
             }
-            OverlayMessage::Event(OverlayEvent::ToggleAllStickers) => {
+            OverlayMessage::Event(monitor_id, OverlayEvent::ToggleAllStickers) => {
                 // Глобальный хоткей работает независимо от режима
                 // редактирования (M2b7) — та же логика, что у BTN_TOGGLE_ALL
                 // на панели у курсора (docs/M2_WIRING_PLAN.md, раздел 6).
@@ -649,122 +764,163 @@ fn run(
                     if let Err(e) = config::save(&cfg, &config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить config.json после «показать/скрыть все»");
                     }
-                    let screen = screen_dip_rect((width, height), scale);
-                    rebuild_cursor_panel(&mut edit, &cfg, &screen);
+                    if let Some(ms) = monitors_map.get(&monitor_id) {
+                        let screen = screen_dip_rect((ms.width, ms.height), ms.scale);
+                        rebuild_cursor_panel(&mut edit, &cfg, &screen);
+                    }
                     need_redraw = true;
                 }
             }
-            OverlayMessage::Event(OverlayEvent::DpiChanged { dpi, size }) => {
+            OverlayMessage::Event(monitor_id, OverlayEvent::DpiChanged { dpi, size }) => {
                 // Окно уже переехало на рекомендованный прямоугольник
                 // (rst_win32::overlay::handle_dpi_changed) — здесь досчитываем
                 // рендер: пересоздать цепочку под новый размер, обновить
                 // масштаб DIP→физика и геометрию тулбара/панели у курсора,
                 // которая от него зависит (docs/M3_PREP_NOTES.md, раздел 3.6).
-                let old_scale = scale;
-                width = size.0;
-                height = size.1;
-                scale = dpi as f32 / 96.0;
-                renderer.set_dpi_scale(scale);
-                if let Err(e) = renderer.resize(width, height) {
+                let Some(ms) = monitors_map.get_mut(&monitor_id) else {
+                    continue;
+                };
+                let old_scale = ms.scale;
+                ms.width = size.0;
+                ms.height = size.1;
+                ms.scale = dpi as f32 / 96.0;
+                ms.target.set_dpi_scale(ms.scale);
+                if let Err(e) = ms.target.resize(&device, ms.width, ms.height) {
                     tracing::error!(error = %e, "не удалось пересоздать цепочку рендера после смены DPI");
                 }
-                // `cursor_pos` — DIP от старого масштаба; физическая позиция
-                // курсора смена DPI не меняет, поэтому пересчёт — просто
-                // домножение на отношение масштабов, а не ожидание следующего
-                // MouseMove (который без этого не пересобрал бы панель вовсе
-                // — hover-ветка обновляет только состояние существующей панели,
-                // docs/M3_STEP2_3_REVIEW.md, пункт 2.2).
-                let ratio = old_scale / scale;
-                edit.cursor_pos = (
-                    edit.cursor_pos.0 * ratio as f64,
-                    edit.cursor_pos.1 * ratio as f64,
-                );
-                rebuild_ui_panels(&mut edit, &cfg, (width, height), scale);
+                // `cursor_pos` — DIP от старого масштаба ЭТОГО монитора;
+                // физическая позиция курсора смена DPI не меняет, поэтому
+                // пересчёт — просто домножение на отношение масштабов, а не
+                // ожидание следующего MouseMove (который без этого не
+                // пересобрал бы панель вовсе — hover-ветка обновляет только
+                // состояние существующей панели, docs/M3_STEP2_3_REVIEW.md,
+                // пункт 2.2). Если курсор сейчас на другом мониторе, его
+                // DIP уже в системе координат того, другого, монитора —
+                // трогать не надо.
+                if edit.cursor_monitor == monitor_id {
+                    let ratio = old_scale / ms.scale;
+                    edit.cursor_pos = (
+                        edit.cursor_pos.0 * ratio as f64,
+                        edit.cursor_pos.1 * ratio as f64,
+                    );
+                }
+                rebuild_ui_panels(&mut edit, &cfg, (ms.width, ms.height), ms.scale);
                 need_redraw = true;
             }
-            OverlayMessage::Event(OverlayEvent::HotkeyConflict(combo)) => {
+            OverlayMessage::Event(_, OverlayEvent::HotkeyConflict(combo)) => {
                 // Окно продолжает работать без входа в режим редактирования;
                 // предупредить пользователя UI-уведомлением — отдельная
                 // задача (нужен канал в Tauri/трей), пока — хотя бы в лог,
                 // а не тихая потеря события.
                 tracing::warn!(combo = %combo, "хоткей режима редактирования уже занят другим приложением");
             }
-            OverlayMessage::Event(OverlayEvent::MonitorsChanged(monitors)) => {
-                // Диффинг «старое ↔ новое» по device interface path, снос
-                // окна пропавшего монитора, таймер ADR-011 — отдельная,
-                // ещё не подключённая работа (docs/M3_PREP_NOTES.md,
-                // разделы 2.3, 5.3); пока — хотя бы в лог, а не молча.
+            OverlayMessage::Event(_, OverlayEvent::MonitorsChanged(new_monitors)) => {
+                // Диффинг «старое ↔ новое» по device interface path, снос/
+                // создание окон, привязка к таймеру ADR-011
+                // (`monitor_loss::MonitorLossTracker`, уже готов и покрыт
+                // тестами) — отдельная, ещё не подключённая работа
+                // (docs/M3_PREP_NOTES.md, разделы 2.3, 5.3); пока — хотя бы
+                // в лог, а не молча.
                 tracing::info!(
-                    count = monitors.len(),
+                    count = new_monitors.len(),
                     "конфигурация мониторов изменилась (WM_DISPLAYCHANGE)"
                 );
             }
-            OverlayMessage::Event(OverlayEvent::SessionLocked) => {
+            OverlayMessage::Event(_, OverlayEvent::SessionLocked) => {
                 tracing::info!("сессия Windows заблокирована");
             }
-            OverlayMessage::Event(OverlayEvent::SessionUnlocked) => {
+            OverlayMessage::Event(_, OverlayEvent::SessionUnlocked) => {
                 tracing::info!("сессия Windows разблокирована");
             }
-            OverlayMessage::Event(OverlayEvent::SystemSuspending) => {
+            OverlayMessage::Event(_, OverlayEvent::SystemSuspending) => {
                 tracing::info!("система уходит в сон");
             }
-            OverlayMessage::Event(OverlayEvent::SystemResumed) => {
+            OverlayMessage::Event(_, OverlayEvent::SystemResumed) => {
                 tracing::info!("система вышла из сна");
             }
-            OverlayMessage::Event(OverlayEvent::Key {
-                vk,
-                modifiers,
-                pressed: true,
-            }) if edit.active => {
+            OverlayMessage::Event(
+                monitor_id,
+                OverlayEvent::Key {
+                    vk,
+                    modifiers,
+                    pressed: true,
+                },
+            ) if edit.active => {
+                let Some(ms) = monitors_map.get_mut(&monitor_id) else {
+                    continue;
+                };
+                let mut renderer = Renderer {
+                    device: &device,
+                    target: &mut ms.target,
+                };
                 need_redraw = handle_key(
                     vk,
                     modifiers,
-                    &overlay,
+                    &ms.overlay,
                     &mut renderer,
                     &mut cfg,
                     &config_path,
                     &mut sprites,
                     &mut edit,
-                    (width, height),
-                    scale,
+                    (ms.width, ms.height),
+                    ms.scale,
+                    &monitor_id,
                 );
             }
-            OverlayMessage::Event(OverlayEvent::Key { .. }) => {}
-            OverlayMessage::Event(OverlayEvent::Input(event)) if edit.active => {
+            OverlayMessage::Event(_, OverlayEvent::Key { .. }) => {}
+            OverlayMessage::Event(monitor_id, OverlayEvent::Input(event)) if edit.active => {
+                let Some(ms) = monitors_map.get_mut(&monitor_id) else {
+                    continue;
+                };
+                let mut renderer = Renderer {
+                    device: &device,
+                    target: &mut ms.target,
+                };
                 need_redraw = handle_input(
                     event,
-                    scale,
-                    &overlay,
+                    ms.scale,
+                    &ms.overlay,
                     &mut renderer,
-                    (width, height),
+                    (ms.width, ms.height),
                     &mut cfg,
                     &config_path,
                     &mut sprites,
                     &mut edit,
+                    &monitor_id,
                 );
             }
-            OverlayMessage::Event(OverlayEvent::Input(_)) => {
+            OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
                 // Вне режима редактирования окно клик-прозрачно — эти
                 // события приходить не должны, но игнорируем на всякий случай.
             }
         }
         if need_redraw {
-            redraw(
-                &mut renderer,
-                &sprites,
-                &cfg,
-                &edit,
-                &white_tex,
-                &black_tex,
-                &mut ui_cache,
-                width,
-                height,
-                scale,
-            );
+            for (monitor_id, ms) in monitors_map.iter_mut() {
+                let mut renderer = Renderer {
+                    device: &device,
+                    target: &mut ms.target,
+                };
+                redraw(
+                    &mut renderer,
+                    &sprites,
+                    &cfg,
+                    &edit,
+                    &white_tex,
+                    &black_tex,
+                    &mut ui_cache,
+                    ms.width,
+                    ms.height,
+                    ms.scale,
+                    monitor_id,
+                );
+            }
         }
     }
-    // renderer и overlay освобождаются здесь в обратном порядке объявления:
-    // сначала renderer (COM/DComp), затем overlay (окно) — корректный порядок.
+    // monitors_map (Device+WindowTarget-обёртки внутри Renderer конструируются
+    // временно и не переживают итерацию) и device освобождаются здесь;
+    // MonitorState.target дропается раньше MonitorState.overlay в порядке
+    // полей — тот же безопасный порядок «рендер раньше окна», что был у
+    // одного монитора (COM/DComp раньше HWND).
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -966,6 +1122,7 @@ fn begin_delete(
     center: (f64, f64),
     overlay_size: (u32, u32),
     scale: f32,
+    monitor_id: &MonitorId,
 ) -> bool {
     if edit.selection.is_empty() {
         return false;
@@ -974,6 +1131,7 @@ fn begin_delete(
         edit.confirm = Some(ConfirmState {
             snapshot: cfg.clone(),
             ids: edit.selection.ids().to_vec(),
+            monitor_id: monitor_id.clone(),
             panel: confirm_dialog::build(edit.selection.ids().len() as u32, center),
         });
     } else {
@@ -1008,6 +1166,7 @@ fn handle_key(
     edit: &mut EditState,
     overlay_size: (u32, u32),
     scale: f32,
+    monitor_id: &MonitorId,
 ) -> bool {
     // История/удаление/дублирование во время активного жеста (сцены или
     // панели — ползунок прозрачности тоже держит указатель) мутировали бы
@@ -1121,6 +1280,7 @@ fn handle_key(
                 center,
                 overlay_size,
                 scale,
+                monitor_id,
             )
         }
         VK_D if modifiers.ctrl => {
@@ -1145,9 +1305,16 @@ fn handle_key(
             rebuild_ui_panels(edit, cfg, overlay_size, scale);
             true
         }
-        VK_V if modifiers.ctrl => {
-            paste_from_clipboard(overlay, renderer, cfg, config_path, sprites, edit, scale)
-        }
+        VK_V if modifiers.ctrl => paste_from_clipboard(
+            overlay,
+            renderer,
+            cfg,
+            config_path,
+            sprites,
+            edit,
+            scale,
+            monitor_id,
+        ),
         _ => false,
     }
 }
@@ -1176,6 +1343,7 @@ fn widget_key(vk: u32, modifiers: Modifiers) -> Option<Key> {
 /// доходят до виджетов (`widget_key` возвращает `None`), и это отдельный,
 /// пока не подключённый срез. Отсутствие изображения в буфере — не ошибка,
 /// просто `false` (нет перерисовки).
+#[allow(clippy::too_many_arguments)]
 fn paste_from_clipboard(
     overlay: &OverlayWindow,
     renderer: &mut Renderer,
@@ -1184,6 +1352,7 @@ fn paste_from_clipboard(
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
     scale: f32,
+    monitor_id: &MonitorId,
 ) -> bool {
     let image = match clipboard::read_image() {
         Ok(Some(image)) => image,
@@ -1219,6 +1388,7 @@ fn paste_from_clipboard(
                     path,
                     false,
                     scale,
+                    monitor_id,
                 ) {
                     added = true;
                 }
@@ -1244,6 +1414,7 @@ fn paste_from_clipboard(
                         path.clone(),
                         true,
                         scale,
+                        monitor_id,
                     ) {
                         commit_undo_snapshot(edit, before);
                         true
@@ -1278,9 +1449,10 @@ fn to_dip(pos: rst_win32::input::Point, scale: f32) -> (f64, f64) {
 /// скейлить и вернуть кнопкой «глаз»»), поэтому `visible` здесь не
 /// фильтруется — в отличие от `redraw`, где скрытые вне режима редактирования
 /// не рисуются вообще.
-fn hit_sticker_at(cfg: &Config, dip_x: f64, dip_y: f64) -> Option<Uuid> {
+fn hit_sticker_at(cfg: &Config, monitor_id: &MonitorId, dip_x: f64, dip_y: f64) -> Option<Uuid> {
     cfg.stickers
         .iter()
+        .filter(|s| s.placement.monitor_id == *monitor_id)
         .filter(|s| hittest::contains(&s.placement, &s.transform, dip_x, dip_y))
         .max_by_key(|s| s.order)
         .map(|s| s.id)
@@ -1296,9 +1468,19 @@ fn point_in_box2d(r: &Box2D, x: f64, y: f64) -> bool {
 /// порядок проверки — обратный порядку отрисовки. Ручки/кольцо поворота
 /// доступны только для одиночного выделения (мультивыделение — следующий
 /// срез).
-fn resolve_zone(cfg: &Config, selection: &SelectionSet, dip_x: f64, dip_y: f64) -> Zone {
+fn resolve_zone(
+    cfg: &Config,
+    selection: &SelectionSet,
+    monitor_id: &MonitorId,
+    dip_x: f64,
+    dip_y: f64,
+) -> Zone {
     if let [id] = selection.ids() {
-        if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) {
+        if let Some(sticker) = cfg
+            .stickers
+            .iter()
+            .find(|s| s.id == *id && s.placement.monitor_id == *monitor_id)
+        {
             let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
             // Ручки ресайза — высший приоритет: их квадрат (сторона
             // HANDLE_SIZE_DIP) целиком накрывает свой угол, поэтому кольцо
@@ -1324,7 +1506,7 @@ fn resolve_zone(cfg: &Config, selection: &SelectionSet, dip_x: f64, dip_y: f64) 
             return Zone::Background;
         }
     }
-    match hit_sticker_at(cfg, dip_x, dip_y) {
+    match hit_sticker_at(cfg, monitor_id, dip_x, dip_y) {
         Some(id) => Zone::StickerBody(id),
         None => Zone::Background,
     }
@@ -1535,6 +1717,7 @@ fn handle_toolbar_up(
     pos: (f64, f64),
     overlay_size: (u32, u32),
     scale: f32,
+    monitor_id: &MonitorId,
 ) -> bool {
     if let Some(panel) = &mut edit.toolbar {
         panel.pointer_event(PointerEvent::Up { pos });
@@ -1631,6 +1814,7 @@ fn handle_toolbar_up(
             center,
             overlay_size,
             scale,
+            monitor_id,
         );
     }
     true
@@ -1651,6 +1835,7 @@ fn add_sticker_from_dialog(
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
     scale: f32,
+    monitor_id: &MonitorId,
 ) {
     match file_dialog::pick_image_file(overlay.hwnd()) {
         Ok(Some(path)) => {
@@ -1664,6 +1849,7 @@ fn add_sticker_from_dialog(
                 path,
                 false,
                 scale,
+                monitor_id,
             ) {
                 commit_undo_snapshot(edit, before);
             }
@@ -1686,6 +1872,7 @@ fn handle_cursor_panel_up(
     pos: (f64, f64),
     overlay_size: (u32, u32),
     scale: f32,
+    monitor_id: &MonitorId,
 ) -> bool {
     if let Some(panel) = &mut edit.cursor_panel {
         panel.pointer_event(PointerEvent::Up { pos });
@@ -1698,7 +1885,16 @@ fn handle_cursor_panel_up(
     };
 
     if clicked(edit, cursor_panel::BTN_LOAD_FILE) {
-        add_sticker_from_dialog(overlay, renderer, cfg, config_path, sprites, edit, scale);
+        add_sticker_from_dialog(
+            overlay,
+            renderer,
+            cfg,
+            config_path,
+            sprites,
+            edit,
+            scale,
+            monitor_id,
+        );
         let screen = screen_dip_rect(overlay_size, scale);
         rebuild_cursor_panel(edit, cfg, &screen);
         return true;
@@ -1785,6 +1981,7 @@ fn handle_input(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
+    monitor_id: &MonitorId,
 ) -> bool {
     let monitor = DipRect::new(
         0.0,
@@ -1830,7 +2027,7 @@ fn handle_input(
                 }
             }
             edit.pointer_owner = PointerOwner::Scene;
-            let zone = resolve_zone(cfg, &edit.selection, dip_x, dip_y);
+            let zone = resolve_zone(cfg, &edit.selection, monitor_id, dip_x, dip_y);
             match zone {
                 Zone::Background => {
                     // Решение «клик или марка» откладывается до `MouseUp`/
@@ -1919,6 +2116,7 @@ fn handle_input(
         } => {
             let (dip_x, dip_y) = to_dip(pos, scale);
             edit.cursor_pos = (dip_x, dip_y);
+            edit.cursor_monitor = monitor_id.clone();
             if let Some(confirm) = &mut edit.confirm {
                 confirm.panel.pointer_event(PointerEvent::Move {
                     pos: (dip_x, dip_y),
@@ -1944,8 +2142,15 @@ fn handle_input(
                     return true;
                 }
                 PointerOwner::Scene if dragging => {
-                    let need_redraw =
-                        apply_gesture(cfg, sprites, edit, (dip_x, dip_y), modifiers, monitor);
+                    let need_redraw = apply_gesture(
+                        cfg,
+                        sprites,
+                        edit,
+                        (dip_x, dip_y),
+                        modifiers,
+                        monitor,
+                        monitor_id,
+                    );
                     if need_redraw {
                         // Драг/ресайз/поворот меняют placement/opacity живо —
                         // тулбар должен следовать за стикером в том же кадре
@@ -1993,7 +2198,7 @@ fn handle_input(
             if over_panel {
                 overlay.post_cursor_shape(CursorShape::Arrow);
             } else {
-                let zone = resolve_zone(cfg, &edit.selection, dip_x, dip_y);
+                let zone = resolve_zone(cfg, &edit.selection, monitor_id, dip_x, dip_y);
                 overlay.post_cursor_shape(cursor_shape_for_zone(&zone));
             }
             need_redraw
@@ -2079,6 +2284,7 @@ fn handle_input(
                         (dip_x, dip_y),
                         overlay_size,
                         scale,
+                        monitor_id,
                     );
                 }
                 PointerOwner::Toolbar => {
@@ -2092,6 +2298,7 @@ fn handle_input(
                         (dip_x, dip_y),
                         overlay_size,
                         scale,
+                        monitor_id,
                     );
                 }
                 PointerOwner::Scene | PointerOwner::None => {}
@@ -2202,6 +2409,7 @@ fn apply_gesture(
     (dip_x, dip_y): (f64, f64),
     modifiers: Modifiers,
     monitor: DipRect,
+    monitor_id: &MonitorId,
 ) -> bool {
     if let Some(Gesture::Marquee { anchor, .. }) = &edit.gesture {
         let anchor = *anchor;
@@ -2216,7 +2424,21 @@ fn apply_gesture(
         {
             edit.marquee_started = true;
             edit.marquee = Some((anchor.0, anchor.1, dip_x, dip_y));
-            edit.selection.rubber_band(&cfg.stickers, &rect);
+            // Марка тянется в локальных DIP одного монитора (мышь захвачена
+            // его окном) — сравнивать рамку нужно только со стикерами того
+            // же монитора, иначе совпадение координат с другим монитором
+            // выделило бы чужой стикер (M3). Как и раньше, `rubber_band`
+            // заменяет выделение целиком — стикеры других мониторов,
+            // выделенные до начала этой марки, тоже снимутся: то же
+            // поведение «замены», что и в однооконном мире, только теперь
+            // применимое и к чужим мониторам.
+            let same_monitor: Vec<Sticker> = cfg
+                .stickers
+                .iter()
+                .filter(|s| s.placement.monitor_id == *monitor_id)
+                .cloned()
+                .collect();
+            edit.selection.rubber_band(&same_monitor, &rect);
         }
         return true;
     }
@@ -2284,6 +2506,15 @@ fn apply_gesture(
 /// активен режим редактирования), стикеры по `order` (снизу вверх), затем
 /// рамка выделения поверх (тулбар и панель у курсора — следующий срез,
 /// docs/M2_INTEGRATION_PLAN.md, раздел 11).
+///
+/// Собрать и отрисовать кадр ровно для одного монитора (`monitor_id`) — M3:
+/// каждое окно получает свой кадр, отфильтрованный по `placement.monitor_id`
+/// (M3_PREP_NOTES.md, раздел 5.2). Затемнение режима редактирования рисуется
+/// на **каждом** мониторе безусловно (единый режим на весь десктоп,
+/// M3_PREP_NOTES.md §5.1); тулбар/панель у курсора/марка/модал — только на
+/// том мониторе, к которому они сейчас относятся (выделенный стикер, позиция
+/// курсора, монитор, открывший диалог — соответственно), иначе один и тот же
+/// UI-элемент нарисовался бы на всех окнах сразу.
 #[allow(clippy::too_many_arguments)]
 fn redraw(
     renderer: &mut Renderer,
@@ -2296,9 +2527,9 @@ fn redraw(
     width_px: u32,
     height_px: u32,
     scale: f32,
+    monitor_id: &MonitorId,
 ) {
     let mut frame: Vec<Sprite> = Vec::with_capacity(sprites.len() + 1 + 12);
-    let monitor_id = MonitorId::default();
     // Растровый шрифт — целочисленный пиксельный масштаб; `scale` (DPI/96)
     // округляем, а не берём как есть (text::rasterize ждёт `u32`).
     let text_scale = scale.round().max(1.0) as u32;
@@ -2308,13 +2539,14 @@ fn redraw(
         let h_dip = height_px as f64 / scale as f64;
         frame.push(solid_sprite(
             black_tex,
-            &monitor_id,
+            monitor_id,
             &edit_overlay(w_dip, h_dip),
             rst_render::EDIT_OVERLAY_OPACITY,
         ));
     }
 
     // Порядок отрисовки стикеров — по `order` (больше — выше, CONFIG.md).
+    // Только стикеры ЭТОГО монитора (M3) — чужие рисуются в своём кадре.
     // Скрытые рисуются только в режиме редактирования — чёрно-розовой
     // шахматкой по форме AABB вместо реального содержимого (SPEC.md 3.7):
     // стикер остаётся полностью интерактивным (см. `hit_sticker_at`), просто
@@ -2322,6 +2554,7 @@ fn redraw(
     let mut order: Vec<&Sticker> = cfg
         .stickers
         .iter()
+        .filter(|s| s.placement.monitor_id == *monitor_id)
         .filter(|s| s.visible || edit.active)
         .collect();
     order.sort_by_key(|s| s.order);
@@ -2349,7 +2582,7 @@ fn redraw(
                 // Полная непрозрачность независимо от собственной opacity
                 // стикера — шахматка должна быть чётко видна, а не выцветать
                 // вместе со скрытым содержимым под ней.
-                frame.push(solid_sprite(&tex, &monitor_id, &rect, 1.0));
+                frame.push(solid_sprite(&tex, monitor_id, &rect, 1.0));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "не удалось создать текстуру шахматки для скрытого стикера");
@@ -2358,80 +2591,84 @@ fn redraw(
     }
 
     // Марка — под рамками выделения, только пока реально тянется (порог
-    // протяжки, docs/M2_WIRING_PLAN.md, раздел 8/11).
+    // протяжки, docs/M2_WIRING_PLAN.md, раздел 8/11) и только на мониторе,
+    // где она сейчас тянется (M3: мышь захвачена этим окном на всё время
+    // жеста, `edit.cursor_monitor` — тот же монитор всю дорогу).
     if let Some((ax, ay, cx, cy)) = edit.marquee {
-        let visuals = marquee_visuals((ax, ay), (cx, cy));
-        if let Some(tex) = ui_cache.fill_texture(renderer, theme::SLIDER_FILL) {
-            if let Some(fill_rect) = &visuals.fill {
-                frame.push(solid_sprite(
-                    &tex,
-                    &monitor_id,
-                    fill_rect,
-                    rst_render::MARQUEE_FILL_OPACITY,
-                ));
-            }
-            for dash in &visuals.dashes {
-                frame.push(solid_sprite(
-                    &tex,
-                    &monitor_id,
-                    dash,
-                    rst_render::MARQUEE_STROKE_OPACITY,
-                ));
+        if edit.cursor_monitor == *monitor_id {
+            let visuals = marquee_visuals((ax, ay), (cx, cy));
+            if let Some(tex) = ui_cache.fill_texture(renderer, theme::SLIDER_FILL) {
+                if let Some(fill_rect) = &visuals.fill {
+                    frame.push(solid_sprite(
+                        &tex,
+                        monitor_id,
+                        fill_rect,
+                        rst_render::MARQUEE_FILL_OPACITY,
+                    ));
+                }
+                for dash in &visuals.dashes {
+                    frame.push(solid_sprite(
+                        &tex,
+                        monitor_id,
+                        dash,
+                        rst_render::MARQUEE_STROKE_OPACITY,
+                    ));
+                }
             }
         }
     }
 
     if edit.active {
         for id in edit.selection.ids() {
-            let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) else {
+            let Some(sticker) = cfg
+                .stickers
+                .iter()
+                .find(|s| s.id == *id && s.placement.monitor_id == *monitor_id)
+            else {
                 continue;
             };
             let selection_box = SelectionBox::new(&sticker.placement, &sticker.transform);
             for rect in selection_box.all_rects() {
-                frame.push(solid_sprite(white_tex, &monitor_id, &rect, 1.0));
+                frame.push(solid_sprite(white_tex, monitor_id, &rect, 1.0));
             }
         }
     }
 
     // Тулбар и панель у курсора — над рамками выделения, под модалом
-    // (раздел 11).
+    // (раздел 11). Тулбар следует за монитором выделенного стикера; панель
+    // у курсора и марка — за `edit.cursor_monitor` (M3, см. выше).
+    let toolbar_monitor = single_selected_id(&edit.selection)
+        .and_then(|id| cfg.stickers.iter().find(|s| s.id == id))
+        .map(|s| &s.placement.monitor_id);
     if let Some(toolbar) = &edit.toolbar {
-        let mut prims = Vec::new();
-        toolbar.draw(&mut prims);
-        primitives_to_sprites(
-            &prims,
-            ui_cache,
-            renderer,
-            &monitor_id,
-            text_scale,
-            &mut frame,
-        );
+        if toolbar_monitor == Some(monitor_id) {
+            let mut prims = Vec::new();
+            toolbar.draw(&mut prims);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
     }
     if let Some(cursor_panel) = &edit.cursor_panel {
-        let mut prims = Vec::new();
-        cursor_panel.draw(&mut prims);
-        primitives_to_sprites(
-            &prims,
-            ui_cache,
-            renderer,
-            &monitor_id,
-            text_scale,
-            &mut frame,
-        );
+        if edit.cursor_monitor == *monitor_id {
+            let mut prims = Vec::new();
+            cursor_panel.draw(&mut prims);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
     }
 
-    // Модал подтверждения — самый верх (раздел 11).
+    // Модал подтверждения — самый верх (раздел 11), только на мониторе,
+    // открывшем удаление (M3).
     if let Some(confirm) = &edit.confirm {
-        let mut prims = Vec::new();
-        confirm.panel.draw(&mut prims);
-        primitives_to_sprites(
-            &prims,
-            ui_cache,
-            renderer,
-            &monitor_id,
-            text_scale,
-            &mut frame,
-        );
+        if confirm.monitor_id == *monitor_id {
+            let mut prims = Vec::new();
+            confirm.panel.draw(&mut prims);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
     }
 
     if let Err(e) = renderer.draw(&frame) {
@@ -2456,6 +2693,7 @@ fn add_sticker(
     path: PathBuf,
     pasted: bool,
     scale: f32,
+    monitor_id: &MonitorId,
 ) -> bool {
     let texture = match renderer.load_image(&path) {
         Ok(t) => t,
@@ -2474,11 +2712,12 @@ fn add_sticker(
         screen_w as f64 / scale as f64 / 2.0,
         screen_h as f64 / scale as f64 / 2.0,
     );
-    // M3: реальный device interface path монитора; M1 — один монитор, заглушка.
+    // M3: реальный device interface path монитора, откуда пришло добавление
+    // (перетаскивание/вставка/диалог на конкретном окне) — `monitor_id`.
     let sticker = if pasted {
         Sticker::new_pasted(
             path,
-            MonitorId::default(),
+            monitor_id.clone(),
             center_x,
             center_y,
             w as f64,
@@ -2488,7 +2727,7 @@ fn add_sticker(
         Sticker::new_file(
             path,
             MediaType::Image,
-            MonitorId::default(),
+            monitor_id.clone(),
             center_x,
             center_y,
             w as f64,
