@@ -1181,6 +1181,13 @@ fn run(
                     bounds.bounds_px.h = ms.height;
                     bounds.scale = ms.scale as f64;
                 }
+                // Найдено независимым ревью (2026-08-04): без пересчёта здесь
+                // `occluder_cache` этого монитора остаётся в СТАРОМ
+                // монитор-локальном пространстве физических px до следующего
+                // `Windows(Changed)` — маска резалась бы не там (видимый
+                // баг, не просто задержка), пока не придёт первое реальное
+                // изменение окон после смены DPI.
+                occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
                 rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
                 need_redraw = true;
             }
@@ -1404,6 +1411,15 @@ fn run(
                         ))
                     })
                     .collect();
+                // Найдено независимым ревью (2026-08-04): без пересчёта
+                // здесь `occluder_cache` остаётся в СТАРОМ монитор-локальном
+                // пространстве физических px изменившихся мониторов до
+                // следующего `Windows(Changed)` — маска резалась бы не там
+                // (видимый баг, не просто задержка). `window_snapshot` сам
+                // по себе сменой мониторов не устаревает — окна остаются
+                // окнами, устарели только границы монитора, к которым их
+                // клипает `occluder_rects_for`.
+                occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
 
                 // 5. Новый «эталон» и прогон автомата потери монитора.
                 last_snapshot = new_snapshot;
@@ -2433,6 +2449,12 @@ fn window_rect_to_core(r: &WindowRect) -> Option<Rect> {
     })
 }
 
+/// Радиус скругления маски перекрытия, физические px — должен совпадать с
+/// радиусом в `mainMaskPS` (`crates/rst-render/src/shader.rs`). Дублируется
+/// здесь константой, а не импортируется: `shader.rs` — HLSL-строка, у неё
+/// нет Rust-API для этого числа.
+const MASK_CORNER_RADIUS_PX: i32 = 8;
+
 /// Целиком ли AABB стикера (DIP, `placement`/`rotation`) лежит внутри ОДНОГО
 /// из `rects` (физические px, локальные для монитора — та же система
 /// координат, что у AABB после перевода через `scale`, ROADMAP.md M4
@@ -2440,6 +2462,14 @@ fn window_rect_to_core(r: &WindowRect) -> Option<Rect> {
 /// покрытие достигается только объединением нескольких прямоугольников —
 /// приемлемо для чистой оптимизации отрисовки (маска всё равно скрывает
 /// стикер визуально), лишь бы не было ложноположительных срабатываний.
+///
+/// Каждый `rect` перед проверкой уменьшается на [`MASK_CORNER_RADIUS_PX`] со
+/// всех сторон (`inset_for_mask_radius`): маска реально рисуется со
+/// скруглёнными углами (SDF в `mainMaskPS`), поэтому содержание AABB в
+/// ПОЛНОМ прямоугольнике-окклюдере не гарантирует покрытие — угловые дуги
+/// (~8px от каждого угла) под маской не оказываются. Без этого уменьшения
+/// стикер, попадающий в зону дуги, отсекался бы отсюда, хотя маска реально
+/// показала бы его угол (найдено независимым ревью, 2026-08-04).
 fn sticker_fully_covered(placement: &Placement, rotation: f64, scale: f32, rects: &[Rect]) -> bool {
     let aabb = hittest::aabb(placement, rotation);
     let px = Rect {
@@ -2448,7 +2478,29 @@ fn sticker_fully_covered(placement: &Placement, rotation: f64, scale: f32, rects
         w: (aabb.w * f64::from(scale)).round().max(0.0) as u32,
         h: (aabb.h * f64::from(scale)).round().max(0.0) as u32,
     };
-    rects.iter().any(|r| rect_contains(r, &px))
+    rects
+        .iter()
+        .filter_map(inset_for_mask_radius)
+        .any(|r| rect_contains(&r, &px))
+}
+
+/// `outer` уменьшенный на [`MASK_CORNER_RADIUS_PX`] со всех сторон — область,
+/// где полное покрытие скруглённой маской гарантировано (см.
+/// `sticker_fully_covered`). `None`, если `outer` меньше `2×radius` по
+/// любой стороне (после уменьшения ничего не остаётся — прямоугольник
+/// целиком в зоне угловых дуг, значит гарантированного покрытия для него нет
+/// вообще).
+fn inset_for_mask_radius(outer: &Rect) -> Option<Rect> {
+    let inset2 = MASK_CORNER_RADIUS_PX * 2;
+    if (outer.w as i32) <= inset2 || (outer.h as i32) <= inset2 {
+        return None;
+    }
+    Some(Rect {
+        x: outer.x + MASK_CORNER_RADIUS_PX,
+        y: outer.y + MASK_CORNER_RADIUS_PX,
+        w: outer.w - inset2 as u32,
+        h: outer.h - inset2 as u32,
+    })
 }
 
 /// `inner` целиком внутри `outer` (обе — физические px, общая система
@@ -4558,5 +4610,39 @@ mod tests {
             2.0,
             &[occluder_for_scale_2]
         ));
+    }
+
+    #[test]
+    fn sticker_fully_covered_false_for_sticker_tucked_in_rounded_corner() {
+        // Найдено независимым ревью (2026-08-04): маска реально скруглена
+        // (mainMaskPS, радиус MASK_CORNER_RADIUS_PX) — стикер, чей AABB
+        // целиком внутри ПОЛНОГО прямоугольника-окклюдера, но лежит в зоне
+        // угловой дуги, реально остаётся хоть немного видимым под маской.
+        // AABB (2,2,8,8) — целиком в (0,0,200,200), но целиком и в зоне
+        // дуги верхнего левого угла (уменьшенный на 8px прямоугольник
+        // начинается только с (8,8)).
+        let placement = Placement {
+            monitor_id: monitor_id("M1"),
+            cx: 6.0,
+            cy: 6.0,
+            w: 8.0,
+            h: 8.0,
+        };
+        let occluder = bounds(0, 0, 200, 200);
+        assert!(!sticker_fully_covered(&placement, 0.0, 1.0, &[occluder]));
+    }
+
+    #[test]
+    fn inset_for_mask_radius_shrinks_by_radius_on_each_side() {
+        assert_eq!(
+            inset_for_mask_radius(&bounds(10, 20, 100, 100)),
+            Some(bounds(18, 28, 84, 84))
+        );
+    }
+
+    #[test]
+    fn inset_for_mask_radius_none_when_too_small() {
+        assert_eq!(inset_for_mask_radius(&bounds(0, 0, 16, 100)), None);
+        assert_eq!(inset_for_mask_radius(&bounds(0, 0, 100, 16)), None);
     }
 }
