@@ -10,6 +10,7 @@ mod cursor_panel;
 mod logging;
 mod overlay_manager;
 mod toolbar;
+mod window_picker;
 
 use std::path::PathBuf;
 use std::sync::mpsc;

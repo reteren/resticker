@@ -64,7 +64,11 @@ pub fn is_occluder(
 
 /// Правило матчит окно, если совпадает `process_name` ИЛИ `title_pattern`.
 /// Пустое правило (оба `None`) не матчит ничего — окно остаётся окклюдером.
-fn rule_matches(rule: &OverlapRule, window: &OccluderCandidate) -> bool {
+///
+/// `pub`: панель выбора окон (docs/M4_WINDOW_PICKER_DESIGN.md §2.1) отвечает
+/// «выбран ли чекбокс строки/процесса» ровно этим предикатом, которым маска
+/// решает про окклюдера, — иначе панель и маска могли бы разойтись во мнениях.
+pub fn rule_matches(rule: &OverlapRule, window: &OccluderCandidate) -> bool {
     let by_path = match (&rule.process_name, &window.exe_path) {
         (Some(rule_name), Some(exe_path)) => path_eq_ignore_case(rule_name, exe_path),
         // Правило по процессу, но путь окна неизвестен — не матчим
