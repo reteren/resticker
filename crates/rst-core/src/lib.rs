@@ -13,6 +13,7 @@ pub mod migration;
 pub mod model;
 pub mod monitor_loss;
 pub mod monitor_rebind;
+pub mod occluders;
 pub mod ops;
 pub mod selection_set;
 pub mod snap;
