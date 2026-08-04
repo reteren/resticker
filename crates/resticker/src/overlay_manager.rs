@@ -118,7 +118,13 @@ struct MonitorState {
     /// возвращал бы `DeviceLost` на каждом кадре и превращал бы КАЖДОЕ
     /// следующее redraw-событие в полное повторное восстановление всех GPU-
     /// ресурсов (docs/M3_DEVICE_RECOVERY_REVIEW.md, пункт 2.1). Снимается
-    /// следующим успешным `recover_device` для этого монитора.
+    /// следующим успешным `recover_device` для этого монитора. Если `broken`
+    /// у ВСЕХ мониторов сразу (все цели не пересоздались на новом
+    /// устройстве) — `redraw_all` не рисует ничего и возвращает `false`,
+    /// новых попыток `recover_device` больше не будет (детект идёт от
+    /// `present` здоровой цели, а её не осталось): тихий чёрный экран без
+    /// восстановления, кроме перезапуска процесса (M3_STEP5_6_REVIEW.md,
+    /// пункт 2.6). На практике маловероятно — устройство только что создано.
     broken: bool,
 }
 
@@ -191,18 +197,22 @@ fn create_monitor_state(
     })
 }
 
-/// Снести состояние пропавшего монитора (ветка `MonitorsChanged`,
-/// M3_HOTPLUG_DESIGN.md §2, чек-лист сноса): удаляет `MonitorState` (порядок
-/// дропа полей — `target` раньше `overlay`, уже безопасен, docs/
-/// M3_STEP4_REVIEW.md пункт 2.3; поток-форвардер окна завершается сам, когда
-/// закрывается канал событий уничтоженного окна), чистит снимки-копии
-/// (`monitor_geometry`/`monitor_bounds` — иначе панели/rebind продолжат
-/// видеть мёртвый монитор) и, если режим редактирования активен: снимает с
+/// Снести состояние монитора (ветка `MonitorsChanged`, M3_HOTPLUG_DESIGN.md
+/// §2, чек-лист сноса): удаляет `MonitorState` (порядок дропа полей —
+/// `target` раньше `overlay`, уже безопасен, docs/M3_STEP4_REVIEW.md пункт
+/// 2.3; поток-форвардер окна завершается сам, когда закрывается канал
+/// событий уничтоженного окна) и чистит снимки-копии (`monitor_geometry`/
+/// `monitor_bounds`). Дважды используется с разным смыслом `physically_gone`
+/// (M3_STEP5_6_REVIEW.md, пункт 2.3): `true` — монитор реально пропал
+/// (шаг 3), тогда, если режим редактирования активен, ещё снимает с
 /// выделения стикеры этого монитора, переносит `cursor_monitor`/`cursor_pos`
 /// на новый основной, если курсор был там же, отменяет незавершённый жест
 /// сцены на этом мониторе так же, как `CaptureLost` (окно уже уничтожено —
-/// `WM_CAPTURECHANGED` от него больше не придёт), и пересобирает панели.
-/// Стикеры пропавшего монитора **не трогает** — их прячет
+/// `WM_CAPTURECHANGED` от него больше не придёт), и пересобирает панели;
+/// `false` — монитор физически на месте, окно сносится только ради
+/// перерегистрации хоткея на новом primary (шаг 1) — трогать выделение/
+/// курсор/жест живого монитора ради этого не нужно. Стикеры пропавшего
+/// монитора **не трогает** ни в одном случае — их прячет
 /// `MonitorLossTracker` своим `LossAction::HideSticker` отдельно; снос окна и
 /// скрытие стикеров — два разных эффекта одного события.
 #[allow(clippy::too_many_arguments)]
@@ -215,12 +225,13 @@ fn teardown_monitor_state(
     cfg: &mut Config,
     sprites: &mut [(Uuid, Sprite)],
     new_primary_id: &MonitorId,
+    physically_gone: bool,
 ) {
     monitors_map.remove(id);
     monitor_geometry.remove(id);
     monitor_bounds.remove(id);
 
-    if !edit.active {
+    if !physically_gone || !edit.active {
         return;
     }
 
@@ -239,13 +250,19 @@ fn teardown_monitor_state(
         edit.selection.deselect(sid);
     }
 
-    if edit.cursor_monitor == *id {
+    // Захватить ДО переназначения ниже — иначе сравнение в ветке марки всегда
+    // false (M3_STEP5_6_REVIEW.md, пункт 2.1): пока марка активна, курсор на
+    // этом мониторе всегда здесь же (каждый `MouseMove` окна ставит
+    // `cursor_monitor = monitor_id`, а марка живёт только на своём окне) —
+    // сравнивать нужно с состоянием ДО переезда курсора на новый primary.
+    let cursor_was_here = edit.cursor_monitor == *id;
+    if cursor_was_here {
         edit.cursor_monitor = new_primary_id.clone();
         edit.cursor_pos = (0.0, 0.0);
     }
 
     let cancel_gesture = match &edit.gesture {
-        Some(Gesture::Marquee { .. }) => edit.cursor_monitor == *id,
+        Some(Gesture::Marquee { .. }) => cursor_was_here,
         Some(other) => other.start().is_some_and(|start| {
             cfg.stickers
                 .iter()
@@ -1079,6 +1096,11 @@ fn run(
                 // на pump-потоке своего окна и снимается только вместе с
                 // ним — «перерегистрация» здесь означает пересоздание окна.
                 if new_primary_id != primary_id {
+                    // `physically_gone: false` — монитор ещё на месте, просто
+                    // больше не primary; сносим окно только ради
+                    // перерегистрации хоткея, edit-state живого монитора
+                    // трогать не нужно (M3_STEP5_6_REVIEW.md, пункт 2.3).
+                    let old_primary_still_connected = new_infos.iter().any(|m| m.id == primary_id);
                     teardown_monitor_state(
                         &mut monitors_map,
                         &mut monitor_geometry,
@@ -1088,6 +1110,7 @@ fn run(
                         &mut cfg,
                         &mut sprites,
                         &new_primary_id,
+                        !old_primary_still_connected,
                     );
                     // Старый primary мог остаться физически подключённым —
                     // просто больше не primary: тогда монитору нужно новое
@@ -1115,23 +1138,38 @@ fn run(
                     }
                 }
 
-                // 2. Прочие появившиеся мониторы (не участвовавшие в смене
-                // хоткея выше) → новое окно + цель + форвардер, без хоткея —
-                // им никогда не быть только что назначенным primary (тот уже
-                // обработан шагом 1, если менялся).
+                // 2. Прочие появившиеся мониторы → новое окно + цель +
+                // форвардер. Хоткей достаётся тому, чей id == new_primary_id —
+                // обычно это уже отфильтровано шагом 1 (contains_key), но
+                // если создание окна нового primary там ПРОВАЛИЛОСЬ, эта
+                // проверка даёт ему второй шанс с правильными хоткеями вместо
+                // молчаливого создания без них (M3_STEP5_6_REVIEW.md, пункт
+                // 2.4) — иначе глобальный хоткей остался бы незарегистрирован
+                // до следующей смены primary.
                 for info in &new_infos {
                     if monitors_map.contains_key(&info.id) {
                         continue;
                     }
-                    if let Some(ms) =
-                        create_monitor_state(&device, &tx, info, None, None, edit.active)
-                    {
+                    let (edit_hotkey, this_toggle_all) = if info.id == new_primary_id {
+                        (Some(hotkey), toggle_all_hotkey)
+                    } else {
+                        (None, None)
+                    };
+                    if let Some(ms) = create_monitor_state(
+                        &device,
+                        &tx,
+                        info,
+                        edit_hotkey,
+                        this_toggle_all,
+                        edit.active,
+                    ) {
                         monitors_map.insert(info.id.clone(), ms);
                     }
                 }
 
                 // 3. Пропавшие мониторы → снос (чек-лист в
-                // teardown_monitor_state, включая edit-state).
+                // teardown_monitor_state, включая edit-state:
+                // `physically_gone: true`).
                 let new_ids: HashSet<&MonitorId> = new_infos.iter().map(|m| &m.id).collect();
                 let gone: Vec<MonitorId> = monitors_map
                     .keys()
@@ -1148,11 +1186,19 @@ fn run(
                         &mut cfg,
                         &mut sprites,
                         &new_primary_id,
+                        true,
                     );
                 }
 
                 // 4. Пересобрать снимки-копии из живого monitors_map — так
-                // же, как на старте.
+                // же, как на старте. `monitor_geometry` берёт w/h/scale из
+                // окна/цели (не пересозданных, если этот монитор просто
+                // остался подключён), а `monitor_bounds` — из `new_infos`
+                // (актуальные границы ОС): при смене разрешения на мониторе,
+                // который никто не трогал в шагах 1-3, эти два снимка
+                // разойдутся — окно рисует старую область, а rebind уже
+                // считает по новым границам (известный gap, расширено в
+                // ROADMAP.md M3; M3_STEP5_6_REVIEW.md, пункт 2.5).
                 monitor_geometry = monitors_map
                     .iter()
                     .map(|(id, ms)| (id.clone(), (ms.width, ms.height, ms.scale)))
@@ -2971,7 +3017,6 @@ fn handle_input(
                 // шагом истории.
                 if let Some(before) = edit.pending_snapshot.take() {
                     if before != *cfg {
-                        commit_undo_snapshot(edit, before);
                         // Пользователь вручную подвинул/повернул стикер —
                         // если тот был смигрирован автоматом потери монитора,
                         // это осознанная правка поверх старого места: сбросить
@@ -2979,6 +3024,14 @@ fn handle_input(
                         // стикер обратно и не затёр ручную правку (SPEC 6.1,
                         // пункт 4). Rotate намеренно тоже сюда попадает —
                         // ReturnHome восстанавливает и origin.rotation.
+                        //
+                        // Известное ограничение (M3_STEP5_6_REVIEW.md, пункт
+                        // 2.2): память трекера (`edited`) в undo не участвует.
+                        // `Ctrl+Z` после этой правки вернёт `origin = Some`
+                        // (из-за отката `cfg` к `before`), но трекер продолжит
+                        // считать стикер уже отредактированным пользователем и
+                        // не запустит автовозврат — стикер не теряется, но
+                        // останется на месте миграции с «мёртвым» origin.
                         if let Some(id) = gesture_sticker_id {
                             if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
                                 let actions = loss_tracker.on_user_edit(sticker);
@@ -2987,6 +3040,7 @@ fn handle_input(
                                 }
                             }
                         }
+                        commit_undo_snapshot(edit, before);
                     }
                 }
                 if let Err(e) = config::save(cfg, config_path) {
