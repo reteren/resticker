@@ -34,6 +34,7 @@ use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{
     Config, MediaType, MonitorId, Placement, Rect, Sticker, StickerSource, Transform,
+    VisibilityMode,
 };
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
@@ -55,6 +56,7 @@ use rst_win32::input::{
 };
 use rst_win32::monitors;
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
+use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker};
 use uuid::Uuid;
 
 use crate::{confirm_dialog, cursor_panel, toolbar};
@@ -385,6 +387,10 @@ enum OverlayMessage {
     Command(OverlayCommand),
     Event(MonitorId, OverlayEvent),
     Tick,
+    /// Снимок кэша окон от `WindowTracker` (M4_WINDOW_TRACKER_DESIGN.md §6) —
+    /// не привязан к монитору, форвардится тем же паттерном, что и per-monitor
+    /// события: поток-мост копирует `WindowEvent` трекера в общий канал.
+    Windows(TrackerWindowEvent),
 }
 
 /// Период тика автомата потери монитора (M3_HOTPLUG_DESIGN.md §1):
@@ -913,6 +919,37 @@ fn run(
             }
         }
     });
+
+    // Трекер окон (M4_WINDOW_TRACKER_DESIGN.md §6): свой поток + канал, как у
+    // OverlayWindow/тика — мост копирует его WindowEvent в общий канал.
+    // Неудача запуска не фатальна для всего процесса (стикеры без слоёв
+    // видимости продолжают работать как обычно) — просто не будет ни хуков,
+    // ни маски перекрытия в этой сессии.
+    let window_tracker = match WindowTracker::start() {
+        Ok((tracker, tracker_rx)) => {
+            let windows_tx = tx.clone();
+            thread::spawn(move || {
+                for ev in tracker_rx {
+                    if windows_tx.send(OverlayMessage::Windows(ev)).is_err() {
+                        break;
+                    }
+                }
+            });
+            Some(tracker)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "не удалось запустить трекер окон — маска перекрытия недоступна в этой сессии");
+            None
+        }
+    };
+    // Гейт хуков трекера (ADR-005, M4_PREP_NOTES §6.4): пересчитывается раз
+    // за итерацию цикла вместо разбрасывания вызова по всем ~20 местам,
+    // мутирующим `cfg` — дёшево при типичном числе стикеров, и невозможно
+    // забыть точку пересчёта.
+    let mut last_mask_needed = mask_needed(&cfg);
+    if let Some(tracker) = &window_tracker {
+        tracker.set_mask_needed(last_mask_needed);
+    }
 
     // Автомат ADR-011 (SPEC 6.1) и его «эталонный» снимок мониторов — сверяет
     // с ним каждый `MonitorsChanged` (диффинг всегда против ЖИВОГО состояния,
@@ -1475,6 +1512,26 @@ fn run(
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
                 // Вне режима редактирования окно клик-прозрачно — эти
                 // события приходить не должны, но игнорируем на всякий случай.
+            }
+            OverlayMessage::Windows(TrackerWindowEvent::Changed(windows)) => {
+                // M4: пока только залогировать — вычисление окклюдеров/маски
+                // перекрытия по allow-list каждого стикера и отсечение
+                // полностью перекрытых из рендера — следующий срез
+                // (M4_WINDOW_TRACKER_DESIGN.md §6), который заведёт хранение
+                // снимка вместе со своим первым настоящим потребителем.
+                // `need_redraw` здесь не трогаем: снимок пока ни на что не
+                // влияет визуально.
+                tracing::debug!(count = windows.len(), "снимок окон обновлён");
+            }
+        }
+        // Гейт хуков трекера — раз за итерацию, дёшево (см. комментарий у
+        // объявления `last_mask_needed`); переключается только при реальном
+        // изменении, не на каждой итерации подряд.
+        let new_mask_needed = mask_needed(&cfg);
+        if new_mask_needed != last_mask_needed {
+            last_mask_needed = new_mask_needed;
+            if let Some(tracker) = &window_tracker {
+                tracker.set_mask_needed(last_mask_needed);
             }
         }
         if need_redraw
@@ -2214,6 +2271,17 @@ fn reenumerate_monitors(tx: &Sender<OverlayMessage>, primary_id: &MonitorId, rea
             tracing::warn!(error = %e, reason, "не удалось переперечислить мониторы");
         }
     }
+}
+
+/// Нужна ли трекеру окон живая маска перекрытия (ADR-005, M4_PREP_NOTES
+/// §6.4): `false`, только если у ВСЕХ стикеров `VisibilityMode::Always` —
+/// тогда окклюдеры в принципе не на что накладывать, и хуки не ставятся
+/// вовсе (fast path). Пустой список стикеров — `false` (`any` на пустом
+/// итераторе), тот же смысл: маска не на что переключать.
+fn mask_needed(cfg: &Config) -> bool {
+    cfg.stickers
+        .iter()
+        .any(|s| s.visibility.mode != VisibilityMode::Always)
 }
 
 /// `rst_win32::monitors::MonitorInfo` → `rst_core::monitor_loss::MonitorSnapshot`
