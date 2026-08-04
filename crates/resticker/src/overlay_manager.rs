@@ -1350,16 +1350,32 @@ fn run(
                 }
             }
             OverlayMessage::Event(_, OverlayEvent::SessionLocked) => {
+                // SPEC.md §9: на экране блокировки стикеры не видны — это
+                // обеспечивает сама ОС (оверлеи принадлежат пользовательской
+                // сессии), кода не требует. Приостановка декодирования видео/
+                // звука из того же пункта — не наш случай сейчас: декодер
+                // появится только в M5 (ROADMAP.md); откладывать
+                // соответствующую логику до тех пор.
                 tracing::info!("сессия Windows заблокирована");
             }
             OverlayMessage::Event(_, OverlayEvent::SessionUnlocked) => {
                 tracing::info!("сессия Windows разблокирована");
+                reenumerate_monitors(&tx, &primary_id, "разблокировки сессии");
             }
             OverlayMessage::Event(_, OverlayEvent::SystemSuspending) => {
                 tracing::info!("система уходит в сон");
             }
             OverlayMessage::Event(_, OverlayEvent::SystemResumed) => {
                 tracing::info!("система вышла из сна");
+                // SPEC.md §9: при выходе из сна переинициализация D3D
+                // обязательна — устройство могло быть потеряно. `redraw_all`/
+                // `recover_device` уже умеют это обнаруживать и чинить, но
+                // реактивно — только при следующей попытке `present`; здесь
+                // просто гарантируем, что эта попытка случится немедленно, а
+                // не будет ждать несвязанного события (может не быть долго,
+                // если после сна ничего на экране не меняется).
+                need_redraw = true;
+                reenumerate_monitors(&tx, &primary_id, "выхода из сна");
             }
             OverlayMessage::Event(
                 monitor_id,
@@ -2121,6 +2137,32 @@ fn toolbar_monitor<'a>(selection: &SelectionSet, cfg: &'a Config) -> Option<&'a 
     single_selected_id(selection)
         .and_then(|id| cfg.stickers.iter().find(|s| s.id == id))
         .map(|s| &s.placement.monitor_id)
+}
+
+/// Перечислить мониторы заново и, если получилось, отправить результат в
+/// общий канал тем же событием, что и настоящий `WM_DISPLAYCHANGE` —
+/// страховка на случай смены топологии/primary во время блокировки сессии
+/// или сна без отдельного `WM_DISPLAYCHANGE` (допущение
+/// M3_HOTPLUG_DESIGN.md §7: «Windows всегда шлёт его при смене раскладки
+/// виртуального десктопа» — если на практике найдётся исключение, эта
+/// страховка перечислит мониторы сама на `SessionUnlocked`/`SystemResumed`).
+/// Идентификатор монитора в отправленном `OverlayMessage::Event` не имеет
+/// значения — ветка `MonitorsChanged` его игнорирует (`_`), поэтому годится
+/// текущий `primary_id`. Отправка, а не прямой вызов обработчика: событие
+/// уйдёт в очередь и обработается на следующей итерации цикла `run()`, как и
+/// любое другое сообщение (без реентрантности/рекурсии в текущий кадр match).
+fn reenumerate_monitors(tx: &Sender<OverlayMessage>, primary_id: &MonitorId, reason: &str) {
+    match monitors::enumerate() {
+        Ok(infos) => {
+            let _ = tx.send(OverlayMessage::Event(
+                primary_id.clone(),
+                OverlayEvent::MonitorsChanged(infos),
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, reason, "не удалось переперечислить мониторы");
+        }
+    }
 }
 
 /// `rst_win32::monitors::MonitorInfo` → `rst_core::monitor_loss::MonitorSnapshot`
