@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
@@ -18,10 +18,17 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetWindow,
-    GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SMTO_ABORTIFHUNG,
+    SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, PWSTR};
+
+/// Таймаут кросс-поточного чтения заголовка (мс), [`window_text`]. Верх
+/// диапазона 200–500 мс: `SMTO_ABORTIFHUNG` и так возвращает сразу на
+/// зависших потоках, таймаут ограничивает только «живые, но медленные»
+/// окна — им 500 мс хватает вернуть заголовок (пустой заголовок деградирует
+/// панель выбора M4, а `title_pattern` с ним просто не совпадает).
+const TITLE_FETCH_TIMEOUT_MS: u32 = 500;
 
 /// Прямоугольник окна в **физических** пикселях (маска перекрытия живёт в
 /// физических — M4_PREP_NOTES §2.1; перевод в DIP — на стороне координатора).
@@ -238,19 +245,40 @@ pub(crate) fn extended_frame_bounds(hwnd: HWND) -> WindowRect {
     }
 }
 
-/// Заголовок окна. Пустая строка — нет заголовка или сбой API (не критично,
-/// окно остаётся в списке).
+/// Заголовок окна. Пустая строка — нет заголовка, сбой API или таймаут
+/// (не критично, окно остаётся в списке).
+///
+/// Заголовок чужого процесса читается кросс-поточным `WM_GETTEXT` (как и
+/// `GetWindowTextW` под капотом): без ограничения зависшее окно держит
+/// вызов до системного таймаута (~5 с), а это перечисление стоит на пути
+/// маски M4 и цикла координатора (сообщения обрабатываются
+/// последовательно, ADR-006). `SendMessageTimeoutW` с `SMTO_ABORTIFHUNG` и
+/// [`TITLE_FETCH_TIMEOUT_MS`] обрывают зависшие потоки сразу, а живые — не
+/// дольше таймаута.
 fn window_text(hwnd: HWND) -> String {
-    // SAFETY: hwnd — из EnumWindows, действительно на время вызова.
-    let len = unsafe { GetWindowTextLengthW(hwnd) };
-    if len <= 0 {
+    // Один обход с фиксированным буфером вместо пары GetWindowTextLengthW +
+    // GetWindowTextW (два кросс-поточных обхода при зависании в два раза
+    // дольше); размер буфера — как у exe-пути в `process_info` (1024).
+    let mut buf = [0u16; 1024];
+    let mut copied: usize = 0;
+    // SAFETY: hwnd — из EnumWindows, действительно на время вызова; buf —
+    // буфер достаточного размера (WM_GETTEXT копирует максимум len-1
+    // символов и нуль-терминатор); copied — валидный out-параметр.
+    let result = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_GETTEXT,
+            WPARAM(buf.len()),
+            LPARAM(buf.as_mut_ptr() as isize),
+            SMTO_ABORTIFHUNG,
+            TITLE_FETCH_TIMEOUT_MS,
+            Some(&mut copied),
+        )
+    };
+    if result.0 == 0 {
         return String::new();
     }
-    let mut buf = vec![0u16; len as usize + 1];
-    // SAFETY: buf — буфер достаточного размера (len зарезервирован выше).
-    let copied = unsafe { GetWindowTextW(hwnd, &mut buf) };
-    buf.truncate(copied.max(0) as usize);
-    String::from_utf16_lossy(&buf)
+    String::from_utf16_lossy(&buf[..copied.min(buf.len())])
 }
 
 /// Класс окна (для панели выбора и будущих правил перекрытия).
@@ -306,6 +334,110 @@ fn process_info(hwnd: HWND) -> (u32, PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread::{self, JoinHandle};
+    use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, LRESULT};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WNDCLASSEXW,
+        WS_OVERLAPPED,
+    };
+    use windows::core::w;
+
+    /// HWND не `Send` (сырой указатель) — обёртка для пересылки между
+    /// потоками, как в window_tracker.rs/tray.rs/overlay.rs.
+    struct SendHwnd(HWND);
+
+    unsafe impl Send for SendHwnd {}
+
+    unsafe extern "system" fn test_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        // SAFETY: делегирование системному обработчику.
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    /// Окно, чей поток НЕ пампит сообщения — в отличие от `RealWindow` в
+    /// window_tracker.rs (ему цикл обязателен, чтобы хуки его увидели).
+    /// Снаружи такое окно выглядит «зависшим», и кросс-поточное чтение
+    /// заголовка не должно блокироваться на нём.
+    struct HungWindow {
+        hwnd: HWND,
+        thread: Option<JoinHandle<()>>,
+        kill: Option<mpsc::Sender<()>>,
+    }
+
+    impl HungWindow {
+        fn create() -> Self {
+            let (ready_tx, ready_rx) = mpsc::channel::<SendHwnd>();
+            let (kill_tx, kill_rx) = mpsc::channel::<()>();
+            let thread = thread::spawn(move || {
+                // SAFETY: GetModuleHandleW(None) — хэндл текущего модуля.
+                let hinstance = unsafe { GetModuleHandleW(None) }.expect("хэндл модуля");
+                let wc = WNDCLASSEXW {
+                    cbSize: size_of::<WNDCLASSEXW>() as u32,
+                    lpfnWndProc: Some(test_wndproc),
+                    hInstance: hinstance.into(),
+                    lpszClassName: w!("resticker_window_enum_test"),
+                    ..Default::default()
+                };
+                // SAFETY: wc заполнена корректно; повторная регистрация
+                // (параллельные тесты) — не ошибка.
+                if unsafe { RegisterClassExW(&wc) } == 0 {
+                    let err = unsafe { GetLastError() };
+                    assert_eq!(err, ERROR_CLASS_ALREADY_EXISTS);
+                }
+                // SAFETY: все аргументы — валидные константы/только что
+                // зарегистрированный класс; видимость для window_text не важна.
+                let hwnd = unsafe {
+                    CreateWindowExW(
+                        Default::default(),
+                        w!("resticker_window_enum_test"),
+                        w!("resticker window_enum test"),
+                        WS_OVERLAPPED,
+                        0,
+                        0,
+                        200,
+                        150,
+                        None,
+                        None,
+                        Some(hinstance.into()),
+                        None,
+                    )
+                }
+                .expect("создание тестового окна");
+                ready_tx.send(SendHwnd(hwnd)).expect("получатель ещё жив");
+                // Намеренно НЕ пампим: поток блокируется, пока тест не
+                // попросит завершиться.
+                let _ = kill_rx.recv();
+                // SAFETY: hwnd создано этим потоком; DestroyWindow на своём
+                // потоке — корректный способ закрыть окно без цикла сообщений.
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            });
+            let hwnd = ready_rx.recv().expect("поток тестового окна не упал").0;
+            Self {
+                hwnd,
+                thread: Some(thread),
+                kill: Some(kill_tx),
+            }
+        }
+    }
+
+    impl Drop for HungWindow {
+        fn drop(&mut self) {
+            if let Some(k) = self.kill.take() {
+                let _ = k.send(());
+            }
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
 
     fn flags(overrides: impl Fn(&mut WindowFlags)) -> WindowFlags {
         let mut f = WindowFlags {
@@ -391,6 +523,24 @@ mod tests {
                 h: 200
             }
         );
+    }
+
+    #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 window_enum -- --ignored"]
+    fn hung_window_title_fetch_is_bounded() {
+        let win = HungWindow::create();
+        let started = std::time::Instant::now();
+        let title = window_text(win.hwnd);
+        let elapsed = started.elapsed();
+        // Зависшее окно не должно держать чтение заголовка дольше таймаута
+        // (500 мс); старый GetWindowTextW висел бы ~5 с на системном
+        // таймауте SendMessage. 3 с — запас на планировщик, но на порядок
+        // меньше системного умолчания.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "чтение заголовка зависшего окна заняло {elapsed:?}"
+        );
+        assert!(title.is_empty(), "зависшее окно не должно иметь заголовка");
     }
 
     #[test]
