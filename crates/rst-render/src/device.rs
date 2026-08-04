@@ -625,3 +625,302 @@ mod tests {
         assert_eq!(placement_to_physical(&p, 1.0), [100.0, 50.0, 200.0, 80.0]);
     }
 }
+
+/// Тесты маски перекрытия (M4), требующие реального GPU-устройства.
+///
+/// Живут ЗДЕСЬ (внутри крейта), а не в `tests/gpu_smoke.rs`: CPU-readback
+/// нужен `ID3D11Device`/`ID3D11DeviceContext` (приватные поля `Device`) и
+/// ресурс за RTV текстуры/цели (`Texture::rtv`/`WindowTarget::rtv` —
+/// `pub(crate)`) — ничего из этого не видно из отдельного интеграционного
+/// бинаря `tests/`, только из модуля-потомка `device.rs`. Запуск вручную:
+/// `cargo test -p rst-render --lib -- --ignored`.
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+    use rst_core::model::{MonitorId, Placement, Transform};
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+    };
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::core::w;
+
+    /// Прочитать одноканальную (R8_UNORM) текстуру устройства в CPU-буфер
+    /// (staging + `CopyResource` + `Map`), построчно — GPU может паддить
+    /// строки (`RowPitch` не обязан равняться `width`).
+    fn read_r8_texture(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        resource: &ID3D11Resource,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging: Option<ID3D11Texture2D> = None;
+        // SAFETY: desc валиден; out-параметр валиден.
+        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) }
+            .expect("staging-текстура создаётся");
+        let staging = staging.expect("CreateTexture2D без ошибки возвращает объект");
+        let staging_res: ID3D11Resource = staging.cast().expect("Texture2D -> Resource");
+        // SAFETY: `resource` и `staging_res` — валидные ресурсы одного
+        // устройства, совпадающих формата/размера (R8_UNORM, width×height).
+        unsafe { context.CopyResource(&staging_res, resource) };
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: `staging_res` создан с `CPU_ACCESS_READ`; out-параметр валиден.
+        unsafe { context.Map(Some(&staging_res), 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .expect("Map staging-текстуры");
+        let mut out = vec![0u8; (width * height) as usize];
+        // SAFETY: `mapped.pData` валиден на `height` строк по `RowPitch`
+        // байт каждая (D3D11 гарантирует это для успешного `Map`).
+        unsafe {
+            for y in 0..height {
+                let row_ptr = mapped
+                    .pData
+                    .cast::<u8>()
+                    .add((y * mapped.RowPitch) as usize);
+                let row = std::slice::from_raw_parts(row_ptr, width as usize);
+                out[(y * width) as usize..(y * width + width) as usize].copy_from_slice(row);
+            }
+            context.Unmap(Some(&staging_res), 0);
+        }
+        out
+    }
+
+    /// Как [`read_r8_texture`], но для `B8G8R8A8_UNORM` (backbuffer
+    /// `WindowTarget`) — 4 байта на пиксель, тот же паттерн staging/`RowPitch`.
+    fn read_bgra_texture(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        resource: &ID3D11Resource,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging: Option<ID3D11Texture2D> = None;
+        // SAFETY: desc валиден; out-параметр валиден.
+        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) }
+            .expect("staging-текстура создаётся");
+        let staging = staging.expect("CreateTexture2D без ошибки возвращает объект");
+        let staging_res: ID3D11Resource = staging.cast().expect("Texture2D -> Resource");
+        // SAFETY: `resource` и `staging_res` — валидные ресурсы одного
+        // устройства, совпадающих формата/размера (BGRA, width×height).
+        unsafe { context.CopyResource(&staging_res, resource) };
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: `staging_res` создан с `CPU_ACCESS_READ`; out-параметр валиден.
+        unsafe { context.Map(Some(&staging_res), 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .expect("Map staging-текстуры");
+        let row_bytes = (width * 4) as usize;
+        let mut out = vec![0u8; row_bytes * height as usize];
+        // SAFETY: см. `read_r8_texture` — тот же RowPitch-паттерн, 4 байта/px.
+        unsafe {
+            for y in 0..height {
+                let row_ptr = mapped
+                    .pData
+                    .cast::<u8>()
+                    .add((y * mapped.RowPitch) as usize);
+                let row = std::slice::from_raw_parts(row_ptr, row_bytes);
+                out[y as usize * row_bytes..(y as usize + 1) * row_bytes].copy_from_slice(row);
+            }
+            context.Unmap(Some(&staging_res), 0);
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn draw_mask_produces_expected_coverage() {
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let (w, h) = (64u32, 64u32);
+        let mask = device.create_mask_texture(w, h).expect("маска создаётся");
+        let rect = Rect {
+            x: 16,
+            y: 16,
+            w: 32,
+            h: 32,
+        };
+        device
+            .draw_mask(&mask, &[rect])
+            .expect("draw_mask не падает");
+
+        // SAFETY: RTV только что создан `create_mask_texture`, ресурс за ним
+        // жив, пока жива `mask`.
+        let resource: ID3D11Resource = unsafe {
+            mask.rtv()
+                .expect("create_mask_texture всегда даёт RTV")
+                .GetResource()
+        }
+        .expect("RTV даёт исходный ресурс");
+        let pixels = read_r8_texture(&device.device, &device.context, &resource, w, h);
+        let at = |x: u32, y: u32| pixels[(y * w + x) as usize];
+
+        // Центр прямоугольника, вдали от скруглённых углов, — занят маской.
+        assert!(
+            at(32, 32) > 250,
+            "центр прямоугольника должен быть занят маской: {}",
+            at(32, 32)
+        );
+        // Далеко за пределами прямоугольника — не occluded.
+        assert_eq!(
+            at(4, 4),
+            0,
+            "точка вне прямоугольника не должна быть замаскирована"
+        );
+        // Радиус скругления — 8px (mainMaskPS): на строке верхнего края
+        // прямоугольника (y = rect.y), между углом AABB (x = rect.x, вне
+        // скруглённой формы) и началом прямого участка края (x = rect.x + 8,
+        // уже внутри) должна быть зона антиалиасинга — значение строго между
+        // 0 и 255 хотя бы в одной точке.
+        let corner_has_partial = (0..8).any(|d| {
+            let v = at(16 + d, 16);
+            v > 0 && v < 255
+        });
+        assert!(
+            corner_has_partial,
+            "должна быть антиалиасинг-зона у скруглённого угла"
+        );
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn draw_masked_cuts_out_occluded_sprite() {
+        // SAFETY: окно системного класса Static, как в tests/gpu_smoke.rs —
+        // регистрация своего класса не нужна, все параметры валидны.
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render mask gpu test"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let target = WindowTarget::new(&device, hwnd, 64, 64).expect("цель создаётся");
+
+        // Непрозрачный жёлтый спрайт на весь экран (premultiplied: полная
+        // альфа, цвет как есть).
+        let sprite_tex = device
+            .create_texture_from_rgba(&[255, 255, 0, 255], 1, 1)
+            .expect("текстура спрайта создаётся");
+        let sprite = Sprite::new(
+            sprite_tex,
+            Placement {
+                monitor_id: MonitorId(String::new()),
+                cx: 32.0,
+                cy: 32.0,
+                w: 64.0,
+                h: 64.0,
+            },
+            Transform::default(),
+        );
+
+        // Маска покрывает ЛЕВУЮ половину экрана (x: 0..32) на всю высоту —
+        // на середине высоты (y=32) это прямой край, без скругления углов
+        // (те — только у верхней/нижней пары углов), так что x=32 — чёткая
+        // граница occluded/visible без зоны неоднозначности.
+        let mask = device.create_mask_texture(64, 64).expect("маска создаётся");
+        device
+            .draw_mask(
+                &mask,
+                &[Rect {
+                    x: 0,
+                    y: 0,
+                    w: 32,
+                    h: 64,
+                }],
+            )
+            .expect("draw_mask не падает");
+
+        device
+            .draw_masked(&target, std::slice::from_ref(&sprite), &[Some(&mask)])
+            .expect("draw_masked не падает");
+        // Композиционный swapchain (FLIP_SEQUENTIAL, 2 буфера) — после
+        // одного Present() тот RTV, что закэширован `WindowTarget` с момента
+        // создания, может указывать не на тот буфер, что реально сейчас
+        // «текущий back buffer»; второй одинаковый кадр гарантирует, что
+        // именно ЭТОТ (закэшированный) буфер получил актуальную отрисовку
+        // непосредственно перед чтением.
+        device
+            .draw_masked(&target, &[sprite], &[Some(&mask)])
+            .expect("draw_masked не падает (второй кадр)");
+
+        // SAFETY: RTV только что создан `draw_masked`/`WindowTarget::new`,
+        // ресурс за ним жив, пока жива `target`.
+        let resource: ID3D11Resource = unsafe {
+            target
+                .rtv()
+                .expect("цель ненулевого размера имеет RTV")
+                .GetResource()
+        }
+        .expect("RTV даёт исходный ресурс");
+        let pixels = read_bgra_texture(&device.device, &device.context, &resource, 64, 64);
+        let at = |x: u32, y: u32| {
+            let i = ((y * 64 + x) * 4) as usize;
+            (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3])
+        };
+
+        // Замаскированная половина (x=8 < 32): discard сработал — пиксель
+        // остался таким, каким был очищен (`draw_masked`'s clear = полностью
+        // прозрачный чёрный), НЕ цветом спрайта. Discard — это не «стать
+        // прозрачным», а «не записать вообще»: проверяем именно это, а не
+        // произвольную альфу.
+        assert_eq!(
+            at(8, 32),
+            (0, 0, 0, 0),
+            "замаскированная половина должна остаться clear-цветом (discard сработал)"
+        );
+        // Незамаскированная половина (x=48 >= 32): виден жёлтый спрайт.
+        // B8G8R8A8: байты в порядке B,G,R,A; premultiplied непрозрачный
+        // жёлтый (R=G=255,B=0,A=255) остаётся как есть при полной альфе.
+        assert_eq!(
+            at(48, 32),
+            (0, 255, 255, 255),
+            "незамаскированная половина должна показывать спрайт"
+        );
+
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+}
