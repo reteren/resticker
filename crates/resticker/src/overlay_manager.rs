@@ -24,14 +24,16 @@
 //! уходит по `coordinator_tx` на поток Tauri (докс §12) — M2 закрыт
 //! полностью (ROADMAP.md).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{Config, MediaType, MonitorId, Placement, Sticker, StickerSource, Transform};
+use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
 use rst_core::ops;
 use rst_core::selection_set::SelectionSet;
@@ -120,6 +122,168 @@ struct MonitorState {
     broken: bool,
 }
 
+/// Окно + `WindowTarget` + поток-форвардер событий для одного монитора —
+/// общий блок для старта и для hot-plug (ветка `MonitorsChanged`,
+/// M3_HOTPLUG_DESIGN.md §2). Возвращает `None` (с логом) при неудаче — так
+/// же, как раньше делал стартовый цикл напрямую. `edit_active` — если
+/// монитор появляется, пока режим редактирования уже активен, его окно
+/// должно сразу стать интерактивным (`set_interactive`), иначе мышь на нём
+/// проваливалась бы сквозь режим, как и у остальных окон в этот момент
+/// (M3_PREP_NOTES.md §3.5).
+#[allow(clippy::too_many_arguments)]
+fn create_monitor_state(
+    device: &Device,
+    tx: &Sender<OverlayMessage>,
+    info: &monitors::MonitorInfo,
+    edit_hotkey: Option<HotkeyCombo>,
+    toggle_all_hotkey: Option<HotkeyCombo>,
+    edit_active: bool,
+) -> Option<MonitorState> {
+    let (overlay, events) = match OverlayWindow::create_on_monitor(
+        info.bounds_px,
+        edit_hotkey,
+        toggle_all_hotkey,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, monitor = %info.id.0, "не удалось создать оверлей-окно монитора");
+            return None;
+        }
+    };
+    if edit_active {
+        overlay.set_interactive(true);
+    }
+    let (width, height) = overlay.size();
+    let mut target = match WindowTarget::new(device, overlay.hwnd(), width, height) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error = %e, monitor = %info.id.0, "не удалось создать цель рендера монитора");
+            return None;
+        }
+    };
+    let dpi = overlay.dpi();
+    target.set_dpi_scale(dpi as f32 / 96.0);
+    let scale = target.dpi_scale();
+
+    // Мост «события окна → общий канал координатора», по одному на монитор —
+    // каждый помечает свои события своим `MonitorId`, чтобы координатор не
+    // спутал координаты/геометрию разных окон (M3_PREP_NOTES.md, раздел 3.4).
+    let monitor_id = info.id.clone();
+    let tx_for_events = tx.clone();
+    thread::spawn(move || {
+        for event in events {
+            if tx_for_events
+                .send(OverlayMessage::Event(monitor_id.clone(), event))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    Some(MonitorState {
+        overlay,
+        target,
+        width,
+        height,
+        scale,
+        broken: false,
+    })
+}
+
+/// Снести состояние пропавшего монитора (ветка `MonitorsChanged`,
+/// M3_HOTPLUG_DESIGN.md §2, чек-лист сноса): удаляет `MonitorState` (порядок
+/// дропа полей — `target` раньше `overlay`, уже безопасен, docs/
+/// M3_STEP4_REVIEW.md пункт 2.3; поток-форвардер окна завершается сам, когда
+/// закрывается канал событий уничтоженного окна), чистит снимки-копии
+/// (`monitor_geometry`/`monitor_bounds` — иначе панели/rebind продолжат
+/// видеть мёртвый монитор) и, если режим редактирования активен: снимает с
+/// выделения стикеры этого монитора, переносит `cursor_monitor`/`cursor_pos`
+/// на новый основной, если курсор был там же, отменяет незавершённый жест
+/// сцены на этом мониторе так же, как `CaptureLost` (окно уже уничтожено —
+/// `WM_CAPTURECHANGED` от него больше не придёт), и пересобирает панели.
+/// Стикеры пропавшего монитора **не трогает** — их прячет
+/// `MonitorLossTracker` своим `LossAction::HideSticker` отдельно; снос окна и
+/// скрытие стикеров — два разных эффекта одного события.
+#[allow(clippy::too_many_arguments)]
+fn teardown_monitor_state(
+    monitors_map: &mut HashMap<MonitorId, MonitorState>,
+    monitor_geometry: &mut HashMap<MonitorId, (u32, u32, f32)>,
+    monitor_bounds: &mut HashMap<MonitorId, MonitorBounds>,
+    id: &MonitorId,
+    edit: &mut EditState,
+    cfg: &mut Config,
+    sprites: &mut [(Uuid, Sprite)],
+    new_primary_id: &MonitorId,
+) {
+    monitors_map.remove(id);
+    monitor_geometry.remove(id);
+    monitor_bounds.remove(id);
+
+    if !edit.active {
+        return;
+    }
+
+    let dead_selected: Vec<Uuid> = edit
+        .selection
+        .ids()
+        .iter()
+        .copied()
+        .filter(|sid| {
+            cfg.stickers
+                .iter()
+                .any(|s| s.id == *sid && s.placement.monitor_id == *id)
+        })
+        .collect();
+    for sid in dead_selected {
+        edit.selection.deselect(sid);
+    }
+
+    if edit.cursor_monitor == *id {
+        edit.cursor_monitor = new_primary_id.clone();
+        edit.cursor_pos = (0.0, 0.0);
+    }
+
+    let cancel_gesture = match &edit.gesture {
+        Some(Gesture::Marquee { .. }) => edit.cursor_monitor == *id,
+        Some(other) => other.start().is_some_and(|start| {
+            cfg.stickers
+                .iter()
+                .any(|s| s.id == start.id && s.placement.monitor_id == *id)
+        }),
+        None => false,
+    };
+    if cancel_gesture {
+        match edit.gesture.take() {
+            Some(Gesture::Marquee { before, .. }) => {
+                edit.selection.clear();
+                for sid in before {
+                    edit.selection.select(sid);
+                }
+                edit.marquee = None;
+                edit.marquee_started = false;
+            }
+            Some(gesture) => {
+                if let Some(start) = gesture.start() {
+                    apply_transform(
+                        cfg,
+                        sprites,
+                        start.id,
+                        start.placement.clone(),
+                        start.transform,
+                    );
+                }
+                edit.marquee = None;
+                edit.marquee_started = false;
+                edit.pending_snapshot = None;
+            }
+            None => {}
+        }
+    }
+
+    rebuild_ui_panels(edit, cfg, monitor_geometry);
+}
+
 /// Хоткей входа/выхода из режима редактирования по умолчанию (CONFIG.md),
 /// если в конфиге он не задан или не парсится.
 const DEFAULT_EDIT_HOTKEY: &str = "Ctrl+Alt+S";
@@ -162,14 +326,25 @@ pub enum CoordinatorRequest {
     OpenSettings,
 }
 
-/// Сообщение объединённого канала координатора: команда от Tauri или
-/// событие от потока оверлей-окна конкретного монитора (M3: несколько окон
-/// на процесс — событие несёт `MonitorId`, чтобы координатор не спутал
-/// координаты/геометрию одного монитора с другим, M3_PREP_NOTES.md §3.4).
+/// Сообщение объединённого канала координатора: команда от Tauri, событие от
+/// потока оверлей-окна конкретного монитора (M3: несколько окон на процесс —
+/// событие несёт `MonitorId`, чтобы координатор не спутал координаты/геометрию
+/// одного монитора с другим, M3_PREP_NOTES.md §3.4), или периодический
+/// «будильник» автомата потери монитора (M3_HOTPLUG_DESIGN.md §1).
 enum OverlayMessage {
     Command(OverlayCommand),
     Event(MonitorId, OverlayEvent),
+    Tick,
 }
+
+/// Период тика автомата потери монитора (M3_HOTPLUG_DESIGN.md §1):
+/// `monitor_loss::LOSS_TIMEOUT` (20 с) не может истечь сам по себе — цикл
+/// координатора чисто событийный (ADR-006), периодических механизмов в
+/// кодовой базе больше нет нигде — тик существует ровно для того, чтобы дать
+/// таймеру шанс истечь без какого-либо внешнего события. Секундная точность
+/// не нужна, важно лишь не ждать следующего `WM_DISPLAYCHANGE` неопределённо
+/// долго.
+const LOSS_TICK_PERIOD: Duration = Duration::from_secs(1);
 
 /// Ручка для отправки команд оверлей-потоку; `Drop` останавливает поток.
 pub struct OverlayHandle {
@@ -548,7 +723,9 @@ fn run(
             return;
         }
     };
-    let primary_id = monitor_infos
+    // `mut`: пересоздаётся веткой `MonitorsChanged`, если основной монитор
+    // сменился (M3_HOTPLUG_DESIGN.md §2).
+    let mut primary_id = monitor_infos
         .iter()
         .find(|m| m.is_primary)
         .unwrap_or(&monitor_infos[0])
@@ -620,57 +797,11 @@ fn run(
         } else {
             (None, None)
         };
-        let (overlay, events) = match OverlayWindow::create_on_monitor(
-            info.bounds_px,
-            edit_hotkey,
-            this_toggle_all,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(error = %e, monitor = %info.id.0, "не удалось создать оверлей-окно монитора");
-                continue;
-            }
-        };
-        let (width, height) = overlay.size();
-        let mut target = match WindowTarget::new(&device, overlay.hwnd(), width, height) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(error = %e, monitor = %info.id.0, "не удалось создать цель рендера монитора");
-                continue;
-            }
-        };
-        let dpi = overlay.dpi();
-        target.set_dpi_scale(dpi as f32 / 96.0);
-        let scale = target.dpi_scale();
-
-        // Мост «события окна → общий канал координатора», по одному на
-        // монитор — каждый помечает свои события своим `MonitorId`, чтобы
-        // координатор не спутал координаты/геометрию разных окон
-        // (M3_PREP_NOTES.md, раздел 3.4).
-        let monitor_id = info.id.clone();
-        let tx_for_events = tx.clone();
-        thread::spawn(move || {
-            for event in events {
-                if tx_for_events
-                    .send(OverlayMessage::Event(monitor_id.clone(), event))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        monitors_map.insert(
-            info.id.clone(),
-            MonitorState {
-                overlay,
-                target,
-                width,
-                height,
-                scale,
-                broken: false,
-            },
-        );
+        if let Some(ms) =
+            create_monitor_state(&device, &tx, info, edit_hotkey, this_toggle_all, false)
+        {
+            monitors_map.insert(info.id.clone(), ms);
+        }
     }
 
     if monitors_map.is_empty() {
@@ -710,6 +841,34 @@ fn run(
             ))
         })
         .collect();
+
+    // Будильник автомата потери монитора — тот же паттерн «поток + сообщение
+    // в общий канал», что и у пер-мониторных форвардеров выше (M3_HOTPLUG_
+    // DESIGN.md §1); выходит сам, как только канал закрыт (координатор
+    // завершился).
+    let tick_tx = tx.clone();
+    thread::spawn(move || {
+        loop {
+            thread::sleep(LOSS_TICK_PERIOD);
+            if tick_tx.send(OverlayMessage::Tick).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Автомат ADR-011 (SPEC 6.1) и его «эталонный» снимок мониторов — сверяет
+    // с ним каждый `MonitorsChanged` (диффинг всегда против ЖИВОГО состояния,
+    // не отдельной копии — WM_DISPLAYCHANGE рассылается всем окнам, дубликаты
+    // событий идемпотентны сами по себе, M3_HOTPLUG_DESIGN.md §2) и служит
+    // входом для `Tick`, где сам снимок не меняется — только даёт таймерам
+    // шанс истечь.
+    let mut loss_tracker = MonitorLossTracker::new();
+    let mut last_snapshot: Vec<MonitorSnapshot> = monitor_infos.iter().map(core_snapshot).collect();
+    // Обязательный старый прогон: без него первый реальный `MonitorsChanged`
+    // сравнил бы новый снимок с ПУСТЫМ prev и принял бы мониторы, живые с
+    // самого старта, за только что пропавшие (M3_HOTPLUG_DESIGN.md §2).
+    // Действия здесь заведомо пусты — это только инициализация `prev_snapshot`.
+    let _ = loss_tracker.on_monitor_snapshot(&last_snapshot, &cfg.stickers, Instant::now());
 
     let mut edit = EditState {
         active: false,
@@ -890,17 +1049,157 @@ fn run(
                 // а не тихая потеря события.
                 tracing::warn!(combo = %combo, "хоткей режима редактирования уже занят другим приложением");
             }
-            OverlayMessage::Event(_, OverlayEvent::MonitorsChanged(new_monitors)) => {
-                // Диффинг «старое ↔ новое» по device interface path, снос/
-                // создание окон, привязка к таймеру ADR-011
-                // (`monitor_loss::MonitorLossTracker`, уже готов и покрыт
-                // тестами) — отдельная, ещё не подключённая работа
-                // (docs/M3_PREP_NOTES.md, разделы 2.3, 5.3); пока — хотя бы
-                // в лог, а не молча.
-                tracing::info!(
-                    count = new_monitors.len(),
-                    "конфигурация мониторов изменилась (WM_DISPLAYCHANGE)"
-                );
+            OverlayMessage::Event(_, OverlayEvent::MonitorsChanged(new_infos)) => {
+                // Диффинг — всегда против ЖИВОГО состояния (`monitors_map`),
+                // не отдельной копии: WM_DISPLAYCHANGE рассылается КАЖДОМУ
+                // живому окну, на одну смену топологии в канал приходит N
+                // одинаковых событий; идемпотентный дифф по device interface
+                // path делает дубликаты естественно безопасными
+                // (M3_HOTPLUG_DESIGN.md §2).
+                if new_infos.is_empty() {
+                    tracing::warn!(
+                        "WM_DISPLAYCHANGE: перечисление мониторов вернуло пустой список, игнорирую"
+                    );
+                    continue;
+                }
+                let new_snapshot: Vec<MonitorSnapshot> =
+                    new_infos.iter().map(core_snapshot).collect();
+                let new_primary_id = new_infos
+                    .iter()
+                    .find(|m| m.is_primary)
+                    .unwrap_or(&new_infos[0])
+                    .id
+                    .clone();
+
+                // 1. Смена владельца глобального хоткея — ПЕРВОЙ: снять
+                // регистрацию со старого primary (если его окно ещё живо) до
+                // того, как новое окно попробует свою — иначе RegisterHotKey
+                // наткнётся на ещё занятую комбинацию и уйдёт в
+                // HotkeyConflict вместо «переезда». `RegisteredHotkey` живёт
+                // на pump-потоке своего окна и снимается только вместе с
+                // ним — «перерегистрация» здесь означает пересоздание окна.
+                if new_primary_id != primary_id {
+                    teardown_monitor_state(
+                        &mut monitors_map,
+                        &mut monitor_geometry,
+                        &mut monitor_bounds,
+                        &primary_id,
+                        &mut edit,
+                        &mut cfg,
+                        &mut sprites,
+                        &new_primary_id,
+                    );
+                    // Старый primary мог остаться физически подключённым —
+                    // просто больше не primary: тогда монитору нужно новое
+                    // окно без хоткея, иначе он потеряет оверлей вовсе. Если
+                    // он пропал совсем, ниже его не найдёт (не в new_infos) —
+                    // снос уже случился, воссоздавать нечего.
+                    if let Some(info) = new_infos.iter().find(|m| m.id == primary_id) {
+                        if let Some(ms) =
+                            create_monitor_state(&device, &tx, info, None, None, edit.active)
+                        {
+                            monitors_map.insert(info.id.clone(), ms);
+                        }
+                    }
+                    if let Some(info) = new_infos.iter().find(|m| m.id == new_primary_id) {
+                        if let Some(ms) = create_monitor_state(
+                            &device,
+                            &tx,
+                            info,
+                            Some(hotkey),
+                            toggle_all_hotkey,
+                            edit.active,
+                        ) {
+                            monitors_map.insert(info.id.clone(), ms);
+                        }
+                    }
+                }
+
+                // 2. Прочие появившиеся мониторы (не участвовавшие в смене
+                // хоткея выше) → новое окно + цель + форвардер, без хоткея —
+                // им никогда не быть только что назначенным primary (тот уже
+                // обработан шагом 1, если менялся).
+                for info in &new_infos {
+                    if monitors_map.contains_key(&info.id) {
+                        continue;
+                    }
+                    if let Some(ms) =
+                        create_monitor_state(&device, &tx, info, None, None, edit.active)
+                    {
+                        monitors_map.insert(info.id.clone(), ms);
+                    }
+                }
+
+                // 3. Пропавшие мониторы → снос (чек-лист в
+                // teardown_monitor_state, включая edit-state).
+                let new_ids: HashSet<&MonitorId> = new_infos.iter().map(|m| &m.id).collect();
+                let gone: Vec<MonitorId> = monitors_map
+                    .keys()
+                    .filter(|id| !new_ids.contains(id))
+                    .cloned()
+                    .collect();
+                for id in gone {
+                    teardown_monitor_state(
+                        &mut monitors_map,
+                        &mut monitor_geometry,
+                        &mut monitor_bounds,
+                        &id,
+                        &mut edit,
+                        &mut cfg,
+                        &mut sprites,
+                        &new_primary_id,
+                    );
+                }
+
+                // 4. Пересобрать снимки-копии из живого monitors_map — так
+                // же, как на старте.
+                monitor_geometry = monitors_map
+                    .iter()
+                    .map(|(id, ms)| (id.clone(), (ms.width, ms.height, ms.scale)))
+                    .collect();
+                monitor_bounds = new_infos
+                    .iter()
+                    .filter_map(|info| {
+                        let ms = monitors_map.get(&info.id)?;
+                        Some((
+                            info.id.clone(),
+                            MonitorBounds {
+                                id: info.id.clone(),
+                                bounds_px: info.bounds_px,
+                                scale: ms.scale as f64,
+                            },
+                        ))
+                    })
+                    .collect();
+
+                // 5. Новый «эталон» и прогон автомата потери монитора.
+                last_snapshot = new_snapshot;
+                let actions =
+                    loss_tracker.on_monitor_snapshot(&last_snapshot, &cfg.stickers, Instant::now());
+                if !actions.is_empty() {
+                    apply_loss_actions(&mut cfg, &mut sprites, actions);
+                    if let Err(e) = config::save(&cfg, &config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить config.json после миграции монитора");
+                    }
+                }
+                // 6. Обновить `primary_id` — нужен `AddSticker` и фолбэкам.
+                primary_id = new_primary_id;
+                need_redraw = true;
+            }
+            OverlayMessage::Tick => {
+                // Тик сам по себе снимок мониторов не меняет (диффить не
+                // против чего) — единственная цель дать шанс истечь
+                // таймерам автомата потери монитора (M3_HOTPLUG_DESIGN.md
+                // §1); редрав только если автомат правда что-то изменил.
+                let actions =
+                    loss_tracker.on_monitor_snapshot(&last_snapshot, &cfg.stickers, Instant::now());
+                if !actions.is_empty() {
+                    apply_loss_actions(&mut cfg, &mut sprites, actions);
+                    if let Err(e) = config::save(&cfg, &config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить config.json после миграции монитора");
+                    }
+                    need_redraw = true;
+                }
             }
             OverlayMessage::Event(_, OverlayEvent::SessionLocked) => {
                 tracing::info!("сессия Windows заблокирована");
@@ -966,6 +1265,7 @@ fn run(
                     &monitor_id,
                     &monitor_geometry,
                     &monitor_bounds,
+                    &mut loss_tracker,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
@@ -1675,6 +1975,78 @@ fn toolbar_monitor<'a>(selection: &SelectionSet, cfg: &'a Config) -> Option<&'a 
         .map(|s| &s.placement.monitor_id)
 }
 
+/// `rst_win32::monitors::MonitorInfo` → `rst_core::monitor_loss::MonitorSnapshot`
+/// (M3_HOTPLUG_DESIGN.md §2): тот же id/границы/флаг основного, без
+/// платформенных полей (`friendly_name`/`dpi`), которые автомату не нужны.
+fn core_snapshot(info: &monitors::MonitorInfo) -> MonitorSnapshot {
+    MonitorSnapshot {
+        id: info.id.clone(),
+        bounds_px: info.bounds_px,
+        is_primary: info.is_primary,
+    }
+}
+
+/// Применить системные действия автомата потери монитора (ADR-011, SPEC 6.1)
+/// к `cfg`/`sprites`. НЕ кладёт снимок в undo-историю — вызывающий код
+/// (ветки `MonitorsChanged`/`Tick`) не трогает `edit.undo_stack`/`redo_stack`/
+/// `pending_snapshot`: системная миграция пропавшего монитора не должна быть
+/// отменяемой пользователем — `Ctrl+Z` иначе воскрешал бы стикеры на
+/// физически отсутствующем мониторе (M3_PREP_NOTES.md §5.3).
+fn apply_loss_actions(cfg: &mut Config, sprites: &mut [(Uuid, Sprite)], actions: Vec<LossAction>) {
+    for action in actions {
+        match action {
+            LossAction::HideSticker { sticker_id } => {
+                if let Some(s) = cfg.stickers.iter_mut().find(|s| s.id == sticker_id) {
+                    s.visible = false;
+                }
+            }
+            LossAction::RestoreVisibility {
+                sticker_id,
+                visible,
+            } => {
+                if let Some(s) = cfg.stickers.iter_mut().find(|s| s.id == sticker_id) {
+                    s.visible = visible;
+                }
+            }
+            LossAction::Migrate {
+                sticker_id,
+                placement,
+                origin,
+                visible,
+            } => {
+                if let Some(s) = cfg.stickers.iter_mut().find(|s| s.id == sticker_id) {
+                    s.placement = placement.clone();
+                    s.origin = Some(origin);
+                    s.visible = visible;
+                }
+                if let Some((_, sprite)) = sprites.iter_mut().find(|(id, _)| *id == sticker_id) {
+                    sprite.placement = placement;
+                }
+            }
+            LossAction::ReturnHome {
+                sticker_id,
+                placement,
+                rotation,
+            } => {
+                if let Some(s) = cfg.stickers.iter_mut().find(|s| s.id == sticker_id) {
+                    s.placement = placement.clone();
+                    s.transform.rotation = rotation;
+                    s.origin = None;
+                }
+                if let Some((_, sprite)) = sprites.iter_mut().find(|(id, _)| *id == sticker_id) {
+                    sprite.placement = placement;
+                    sprite.transform.rotation = rotation;
+                }
+            }
+            LossAction::ClearOrigin { sticker_id } => {
+                if let Some(s) = cfg.stickers.iter_mut().find(|s| s.id == sticker_id) {
+                    s.origin = None;
+                }
+            }
+        }
+    }
+}
+
 /// Применить прозрачность `percent` (0..=100, зеркалирует модель ползунка) к
 /// стикеру `id`: конвертация в `0.0..=1.0` и запись через `apply_transform`
 /// (позиция/поворот не меняются — только `transform.opacity`, раздел 6).
@@ -2148,6 +2520,7 @@ fn handle_input(
     monitor_id: &MonitorId,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    loss_tracker: &mut MonitorLossTracker,
 ) -> bool {
     let monitor = DipRect::new(
         0.0,
@@ -2588,6 +2961,7 @@ fn handle_input(
                     }
                 }
             }
+            let gesture_sticker_id = edit.gesture.as_ref().and_then(Gesture::start).map(|s| s.id);
             if edit.gesture.take().is_some() {
                 // Снимок кладём в историю только сейчас, и только если жест
                 // реально что-то изменил — клик без движения не тратит шаг
@@ -2598,6 +2972,21 @@ fn handle_input(
                 if let Some(before) = edit.pending_snapshot.take() {
                     if before != *cfg {
                         commit_undo_snapshot(edit, before);
+                        // Пользователь вручную подвинул/повернул стикер —
+                        // если тот был смигрирован автоматом потери монитора,
+                        // это осознанная правка поверх старого места: сбросить
+                        // `origin`, чтобы будущий автовозврат не «воскресил»
+                        // стикер обратно и не затёр ручную правку (SPEC 6.1,
+                        // пункт 4). Rotate намеренно тоже сюда попадает —
+                        // ReturnHome восстанавливает и origin.rotation.
+                        if let Some(id) = gesture_sticker_id {
+                            if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                                let actions = loss_tracker.on_user_edit(sticker);
+                                if !actions.is_empty() {
+                                    apply_loss_actions(cfg, sprites, actions);
+                                }
+                            }
+                        }
                     }
                 }
                 if let Err(e) = config::save(cfg, config_path) {
