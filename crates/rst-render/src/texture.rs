@@ -17,6 +17,11 @@ pub struct Texture {
     _texture: ID3D11Texture2D,
     width: u32,
     height: u32,
+    /// `Some` только для текстур-масок (M4, создаются
+    /// `Device::create_mask_texture`, R8, рендер-таргет + SRV) — обычные
+    /// спрайтовые текстуры (`from_rgba`) в render target не рисуются, у них
+    /// `None`.
+    rtv: Option<ID3D11RenderTargetView>,
 }
 
 impl std::fmt::Debug for Texture {
@@ -39,6 +44,14 @@ impl Texture {
     /// SRV для биндинга в пиксельный шейдер (только внутри крейта).
     pub(crate) fn srv(&self) -> &ID3D11ShaderResourceView {
         &self.srv
+    }
+
+    /// RTV для рендера В эту текстуру — только у масок
+    /// (`Device::create_mask_texture`). `None` у обычных спрайтовых текстур.
+    /// Возвращает клон (тот же паттерн, что `WindowTarget::rtv`) — COM
+    /// `AddRef`, дёшево.
+    pub(crate) fn rtv(&self) -> Option<ID3D11RenderTargetView> {
+        self.rtv.clone()
     }
 
     /// Загрузить RGBA-пиксели (straight alpha) в GPU: premultiply на CPU,
@@ -117,6 +130,67 @@ impl Texture {
             _texture: texture,
             width,
             height,
+            rtv: None,
+        })
+    }
+
+    /// Создать R8_UNORM offscreen render target для маски перекрытия (M4,
+    /// docs/M4_MASK_RENDER_DESIGN.md §3): рендер-таргет + SRV на одной
+    /// текстуре (`Device::draw_mask` рисует в неё, `Device::draw_masked`
+    /// сэмплирует в шейдере спрайта, t1). `R8_UNORM` достаточно поддержан
+    /// FL 11.0 и как рендер-таргет, и как SRV — автогенерация мипмапов не
+    /// нужна (маска сэмплируется 1:1 с backbuffer, mip 0 всегда).
+    pub(crate) fn create_mask_target(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RenderError> {
+        if width == 0 || height == 0 {
+            return Err(RenderError::InvalidTextureData(
+                "нулевая ширина или высота маски".to_string(),
+            ));
+        }
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture: Option<ID3D11Texture2D> = None;
+        // SAFETY: desc валиден; out-параметр валиден.
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+            .map_err(RenderError::Windows)?;
+        let texture = texture.expect("CreateTexture2D без ошибки возвращает объект");
+
+        let mut srv: Option<ID3D11ShaderResourceView> = None;
+        // SAFETY: `texture` — валидный ID3D11Resource; out-параметр валиден.
+        unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv)) }
+            .map_err(RenderError::Windows)?;
+        let srv = srv.expect("CreateShaderResourceView без ошибки возвращает объект");
+
+        let mut rtv: Option<ID3D11RenderTargetView> = None;
+        // SAFETY: `texture` — валидный ID3D11Resource с BIND_RENDER_TARGET;
+        // out-параметр валиден.
+        unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv)) }
+            .map_err(RenderError::Windows)?;
+        let rtv = rtv.expect("CreateRenderTargetView без ошибки возвращает объект");
+
+        Ok(Self {
+            srv,
+            _texture: texture,
+            width,
+            height,
+            rtv: Some(rtv),
         })
     }
 }

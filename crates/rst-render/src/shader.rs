@@ -46,9 +46,35 @@ VSOut mainVS(uint vid : SV_VertexID) {
 }
 Texture2D tex0 : register(t0);
 SamplerState samp0 : register(s0);
+Texture2D maskTex : register(t1);
+SamplerState maskSamp : register(s1);
 float4 mainPS(VSOut i) : SV_Target {
+    // Маска перекрытия (M4): сэмплится по экранной позиции пикселя, не по
+    // uv стикера — вырез стабилен при движении/повороте стикера. misc2.yz
+    // уже несёт размер экрана (тот же, что для NDC-конверсии в mainVS).
+    // discard ДО умножения на opacity — иначе преждевременный выход ушёл бы
+    // с ненулевой premultiplied-альфой (M4_PREP_NOTES §4.3). Быстрый путь
+    // (нет окклюдеров/стикер Always) — маска-параметр биндит 1x1 чёрную
+    // текстуру (r == 0), discard никогда не срабатывает, отдельный шейдер
+    // для этого случая не нужен.
+    float2 maskUv = i.pos.xy / misc2.yz;
+    if (maskTex.Sample(maskSamp, maskUv).r > 0.5) discard;
     // Текстура уже premultiplied: умножение на opacity корректно и для rgb.
     return tex0.Sample(samp0, i.uv) * i.opacity;
+}
+/// Скруглённый прямоугольник в маску перекрытия (M4, ADR-004): один
+/// оклюдер за вызов, `tr` несёт его центр/размер в физических px (тот же VS
+/// и раскладка CB, что у спрайта — mainVS не меняется). SDF скруглённого
+/// прямоугольника с 1-px антиалиасингом края; при узком/низком прямоугольнике
+/// (half <= радиус) корректно деградирует к капсуле/линии.
+float4 mainMaskPS(VSOut i) : SV_Target {
+    float2 center = tr.xy;
+    float2 halfSize = tr.zw * 0.5;
+    float2 radius = float2(8.0, 8.0);
+    float2 q = abs(i.pos.xy - center) - (halfSize - radius);
+    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius.x;
+    float cov = 1.0 - smoothstep(0.0, 1.0, d);
+    return float4(cov, 0.0, 0.0, cov);
 }
 "#;
 
@@ -119,6 +145,17 @@ mod tests {
         assert!(!blob_bytes(&ps).is_empty(), "ps_5_0 должен дать байткод");
     }
 
+    /// Маска перекрытия (M4) — отдельная точка входа PS, тот же VS/CB.
+    #[test]
+    fn mask_shader_compiles() {
+        let ps = compile(
+            PCSTR::from_raw(c"mainMaskPS".as_ptr().cast()),
+            PCSTR::from_raw(c"ps_5_0".as_ptr().cast()),
+        )
+        .expect("PS маски должен компилироваться");
+        assert!(!blob_bytes(&ps).is_empty(), "ps_5_0 должен дать байткод");
+    }
+
     /// Инварианты исходника HLSL, критичные для спрайтового рендера:
     /// обе точки входа, константный буфер и premultiplied-умножение на opacity.
     #[test]
@@ -128,5 +165,27 @@ mod tests {
         assert!(SPRITE_HLSL.contains("cbuffer Cb"));
         // Текстура уже premultiplied, поэтому rgb тоже умножается на opacity.
         assert!(SPRITE_HLSL.contains("tex0.Sample(samp0, i.uv) * i.opacity"));
+    }
+
+    /// Инварианты маски (M4, docs/M4_MASK_RENDER_DESIGN.md §4.3): второй
+    /// слот текстуры/сэмплера, отдельная точка входа PS маски, и — самое
+    /// важное — `discard` стоит РАНЬШЕ умножения на opacity в исходном
+    /// тексте (иначе преждевременный выход ушёл бы с ненулевой
+    /// premultiplied-альфой).
+    #[test]
+    fn mask_hlsl_contract() {
+        assert!(SPRITE_HLSL.contains("register(t1)"));
+        assert!(SPRITE_HLSL.contains("register(s1)"));
+        assert!(SPRITE_HLSL.contains("mainMaskPS"));
+        let discard_pos = SPRITE_HLSL
+            .find("discard;")
+            .expect("discard по маске должен присутствовать");
+        let opacity_mul_pos = SPRITE_HLSL
+            .find("tex0.Sample(samp0, i.uv) * i.opacity")
+            .expect("умножение на opacity должно присутствовать");
+        assert!(
+            discard_pos < opacity_mul_pos,
+            "discard обязан стоять до умножения на opacity (не после premultiply)"
+        );
     }
 }

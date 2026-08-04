@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use rst_core::model::Placement;
+use rst_core::model::{Placement, Rect};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
@@ -64,6 +64,23 @@ pub struct Device {
     cb: ID3D11Buffer,
     sampler: ID3D11SamplerState,
     blend: ID3D11BlendState,
+    /// M4: PS маски перекрытия (`mainMaskPS`, SDF скруглённого прямоугольника).
+    mask_ps: ID3D11PixelShader,
+    /// M4: `POINT`/`CLAMP` — точное совпадение текселя маски с пикселем
+    /// экрана (никакой фильтрации на краях выреза, docs/M4_MASK_RENDER_DESIGN.md §4.4).
+    mask_sampler: ID3D11SamplerState,
+    /// M4: аддитивный блендинг для объединения оклюдеров в одной маске
+    /// (`ONE, ONE, ADD` — значения могут превысить 1, порог `> 0.5` в
+    /// шейдере спрайта это переваривает; `BLEND_OP_MAX` не используем, чтобы
+    /// не завязываться на FL 11.1).
+    mask_blend: ID3D11BlendState,
+    /// M4: 1×1 R8-текстура, очищенная в 0 — «нет маски» по умолчанию.
+    /// `mainPS` теперь ВСЕГДА сэмплирует `t1` (маска — часть общего шейдера
+    /// спрайта, не отдельная точка входа), поэтому `draw()` — путь M2/M3 без
+    /// изменений вызова — обязан явно забиндить что-то в `t1`, а не полагаться
+    /// на неявное поведение D3D11 «несвязанный SRV даёт 0» (корректно, но
+    /// неявно). Тот же текстур служит фолбэком `draw_masked` для `None`.
+    mask_empty: Texture,
 }
 
 impl Device {
@@ -127,6 +144,19 @@ impl Device {
             .map_err(RenderError::Windows)?;
         let ps = ps.expect("CreatePixelShader без ошибки возвращает объект");
 
+        // --- PS маски перекрытия (M4) — тот же VS/CB, отдельная точка входа ---
+        let mask_ps_blob = shader::compile(
+            PCSTR::from_raw(c"mainMaskPS".as_ptr().cast()),
+            PCSTR::from_raw(c"ps_5_0".as_ptr().cast()),
+        )?;
+        let mut mask_ps: Option<ID3D11PixelShader> = None;
+        // SAFETY: байткод из живого blob; out-параметр валиден.
+        unsafe {
+            device.CreatePixelShader(shader::blob_bytes(&mask_ps_blob), None, Some(&mut mask_ps))
+        }
+        .map_err(RenderError::Windows)?;
+        let mask_ps = mask_ps.expect("CreatePixelShader без ошибки возвращает объект");
+
         // --- Константный буфер, сэмплер, blend-состояние ---
         let cb_desc = D3D11_BUFFER_DESC {
             ByteWidth: size_of::<SpriteParams>() as u32,
@@ -176,6 +206,51 @@ impl Device {
             .map_err(RenderError::Windows)?;
         let blend = blend.expect("CreateBlendState без ошибки возвращает объект");
 
+        // --- Сэмплер и blend-состояние маски перекрытия (M4) ---
+        let mask_sampler_desc = D3D11_SAMPLER_DESC {
+            Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        };
+        let mut mask_sampler: Option<ID3D11SamplerState> = None;
+        // SAFETY: desc валиден; out-параметр валиден.
+        unsafe { device.CreateSamplerState(&mask_sampler_desc, Some(&mut mask_sampler)) }
+            .map_err(RenderError::Windows)?;
+        let mask_sampler = mask_sampler.expect("CreateSamplerState без ошибки возвращает объект");
+
+        // Аддитивное объединение оклюдеров в одной маске (docs/M4_MASK_RENDER_DESIGN.md §4.1).
+        let mask_rt_blend = D3D11_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            SrcBlend: D3D11_BLEND_ONE,
+            DestBlend: D3D11_BLEND_ONE,
+            BlendOp: D3D11_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D11_BLEND_ONE,
+            DestBlendAlpha: D3D11_BLEND_ONE,
+            BlendOpAlpha: D3D11_BLEND_OP_ADD,
+            RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+        };
+        let mut mask_blend_desc = D3D11_BLEND_DESC::default();
+        mask_blend_desc.RenderTarget[0] = mask_rt_blend;
+        let mut mask_blend: Option<ID3D11BlendState> = None;
+        // SAFETY: desc валиден; out-параметр валиден.
+        unsafe { device.CreateBlendState(&mask_blend_desc, Some(&mut mask_blend)) }
+            .map_err(RenderError::Windows)?;
+        let mask_blend = mask_blend.expect("CreateBlendState без ошибки возвращает объект");
+
+        // --- «Нет маски» по умолчанию: 1x1 R8, очищена в 0 ---
+        let mask_empty = Texture::create_mask_target(&device, 1, 1)?;
+        // SAFETY: только что созданный RTV собственной текстуры устройства;
+        // единоразовая очистка при старте, вне цикла отрисовки.
+        unsafe {
+            let rtv = mask_empty
+                .rtv()
+                .expect("create_mask_target всегда даёт RTV");
+            context.ClearRenderTargetView(&rtv, &[0.0f32; 4]);
+        }
+
         Ok(Self {
             device,
             context,
@@ -186,6 +261,10 @@ impl Device {
             cb,
             sampler,
             blend,
+            mask_ps,
+            mask_sampler,
+            mask_blend,
+            mask_empty,
         })
     }
 
@@ -255,6 +334,13 @@ impl Device {
                 .PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            self.context
+                .PSSetSamplers(1, Some(&[Some(self.mask_sampler.clone())]));
+            // Маска не варьируется по спрайту в этом пути — биндится один
+            // раз, вне цикла: `mainPS` теперь всегда сэмплирует t1, но у
+            // немаскированной отрисовки (M2/M3, этот метод) окклюдеров нет.
+            self.context
+                .PSSetShaderResources(1, Some(&[Some(self.mask_empty.srv().clone())]));
         }
 
         // SAFETY: `cb` — валидный ID3D11Resource; mapped-память валидна
@@ -297,6 +383,200 @@ impl Device {
                 self.context.Unmap(Some(&cb_res), 0);
                 self.context
                     .PSSetShaderResources(0, Some(&[Some(sprite.texture.srv().clone())]));
+                self.context.Draw(6, 0);
+            }
+        }
+        target.present()
+    }
+
+    /// Создать маску перекрытия (M4, docs/M4_MASK_RENDER_DESIGN.md §3):
+    /// offscreen R8-рендер-таргет размером `width`×`height` физических px —
+    /// должен совпадать 1:1 с размером цели монитора, для которого считается
+    /// (`WindowTarget::size()`), иначе `SV_Position`-сэмплинг в `mainPS`
+    /// разъедется с реальными пикселями. Пересоздавать при ресайзе/DPI-смене
+    /// монитора и после `DEVICE_REMOVED`, как и сам `WindowTarget`.
+    pub fn create_mask_texture(&self, width: u32, height: u32) -> Result<Texture, RenderError> {
+        Texture::create_mask_target(&self.device, width, height)
+    }
+
+    /// Залить маску `mask` объединением скруглённых прямоугольников
+    /// `rects` (физические px, локальные для монитора — см.
+    /// `rst_core::occluders::clip_rect`). Чистит маску в 0, затем рисует
+    /// каждый прямоугольник аддитивно (`mask_blend`) через SDF-заливку
+    /// (`mainMaskPS`, радиус 8 px). Не вызывает `present` — маска не
+    /// показывается сама по себе, только сэмплируется `draw_masked`.
+    pub fn draw_mask(&self, mask: &Texture, rects: &[Rect]) -> Result<(), RenderError> {
+        let Some(rtv) = mask.rtv() else {
+            return Err(RenderError::InvalidTextureData(
+                "draw_mask вызван на текстуре без RTV — не создана create_mask_texture".to_string(),
+            ));
+        };
+        let (w, h) = (mask.width(), mask.height());
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+
+        // SAFETY: все COM-объекты живы и принадлежат self; контекст
+        // используется только с потока-владельца (Device намеренно не
+        // Send/Sync).
+        unsafe {
+            self.context.ClearRenderTargetView(&rtv, &[0.0f32; 4]);
+            let vp = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: w as f32,
+                Height: h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            self.context.RSSetViewports(Some(&[vp]));
+            self.context.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            self.context
+                .OMSetBlendState(&self.mask_blend, None, 0xffffffff);
+            self.context.IASetInputLayout(None);
+            self.context
+                .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            // Тот же VS/CB, что у спрайта (docs/M4_MASK_RENDER_DESIGN.md §4.1)
+            // — только PS другой.
+            self.context.VSSetShader(&self.vs, None);
+            self.context
+                .VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            self.context.PSSetShader(&self.mask_ps, None);
+            self.context
+                .PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+        }
+
+        // SAFETY: `cb` — валидный ID3D11Resource; mapped-память валидна
+        // между Map и Unmap; SpriteParams — repr(C) и помещается в буфер.
+        unsafe {
+            let cb_res: ID3D11Resource = self.cb.cast().map_err(RenderError::Windows)?;
+            for rect in rects {
+                if rect.w == 0 || rect.h == 0 {
+                    continue;
+                }
+                // Rect — top-left/w/h; CB (tr) ждёт центр/размер, как Placement.
+                let cx = rect.x as f32 + rect.w as f32 * 0.5;
+                let cy = rect.y as f32 + rect.h as f32 * 0.5;
+                let params = SpriteParams {
+                    tr: [cx, cy, rect.w as f32, rect.h as f32],
+                    // Оклюдер не повёрнут (cos=1, sin=0), opacity/flip не
+                    // используются `mainMaskPS`, но mainVS их всё равно читает.
+                    misc: [1.0, 0.0, 1.0, 1.0],
+                    misc2: [1.0, w as f32, h as f32, 0.0],
+                };
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                self.context
+                    .Map(
+                        Some(&cb_res),
+                        0,
+                        D3D11_MAP_WRITE_DISCARD,
+                        0,
+                        Some(&mut mapped),
+                    )
+                    .map_err(RenderError::Windows)?;
+                std::ptr::copy_nonoverlapping(&params, mapped.pData.cast::<SpriteParams>(), 1);
+                self.context.Unmap(Some(&cb_res), 0);
+                self.context.Draw(6, 0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Как [`Self::draw`], но каждый спрайт вырезается по своей маске
+    /// (M4): `masks[i]` — маска стикера `sprites[i]` (`None` — стикер без
+    /// ограничений видимости, биндится встроенная пустая маска, тот же
+    /// эффект, что `draw()`). `masks.len()` должен совпадать с
+    /// `sprites.len()` — лишние/недостающие элементы просто не влияют на
+    /// хвост без пары (используется пустая маска).
+    pub fn draw_masked(
+        &self,
+        target: &WindowTarget,
+        sprites: &[Sprite],
+        masks: &[Option<&Texture>],
+    ) -> Result<(), RenderError> {
+        let (w, h) = target.size();
+        let Some(rtv) = target.rtv() else {
+            return Ok(());
+        };
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+
+        // SAFETY: см. draw() — тот же контекст, та же нить-владелец.
+        unsafe {
+            let clear = [0.0f32; 4];
+            self.context.ClearRenderTargetView(&rtv, &clear);
+            let vp = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: w as f32,
+                Height: h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            self.context.RSSetViewports(Some(&[vp]));
+            self.context.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            self.context.OMSetBlendState(&self.blend, None, 0xffffffff);
+            self.context.IASetInputLayout(None);
+            self.context
+                .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context.VSSetShader(&self.vs, None);
+            self.context
+                .VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            self.context.PSSetShader(&self.ps, None);
+            self.context
+                .PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            self.context
+                .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            self.context
+                .PSSetSamplers(1, Some(&[Some(self.mask_sampler.clone())]));
+        }
+
+        // SAFETY: см. draw() — тот же паттерн Map/Unmap-на-спрайт.
+        unsafe {
+            let cb_res: ID3D11Resource = self.cb.cast().map_err(RenderError::Windows)?;
+            let scale = target.dpi_scale();
+            for (i, sprite) in sprites.iter().enumerate() {
+                if sprite.placement.w <= 0.0 || sprite.placement.h <= 0.0 {
+                    continue;
+                }
+                let [cx, cy, sw, sh] = placement_to_physical(&sprite.placement, scale);
+                let (sin, cos) = (sprite.transform.rotation as f32).sin_cos();
+                let params = SpriteParams {
+                    tr: [cx, cy, sw, sh],
+                    misc: [
+                        cos,
+                        sin,
+                        sprite.transform.opacity as f32,
+                        if sprite.transform.flip_h { -1.0 } else { 1.0 },
+                    ],
+                    misc2: [
+                        if sprite.transform.flip_v { -1.0 } else { 1.0 },
+                        w as f32,
+                        h as f32,
+                        0.0,
+                    ],
+                };
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                self.context
+                    .Map(
+                        Some(&cb_res),
+                        0,
+                        D3D11_MAP_WRITE_DISCARD,
+                        0,
+                        Some(&mut mapped),
+                    )
+                    .map_err(RenderError::Windows)?;
+                std::ptr::copy_nonoverlapping(&params, mapped.pData.cast::<SpriteParams>(), 1);
+                self.context.Unmap(Some(&cb_res), 0);
+                self.context
+                    .PSSetShaderResources(0, Some(&[Some(sprite.texture.srv().clone())]));
+                let mask_srv = match masks.get(i).copied().flatten() {
+                    Some(mask) => mask.srv().clone(),
+                    None => self.mask_empty.srv().clone(),
+                };
+                self.context
+                    .PSSetShaderResources(1, Some(&[Some(mask_srv)]));
                 self.context.Draw(6, 0);
             }
         }
