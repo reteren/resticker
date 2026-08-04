@@ -109,6 +109,15 @@ struct MonitorState {
     width: u32,
     height: u32,
     scale: f32,
+    /// `true`, если `recover_device` не смог пересоздать `target` этого
+    /// монитора на новом устройстве (стал `stale` — указывает на уже
+    /// уничтоженное устройство). `redraw_all` пропускает такие мониторы
+    /// целиком: без этого флага `present` на устаревшей цели гарантированно
+    /// возвращал бы `DeviceLost` на каждом кадре и превращал бы КАЖДОЕ
+    /// следующее redraw-событие в полное повторное восстановление всех GPU-
+    /// ресурсов (docs/M3_DEVICE_RECOVERY_REVIEW.md, пункт 2.1). Снимается
+    /// следующим успешным `recover_device` для этого монитора.
+    broken: bool,
 }
 
 /// Хоткей входа/выхода из режима редактирования по умолчанию (CONFIG.md),
@@ -659,6 +668,7 @@ fn run(
                 width,
                 height,
                 scale,
+                broken: false,
             },
         );
     }
@@ -2962,6 +2972,15 @@ fn redraw_all(
     ui_cache: &mut UiTextureCache,
 ) -> bool {
     for (monitor_id, ms) in monitors_map.iter_mut() {
+        // Устаревшая цель на уже уничтоженном устройстве, которую не
+        // удалось пересоздать при последнем восстановлении — не рисуем: её
+        // `present` гарантированно вернёт `DeviceLost` заново и превратит
+        // каждое следующее redraw-событие в полное повторное восстановление
+        // (docs/M3_DEVICE_RECOVERY_REVIEW.md, пункт 2.1). Ждёт следующего
+        // успешного `recover_device` для этого монитора.
+        if ms.broken {
+            continue;
+        }
         let mut renderer = Renderer {
             device,
             target: &mut ms.target,
@@ -3016,9 +3035,19 @@ fn recover_device(
     };
     for (id, ms) in monitors_map.iter_mut() {
         match WindowTarget::new(&new_device, ms.overlay.hwnd(), ms.width, ms.height) {
-            Ok(target) => ms.target = target,
+            Ok(target) => {
+                ms.target = target;
+                ms.broken = false;
+            }
             Err(e) => {
-                tracing::error!(error = %e, monitor = %id.0, "не удалось пересоздать цель рендера монитора после потери устройства");
+                // Оставляем старую (устаревшую) цель как есть — трогать её
+                // незачем, `redraw_all` теперь пропускает монитор целиком по
+                // флагу `broken`, не пытаясь рисовать в неё и не порождая
+                // второй `DeviceLost` (docs/M3_DEVICE_RECOVERY_REVIEW.md,
+                // пункт 2.1). Следующая потеря устройства (или ручной
+                // перезапуск) — единственный способ снова попробовать.
+                tracing::error!(error = %e, monitor = %id.0, "не удалось пересоздать цель рендера монитора после потери устройства — окно исключено из отрисовки");
+                ms.broken = true;
                 continue;
             }
         }
@@ -3032,6 +3061,12 @@ fn recover_device(
         Ok(t) => *black_tex = t,
         Err(e) => tracing::error!(error = %e, "не удалось пересоздать текстуру затемнения"),
     }
+    // Стикер, чья текстура здесь не перезагрузилась, просто отсутствует в
+    // `sprites` и не рисуется — без явного ретрая, до ближайшего триггера
+    // `resync_sprites` (undo/redo, жест, удаление, дублирование — он
+    // пересоздаёт спрайты из cfg заново). Приемлемая деградация: путь и так
+    // залогирован, а `resync_sprites` в этом сеансе обычно случается скоро
+    // (docs/M3_DEVICE_RECOVERY_REVIEW.md, пункт 2.2).
     sprites.clear();
     for sticker in &cfg.stickers {
         if let Some(path) = sticker_image_path(&sticker.source) {
