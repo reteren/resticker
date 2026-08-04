@@ -33,11 +33,12 @@ use std::time::{Duration, Instant};
 use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{
-    Config, MediaType, MonitorId, Placement, Rect, Sticker, StickerSource, Transform,
+    Config, MediaType, MonitorId, OverlapRule, Placement, Rect, Sticker, StickerSource, Transform,
     VisibilityMode,
 };
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
+use rst_core::occluders::{self, OccluderCandidate, OccluderSet};
 use rst_core::ops;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
@@ -56,6 +57,7 @@ use rst_win32::input::{
 };
 use rst_win32::monitors;
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
+use rst_win32::window_enum::{WindowInfo, WindowRect};
 use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker};
 use uuid::Uuid;
 
@@ -93,6 +95,16 @@ impl Renderer<'_> {
 
     fn draw(&self, sprites: &[Sprite]) -> Result<(), RenderError> {
         self.device.draw(&*self.target, sprites)
+    }
+
+    /// Как [`Self::draw`], но с маской перекрытия на спрайт (M4) — см.
+    /// `Device::draw_masked`.
+    fn draw_masked(
+        &self,
+        sprites: &[Sprite],
+        masks: &[Option<&Texture>],
+    ) -> Result<(), RenderError> {
+        self.device.draw_masked(&*self.target, sprites, masks)
     }
 }
 
@@ -951,6 +963,26 @@ fn run(
         tracker.set_mask_needed(last_mask_needed);
     }
 
+    // Последний снимок окон трекера (M4_OCCLUDERS_DESIGN.md §1) — обычная
+    // локальная переменная `run()`, не поле `EditState`: маска перекрытия не
+    // относится к режиму редактирования и должна переживать вход/выход из
+    // него. Пусто до первого `Windows(Changed)` — первый кадр рисуется без
+    // окклюдеров (консервативно безопасно: ничего не прячется зря, самое
+    // страшное — секундная вспышка стикера поверх окна до первого снимка).
+    let mut window_snapshot: Vec<WindowInfo> = Vec::new();
+    // Группы окклюдеров по монитору — топология (CPU, `Rect`), не GPU-текстуры
+    // (M4_OCCLUDERS_DESIGN.md §1/§7): один шейдерный проход-маска на группу
+    // стикеров с одинаковым эффективным правилом видимости, чтобы allow-list
+    // одного стикера не просачивался в другой (M4_PREP_NOTES.md §4.2). Сами
+    // GPU-текстуры масок строятся `redraw()` заново на каждый вызов — они
+    // event-driven, как и весь рендер (ADR-006), пересоздавать их тут вместе с
+    // топологией смысла нет (размер маски должен быть текущим размером цели
+    // монитора на момент отрисовки, а не на момент пересчёта окклюдеров).
+    // Начальный пересчёт с пустым снимком окон — до первого `Windows(Changed)`
+    // группы для стикеров с `VisibilityMode != Always` уже существуют, но с
+    // пустым `rects` (нет известных окклюдеров), что рисует их как обычно.
+    let mut occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
+
     // Автомат ADR-011 (SPEC 6.1) и его «эталонный» снимок мониторов — сверяет
     // с ним каждый `MonitorsChanged` (диффинг всегда против ЖИВОГО состояния,
     // не отдельной копии — WM_DISPLAYCHANGE рассылается всем окнам, дубликаты
@@ -1004,6 +1036,7 @@ fn run(
         &white_tex,
         &black_tex,
         &mut ui_cache,
+        &occluder_cache,
     ) {
         if recover_device(
             &mut device,
@@ -1023,6 +1056,7 @@ fn run(
                 &white_tex,
                 &black_tex,
                 &mut ui_cache,
+                &occluder_cache,
             );
         } else {
             device_needs_recovery = true;
@@ -1514,14 +1548,14 @@ fn run(
                 // события приходить не должны, но игнорируем на всякий случай.
             }
             OverlayMessage::Windows(TrackerWindowEvent::Changed(windows)) => {
-                // M4: пока только залогировать — вычисление окклюдеров/маски
-                // перекрытия по allow-list каждого стикера и отсечение
-                // полностью перекрытых из рендера — следующий срез
-                // (M4_WINDOW_TRACKER_DESIGN.md §6), который заведёт хранение
-                // снимка вместе со своим первым настоящим потребителем.
-                // `need_redraw` здесь не трогаем: снимок пока ни на что не
-                // влияет визуально.
+                // M4: снимок окон трекера — пересчитываем группы окклюдеров
+                // по всем мониторам (M4_OCCLUDERS_DESIGN.md §1) и просим
+                // перерисовать: старая маска могла прятать/показывать
+                // стикер неверно относительно нового расположения окон.
                 tracing::debug!(count = windows.len(), "снимок окон обновлён");
+                window_snapshot = windows;
+                occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
+                need_redraw = true;
             }
         }
         // Гейт хуков трекера — раз за итерацию, дёшево (см. комментарий у
@@ -1544,6 +1578,7 @@ fn run(
                 &white_tex,
                 &black_tex,
                 &mut ui_cache,
+                &occluder_cache,
             )
         {
             if recover_device(
@@ -1565,6 +1600,7 @@ fn run(
                     &white_tex,
                     &black_tex,
                     &mut ui_cache,
+                    &occluder_cache,
                 );
             } else {
                 device_needs_recovery = true;
@@ -2282,6 +2318,119 @@ fn mask_needed(cfg: &Config) -> bool {
     cfg.stickers
         .iter()
         .any(|s| s.visibility.mode != VisibilityMode::Always)
+}
+
+/// Пересчитать группы окклюдеров по каждому монитору (M4_OCCLUDERS_DESIGN.md
+/// §1/§7). Стикеры с одинаковым эффективным правилом видимости (`mode` +
+/// `rules` — единственное, от чего зависит результат `occluders::is_occluder`
+/// для конкретного окна) делят одну маску: изначальная идея из
+/// M4_PREP_NOTES.md §4.2 — одна общая маска на весь монитор — ломала allow-
+/// list, если у стикеров разные правила (окно из allow-list одного стикера
+/// пряталось бы и под другим, для которого оно должно быть окклюдером).
+/// Монитор без стикеров, которым вообще нужна маска, просто не попадает в
+/// результат — `redraw` тогда не строит ни одной текстуры маски для него.
+fn refresh_occlusion(
+    cfg: &Config,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_snapshot: &[WindowInfo],
+) -> HashMap<MonitorId, Vec<OccluderSet>> {
+    let never_overlap_taskbar = cfg.settings.never_overlap_taskbar;
+    let mut result: HashMap<MonitorId, Vec<OccluderSet>> = HashMap::new();
+    for (monitor_id, bounds) in monitor_bounds {
+        // Правило (mode, rules) каждой уже собранной группы этого монитора —
+        // для группировки стикеров без Hash на `Vec<OverlapRule>` (сравниваем
+        // напрямую через `==`; дёшево при типичном числе стикеров/групп).
+        let mut signatures: Vec<(VisibilityMode, Vec<OverlapRule>)> = Vec::new();
+        let mut groups: Vec<OccluderSet> = Vec::new();
+        for sticker in cfg
+            .stickers
+            .iter()
+            .filter(|s| s.placement.monitor_id == *monitor_id)
+            .filter(|s| s.visibility.mode != VisibilityMode::Always)
+        {
+            let sig = (sticker.visibility.mode, sticker.visibility.rules.clone());
+            let group_idx = match signatures.iter().position(|s| *s == sig) {
+                Some(i) => i,
+                None => {
+                    let rects = occluder_rects_for(
+                        sig.0,
+                        &sig.1,
+                        never_overlap_taskbar,
+                        window_snapshot,
+                        &bounds.bounds_px,
+                    );
+                    signatures.push(sig);
+                    groups.push(OccluderSet {
+                        stickers: Vec::new(),
+                        rects,
+                    });
+                    groups.len() - 1
+                }
+            };
+            groups[group_idx].stickers.push(sticker.id);
+        }
+        if !groups.is_empty() {
+            result.insert(monitor_id.clone(), groups);
+        }
+    }
+    result
+}
+
+/// Прямоугольники окон-окклюдеров для одной группы (physические px,
+/// локальные для монитора — `occluders::clip_rect`). Свёрнутые окна не
+/// участвуют: их прямоугольник мусорный (`WindowInfo::iconic`,
+/// M4_PREP_NOTES.md §2.2) — они всё равно не показывают содержимого, под
+/// которым стикеру имело бы смысл прятаться.
+fn occluder_rects_for(
+    mode: VisibilityMode,
+    rules: &[OverlapRule],
+    never_overlap_taskbar: bool,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds_px: &Rect,
+) -> Vec<Rect> {
+    window_snapshot
+        .iter()
+        .filter(|w| !w.iconic)
+        .filter(|w| {
+            let candidate = OccluderCandidate {
+                exe_path: window_exe_path(w),
+                title: w.title.clone(),
+                class: w.class.clone(),
+            };
+            occluders::is_occluder(&candidate, mode, rules, never_overlap_taskbar)
+        })
+        .filter_map(|w| {
+            let win_rect = window_rect_to_core(&w.rect)?;
+            occluders::clip_rect(&win_rect, monitor_bounds_px)
+        })
+        .collect()
+}
+
+/// `WindowInfo::exe_path` — пустой `PathBuf`, когда `OpenProcess` не дал путь
+/// (защищённый процесс, window_enum.rs) — `occluders::is_occluder` ждёт в
+/// этом случае `None` (правила по процессу консервативно не матчат).
+fn window_exe_path(w: &WindowInfo) -> Option<String> {
+    if w.exe_path.as_os_str().is_empty() {
+        None
+    } else {
+        w.exe_path.to_str().map(str::to_owned)
+    }
+}
+
+/// `WindowRect` (физические px, `i32` ширина/высота — DWM иногда отдаёт
+/// вырожденные значения) → `rst_core::model::Rect`. `None` на невырожденных
+/// отрицательных/нулевых размерах — таких окно не занимает экранного места,
+/// окклюдером быть не может.
+fn window_rect_to_core(r: &WindowRect) -> Option<Rect> {
+    if r.w <= 0 || r.h <= 0 {
+        return None;
+    }
+    Some(Rect {
+        x: r.x,
+        y: r.y,
+        w: r.w as u32,
+        h: r.h as u32,
+    })
 }
 
 /// `rst_win32::monitors::MonitorInfo` → `rst_core::monitor_loss::MonitorSnapshot`
@@ -3513,8 +3662,16 @@ fn redraw(
     height_px: u32,
     scale: f32,
     monitor_id: &MonitorId,
+    occluders: Option<&[OccluderSet]>,
 ) -> bool {
     let mut frame: Vec<Sprite> = Vec::with_capacity(sprites.len() + 1 + 12);
+    // (индекс в `frame`, индекс группы в `occluders`) для каждого видимого
+    // стикера этого монитора, у которого `visibility.mode != Always` (M4).
+    // Заполняется только в ветке `sticker.visible` ниже — единственное
+    // место, где в `frame` попадает реальный спрайт стикера (шахматка
+    // скрытого стикера и весь остальной UI никогда не маскируются, и то, и
+    // то видно только при `edit.active`, а маски там всё равно выключены).
+    let mut sticker_mask_slots: Vec<(usize, usize)> = Vec::new();
     // Растровый шрифт — целочисленный пиксельный масштаб; `scale` (DPI/96)
     // округляем, а не берём как есть (text::rasterize ждёт `u32`).
     let text_scale = scale.round().max(1.0) as u32;
@@ -3546,6 +3703,13 @@ fn redraw(
     for sticker in order {
         if sticker.visible {
             if let Some((_, sprite)) = sprites.iter().find(|(id, _)| *id == sticker.id) {
+                if let Some(groups) = occluders {
+                    if let Some(group_idx) =
+                        groups.iter().position(|g| g.stickers.contains(&sticker.id))
+                    {
+                        sticker_mask_slots.push((frame.len(), group_idx));
+                    }
+                }
                 frame.push(sprite.clone());
             }
             continue;
@@ -3653,7 +3817,73 @@ fn redraw(
         }
     }
 
-    if let Err(e) = renderer.draw(&frame) {
+    // Маска перекрытия выключена в режиме редактирования (M4_OCCLUDERS_
+    // DESIGN.md §6: стикер должен оставаться полностью видимым и
+    // интерактивным, пока его двигают/крутят, независимо от окон под ним) и
+    // когда на этом мониторе нет ни одного видимого стикера с активной
+    // группой окклюдеров — тогда обычный `draw()` не отличается от
+    // `draw_masked()` с пустыми масками, но дешевле (не строит текстуры).
+    let draw_result = if edit.active || sticker_mask_slots.is_empty() {
+        renderer.draw(&frame)
+    } else {
+        // Одна GPU-текстура маски на ГРУППУ окклюдеров (не на стикер) —
+        // строится заново каждый вызов `redraw`, а не кэшируется вместе с
+        // топологией (`occluder_cache` в `run()`): рендер event-driven
+        // (ADR-006), `redraw` и так вызывается только на реальные события,
+        // а свежий размер текстуры маски гарантированно совпадает с
+        // текущим размером цели монитора (пересчитанный на смене DPI/
+        // ресайза кэш топологии мог бы держать маску старого размера).
+        let mut group_textures: HashMap<usize, Texture> = HashMap::new();
+        let mut device_lost_building_mask = false;
+        let mut mask_build_failed = false;
+        if let Some(groups) = occluders {
+            for &(_, group_idx) in &sticker_mask_slots {
+                if group_textures.contains_key(&group_idx) {
+                    continue;
+                }
+                let build = renderer
+                    .device
+                    .create_mask_texture(width_px, height_px)
+                    .and_then(|tex| {
+                        renderer.device.draw_mask(&tex, &groups[group_idx].rects)?;
+                        Ok(tex)
+                    });
+                match build {
+                    Ok(tex) => {
+                        group_textures.insert(group_idx, tex);
+                    }
+                    Err(e) => {
+                        let device_lost = matches!(e, RenderError::DeviceLost(_));
+                        tracing::warn!(
+                            error = %e,
+                            device_lost,
+                            "не удалось построить маску перекрытия для группы окклюдеров"
+                        );
+                        if device_lost {
+                            device_lost_building_mask = true;
+                            break;
+                        }
+                        mask_build_failed = true;
+                    }
+                }
+            }
+        }
+        if device_lost_building_mask {
+            return true;
+        }
+        // Отказ построить хотя бы одну маску — рисуем кадр целиком без масок
+        // (стикеры этой группы на один кадр останутся полностью видимыми),
+        // а не роняем весь кадр: та же «приемлемая деградация», что и у
+        // прочих несмертельных ошибок текстур в этой функции.
+        let mut masks: Vec<Option<&Texture>> = vec![None; frame.len()];
+        if !mask_build_failed {
+            for &(idx, group_idx) in &sticker_mask_slots {
+                masks[idx] = group_textures.get(&group_idx);
+            }
+        }
+        renderer.draw_masked(&frame, &masks)
+    };
+    if let Err(e) = draw_result {
         let device_lost = matches!(e, RenderError::DeviceLost(_));
         tracing::warn!(error = %e, device_lost, "не удалось отрисовать кадр");
         return device_lost;
@@ -3676,6 +3906,7 @@ fn redraw_all(
     white_tex: &Texture,
     black_tex: &Texture,
     ui_cache: &mut UiTextureCache,
+    occluder_cache: &HashMap<MonitorId, Vec<OccluderSet>>,
 ) -> bool {
     for (monitor_id, ms) in monitors_map.iter_mut() {
         // Устаревшая цель на уже уничтоженном устройстве, которую не
@@ -3703,6 +3934,7 @@ fn redraw_all(
             ms.height,
             ms.scale,
             monitor_id,
+            occluder_cache.get(monitor_id).map(Vec::as_slice),
         );
         if device_lost {
             return true;
@@ -3920,5 +4152,254 @@ mod tests {
             bounds(-1920, -200, 1920, 1080),
             1.0
         ));
+    }
+
+    // --- M4: refresh_occlusion / occluder_rects_for / конвертеры ---
+
+    fn monitor_id(s: &str) -> MonitorId {
+        MonitorId(s.to_string())
+    }
+
+    fn sticker_with_visibility(
+        monitor: &str,
+        mode: VisibilityMode,
+        rules: Vec<OverlapRule>,
+    ) -> Sticker {
+        Sticker {
+            id: Uuid::new_v4(),
+            placement: Placement {
+                monitor_id: monitor_id(monitor),
+                ..Default::default()
+            },
+            visibility: rst_core::model::VisibilityRule { mode, rules },
+            ..Sticker::default()
+        }
+    }
+
+    fn window(
+        exe: Option<&str>,
+        title: &str,
+        class: &str,
+        rect: WindowRect,
+        iconic: bool,
+    ) -> WindowInfo {
+        WindowInfo {
+            exe_path: exe.map(std::path::PathBuf::from).unwrap_or_default(),
+            title: title.to_string(),
+            class: class.to_string(),
+            rect,
+            iconic,
+            ..Default::default()
+        }
+    }
+
+    fn single_monitor_bounds(id: &str, bounds_px: Rect) -> HashMap<MonitorId, MonitorBounds> {
+        let mid = monitor_id(id);
+        HashMap::from([(
+            mid.clone(),
+            MonitorBounds {
+                id: mid,
+                bounds_px,
+                scale: 1.0,
+            },
+        )])
+    }
+
+    #[test]
+    fn refresh_occlusion_groups_stickers_by_visibility_signature() {
+        // Два стикера с одинаковым (mode, rules) делят одну маску, третий с
+        // другими rules — свою (M4_PREP_NOTES.md §4.2 — иначе allow-list
+        // одного стикера просачивался бы в другой).
+        let rule_a = OverlapRule {
+            process_name: Some("chrome.exe".to_string()),
+            title_pattern: None,
+        };
+        let s1 =
+            sticker_with_visibility("M1", VisibilityMode::OverlapAllowlist, vec![rule_a.clone()]);
+        let s2 = sticker_with_visibility("M1", VisibilityMode::OverlapAllowlist, vec![rule_a]);
+        let s3 = sticker_with_visibility("M1", VisibilityMode::NeverOverlap, vec![]);
+        let cfg = Config {
+            stickers: vec![s1.clone(), s2.clone(), s3.clone()],
+            ..Config::default()
+        };
+        let bounds = single_monitor_bounds("M1", bounds(0, 0, 1920, 1080));
+        let result = refresh_occlusion(&cfg, &bounds, &[]);
+        let groups = result.get(&monitor_id("M1")).expect("группы для M1");
+        assert_eq!(groups.len(), 2, "два разных правила — две группы");
+        let group_of = |id: uuid::Uuid| {
+            groups
+                .iter()
+                .position(|g| g.stickers.contains(&id))
+                .expect("стикер должен быть в какой-то группе")
+        };
+        assert_eq!(
+            group_of(s1.id),
+            group_of(s2.id),
+            "одинаковое правило — одна группа"
+        );
+        assert_ne!(
+            group_of(s1.id),
+            group_of(s3.id),
+            "разное правило — разные группы"
+        );
+    }
+
+    #[test]
+    fn refresh_occlusion_skips_always_visibility_stickers() {
+        let always = sticker_with_visibility("M1", VisibilityMode::Always, vec![]);
+        let cfg = Config {
+            stickers: vec![always],
+            ..Config::default()
+        };
+        let bounds = single_monitor_bounds("M1", bounds(0, 0, 1920, 1080));
+        let result = refresh_occlusion(&cfg, &bounds, &[]);
+        assert!(
+            !result.contains_key(&monitor_id("M1")),
+            "монитор без стикеров, которым нужна маска, не должен попадать в результат"
+        );
+    }
+
+    #[test]
+    fn refresh_occlusion_empty_window_snapshot_yields_group_with_empty_rects() {
+        // Топология (группы) существует независимо от того, есть ли уже
+        // известные окна — до первого Windows(Changed) стикер просто ничего
+        // не прячет (безопасный дефолт).
+        let s = sticker_with_visibility("M1", VisibilityMode::NeverOverlap, vec![]);
+        let cfg = Config {
+            stickers: vec![s.clone()],
+            ..Config::default()
+        };
+        let bounds = single_monitor_bounds("M1", bounds(0, 0, 1920, 1080));
+        let result = refresh_occlusion(&cfg, &bounds, &[]);
+        let groups = result.get(&monitor_id("M1")).expect("группа для M1");
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].rects.is_empty());
+        assert_eq!(groups[0].stickers, vec![s.id]);
+    }
+
+    #[test]
+    fn occluder_rects_for_skips_iconic_windows() {
+        let windows = vec![window(
+            None,
+            "t",
+            "c",
+            WindowRect {
+                x: 10,
+                y: 10,
+                w: 100,
+                h: 100,
+            },
+            true,
+        )];
+        let rects = occluder_rects_for(
+            VisibilityMode::NeverOverlap,
+            &[],
+            false,
+            &windows,
+            &bounds(0, 0, 1920, 1080),
+        );
+        assert!(
+            rects.is_empty(),
+            "свёрнутое окно не должно давать оклюдер-прямоугольник"
+        );
+    }
+
+    #[test]
+    fn occluder_rects_for_clips_to_monitor_bounds() {
+        let windows = vec![window(
+            None,
+            "t",
+            "c",
+            WindowRect {
+                x: 1800,
+                y: 1000,
+                w: 300,
+                h: 300,
+            },
+            false,
+        )];
+        let rects = occluder_rects_for(
+            VisibilityMode::NeverOverlap,
+            &[],
+            false,
+            &windows,
+            &bounds(0, 0, 1920, 1080),
+        );
+        assert_eq!(rects, vec![bounds(1800, 1000, 120, 80)]);
+    }
+
+    #[test]
+    fn occluder_rects_for_allowlisted_window_is_excluded() {
+        let windows = vec![window(
+            Some("chrome.exe"),
+            "t",
+            "c",
+            WindowRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
+            false,
+        )];
+        let rule = OverlapRule {
+            process_name: Some("chrome.exe".to_string()),
+            title_pattern: None,
+        };
+        let rects = occluder_rects_for(
+            VisibilityMode::OverlapAllowlist,
+            &[rule],
+            false,
+            &windows,
+            &bounds(0, 0, 1920, 1080),
+        );
+        assert!(rects.is_empty());
+    }
+
+    #[test]
+    fn window_exe_path_empty_pathbuf_is_none() {
+        let w = window(None, "t", "c", WindowRect::default(), false);
+        assert_eq!(window_exe_path(&w), None);
+    }
+
+    #[test]
+    fn window_exe_path_nonempty_is_some() {
+        let w = window(Some("chrome.exe"), "t", "c", WindowRect::default(), false);
+        assert_eq!(window_exe_path(&w), Some("chrome.exe".to_string()));
+    }
+
+    #[test]
+    fn window_rect_to_core_rejects_zero_or_negative_size() {
+        assert_eq!(
+            window_rect_to_core(&WindowRect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 10
+            }),
+            None
+        );
+        assert_eq!(
+            window_rect_to_core(&WindowRect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: -5
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn window_rect_to_core_converts_valid_rect() {
+        assert_eq!(
+            window_rect_to_core(&WindowRect {
+                x: -10,
+                y: 20,
+                w: 100,
+                h: 200
+            }),
+            Some(bounds(-10, 20, 100, 200))
+        );
     }
 }
