@@ -394,6 +394,14 @@ enum OverlayMessage {
 /// таймеру шанс истечь без какого-либо внешнего события. Секундная точность
 /// не нужна, важно лишь не ждать следующего `WM_DISPLAYCHANGE` неопределённо
 /// долго.
+///
+/// Через сон (`Instant` монотонен и не движется, пока процесс не исполняется,
+/// а тик — единственный источник промежуточных вызовов `on_monitor_snapshot`)
+/// таймер фактически ставится на паузу: если монитор пропал прямо перед сном,
+/// 20-секундный отсчёт стартует не с момента пропажи, а с первого снапшота
+/// **после пробуждения** (`reenumerate_monitors` на `SystemResumed`) — время
+/// сна в отсчёт не идёт. Врождённо событийной модели, не баг
+/// (M3_SESSION_SLEEP_REVIEW.md, пункт 2.2).
 const LOSS_TICK_PERIOD: Duration = Duration::from_secs(1);
 
 /// Ручка для отправки команд оверлей-потоку; `Drop` останавливает поток.
@@ -941,6 +949,15 @@ fn run(
     };
     let mut ui_cache = UiTextureCache::new();
 
+    // `true`, пока последняя попытка `recover_device` заканчивалась неудачей
+    // (например, `Device::new()` не создался сразу после выхода из сна, пока
+    // адаптер ещё «оседает», M3_SESSION_SLEEP_REVIEW.md, пункт 2.3): без
+    // этого флага повтор ждал бы следующего события, выставляющего
+    // `need_redraw`, — которого может не быть долго (ховер-движения его не
+    // выставляют) — оверлей оставался бы чёрным. Ветка `Tick` ниже форсирует
+    // `need_redraw`, пока флаг не снимется успешным восстановлением.
+    let mut device_needs_recovery = false;
+
     if redraw_all(
         &device,
         &mut monitors_map,
@@ -950,25 +967,29 @@ fn run(
         &white_tex,
         &black_tex,
         &mut ui_cache,
-    ) && recover_device(
-        &mut device,
-        &mut monitors_map,
-        &mut white_tex,
-        &mut black_tex,
-        &mut sprites,
-        &cfg,
-        &mut ui_cache,
     ) {
-        redraw_all(
-            &device,
+        if recover_device(
+            &mut device,
             &mut monitors_map,
-            &sprites,
+            &mut white_tex,
+            &mut black_tex,
+            &mut sprites,
             &cfg,
-            &edit,
-            &white_tex,
-            &black_tex,
             &mut ui_cache,
-        );
+        ) {
+            redraw_all(
+                &device,
+                &mut monitors_map,
+                &sprites,
+                &cfg,
+                &edit,
+                &white_tex,
+                &black_tex,
+                &mut ui_cache,
+            );
+        } else {
+            device_needs_recovery = true;
+        }
     }
 
     for msg in rx {
@@ -1336,9 +1357,10 @@ fn run(
             }
             OverlayMessage::Tick => {
                 // Тик сам по себе снимок мониторов не меняет (диффить не
-                // против чего) — единственная цель дать шанс истечь
+                // против чего) — одна из двух целей — дать шанс истечь
                 // таймерам автомата потери монитора (M3_HOTPLUG_DESIGN.md
-                // §1); редрав только если автомат правда что-то изменил.
+                // §1); редрав из-за автомата — только если он правда что-то
+                // изменил.
                 let actions =
                     loss_tracker.on_monitor_snapshot(&last_snapshot, &cfg.stickers, Instant::now());
                 if !actions.is_empty() {
@@ -1346,6 +1368,16 @@ fn run(
                     if let Err(e) = config::save(&cfg, &config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить config.json после миграции монитора");
                     }
+                    need_redraw = true;
+                }
+                // Вторая цель — ретрай восстановления устройства, если
+                // предыдущая попытка (например, форсированная SystemResumed)
+                // провалилась: раз в секунду форсируем ещё одну попытку
+                // `redraw_all`/`recover_device`, пока адаптер не «осядет»
+                // после сна (M3_SESSION_SLEEP_REVIEW.md, пункт 2.3) — без
+                // этого чёрный оверлей мог бы простоять до следующего
+                // несвязанного события.
+                if device_needs_recovery {
                     need_redraw = true;
                 }
             }
@@ -1373,7 +1405,15 @@ fn run(
                 // реактивно — только при следующей попытке `present`; здесь
                 // просто гарантируем, что эта попытка случится немедленно, а
                 // не будет ждать несвязанного события (может не быть долго,
-                // если после сна ничего на экране не меняется).
+                // если после сна ничего на экране не меняется). Редрав из-за
+                // `need_redraw` случится в ЭТОЙ итерации, а `MonitorsChanged`
+                // от `reenumerate_monitors` — только в следующей: если во сне
+                // топология сменилась, этот кадр рисует по ещё старому
+                // `monitors_map` (окно пропавшего монитора включительно).
+                // Безвредно — либо тот `present` сам поймает потерю
+                // устройства/укажет на несуществующий дисплей, либо кадр
+                // просто не будет виден; дифф на следующей итерации снесёт
+                // окно и перерисует (M3_SESSION_SLEEP_REVIEW.md, пункт 2.4).
                 need_redraw = true;
                 reenumerate_monitors(&tx, &primary_id, "выхода из сна");
             }
@@ -1448,7 +1488,8 @@ fn run(
                 &black_tex,
                 &mut ui_cache,
             )
-            && recover_device(
+        {
+            if recover_device(
                 &mut device,
                 &mut monitors_map,
                 &mut white_tex,
@@ -1456,18 +1497,21 @@ fn run(
                 &mut sprites,
                 &cfg,
                 &mut ui_cache,
-            )
-        {
-            redraw_all(
-                &device,
-                &mut monitors_map,
-                &sprites,
-                &cfg,
-                &edit,
-                &white_tex,
-                &black_tex,
-                &mut ui_cache,
-            );
+            ) {
+                device_needs_recovery = false;
+                redraw_all(
+                    &device,
+                    &mut monitors_map,
+                    &sprites,
+                    &cfg,
+                    &edit,
+                    &white_tex,
+                    &black_tex,
+                    &mut ui_cache,
+                );
+            } else {
+                device_needs_recovery = true;
+            }
         }
     }
     // monitors_map (Device+WindowTarget-обёртки внутри Renderer конструируются
@@ -2151,6 +2195,13 @@ fn toolbar_monitor<'a>(selection: &SelectionSet, cfg: &'a Config) -> Option<&'a 
 /// текущий `primary_id`. Отправка, а не прямой вызов обработчика: событие
 /// уйдёт в очередь и обработается на следующей итерации цикла `run()`, как и
 /// любое другое сообщение (без реентрантности/рекурсии в текущий кадр match).
+///
+/// Каждое окно регистрируется на сессионные/энергоуведомления по отдельности,
+/// поэтому на N мониторов это вызывается N раз подряд на одно системное
+/// событие (N перечислений + N диффов + N полных `redraw_all`) — идемпотентно
+/// (диффы против живого состояния схлопываются в no-op со второго раза), но
+/// лишняя работа; при обычном числе мониторов (2-4) — миллисекунды, не
+/// оптимизировано намеренно (M3_SESSION_SLEEP_REVIEW.md, пункт 2.1).
 fn reenumerate_monitors(tx: &Sender<OverlayMessage>, primary_id: &MonitorId, reason: &str) {
     match monitors::enumerate() {
         Ok(infos) => {
