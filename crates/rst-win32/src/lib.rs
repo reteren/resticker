@@ -14,5 +14,6 @@ pub mod monitors;
 pub mod overlay;
 pub mod tray;
 pub mod window_enum;
+pub mod window_tracker;
 
 pub use error::Win32Error;

@@ -216,7 +216,10 @@ fn window_flags(hwnd: HWND) -> WindowFlags {
 /// Границы окна по DWM (то, что реально рисует композитор — ровно то, что
 /// вырежет маска перекрытия, M4_PREP_NOTES §2.1). При отказе API — нулевой
 /// прямоугольник (свёрнутые окна и так помечены `iconic`, не оклюдеры).
-fn extended_frame_bounds(hwnd: HWND) -> WindowRect {
+/// `pub(crate)`: переиспользуется `window_tracker` для точечного обновления
+/// rect одного окна на `EVENT_OBJECT_LOCATIONCHANGE`/`MINIMIZEEND`, не через
+/// полное `enumerate()` (M4_WINDOW_TRACKER_DESIGN.md §4).
+pub(crate) fn extended_frame_bounds(hwnd: HWND) -> WindowRect {
     let mut rect = RECT::default();
     // SAFETY: `rect` — валидный буфер под RECT, hwnd — из EnumWindows.
     let ok = unsafe {

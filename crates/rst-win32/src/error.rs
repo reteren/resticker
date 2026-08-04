@@ -14,6 +14,10 @@ pub enum Win32Error {
     OverlayWindowCreateFailed,
     #[error("поток оверлея завершился до инициализации")]
     OverlayThreadCrashed,
+    #[error("не удалось создать окно трекера окон")]
+    WindowTrackerWindowCreateFailed,
+    #[error("поток трекера окон завершился до инициализации")]
+    WindowTrackerThreadCrashed,
     #[error("комбинация клавиш «{0}» уже занята другим приложением")]
     HotkeyConflict(String),
     #[error("некорректная комбинация клавиш: {0}")]
