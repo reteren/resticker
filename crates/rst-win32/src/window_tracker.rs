@@ -330,12 +330,22 @@ fn install_hooks(state: &mut WndState) {
         // сам доставит колбэк в очередь ЭТОГО потока, ADR-005).
         let hook = unsafe { SetWinEventHook(min, max, None, Some(win_event_proc), 0, 0, flags) };
         if hook.0.is_null() {
+            // Половинчатая установка хуже отсутствия: первый диапазон несёт
+            // SHOW/HIDE — единственный источник полных перечислений — его
+            // потеря при живом втором навсегда «замораживает» кэш молча.
+            // Честная деградация — снести уже поставленные и остаться без
+            // хуков вовсе (эквивалент fast path, без эмиссии), а не жить в
+            // полуработающем состоянии (M4_WINDOW_TRACKER_REVIEW.md, пункт
+            // 2.2). Следующий переключающий цикл set_mask_needed(false→true)
+            // повторит попытку — `state.hooks.is_empty()` снова пропустит
+            // идемпотентный ранний выход выше.
             tracing::warn!(
                 min,
                 max,
-                "SetWinEventHook не удался — этот диапазон не отслеживается"
+                "SetWinEventHook не удался — снимаю уже установленные диапазоны, кэш окон не будет живым"
             );
-            continue;
+            uninstall_hooks(state);
+            return;
         }
         state.hooks.push(hook);
     }
@@ -405,6 +415,56 @@ fn rebuild_from_enum(cache: &mut Vec<WindowInfo>) -> Vec<WindowInfo> {
     cache.clone()
 }
 
+/// Одна разрешённая операция над кэшом после снятия приоритетов между
+/// дельтами одного и того же `hwnd` в пределах окна дебаунса.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedOp {
+    Destroy(usize),
+    /// `refresh_rect` — true только для `MINIMIZEEND` (`!iconic`): DWM
+    /// отдаёт свежий rect после восстановления, пересобрать его сразу, не
+    /// дожидаясь отдельного `LOCATIONCHANGE`.
+    Minimize {
+        hwnd: usize,
+        iconic: bool,
+        refresh_rect: bool,
+    },
+    Location(usize),
+}
+
+/// Снять приоритеты между дельтами одного `hwnd`, накопленными за одно окно
+/// дебаунса: снос важнее минимизации/перемещения (мёртвому окну незачем
+/// освежать rect или iconic-флаг), минимизация — важнее отдельного
+/// `LOCATIONCHANGE` того же `hwnd` (уже покрыта через `refresh_rect`).
+/// Чистая функция — тестируется без кэша и без Win32
+/// (M4_WINDOW_TRACKER_REVIEW.md, пункт 2.3). Вызывается только когда
+/// `pending.needs_full == false` — полное перечисление решает целиком, эта
+/// функция для него не нужна.
+fn resolve_pending(pending: &Pending) -> Vec<ResolvedOp> {
+    let mut ops = Vec::with_capacity(
+        pending.destroyed.len() + pending.minimized.len() + pending.location_changed.len(),
+    );
+    for &hwnd in &pending.destroyed {
+        ops.push(ResolvedOp::Destroy(hwnd));
+    }
+    for (&hwnd, &iconic) in &pending.minimized {
+        if pending.destroyed.contains(&hwnd) {
+            continue; // уже снесён — минимизация мертва
+        }
+        ops.push(ResolvedOp::Minimize {
+            hwnd,
+            iconic,
+            refresh_rect: !iconic,
+        });
+    }
+    for &hwnd in &pending.location_changed {
+        if pending.destroyed.contains(&hwnd) || pending.minimized.contains_key(&hwnd) {
+            continue; // уже обработано выше (снос или minimize/restore)
+        }
+        ops.push(ResolvedOp::Location(hwnd));
+    }
+    ops
+}
+
 /// Применить накопленные изменения и отправить свежий снимок. Вызывается из
 /// `WM_TIMER` (обычный дебаунс) и из мест, требующих немедленного полного
 /// перечисления (`set_mask_needed(true)`, разблокировка сессии).
@@ -412,30 +472,25 @@ fn flush_pending(state: &mut WndState) {
     let snapshot = if state.pending.needs_full {
         rebuild_from_enum(&mut state.cache)
     } else {
-        let destroyed = std::mem::take(&mut state.pending.destroyed);
-        let minimized = std::mem::take(&mut state.pending.minimized);
-        let location_changed = std::mem::take(&mut state.pending.location_changed);
-
-        for hwnd in &destroyed {
-            apply_destroy(&mut state.cache, *hwnd);
-        }
-        for (&hwnd, &iconic) in &minimized {
-            if destroyed.contains(&hwnd) {
-                continue; // уже снесён — минимизация мертва
+        for op in resolve_pending(&state.pending) {
+            match op {
+                ResolvedOp::Destroy(hwnd) => {
+                    apply_destroy(&mut state.cache, hwnd);
+                }
+                ResolvedOp::Minimize {
+                    hwnd,
+                    iconic,
+                    refresh_rect,
+                } => {
+                    apply_minimize(&mut state.cache, hwnd, iconic);
+                    if refresh_rect {
+                        refresh_rect_or_destroy(&mut state.cache, hwnd);
+                    }
+                }
+                ResolvedOp::Location(hwnd) => {
+                    refresh_rect_or_destroy(&mut state.cache, hwnd);
+                }
             }
-            apply_minimize(&mut state.cache, hwnd, iconic);
-            if !iconic {
-                // MINIMIZEEND: DWM отдаёт свежий rect после восстановления
-                // (M4_WINDOW_TRACKER_DESIGN.md §3) — заодно пересобрать его,
-                // не дожидаясь отдельного LOCATIONCHANGE.
-                refresh_rect_or_destroy(&mut state.cache, hwnd);
-            }
-        }
-        for &hwnd in &location_changed {
-            if destroyed.contains(&hwnd) || minimized.contains_key(&hwnd) {
-                continue; // уже обработано выше (снос или minimize/restore)
-            }
-            refresh_rect_or_destroy(&mut state.cache, hwnd);
         }
         state.cache.clone()
     };
@@ -454,6 +509,34 @@ fn refresh_rect_or_destroy(cache: &mut Vec<WindowInfo>, hwnd: usize) {
         apply_location(cache, hwnd, window_enum::extended_frame_bounds(h));
     } else {
         apply_destroy(cache, hwnd);
+    }
+}
+
+/// Результат классификации одного WinEvent-события — что сделать с
+/// `Pending`, без самого `Pending` в сигнатуре: чистая функция, тестируемая
+/// без окон и без колбэка (M4_WINDOW_TRACKER_REVIEW.md, пункт 2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingOp {
+    NeedsFull,
+    Destroyed,
+    Minimized(bool),
+    LocationChanged,
+}
+
+/// Классифицировать событие хука (M4_PREP_NOTES §3.2, таблица хуков):
+/// `None` — событие не интересно (лишний код диапазона `SetWinEventHook`
+/// или `LOCATIONCHANGE` окна вне кэша) — колбэк ничего не копит и не
+/// заводит таймер. `in_cache` учитывается только для `LOCATIONCHANGE`:
+/// иначе любая всплывающая подсказка/дропдаун вне кэша будила бы дебаунс
+/// впустую.
+fn classify_event(event: u32, in_cache: bool) -> Option<PendingOp> {
+    match event {
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE => Some(PendingOp::NeedsFull),
+        EVENT_OBJECT_DESTROY => Some(PendingOp::Destroyed),
+        EVENT_SYSTEM_MINIMIZESTART => Some(PendingOp::Minimized(true)),
+        EVENT_SYSTEM_MINIMIZEEND => Some(PendingOp::Minimized(false)),
+        EVENT_OBJECT_LOCATIONCHANGE if in_cache => Some(PendingOp::LocationChanged),
+        _ => None,
     }
 }
 
@@ -494,35 +577,27 @@ unsafe extern "system" fn win_event_proc(
     }
 
     let target = hwnd.0 as usize;
-    let mut dirty = true;
-    match event {
-        EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE => {
-            state.pending.needs_full = true;
-        }
-        EVENT_OBJECT_DESTROY => {
+    let in_cache = state.cache.iter().any(|w| w.hwnd == target);
+    let Some(op) = classify_event(event, in_cache) else {
+        return;
+    };
+    match op {
+        PendingOp::NeedsFull => state.pending.needs_full = true,
+        PendingOp::Destroyed => {
             state.pending.destroyed.insert(target);
         }
-        EVENT_SYSTEM_MINIMIZESTART => {
-            state.pending.minimized.insert(target, true);
+        PendingOp::Minimized(iconic) => {
+            state.pending.minimized.insert(target, iconic);
         }
-        EVENT_SYSTEM_MINIMIZEEND => {
-            state.pending.minimized.insert(target, false);
-        }
-        // Только для окон, которые мы вообще отслеживаем — иначе любая
-        // всплывающая подсказка/дропдаун вне кэша будила бы дебаунс впустую
-        // (M4_WINDOW_TRACKER_DESIGN.md §3).
-        EVENT_OBJECT_LOCATIONCHANGE if state.cache.iter().any(|w| w.hwnd == target) => {
+        PendingOp::LocationChanged => {
             state.pending.location_changed.insert(target);
-        }
-        _ => {
-            dirty = false;
         }
     }
 
     // Колбэк не делает НИКАКИХ других Win32-вызовов, кроме SetTimer — вся
     // остальная работа (перечисление, DWM-запросы) — в WM_TIMER
     // (M4_WINDOW_TRACKER_DESIGN.md §2).
-    if dirty && !state.timer_running {
+    if !state.timer_running {
         // SAFETY: tracker_hwnd — живое окно этого потока.
         let id = unsafe { SetTimer(Some(tracker_hwnd), DEBOUNCE_TIMER_ID, DEBOUNCE_MS, None) };
         if id != 0 {
@@ -560,9 +635,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         install_hooks(state);
                         // Немедленный полный снимок — координатор не ждёт
                         // первого системного события
-                        // (M4_WINDOW_TRACKER_DESIGN.md §5).
-                        let snapshot = rebuild_from_enum(&mut state.cache);
-                        let _ = state.tx.send(WindowEvent::Changed(snapshot));
+                        // (M4_WINDOW_TRACKER_DESIGN.md §5). Но не на
+                        // заблокированной сессии: перечислять там дорого и
+                        // бессмысленно (M4_PREP_NOTES §9) — хуки уже
+                        // установлены и готовы копить дельты, а сам снимок
+                        // придёт из ветки WM_WTSSESSION_CHANGE на
+                        // разблокировке (она проверяет тот же
+                        // `state.mask_needed`, M4_WINDOW_TRACKER_REVIEW.md,
+                        // пункт 2.5).
+                        if !state.frozen {
+                            let snapshot = rebuild_from_enum(&mut state.cache);
+                            let _ = state.tx.send(WindowEvent::Changed(snapshot));
+                        }
                     } else {
                         uninstall_hooks(state);
                         kill_debounce_timer(hwnd, state);
@@ -577,10 +661,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if wparam.0 == DEBOUNCE_TIMER_ID {
                 if let Some(state) = unsafe { state_ptr.as_mut() } {
                     kill_debounce_timer(hwnd, state);
-                    if !state.frozen {
-                        flush_pending(state);
-                    } else {
+                    // `KillTimer` не убирает уже поставленный в очередь
+                    // WM_TIMER (низкий приоритет диспетчеризации) — если
+                    // set_mask_needed(false) успело обработаться раньше
+                    // такого устаревшего сообщения, `pending`/`cache` уже
+                    // сброшены, и наивный flush отправил бы пустой
+                    // Changed(vec![]) уже выключенного трекера
+                    // (M4_WINDOW_TRACKER_REVIEW.md, пункт 2.1).
+                    if !state.mask_needed || state.frozen {
                         state.pending = Pending::default();
+                    } else {
+                        flush_pending(state);
                     }
                 }
                 LRESULT(0)
@@ -722,6 +813,139 @@ mod tests {
     }
 
     #[test]
+    fn classify_event_show_and_hide_need_full() {
+        assert_eq!(
+            classify_event(EVENT_OBJECT_SHOW, false),
+            Some(PendingOp::NeedsFull)
+        );
+        assert_eq!(
+            classify_event(EVENT_OBJECT_HIDE, false),
+            Some(PendingOp::NeedsFull)
+        );
+        // in_cache не важен для SHOW/HIDE — источник полных перечислений
+        // не фильтруется членством (M4_WINDOW_TRACKER_DESIGN.md §3).
+        assert_eq!(
+            classify_event(EVENT_OBJECT_SHOW, true),
+            Some(PendingOp::NeedsFull)
+        );
+    }
+
+    #[test]
+    fn classify_event_destroy_and_minimize() {
+        assert_eq!(
+            classify_event(EVENT_OBJECT_DESTROY, false),
+            Some(PendingOp::Destroyed)
+        );
+        assert_eq!(
+            classify_event(EVENT_SYSTEM_MINIMIZESTART, false),
+            Some(PendingOp::Minimized(true))
+        );
+        assert_eq!(
+            classify_event(EVENT_SYSTEM_MINIMIZEEND, false),
+            Some(PendingOp::Minimized(false))
+        );
+    }
+
+    #[test]
+    fn classify_event_location_change_requires_cache_membership() {
+        assert_eq!(
+            classify_event(EVENT_OBJECT_LOCATIONCHANGE, true),
+            Some(PendingOp::LocationChanged)
+        );
+        assert_eq!(
+            classify_event(EVENT_OBJECT_LOCATIONCHANGE, false),
+            None,
+            "окно вне кэша не должно будить дебаунс"
+        );
+    }
+
+    #[test]
+    fn classify_event_unknown_is_none() {
+        assert_eq!(classify_event(0, true), None);
+        // EVENT_SYSTEM_FOREGROUND (3) — намеренно не в таблице хуков
+        // (z-order маске не нужен, M4_WINDOW_TRACKER_DESIGN.md §3).
+        assert_eq!(classify_event(3, true), None);
+    }
+
+    #[test]
+    fn resolve_pending_empty_yields_no_ops() {
+        assert!(resolve_pending(&Pending::default()).is_empty());
+    }
+
+    #[test]
+    fn resolve_pending_destroy_preempts_minimize_and_location_for_same_hwnd() {
+        let mut pending = Pending::default();
+        pending.destroyed.insert(1);
+        pending.minimized.insert(1, true);
+        pending.location_changed.insert(1);
+        // Другое окно — не должно быть затронуто приоритетом первого.
+        pending.location_changed.insert(2);
+
+        let ops = resolve_pending(&pending);
+        assert_eq!(ops, vec![ResolvedOp::Destroy(1), ResolvedOp::Location(2)]);
+    }
+
+    #[test]
+    fn resolve_pending_minimize_preempts_location_for_same_hwnd() {
+        let mut pending = Pending::default();
+        pending.minimized.insert(1, false);
+        pending.location_changed.insert(1);
+
+        let ops = resolve_pending(&pending);
+        assert_eq!(
+            ops,
+            vec![ResolvedOp::Minimize {
+                hwnd: 1,
+                iconic: false,
+                refresh_rect: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_pending_minimize_start_does_not_refresh_rect() {
+        let mut pending = Pending::default();
+        pending.minimized.insert(1, true);
+
+        let ops = resolve_pending(&pending);
+        assert_eq!(
+            ops,
+            vec![ResolvedOp::Minimize {
+                hwnd: 1,
+                iconic: true,
+                refresh_rect: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_pending_independent_hwnds_all_kept() {
+        let mut pending = Pending::default();
+        pending.destroyed.insert(1);
+        pending.minimized.insert(2, true);
+        pending.location_changed.insert(3);
+
+        let mut ops = resolve_pending(&pending);
+        ops.sort_by_key(|op| match op {
+            ResolvedOp::Destroy(h) => *h,
+            ResolvedOp::Minimize { hwnd, .. } => *hwnd,
+            ResolvedOp::Location(h) => *h,
+        });
+        assert_eq!(
+            ops,
+            vec![
+                ResolvedOp::Destroy(1),
+                ResolvedOp::Minimize {
+                    hwnd: 2,
+                    iconic: true,
+                    refresh_rect: false
+                },
+                ResolvedOp::Location(3),
+            ]
+        );
+    }
+
+    #[test]
     #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 window_tracker -- --ignored"]
     fn start_then_drop_destroys_window() {
         let (tracker, _rx) = WindowTracker::start().expect("создание трекера");
@@ -748,6 +972,48 @@ mod tests {
                 );
             }
             Err(e) => panic!("не дождались Changed после set_mask_needed(true): {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 window_tracker -- --ignored"]
+    fn wts_lock_suppresses_emit_unlock_rebuilds() {
+        // Прямой PostMessage с кодом WM_WTSSESSION_CHANGE на message-only
+        // окно трекера — обработчик читает только wParam и не проверяет
+        // источник сообщения, так что это эквивалентно реальному приходу
+        // события от системы (M4_WINDOW_TRACKER_REVIEW.md, пункт 2.5).
+        let (tracker, rx) = WindowTracker::start().expect("создание трекера");
+        tracker.set_mask_needed(true);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("начальный Changed");
+
+        // SAFETY: tracker.hwnd — наше живое message-only окно.
+        unsafe {
+            let _ = PostMessageW(
+                Some(tracker.hwnd),
+                WM_WTSSESSION_CHANGE,
+                WPARAM(WTS_SESSION_LOCK as usize),
+                LPARAM(0),
+            );
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(event) => panic!("блокировка сессии не должна эмитить, получено: {event:?}"),
+            Err(e) => panic!("канал событий трекера закрылся: {e}"),
+        }
+
+        // SAFETY: tracker.hwnd — наше живое message-only окно.
+        unsafe {
+            let _ = PostMessageW(
+                Some(tracker.hwnd),
+                WM_WTSSESSION_CHANGE,
+                WPARAM(WTS_SESSION_UNLOCK as usize),
+                LPARAM(0),
+            );
+        }
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(WindowEvent::Changed(_)) => {}
+            Err(e) => panic!("не дождались Changed после разблокировки сессии: {e}"),
         }
     }
 
