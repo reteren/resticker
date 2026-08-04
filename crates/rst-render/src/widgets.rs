@@ -169,6 +169,8 @@ pub mod theme {
     pub const FIELD_HEIGHT: f64 = 22.0;
     /// Горизонтальный отступ текста в поле, DIP.
     pub const FIELD_PAD: f64 = 4.0;
+    /// Сторона чекбокса панели выбора окон, DIP.
+    pub const CHECKBOX_SIZE: f64 = 16.0;
 }
 
 /// Событие указателя в DIP-координатах монитора (перевод из `WM_MOUSE*` —
@@ -897,6 +899,189 @@ impl Widget for NumericField {
     }
 }
 
+/// Чекбокс панели выбора окон (docs/M4_WINDOW_PICKER_DESIGN.md, §7.1 п. 2
+/// и §7.3): квадрат с галочкой, рисуется примитивами `Fill` — глифов «☐»/«☑»
+/// в битовом шрифте нет (RST_RENDER_AUDIT 2.6). Состояние удерживается
+/// виджетом; ядро забирает переключение [`Checkbox::take_changed`] и пишет
+/// его в `cfg` тем же путём, что кнопки тулбара.
+pub struct Checkbox {
+    id: WidgetId,
+    bounds: Box2D,
+    checked: bool,
+    /// Недоступен (строки, которые нельзя выразить правилом, панель задач
+    /// при `never_overlap_taskbar` — §2.3, §7.8): рисуется приглушённым,
+    /// хит-тест отключён.
+    disabled: bool,
+    hovered: bool,
+    /// Нажат (указатель зажат внутри), переключение ещё не свершилось.
+    armed: bool,
+    changed: bool,
+}
+
+impl Checkbox {
+    /// Чекбокс с состоянием `checked` в прямоугольнике `bounds` (DIP).
+    pub fn new(id: WidgetId, bounds: Box2D, checked: bool) -> Self {
+        Self {
+            id,
+            bounds,
+            checked,
+            disabled: false,
+            hovered: false,
+            armed: false,
+            changed: false,
+        }
+    }
+
+    /// Чекбокс стандартного размера (`theme::CHECKBOX_SIZE`) с центром
+    /// в `(cx, cy)`.
+    pub fn standard(id: WidgetId, cx: f64, cy: f64, checked: bool) -> Self {
+        Self::new(
+            id,
+            Box2D {
+                cx,
+                cy,
+                w: theme::CHECKBOX_SIZE,
+                h: theme::CHECKBOX_SIZE,
+                rotation: 0.0,
+            },
+            checked,
+        )
+    }
+
+    /// Текущее состояние.
+    pub fn checked(&self) -> bool {
+        self.checked
+    }
+
+    /// Установить состояние извне (пересборка панели из `rules` — §2.1:
+    /// состояние чекбоксов живёт в `cfg`, а не в панели).
+    pub fn set_checked(&mut self, checked: bool) {
+        self.checked = checked;
+    }
+
+    /// Заблокировать/разблокировать (disabled не хитуется и не переключается).
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.disabled = disabled;
+    }
+
+    /// Переключение с прошлого опроса: новое состояние (флаг сбрасывается).
+    pub fn take_changed(&mut self) -> Option<bool> {
+        if self.changed {
+            self.changed = false;
+            Some(self.checked)
+        } else {
+            None
+        }
+    }
+}
+
+impl Widget for Checkbox {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.bounds
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.bounds = bounds;
+    }
+
+    fn hit_test(&self, pos: Point) -> bool {
+        !self.disabled && box_contains(&self.bounds, pos)
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        let opacity = if self.disabled { 0.45 } else { 1.0 };
+        let border = if !self.disabled && (self.armed || self.hovered) {
+            theme::FIELD_BORDER_FOCUS
+        } else {
+            theme::FIELD_BORDER
+        };
+        let bg = if self.armed {
+            theme::BUTTON_BG_ARMED
+        } else {
+            theme::FIELD_BG
+        };
+        out.push(Primitive::Fill {
+            rect: self.bounds,
+            color: border,
+            opacity,
+        });
+        out.push(Primitive::Fill {
+            rect: Box2D {
+                w: (self.bounds.w - 2.0).max(0.0),
+                h: (self.bounds.h - 2.0).max(0.0),
+                ..self.bounds
+            },
+            color: bg,
+            opacity,
+        });
+        // Галочка — два наклонных штриха «✓» (плечо и хвост), геометрия
+        // в долях полустороны от центра, y — вниз.
+        if self.checked {
+            let s = self.bounds.w / 2.0;
+            let thickness = (self.bounds.w * 0.15).max(1.5);
+            let segments = [
+                ((-0.35, 0.00), (-0.15, 0.22)),
+                ((-0.15, 0.22), (0.40, -0.24)),
+            ];
+            for ((x0, y0), (x1, y1)) in segments {
+                let dx = (x1 - x0) * s;
+                let dy = (y1 - y0) * s;
+                out.push(Primitive::Fill {
+                    rect: Box2D {
+                        cx: self.bounds.cx + (x0 + x1) / 2.0 * s,
+                        cy: self.bounds.cy + (y0 + y1) / 2.0 * s,
+                        w: dx.hypot(dy),
+                        h: thickness,
+                        rotation: dy.atan2(dx),
+                    },
+                    color: theme::SLIDER_FILL,
+                    opacity,
+                });
+            }
+        }
+    }
+
+    fn set_hovered(&mut self, hovered: bool) -> bool {
+        std::mem::replace(&mut self.hovered, hovered) != hovered
+    }
+
+    fn pointer_event(&mut self, ev: PointerEvent) -> bool {
+        match ev {
+            PointerEvent::Down { pos } => {
+                if !self.disabled && self.hit_test(pos) {
+                    self.armed = true;
+                    return true;
+                }
+                false
+            }
+            PointerEvent::Up { pos } => {
+                if !self.armed {
+                    return false;
+                }
+                self.armed = false;
+                if self.hit_test(pos) {
+                    self.checked = !self.checked;
+                    self.changed = true;
+                }
+                true
+            }
+            PointerEvent::Move { .. } => false,
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 /// Панель — контейнер виджетов с фоном (SPEC 3.6 «Тулбар», 3.8 «Панель у
 /// курсора»). Порядок отрисовки = порядок добавления (нижний — первым);
 /// хит-тест — в обратном порядке: верхний виджет выигрывает (M2_UI_NOTES §8).
@@ -1128,6 +1313,7 @@ mod tests {
     const ID_BTN: WidgetId = 1;
     const ID_SLIDER: WidgetId = 2;
     const ID_FIELD: WidgetId = 3;
+    const ID_CHECK: WidgetId = 4;
 
     fn rect(cx: f64, cy: f64, w: f64, h: f64) -> Box2D {
         Box2D {
@@ -1360,6 +1546,95 @@ mod tests {
             panic!("каретка — Fill")
         };
         assert!(rect.w < 1.1 && rect.h > 8.0);
+    }
+
+    /// Чекбокс 16×16 с центром в (50, 50).
+    fn checkbox(checked: bool) -> Checkbox {
+        Checkbox::standard(ID_CHECK, 50.0, 50.0, checked)
+    }
+
+    #[test]
+    fn checkbox_click_toggles_and_take_changed() {
+        let mut c = checkbox(false);
+        assert!(!c.checked());
+        assert!(c.pointer_event(PointerEvent::Down { pos: (50.0, 50.0) }));
+        assert!(c.pointer_event(PointerEvent::Up { pos: (50.0, 50.0) }));
+        assert_eq!(c.take_changed(), Some(true));
+        assert_eq!(c.take_changed(), None, "переключение одноразовое");
+        c.pointer_event(PointerEvent::Down { pos: (50.0, 50.0) });
+        c.pointer_event(PointerEvent::Up { pos: (50.0, 50.0) });
+        assert_eq!(c.take_changed(), Some(false), "обратное переключение");
+    }
+
+    #[test]
+    fn checkbox_press_inside_release_outside_no_toggle() {
+        let mut c = checkbox(false);
+        c.pointer_event(PointerEvent::Down { pos: (50.0, 50.0) });
+        c.pointer_event(PointerEvent::Up {
+            pos: (200.0, 200.0),
+        });
+        assert_eq!(c.take_changed(), None);
+        assert!(!c.checked());
+    }
+
+    #[test]
+    fn checkbox_disabled_no_hit_test_and_no_toggle() {
+        let mut c = checkbox(true);
+        c.set_disabled(true);
+        assert!(!c.hit_test((50.0, 50.0)), "disabled не хитуется");
+        assert!(!c.pointer_event(PointerEvent::Down { pos: (50.0, 50.0) }));
+        assert!(!c.pointer_event(PointerEvent::Up { pos: (50.0, 50.0) }));
+        assert_eq!(c.take_changed(), None);
+        assert!(c.checked(), "состояние не тронуто");
+    }
+
+    #[test]
+    fn checkbox_set_checked_syncs_without_event() {
+        let mut c = checkbox(false);
+        c.set_checked(true);
+        assert!(c.checked());
+        assert_eq!(c.take_changed(), None, "внешняя синхронизация не событие");
+    }
+
+    #[test]
+    fn checkbox_draw_primitives() {
+        let mut c = checkbox(false);
+        let mut out = Vec::new();
+        c.draw(&mut out);
+        assert_eq!(out.len(), 2, "рамка + фон");
+        c.set_checked(true);
+        out.clear();
+        c.draw(&mut out);
+        assert_eq!(out.len(), 4, "рамка + фон + два штриха галочки");
+        let Primitive::Fill { rect, .. } = out[2] else {
+            panic!("штрих галочки — Fill")
+        };
+        assert!(rect.rotation.abs() > 0.1, "штрих наклонён");
+    }
+
+    #[test]
+    fn checkbox_hover_redraw_only_on_change() {
+        let mut c = checkbox(false);
+        assert!(c.set_hovered(true));
+        assert!(!c.set_hovered(true));
+        assert!(c.set_hovered(false));
+    }
+
+    #[test]
+    fn panel_disabled_checkbox_click_lands_on_frame() {
+        let mut p = Panel::new(0, rect(100.0, 100.0, 200.0, 100.0));
+        let mut c = Checkbox::standard(ID_CHECK, 100.0, 100.0, true);
+        c.set_disabled(true);
+        p.add_widget(c);
+        let r = p.pointer_event(PointerEvent::Down {
+            pos: (100.0, 100.0),
+        });
+        assert!(r.consumed, "клик поглощён фоном панели");
+        assert_eq!(
+            p.widget_mut::<Checkbox>(ID_CHECK).unwrap().take_changed(),
+            None,
+            "disabled-виджет не получил событие"
+        );
     }
 
     /// Панель (100, 100) 200×100 с двумя перекрывающимися кнопками:

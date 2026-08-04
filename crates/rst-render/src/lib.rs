@@ -45,7 +45,7 @@ pub use text::{Glyph, LINE_HEIGHT, glyph_for, rasterize, text_size, width_up_to}
 pub use texture::Texture;
 pub use ui_textures::{TextureFactory, UiTextures};
 pub use widgets::{
-    Button, ButtonContent, EventResult, Icon, Key, NumericField, Panel, PointerEvent, Primitive,
-    Slider, Widget, WidgetId, box_contains, theme,
+    Button, ButtonContent, Checkbox, EventResult, Icon, Key, NumericField, Panel, PointerEvent,
+    Primitive, Slider, Widget, WidgetId, box_contains, theme,
 };
 pub use window_target::WindowTarget;
