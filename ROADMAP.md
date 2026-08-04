@@ -103,8 +103,8 @@
 
 Технически рискованная часть, но благодаря спайку S0 основная неопределённость уже снята.
 
-- [ ] Перечисление реальных окон с фильтром (cloaked, tool window, owner, ancestor)
-- [ ] `DWMWA_EXTENDED_FRAME_BOUNDS` вместо `GetWindowRect`
+- [x] Перечисление реальных окон с фильтром (cloaked, tool window, owner, ancestor)
+- [x] `DWMWA_EXTENDED_FRAME_BOUNDS` вместо `GetWindowRect`
 - [ ] Инкрементальный кэш окон на WinEvent-хуках, дебаунс 16 мс
 - [ ] Рендер маски перекрытия, скруглённые углы 8 px
 - [ ] Шейдер стикера с `discard` по маске
