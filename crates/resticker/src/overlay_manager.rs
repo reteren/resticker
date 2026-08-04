@@ -1190,15 +1190,64 @@ fn run(
                     );
                 }
 
+                // 3.5. Мониторы, оставшиеся подключёнными (в т.ч. только что
+                // созданные шагами 1-2 — для них проверка ниже — идемпотентный
+                // no-op, их размер уже точно совпадает с bounds_px), но
+                // сменившие геометрию/DPI: подвинуть/растянуть окно и
+                // пересоздать цепочку рендера под новый размер. Закрывает
+                // ранее известный gap (M3_STEP5_6_REVIEW.md, пункт 2.5;
+                // ROADMAP.md M3) — окно монитора, который никто не трогал в
+                // шагах 1-3, раньше не реагировало на смену разрешения вовсе.
+                for info in &new_infos {
+                    let Some(ms) = monitors_map.get_mut(&info.id) else {
+                        continue;
+                    };
+                    // Доверяем живому DPI окна, а не `info.dpi`: смена
+                    // разрешения без смены масштаба по умолчанию не всегда
+                    // шлёт этому окну отдельный WM_DPICHANGED.
+                    let new_scale = ms.overlay.dpi() as f32 / 96.0;
+                    if info.bounds_px.w == ms.width
+                        && info.bounds_px.h == ms.height
+                        && (new_scale - ms.scale).abs() < f32::EPSILON
+                    {
+                        continue;
+                    }
+                    if !ms.overlay.set_bounds(info.bounds_px) {
+                        tracing::error!(
+                            monitor = %info.id.0,
+                            "не удалось переставить окно монитора после смены геометрии"
+                        );
+                        continue;
+                    }
+                    let old_scale = ms.scale;
+                    ms.width = info.bounds_px.w;
+                    ms.height = info.bounds_px.h;
+                    ms.scale = new_scale;
+                    ms.target.set_dpi_scale(ms.scale);
+                    if let Err(e) = ms.target.resize(&device, ms.width, ms.height) {
+                        tracing::error!(
+                            error = %e,
+                            monitor = %info.id.0,
+                            "не удалось пересоздать цепочку рендера после смены геометрии монитора"
+                        );
+                    }
+                    // Как в DpiChanged: физическая позиция курсора смена
+                    // масштаба не меняет, только DIP-représentation.
+                    if edit.cursor_monitor == info.id {
+                        let ratio = old_scale / ms.scale;
+                        edit.cursor_pos = (
+                            edit.cursor_pos.0 * ratio as f64,
+                            edit.cursor_pos.1 * ratio as f64,
+                        );
+                    }
+                }
+
                 // 4. Пересобрать снимки-копии из живого monitors_map — так
-                // же, как на старте. `monitor_geometry` берёт w/h/scale из
-                // окна/цели (не пересозданных, если этот монитор просто
-                // остался подключён), а `monitor_bounds` — из `new_infos`
-                // (актуальные границы ОС): при смене разрешения на мониторе,
-                // который никто не трогал в шагах 1-3, эти два снимка
-                // разойдутся — окно рисует старую область, а rebind уже
-                // считает по новым границам (известный gap, расширено в
-                // ROADMAP.md M3; M3_STEP5_6_REVIEW.md, пункт 2.5).
+                // же, как на старте. Шаг 3.5 уже привёл `ms.width/height/
+                // scale` в соответствие с `new_infos`, так что обе копии
+                // здесь строятся из одного и того же снимка ОС и не
+                // расходятся (бывший gap M3_STEP5_6_REVIEW.md, пункт 2.5 —
+                // закрыт).
                 monitor_geometry = monitors_map
                     .iter()
                     .map(|(id, ms)| (id.clone(), (ms.width, ms.height, ms.scale)))

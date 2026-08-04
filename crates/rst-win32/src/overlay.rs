@@ -321,6 +321,30 @@ impl OverlayWindow {
         }
     }
 
+    /// Переставить и/или изменить размер уже созданного окна под новые
+    /// физические границы монитора — тот же монитор (`MonitorId` не
+    /// поменялся), но сменилось разрешение/позиция в `WM_DISPLAYCHANGE`
+    /// (M3_HOTPLUG_DESIGN.md, известный gap: раньше на такое событие окно не
+    /// реагировало вовсе). Приём — как в `handle_dpi_changed`: `SWP_NOZORDER`
+    /// сохраняет `WS_EX_TOPMOST` в стеке окон, `SWP_NOACTIVATE` не трогает
+    /// фокус. Возвращает `false` при отказе `SetWindowPos` (редкий системный
+    /// сбой) — вызывающий код логирует и оставляет старую геометрию.
+    pub fn set_bounds(&self, bounds_px: Rect) -> bool {
+        // SAFETY: hwnd — наше живое окно; SetWindowPos безопасен с любого потока.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                bounds_px.x,
+                bounds_px.y,
+                bounds_px.w as i32,
+                bounds_px.h as i32,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .is_ok()
+        }
+    }
+
     /// Попросить поток оверлея сменить форму курсора (зона под курсором
     /// вычисляется координатором, не Win32-потоком, ARCHITECTURE.md 5.3).
     pub fn post_cursor_shape(&self, shape: CursorShape) {
@@ -869,6 +893,33 @@ mod tests {
             (1280, 1024)
         );
         assert_eq!(overlay.size(), (1280, 1024));
+    }
+
+    #[test]
+    fn set_bounds_moves_and_resizes_window() {
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+        assert_eq!(overlay.size(), (1280, 1024));
+
+        let moved = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        assert!(overlay.set_bounds(moved), "SetWindowPos должен успеть");
+
+        let mut rect = RECT::default();
+        // SAFETY: hwnd — наше живое окно.
+        unsafe {
+            GetWindowRect(overlay.hwnd(), &mut rect).expect("GetWindowRect");
+        }
+        assert_eq!((rect.left, rect.top), (0, 0));
+        assert_eq!(
+            (rect.right - rect.left, rect.bottom - rect.top),
+            (1920, 1080)
+        );
+        assert_eq!(overlay.size(), (1920, 1080));
     }
 
     #[test]
