@@ -2433,6 +2433,33 @@ fn window_rect_to_core(r: &WindowRect) -> Option<Rect> {
     })
 }
 
+/// Целиком ли AABB стикера (DIP, `placement`/`rotation`) лежит внутри ОДНОГО
+/// из `rects` (физические px, локальные для монитора — та же система
+/// координат, что у AABB после перевода через `scale`, ROADMAP.md M4
+/// «Отсечение полностью перекрытых стикеров»). Консервативно: `false`, если
+/// покрытие достигается только объединением нескольких прямоугольников —
+/// приемлемо для чистой оптимизации отрисовки (маска всё равно скрывает
+/// стикер визуально), лишь бы не было ложноположительных срабатываний.
+fn sticker_fully_covered(placement: &Placement, rotation: f64, scale: f32, rects: &[Rect]) -> bool {
+    let aabb = hittest::aabb(placement, rotation);
+    let px = Rect {
+        x: (aabb.x * f64::from(scale)).round() as i32,
+        y: (aabb.y * f64::from(scale)).round() as i32,
+        w: (aabb.w * f64::from(scale)).round().max(0.0) as u32,
+        h: (aabb.h * f64::from(scale)).round().max(0.0) as u32,
+    };
+    rects.iter().any(|r| rect_contains(r, &px))
+}
+
+/// `inner` целиком внутри `outer` (обе — физические px, общая система
+/// координат).
+fn rect_contains(outer: &Rect, inner: &Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x.saturating_add(inner.w as i32) <= outer.x.saturating_add(outer.w as i32)
+        && inner.y.saturating_add(inner.h as i32) <= outer.y.saturating_add(outer.h as i32)
+}
+
 /// `rst_win32::monitors::MonitorInfo` → `rst_core::monitor_loss::MonitorSnapshot`
 /// (M3_HOTPLUG_DESIGN.md §2): тот же id/границы/флаг основного, без
 /// платформенных полей (`friendly_name`/`dpi`), которые автомату не нужны.
@@ -3702,13 +3729,33 @@ fn redraw(
     order.sort_by_key(|s| s.order);
     for sticker in order {
         if sticker.visible {
+            let group_idx = occluders
+                .and_then(|groups| groups.iter().position(|g| g.stickers.contains(&sticker.id)));
+            // Полностью перекрытый стикер не рисуем вовсе (ROADMAP.md M4,
+            // «Отсечение полностью перекрытых стикеров из рендера») — маска
+            // и так скрыла бы его визуально, отсечение только экономит
+            // GPU-работу. Консервативная проверка: содержится ли AABB
+            // стикера ЦЕЛИКОМ в ОДНОМ прямоугольнике-окклюдере группы — не
+            // ловит покрытие объединением НЕСКОЛЬКИХ окклюдеров, но никогда
+            // не отсекает стикер, который реально хоть немного виден
+            // (никогда не даёт ложноположительный результат).
+            let culled = !edit.active
+                && group_idx.is_some_and(|idx| {
+                    let rects = &occluders.expect("group_idx только из Some(occluders)")[idx].rects;
+                    !rects.is_empty()
+                        && sticker_fully_covered(
+                            &sticker.placement,
+                            sticker.transform.rotation,
+                            scale,
+                            rects,
+                        )
+                });
+            if culled {
+                continue;
+            }
             if let Some((_, sprite)) = sprites.iter().find(|(id, _)| *id == sticker.id) {
-                if let Some(groups) = occluders {
-                    if let Some(group_idx) =
-                        groups.iter().position(|g| g.stickers.contains(&sticker.id))
-                    {
-                        sticker_mask_slots.push((frame.len(), group_idx));
-                    }
+                if let Some(group_idx) = group_idx {
+                    sticker_mask_slots.push((frame.len(), group_idx));
                 }
                 frame.push(sprite.clone());
             }
@@ -4401,5 +4448,115 @@ mod tests {
             }),
             Some(bounds(-10, 20, 100, 200))
         );
+    }
+
+    // --- M4: отсечение полностью перекрытых стикеров ---
+
+    #[test]
+    fn rect_contains_fully_inside() {
+        assert!(rect_contains(
+            &bounds(0, 0, 200, 200),
+            &bounds(50, 50, 50, 50)
+        ));
+    }
+
+    #[test]
+    fn rect_contains_exact_match_is_contained() {
+        assert!(rect_contains(
+            &bounds(0, 0, 100, 100),
+            &bounds(0, 0, 100, 100)
+        ));
+    }
+
+    #[test]
+    fn rect_contains_partial_overlap_is_not_contained() {
+        assert!(!rect_contains(
+            &bounds(0, 0, 100, 100),
+            &bounds(50, 50, 100, 100)
+        ));
+    }
+
+    #[test]
+    fn rect_contains_disjoint_is_not_contained() {
+        assert!(!rect_contains(
+            &bounds(0, 0, 100, 100),
+            &bounds(200, 200, 50, 50)
+        ));
+    }
+
+    #[test]
+    fn sticker_fully_covered_true_when_aabb_inside_one_occluder() {
+        let placement = Placement {
+            monitor_id: monitor_id("M1"),
+            cx: 100.0,
+            cy: 100.0,
+            w: 40.0,
+            h: 40.0,
+        };
+        // AABB без поворота (физические px при scale=1.0): (80,80,40,40).
+        let occluder = bounds(0, 0, 500, 500);
+        assert!(sticker_fully_covered(&placement, 0.0, 1.0, &[occluder]));
+    }
+
+    #[test]
+    fn sticker_fully_covered_false_when_only_partially_covered() {
+        let placement = Placement {
+            monitor_id: monitor_id("M1"),
+            cx: 100.0,
+            cy: 100.0,
+            w: 40.0,
+            h: 40.0,
+        };
+        // Оклюдер накрывает только левую половину AABB (80,80,40,40).
+        let occluder = bounds(0, 0, 100, 500);
+        assert!(!sticker_fully_covered(&placement, 0.0, 1.0, &[occluder]));
+    }
+
+    #[test]
+    fn sticker_fully_covered_false_when_covered_only_by_union_of_two() {
+        // Консервативная проверка: покрытие ДВУМЯ прямоугольниками вместе не
+        // считается — ни один из них по отдельности не содержит AABB целиком.
+        let placement = Placement {
+            monitor_id: monitor_id("M1"),
+            cx: 100.0,
+            cy: 100.0,
+            w: 40.0,
+            h: 40.0,
+        };
+        let left_half = bounds(0, 0, 100, 500);
+        let right_half = bounds(100, 0, 100, 500);
+        assert!(!sticker_fully_covered(
+            &placement,
+            0.0,
+            1.0,
+            &[left_half, right_half]
+        ));
+    }
+
+    #[test]
+    fn sticker_fully_covered_scales_aabb_by_monitor_scale() {
+        let placement = Placement {
+            monitor_id: monitor_id("M1"),
+            cx: 100.0,
+            cy: 100.0,
+            w: 40.0,
+            h: 40.0,
+        };
+        // При scale=2.0 AABB в физических px — (160,160,80,80); прямоугольник,
+        // достаточный только для scale=1.0, больше не накрывает его целиком.
+        let occluder_for_scale_1 = bounds(0, 0, 200, 200);
+        assert!(!sticker_fully_covered(
+            &placement,
+            0.0,
+            2.0,
+            &[occluder_for_scale_1]
+        ));
+        let occluder_for_scale_2 = bounds(0, 0, 500, 500);
+        assert!(sticker_fully_covered(
+            &placement,
+            0.0,
+            2.0,
+            &[occluder_for_scale_2]
+        ));
     }
 }
