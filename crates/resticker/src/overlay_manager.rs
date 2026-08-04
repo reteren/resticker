@@ -32,7 +32,9 @@ use std::time::{Duration, Instant};
 
 use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
-use rst_core::model::{Config, MediaType, MonitorId, Placement, Sticker, StickerSource, Transform};
+use rst_core::model::{
+    Config, MediaType, MonitorId, Placement, Rect, Sticker, StickerSource, Transform,
+};
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
 use rst_core::ops;
@@ -108,6 +110,16 @@ impl Renderer<'_> {
 struct MonitorState {
     target: WindowTarget,
     overlay: OverlayWindow,
+    /// Позиция окна в физических пикселях виртуального десктопа
+    /// (`Rect::x`/`y` монитора на момент последнего `create_monitor_state`
+    /// или шага 3.5 ветки `MonitorsChanged`). Кэшируется отдельно от
+    /// `OverlayWindow`, потому что сравнение «сдвинулся ли монитор» в шаге
+    /// 3.5 должно быть дешёвым и не идти через `GetWindowRect` каждый раз;
+    /// без этого поля чистая перестановка монитора (тот же размер/DPI, но
+    /// другие x/y) была физически неразличима от «монитор не менялся»
+    /// (M3_STEP8_REVIEW.md, пункт 2.1).
+    x: i32,
+    y: i32,
     width: u32,
     height: u32,
     scale: f32,
@@ -190,11 +202,32 @@ fn create_monitor_state(
     Some(MonitorState {
         overlay,
         target,
+        x: info.bounds_px.x,
+        y: info.bounds_px.y,
         width,
         height,
         scale,
         broken: false,
     })
+}
+
+/// Изменилась ли геометрия монитора относительно закэшированной на
+/// `MonitorState` — позиция, размер или масштаб (шаг 3.5 ветки
+/// `MonitorsChanged`, M3_STEP8_REVIEW.md, пункт 2.1). Чистая функция,
+/// вынесена отдельно от обработчика ради юнит-теста: сам `MonitorState`
+/// держит живые Win32/GPU-хендлы (`OverlayWindow`/`WindowTarget`), которые
+/// напрямую не протестировать.
+fn monitor_geometry_changed(
+    cached: (i32, i32, u32, u32, f32),
+    bounds_px: Rect,
+    new_scale: f32,
+) -> bool {
+    let (x, y, w, h, scale) = cached;
+    x != bounds_px.x
+        || y != bounds_px.y
+        || w != bounds_px.w
+        || h != bounds_px.h
+        || (scale - new_scale).abs() >= f32::EPSILON
 }
 
 /// Снести состояние монитора (ветка `MonitorsChanged`, M3_HOTPLUG_DESIGN.md
@@ -1198,21 +1231,32 @@ fn run(
                 // ранее известный gap (M3_STEP5_6_REVIEW.md, пункт 2.5;
                 // ROADMAP.md M3) — окно монитора, который никто не трогал в
                 // шагах 1-3, раньше не реагировало на смену разрешения вовсе.
+                // На не проверенном на смешанном DPI железе теоретически
+                // возможен ping-pong с рекомендованным rect'ом WM_DPICHANGED,
+                // если тот не совпадёт с `bounds_px` (M3_STEP8_REVIEW.md,
+                // пункт 2.4) — не воспроизведено, не фикшено.
                 for info in &new_infos {
                     let Some(ms) = monitors_map.get_mut(&info.id) else {
                         continue;
                     };
-                    // Доверяем живому DPI окна, а не `info.dpi`: смена
-                    // разрешения без смены масштаба по умолчанию не всегда
-                    // шлёт этому окну отдельный WM_DPICHANGED.
-                    let new_scale = ms.overlay.dpi() as f32 / 96.0;
-                    if info.bounds_px.w == ms.width
-                        && info.bounds_px.h == ms.height
-                        && (new_scale - ms.scale).abs() < f32::EPSILON
-                    {
+                    // `info.dpi` — из отдельного, свежего `enumerate()` для
+                    // ЭТОГО монитора, а не живой DPI окна: `ms.overlay.dpi()`
+                    // мог бы вернуть устаревшее значение, если WM_DISPLAYCHANGE
+                    // придёт раньше WM_DPICHANGED (порядок не гарантирован) —
+                    // `info.dpi` не зависит от того, добралось ли до окна
+                    // отдельное DPI-уведомление (M3_STEP8_REVIEW.md, пункт 2.3).
+                    let new_scale = info.dpi as f32 / 96.0;
+                    let cached = (ms.x, ms.y, ms.width, ms.height, ms.scale);
+                    if !monitor_geometry_changed(cached, info.bounds_px, new_scale) {
                         continue;
                     }
                     if !ms.overlay.set_bounds(info.bounds_px) {
+                        // `ms.*` не обновлён — окно и `monitor_bounds`,
+                        // который шаг 4 всё равно построит из `new_infos`,
+                        // разойдутся до следующего WM_DISPLAYCHANGE
+                        // (M3_STEP8_REVIEW.md, пункт 2.5): редкий системный
+                        // сбой, не бесконечный цикл — просто «слепой» монитор
+                        // до следующего триггера.
                         tracing::error!(
                             monitor = %info.id.0,
                             "не удалось переставить окно монитора после смены геометрии"
@@ -1220,6 +1264,8 @@ fn run(
                         continue;
                     }
                     let old_scale = ms.scale;
+                    ms.x = info.bounds_px.x;
+                    ms.y = info.bounds_px.y;
                     ms.width = info.bounds_px.w;
                     ms.height = info.bounds_px.h;
                     ms.scale = new_scale;
@@ -1232,7 +1278,7 @@ fn run(
                         );
                     }
                     // Как в DpiChanged: физическая позиция курсора смена
-                    // масштаба не меняет, только DIP-représentation.
+                    // масштаба не меняет, только его представление в DIP.
                     if edit.cursor_monitor == info.id {
                         let ratio = old_scale / ms.scale;
                         edit.cursor_pos = (
@@ -1279,6 +1325,13 @@ fn run(
                 }
                 // 6. Обновить `primary_id` — нужен `AddSticker` и фолбэкам.
                 primary_id = new_primary_id;
+                // Симметрично ветке DpiChanged (1059): geometry уже свежая
+                // (шаг 4), панели должны это отразить сразу, а не ждать
+                // несвязанный триггер — иначе тулбар ресайзнутого монитора
+                // остаётся с прежней `screen_h`, а панель у курсора не
+                // пере-клампится в новые границы (M3_STEP8_REVIEW.md, пункт
+                // 2.2).
+                rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
                 need_redraw = true;
             }
             OverlayMessage::Tick => {
@@ -3644,4 +3697,67 @@ fn add_sticker(
     }
     sprites.push((id, sprite));
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds(x: i32, y: i32, w: u32, h: u32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn monitor_geometry_changed_false_when_nothing_moved() {
+        let cached = (0, 0, 1920, 1080, 1.0);
+        assert!(!monitor_geometry_changed(
+            cached,
+            bounds(0, 0, 1920, 1080),
+            1.0
+        ));
+    }
+
+    #[test]
+    fn monitor_geometry_changed_true_on_position_only() {
+        // M3_STEP8_REVIEW.md, пункт 2.1: чистая перестановка монитора
+        // (тот же размер и масштаб, другие x/y) должна считаться изменением.
+        let cached = (0, 0, 1920, 1080, 1.0);
+        assert!(monitor_geometry_changed(
+            cached,
+            bounds(1920, 0, 1920, 1080),
+            1.0
+        ));
+    }
+
+    #[test]
+    fn monitor_geometry_changed_true_on_size_only() {
+        let cached = (0, 0, 1920, 1080, 1.0);
+        assert!(monitor_geometry_changed(
+            cached,
+            bounds(0, 0, 1280, 1024),
+            1.0
+        ));
+    }
+
+    #[test]
+    fn monitor_geometry_changed_true_on_scale_only() {
+        let cached = (0, 0, 1920, 1080, 1.0);
+        assert!(monitor_geometry_changed(
+            cached,
+            bounds(0, 0, 1920, 1080),
+            1.5
+        ));
+    }
+
+    #[test]
+    fn monitor_geometry_changed_false_on_negative_coords_matching() {
+        // Неосновной монитор слева/сверху от primary — x/y отрицательные
+        // (виртуальный десктоп), сравнение должно оставаться точным.
+        let cached = (-1920, -200, 1920, 1080, 1.0);
+        assert!(!monitor_geometry_changed(
+            cached,
+            bounds(-1920, -200, 1920, 1080),
+            1.0
+        ));
+    }
 }
