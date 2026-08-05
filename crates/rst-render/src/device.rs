@@ -22,6 +22,7 @@ use windows::core::{Interface, PCSTR};
 use crate::atlas::{AtlasFrame, TextureAtlas};
 use crate::sprite::Sprite;
 use crate::texture::Texture;
+use crate::video::VideoTextures;
 use crate::window_target::WindowTarget;
 use crate::{RenderError, shader};
 
@@ -78,6 +79,10 @@ pub struct Device {
     blend: ID3D11BlendState,
     /// M4: PS маски перекрытия (`mainMaskPS`, SDF скруглённого прямоугольника).
     mask_ps: ID3D11PixelShader,
+    /// M5b: PS видеоспрайта (`mainVideoPS`, YUV→RGB BT.709 limited range на
+    /// трёх R8-плоскостях t2/t3/t4) — тот же VS/CB, отдельная точка входа,
+    /// тем же паттерном, что `mask_ps` (docs/M5B_VIDEO_DESIGN.md §3).
+    video_ps: ID3D11PixelShader,
     /// M4: `POINT`/`CLAMP` — точное совпадение текселя маски с пикселем
     /// экрана (никакой фильтрации на краях выреза, docs/M4_MASK_RENDER_DESIGN.md §4.4).
     mask_sampler: ID3D11SamplerState,
@@ -168,6 +173,23 @@ impl Device {
         }
         .map_err(RenderError::Windows)?;
         let mask_ps = mask_ps.expect("CreatePixelShader без ошибки возвращает объект");
+
+        // --- PS видеоспрайта (M5b) — тот же VS/CB, отдельная точка входа ---
+        let video_ps_blob = shader::compile(
+            PCSTR::from_raw(c"mainVideoPS".as_ptr().cast()),
+            PCSTR::from_raw(c"ps_5_0".as_ptr().cast()),
+        )?;
+        let mut video_ps: Option<ID3D11PixelShader> = None;
+        // SAFETY: байткод из живого blob; out-параметр валиден.
+        unsafe {
+            device.CreatePixelShader(
+                shader::blob_bytes(&video_ps_blob),
+                None,
+                Some(&mut video_ps),
+            )
+        }
+        .map_err(RenderError::Windows)?;
+        let video_ps = video_ps.expect("CreatePixelShader без ошибки возвращает объект");
 
         // --- Константный буфер, сэмплер, blend-состояние ---
         let cb_desc = D3D11_BUFFER_DESC {
@@ -277,6 +299,7 @@ impl Device {
             mask_sampler,
             mask_blend,
             mask_empty,
+            video_ps,
         })
     }
 
@@ -391,12 +414,95 @@ impl Device {
         Ok(TextureAtlas { texture, frames })
     }
 
+    /// Создать три R8-плоскости видеокадра (M5b, docs/M5B_VIDEO_DESIGN.md
+    /// §3): Y — полное разрешение `width`×`height`, U/V — половина по
+    /// каждой оси, округлённая вверх (`ceil(width/2)`×`ceil(height/2)` —
+    /// 4:2:0, нечётные размеры кадра встречаются у декодеров). Заливает
+    /// начальными данными; дальнейшие кадры обновляются
+    /// [`Device::update_video_textures`] — переиспользование, не
+    /// пересоздание (видео меняется каждый показанный кадр).
+    pub fn create_video_textures(
+        &self,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<VideoTextures, RenderError> {
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        // Проверка формата всех трёх плоскостей до работы с GPU — тот же
+        // предикат, что у одиночных текстур (`validate_plane_data`).
+        crate::texture::validate_plane_data(width, height, y.len())?;
+        crate::texture::validate_plane_data(cw, ch, u.len())?;
+        crate::texture::validate_plane_data(cw, ch, v.len())?;
+        let y_tex = Texture::from_r8(&self.device, &self.context, y, width, height)?;
+        let u_tex = Texture::from_r8(&self.device, &self.context, u, cw, ch)?;
+        let v_tex = Texture::from_r8(&self.device, &self.context, v, cw, ch)?;
+        Ok(VideoTextures {
+            y: y_tex,
+            u: u_tex,
+            v: v_tex,
+        })
+    }
+
+    /// Обновить содержимое существующих плоскостей видеокадра (M5b):
+    /// новые данные того же размера, что при создании — текстуры
+    /// переиспользуются через `UpdateSubresource`, не пересоздаются
+    /// (пересоздание трёх текстур на каждый показанный кадр дорого).
+    pub fn update_video_textures(
+        &self,
+        textures: &mut VideoTextures,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+    ) -> Result<(), RenderError> {
+        // Размеры проверяются против реальных размеров текстур (а не
+        // против аргументов): обновление обязано быть того же размера.
+        textures.y.update_r8(&self.context, y)?;
+        textures.u.update_r8(&self.context, u)?;
+        textures.v.update_r8(&self.context, v)?;
+        Ok(())
+    }
+
     /// Отрисовать список спрайтов в цель `target` (порядок списка = порядок
     /// отрисовки, первый — нижний) и представить кадр. Вызывается строго по
     /// требованию (ADR-006): внутреннего цикла и таймеров нет, ноль вызовов =
     /// ноль кадров в покое. Мутация — только состояние GPU-контекста, поэтому
     /// метод берёт `&self`: один и тот же кадр можно отдать на все цели.
+    /// Спрайт с `video: Some` (M5b) рисуется через `mainVideoPS` — тот же
+    /// путь, без изменений в вызове.
     pub fn draw(&self, target: &WindowTarget, sprites: &[Sprite]) -> Result<(), RenderError> {
+        self.draw_common(target, sprites, &[])
+    }
+
+    /// Как [`Self::draw`], но каждый спрайт вырезается по своей маске
+    /// (M4): `masks[i]` — маска стикера `sprites[i]` (`None` — стикер без
+    /// ограничений видимости, биндится встроенная пустая маска, тот же
+    /// эффект, что `draw()`). `masks.len()` может быть меньше
+    /// `sprites.len()` — недостающие элементы трактуются как `None`.
+    /// Видеоспрайты (M5b) поддерживаются тем же discard-паттерном в
+    /// `mainVideoPS`.
+    pub fn draw_masked(
+        &self,
+        target: &WindowTarget,
+        sprites: &[Sprite],
+        masks: &[Option<&Texture>],
+    ) -> Result<(), RenderError> {
+        self.draw_common(target, sprites, masks)
+    }
+
+    /// Общий путь отрисовки для [`Self::draw`] и [`Self::draw_masked`]:
+    /// `masks` — параллельный `sprites` список масок (пустой — все
+    /// немаскированные). PS выбирается per-спрайт: `mainPS` для обычных,
+    /// `mainVideoPS` для `video: Some` (YUV-плоскости биндятся в t2/t3/t4,
+    /// тот же прецедент «спрайт + дополнительные текстуры», что маска в
+    /// t1). Shader-состояние меняется только между спрайтами, в цикле.
+    fn draw_common(
+        &self,
+        target: &WindowTarget,
+        sprites: &[Sprite],
+        masks: &[Option<&Texture>],
+    ) -> Result<(), RenderError> {
         let (w, h) = target.size();
         let Some(rtv) = target.rtv() else {
             return Ok(()); // окно с нулевым размером: рисовать некуда
@@ -428,18 +534,22 @@ impl Device {
             self.context.VSSetShader(&self.vs, None);
             self.context
                 .VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
-            self.context.PSSetShader(&self.ps, None);
             self.context
                 .PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context
                 .PSSetSamplers(1, Some(&[Some(self.mask_sampler.clone())]));
-            // Маска не варьируется по спрайту в этом пути — биндится один
-            // раз, вне цикла: `mainPS` теперь всегда сэмплирует t1, но у
-            // немаскированной отрисовки (M2/M3, этот метод) окклюдеров нет.
-            self.context
-                .PSSetShaderResources(1, Some(&[Some(self.mask_empty.srv().clone())]));
+            // Слоты 2..=4 — сэмплеры Y/U/V видеоспрайтов (M5b): тот же
+            // объект на все три слота, `mainVideoPS` объявляет их по
+            // отдельности (s2/s3/s4). Биндится один раз вне цикла, как
+            // слоты 0/1.
+            let video_samplers = [
+                Some(self.sampler.clone()),
+                Some(self.sampler.clone()),
+                Some(self.sampler.clone()),
+            ];
+            self.context.PSSetSamplers(2, Some(&video_samplers));
         }
 
         // SAFETY: `cb` — валидный ID3D11Resource; mapped-память валидна
@@ -447,7 +557,7 @@ impl Device {
         unsafe {
             let cb_res: ID3D11Resource = self.cb.cast().map_err(RenderError::Windows)?;
             let scale = target.dpi_scale();
-            for sprite in sprites {
+            for (i, sprite) in sprites.iter().enumerate() {
                 if sprite.placement.w <= 0.0 || sprite.placement.h <= 0.0 {
                     continue;
                 }
@@ -482,8 +592,34 @@ impl Device {
                     .map_err(RenderError::Windows)?;
                 std::ptr::copy_nonoverlapping(&params, mapped.pData.cast::<SpriteParams>(), 1);
                 self.context.Unmap(Some(&cb_res), 0);
+                // PS и текстуры выбираются по типу спрайта: обычный —
+                // `mainPS` + `tex0`; видео — `mainVideoPS` + три плоскости.
+                // `PSSetShaderResources(0)` для видеоспрайта не сбрасывается:
+                // `mainVideoPS` сэмплирует только t1..t4.
+                match &sprite.video {
+                    Some(vid) => {
+                        self.context.PSSetShader(&self.video_ps, None);
+                        self.context.PSSetShaderResources(
+                            2,
+                            Some(&[
+                                Some(vid.y.srv().clone()),
+                                Some(vid.u.srv().clone()),
+                                Some(vid.v.srv().clone()),
+                            ]),
+                        );
+                    }
+                    None => {
+                        self.context.PSSetShader(&self.ps, None);
+                        self.context
+                            .PSSetShaderResources(0, Some(&[Some(sprite.texture.srv().clone())]));
+                    }
+                }
+                let mask_srv = match masks.get(i).copied().flatten() {
+                    Some(mask) => mask.srv().clone(),
+                    None => self.mask_empty.srv().clone(),
+                };
                 self.context
-                    .PSSetShaderResources(0, Some(&[Some(sprite.texture.srv().clone())]));
+                    .PSSetShaderResources(1, Some(&[Some(mask_srv)]));
                 self.context.Draw(6, 0);
             }
         }
@@ -585,109 +721,6 @@ impl Device {
             }
         }
         Ok(())
-    }
-
-    /// Как [`Self::draw`], но каждый спрайт вырезается по своей маске
-    /// (M4): `masks[i]` — маска стикера `sprites[i]` (`None` — стикер без
-    /// ограничений видимости, биндится встроенная пустая маска, тот же
-    /// эффект, что `draw()`). `masks.len()` должен совпадать с
-    /// `sprites.len()` — лишние/недостающие элементы просто не влияют на
-    /// хвост без пары (используется пустая маска).
-    pub fn draw_masked(
-        &self,
-        target: &WindowTarget,
-        sprites: &[Sprite],
-        masks: &[Option<&Texture>],
-    ) -> Result<(), RenderError> {
-        let (w, h) = target.size();
-        let Some(rtv) = target.rtv() else {
-            return Ok(());
-        };
-        if w == 0 || h == 0 {
-            return Ok(());
-        }
-
-        // SAFETY: см. draw() — тот же контекст, та же нить-владелец.
-        unsafe {
-            let clear = [0.0f32; 4];
-            self.context.ClearRenderTargetView(&rtv, &clear);
-            let vp = D3D11_VIEWPORT {
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
-                Width: w as f32,
-                Height: h as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            };
-            self.context.RSSetViewports(Some(&[vp]));
-            self.context.OMSetRenderTargets(Some(&[Some(rtv)]), None);
-            self.context.OMSetBlendState(&self.blend, None, 0xffffffff);
-            self.context.IASetInputLayout(None);
-            self.context
-                .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            self.context.VSSetShader(&self.vs, None);
-            self.context
-                .VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
-            self.context.PSSetShader(&self.ps, None);
-            self.context
-                .PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
-            self.context
-                .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-            self.context
-                .PSSetSamplers(1, Some(&[Some(self.mask_sampler.clone())]));
-        }
-
-        // SAFETY: см. draw() — тот же паттерн Map/Unmap-на-спрайт.
-        unsafe {
-            let cb_res: ID3D11Resource = self.cb.cast().map_err(RenderError::Windows)?;
-            let scale = target.dpi_scale();
-            for (i, sprite) in sprites.iter().enumerate() {
-                if sprite.placement.w <= 0.0 || sprite.placement.h <= 0.0 {
-                    continue;
-                }
-                let [cx, cy, sw, sh] = placement_to_physical(&sprite.placement, scale);
-                let (sin, cos) = (sprite.transform.rotation as f32).sin_cos();
-                let params = SpriteParams {
-                    tr: [cx, cy, sw, sh],
-                    misc: [
-                        cos,
-                        sin,
-                        sprite.transform.opacity as f32,
-                        if sprite.transform.flip_h { -1.0 } else { 1.0 },
-                    ],
-                    misc2: [
-                        if sprite.transform.flip_v { -1.0 } else { 1.0 },
-                        w as f32,
-                        h as f32,
-                        0.0,
-                    ],
-                    uv_offset: sprite.uv_offset,
-                    uv_scale: sprite.uv_scale,
-                };
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                self.context
-                    .Map(
-                        Some(&cb_res),
-                        0,
-                        D3D11_MAP_WRITE_DISCARD,
-                        0,
-                        Some(&mut mapped),
-                    )
-                    .map_err(RenderError::Windows)?;
-                std::ptr::copy_nonoverlapping(&params, mapped.pData.cast::<SpriteParams>(), 1);
-                self.context.Unmap(Some(&cb_res), 0);
-                self.context
-                    .PSSetShaderResources(0, Some(&[Some(sprite.texture.srv().clone())]));
-                let mask_srv = match masks.get(i).copied().flatten() {
-                    Some(mask) => mask.srv().clone(),
-                    None => self.mask_empty.srv().clone(),
-                };
-                self.context
-                    .PSSetShaderResources(1, Some(&[Some(mask_srv)]));
-                self.context.Draw(6, 0);
-            }
-        }
-        target.present()
     }
 
     /// Доступ к D3D11-устройству для целей рендера (RTV, swapchain).
@@ -1154,6 +1187,130 @@ mod gpu_tests {
                 (255, 0, 0, 255),
                 "кадр 1 должен быть синим в ({x},{y})"
             );
+        }
+
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn video_yuv_textures_convert_to_rgb_in_shader() {
+        // SAFETY: окно системного класса Static, как в остальных GPU-тестах.
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render video gpu test"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let target = WindowTarget::new(&device, hwnd, 64, 64).expect("цель создаётся");
+
+        // Синтетический 4:2:0 кадр 64×64: сплошной красный (BT.709 limited
+        // Y=63, Cb=102, Cr=240 — те же значения, что в юнит-тесте
+        // `known_yuv_pair_for_red`). Y — 64×64, U/V — 32×32.
+        let solid_planes = |rgb: [u8; 3]| {
+            let (y, u, v) = crate::video::rgb_to_yuv_bt709_limited(rgb);
+            (vec![y; 64 * 64], vec![u; 32 * 32], vec![v; 32 * 32])
+        };
+        let (red_y, red_u, red_v) = solid_planes([255, 0, 0]);
+        let mut vid = device
+            .create_video_textures(&red_y, &red_u, &red_v, 64, 64)
+            .expect("видео-текстуры создаются");
+        assert_eq!(vid.y.width(), 64);
+        assert_eq!(vid.u.height(), 32, "U/V — половина по каждой оси");
+
+        let sprite = Sprite::new(
+            vid.y.clone(),
+            {
+                Placement {
+                    monitor_id: MonitorId(String::new()),
+                    cx: 32.0,
+                    cy: 32.0,
+                    w: 64.0,
+                    h: 64.0,
+                }
+            },
+            Transform::default(),
+        )
+        .with_video(vid.clone());
+
+        // Композиционный swapchain (FLIP_SEQUENTIAL, 2 буфера): второй
+        // одинаковый кадр гарантирует, что прочитан именно тот буфер,
+        // что был отрисован (тот же приём, что в M4/M5a-тестах выше).
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw видеоспрайта не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw видеоспрайта не падает (второй кадр)");
+
+        let readback = |target: &WindowTarget| {
+            // SAFETY: RTV живой, пока жива `target`; ресурс — исходная текстура.
+            let resource: ID3D11Resource = unsafe {
+                target
+                    .rtv()
+                    .expect("цель ненулевого размера имеет RTV")
+                    .GetResource()
+            }
+            .expect("RTV даёт исходный ресурс");
+            read_bgra_texture(&device.device, &device.context, &resource, 64, 64)
+        };
+        let at = |pixels: &[u8], x: u32, y: u32| {
+            let i = ((y * 64 + x) * 4) as usize;
+            (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3])
+        };
+        let pixels = readback(&target);
+        // Ожидание — CPU-зеркало той же формулы (учёт 8-битного квантования
+        // YUV-плоскостей); допуск ±3 на канал — расхождение f32-шейдера и
+        // f64-зеркала, не ошибка конверсии.
+        let want_red = crate::video::yuv_to_rgb_bt709_limited(63, 102, 240);
+        for (x, y) in [(16u32, 16u32), (32, 32), (48, 48)] {
+            let (b, g, r, _a) = at(&pixels, x, y);
+            for (got, want) in [(r, want_red[0]), (g, want_red[1]), (b, want_red[2])] {
+                assert!(
+                    (i16::from(got) - i16::from(want)).abs() <= 3,
+                    "кадр должен быть красным (want {want_red:?}) в ({x},{y}), получили (R{r},G{g},B{b})"
+                );
+            }
+        }
+
+        // Обновление через `update_video_textures` (переиспользование, не
+        // пересоздание): синий кадр в те же текстуры — readback обязан
+        // показать синий.
+        let (blue_y, blue_u, blue_v) = solid_planes([0, 0, 255]);
+        device
+            .update_video_textures(&mut vid, &blue_y, &blue_u, &blue_v)
+            .expect("обновление плоскостей не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite.clone()))
+            .expect("draw после обновления не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite.clone()))
+            .expect("draw после обновления не падает (второй кадр)");
+        let pixels = readback(&target);
+        let want_blue = crate::video::yuv_to_rgb_bt709_limited(32, 240, 118);
+        for (x, y) in [(16u32, 16u32), (32, 32), (48, 48)] {
+            let (b, g, r, _a) = at(&pixels, x, y);
+            for (got, want) in [(r, want_blue[0]), (g, want_blue[1]), (b, want_blue[2])] {
+                assert!(
+                    (i16::from(got) - i16::from(want)).abs() <= 3,
+                    "кадр должен быть синим (want {want_blue:?}) в ({x},{y}), получили (R{r},G{g},B{b})"
+                );
+            }
         }
 
         unsafe { DestroyWindow(hwnd) }.unwrap();

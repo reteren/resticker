@@ -159,6 +159,87 @@ impl Texture {
         })
     }
 
+    /// Создать R8_UNORM текстурy-плоскость для видеокадра (M5b,
+    /// docs/M5B_VIDEO_DESIGN.md §3): один 8-битный канал на тексель, один
+    /// мип, без рендер-таргета. Y/U/V-плоскости видео обновляются на каждый
+    /// показанный кадр через `update_r8` (UpdateSubresource) — пересоздание
+    /// текстуры на каждый кадр дороже, поэтому это отдельный путь от
+    /// `from_rgba`. Мипмапы не генерируются: плоскости перезаливаются
+    /// целиком каждый кадр, автогенерация добавляла бы работу GPU без
+    /// видимой выгоды на видеоспрайте (тот же аргумент, что у атласов M5a).
+    pub(crate) fn from_r8(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RenderError> {
+        validate_plane_data(width, height, data.len())?;
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture: Option<ID3D11Texture2D> = None;
+        // SAFETY: desc валиден; out-параметр валиден.
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+            .map_err(RenderError::Windows)?;
+        let texture = texture.expect("CreateTexture2D без ошибки возвращает объект");
+
+        // SAFETY: `texture` — валидный ID3D11Resource устройства контекста;
+        // `data` живёт до конца вызова; UpdateSubresource копирует синхронно.
+        unsafe {
+            let tex_res: ID3D11Resource = texture.cast().map_err(RenderError::Windows)?;
+            context.UpdateSubresource(Some(&tex_res), 0, None, data.as_ptr().cast(), width, 0);
+        }
+
+        let mut srv: Option<ID3D11ShaderResourceView> = None;
+        // SAFETY: `texture` — валидный ID3D11Resource; out-параметр валиден.
+        unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv)) }
+            .map_err(RenderError::Windows)?;
+        let srv = srv.expect("CreateShaderResourceView без ошибки возвращает объект");
+
+        Ok(Self {
+            srv,
+            _texture: texture,
+            width,
+            height,
+            rtv: None,
+        })
+    }
+
+    /// Обновить содержимое R8-плоскости новыми данными (M5b): тот же
+    /// размер, что при создании (`from_r8`); переиспользование текстуры
+    /// вместо пересоздания — видеокадры меняются каждый кадр, создавать
+    /// три текстуры на каждый показанный кадр дорого.
+    pub(crate) fn update_r8(
+        &self,
+        context: &ID3D11DeviceContext,
+        data: &[u8],
+    ) -> Result<(), RenderError> {
+        validate_plane_data(self.width, self.height, data.len())?;
+        // SAFETY: `self._texture` — валидный ID3D11Resource устройства
+        // контекста; `data` живёт до конца вызова; UpdateSubresource
+        // копирует синхронно; RowPitch = width (1 байт на тексель R8).
+        unsafe {
+            let tex_res: ID3D11Resource =
+                self._texture.clone().cast().map_err(RenderError::Windows)?;
+            context.UpdateSubresource(Some(&tex_res), 0, None, data.as_ptr().cast(), self.width, 0);
+        }
+        Ok(())
+    }
+
     /// Создать R8_UNORM offscreen render target для маски перекрытия (M4,
     /// docs/M4_MASK_RENDER_DESIGN.md §3): рендер-таргет + SRV на одной
     /// текстуре (`Device::draw_mask` рисует в неё, `Device::draw_masked`
@@ -242,6 +323,27 @@ pub(crate) fn validate_texture_data(
     Ok(())
 }
 
+/// Проверка входных данных одноканальной (R8) текстуры-плоскости (M5b,
+/// видео): ровно `width * height` байт. Юнит-тестируется без GPU.
+pub(crate) fn validate_plane_data(
+    width: u32,
+    height: u32,
+    data_len: usize,
+) -> Result<(), RenderError> {
+    if width == 0 || height == 0 {
+        return Err(RenderError::InvalidTextureData(
+            "нулевая ширина или высота".to_string(),
+        ));
+    }
+    let expected = width as usize * height as usize;
+    if data_len != expected {
+        return Err(RenderError::InvalidTextureData(format!(
+            "ожидалось {expected} байт R8, получено {data_len}"
+        )));
+    }
+    Ok(())
+}
+
 /// Приведение straight alpha к premultiplied (требование
 /// DXGI_ALPHA_MODE_PREMULTIPLIED у композиционной цепочки).
 pub(crate) fn premultiply_rgba(data: &mut [u8]) {
@@ -255,7 +357,7 @@ pub(crate) fn premultiply_rgba(data: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{premultiply_rgba, validate_texture_data};
+    use super::{premultiply_rgba, validate_plane_data, validate_texture_data};
     use crate::RenderError;
 
     #[test]
@@ -314,5 +416,30 @@ mod tests {
     #[test]
     fn validate_accepts_exact_data_len() {
         assert!(validate_texture_data(2, 2, 16).is_ok());
+    }
+
+    #[test]
+    fn plane_rejects_zero_width() {
+        let err = validate_plane_data(0, 8, 0).unwrap_err();
+        assert!(matches!(err, RenderError::InvalidTextureData(_)));
+    }
+
+    #[test]
+    fn plane_rejects_zero_height() {
+        let err = validate_plane_data(8, 0, 0).unwrap_err();
+        assert!(matches!(err, RenderError::InvalidTextureData(_)));
+    }
+
+    #[test]
+    fn plane_rejects_wrong_data_len() {
+        let err = validate_plane_data(2, 2, 3).unwrap_err();
+        assert!(matches!(err, RenderError::InvalidTextureData(_)));
+        assert!(validate_plane_data(2, 2, 5).is_err());
+    }
+
+    #[test]
+    fn plane_accepts_exact_data_len() {
+        assert!(validate_plane_data(2, 2, 4).is_ok());
+        assert!(validate_plane_data(31, 17, 31 * 17).is_ok());
     }
 }

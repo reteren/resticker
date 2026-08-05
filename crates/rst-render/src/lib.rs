@@ -26,6 +26,7 @@ mod sprite;
 mod text;
 mod texture;
 mod ui_textures;
+mod video;
 mod widgets;
 mod window_target;
 
@@ -46,6 +47,7 @@ pub use sprite::Sprite;
 pub use text::{Glyph, LINE_HEIGHT, glyph_for, rasterize, text_size, width_up_to};
 pub use texture::Texture;
 pub use ui_textures::{TextureFactory, UiTextures};
+pub use video::VideoTextures;
 pub use widgets::{
     Button, ButtonContent, Checkbox, EventResult, Icon, Key, NumericField, Panel, PointerEvent,
     Primitive, Slider, Widget, WidgetId, box_contains, theme,
