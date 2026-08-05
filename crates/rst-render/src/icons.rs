@@ -36,6 +36,8 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
         Icon::PresetLoad => draw_preset_load(&mut canvas, s),
         Icon::Settings => draw_settings(&mut canvas, s),
         Icon::Exit => draw_exit(&mut canvas, s),
+        Icon::Play => draw_play(&mut canvas, s),
+        Icon::Pause => draw_pause(&mut canvas, s),
     }
     canvas.into_rgba()
 }
@@ -57,6 +59,8 @@ fn color_of(icon: Icon) -> [u8; 3] {
         Icon::PresetLoad => [0x9f, 0xc2, 0xe8],
         Icon::Settings => [0xe8, 0xe8, 0xee],
         Icon::Exit => [0xf2, 0x9a, 0x6a],
+        Icon::Play => [0x8a, 0xd0, 0x9c],
+        Icon::Pause => [0xf0, 0xf0, 0xf0],
     }
 }
 
@@ -315,6 +319,24 @@ fn draw_exit(cv: &mut Canvas, s: f64) {
         (0.68 * s, 0.42 * s),
         (0.68 * s, 0.58 * s),
     );
+}
+
+/// «Играть» (M5b): треугольник вправо — видео-стикер сейчас на паузе, клик
+/// запускает воспроизведение.
+fn draw_play(cv: &mut Canvas, s: f64) {
+    fill_triangle(
+        cv,
+        (0.32 * s, 0.26 * s),
+        (0.32 * s, 0.74 * s),
+        (0.74 * s, 0.5 * s),
+    );
+}
+
+/// «Пауза» (M5b): две вертикальные полосы — видео-стикер сейчас играет,
+/// клик ставит на паузу.
+fn draw_pause(cv: &mut Canvas, s: f64) {
+    fill_rect(cv, 0.30 * s, 0.26 * s, 0.44 * s, 0.74 * s);
+    fill_rect(cv, 0.56 * s, 0.26 * s, 0.70 * s, 0.74 * s);
 }
 
 #[cfg(test)]

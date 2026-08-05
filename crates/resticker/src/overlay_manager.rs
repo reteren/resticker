@@ -3081,9 +3081,27 @@ fn rebuild_toolbar(edit: &mut EditState, cfg: &Config, screen_h: f64) {
         return;
     };
     let bounds = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+    // Видео-виджеты тулбара (M5b) — источник состояния тот же Config, что и
+    // у остальных полей тулбара: play/pause и громкость крутятся в
+    // `sticker.playback`, координатор синхронизирует реальный
+    // `rst_video::VideoSource`/`rst_audio::AudioSource` С НИМ (не наоборот),
+    // поэтому здесь не нужна карта `videos` — она runtime-кэш, а не
+    // источник истины.
+    let is_video = matches!(
+        &sticker.source,
+        StickerSource::File {
+            media_type: MediaType::Video,
+            ..
+        }
+    );
+    let video = is_video.then(|| toolbar::VideoToolbarState {
+        paused: sticker.playback.paused,
+        volume_pct: (sticker.playback.volume.clamp(0.0, 1.0) * 100.0).round() as u32,
+    });
     edit.toolbar = Some(toolbar::build_toolbar(
         &bounds,
         Some(sticker.transform.opacity),
+        video,
         screen_h,
     ));
 }

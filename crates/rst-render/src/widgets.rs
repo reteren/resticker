@@ -75,13 +75,17 @@ pub enum Icon {
     Settings,
     /// «Выйти из режима редактирования» (SPEC 3.8).
     Exit,
+    /// «Играть» — видео-стикер на паузе (M5b).
+    Play,
+    /// «Пауза» — видео-стикер играет (M5b).
+    Pause,
 }
 
 impl Icon {
     /// Все варианты в порядке объявления — для предварительной генерации
     /// кэша иконок (текс-карта `HashMap<Icon, Texture>`, M2_WIRING_PLAN §3)
     /// и тестов генератора `icon_rgba`.
-    pub const ALL: [Icon; 14] = [
+    pub const ALL: [Icon; 16] = [
         Icon::Layers,
         Icon::Eye,
         Icon::EyeOff,
@@ -96,6 +100,8 @@ impl Icon {
         Icon::PresetLoad,
         Icon::Settings,
         Icon::Exit,
+        Icon::Play,
+        Icon::Pause,
     ];
 }
 

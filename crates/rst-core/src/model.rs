@@ -328,6 +328,13 @@ pub struct PlaybackSettings {
     pub audio_track: Option<u32>,
     /// Некоторым стикерам нужен звук даже когда они невидимы (SPEC 8.3).
     pub override_mute_when_invisible: bool,
+    /// Воспроизведение на паузе (M5b) — не применимо к статичным картинкам,
+    /// но живёт здесь, а не в отдельном поле `Sticker`: play/pause — часть
+    /// того же UI-жеста, что остальные настройки воспроизведения. Дефолт
+    /// `false`: автовоспроизведение при добавлении. Старые `config.json`
+    /// без этого поля получают `false` через `#[serde(default)]` на
+    /// структуре — отдельная миграция схемы не нужна.
+    pub paused: bool,
 }
 
 impl Default for PlaybackSettings {
@@ -338,6 +345,7 @@ impl Default for PlaybackSettings {
             loop_mode: LoopMode::default(),
             audio_track: None,
             override_mute_when_invisible: false,
+            paused: false,
         }
     }
 }
