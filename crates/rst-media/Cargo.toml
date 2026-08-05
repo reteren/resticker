@@ -11,7 +11,12 @@ license.workspace = true
 # (CONTRIBUTING.md, «Правило зависимостей»), поэтому материализация вставок
 # живёт здесь, в rst-media.
 rst-win32 = { path = "../rst-win32" }
-image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+# Тип MediaType для sniff_media_type (M5A_ANIMATION_DESIGN.md, раздел 2);
+# rst-core платформенно-независим, зависимость разрешена правилом выше.
+rst-core = { path = "../rst-core" }
+# gif — AnimationDecoder для GIF (GifDecoder), webp — для animated WebP
+# (WebPDecoder); apng() живёт в том же кодеке png, отдельный флаг не нужен.
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "gif", "webp"] }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 
