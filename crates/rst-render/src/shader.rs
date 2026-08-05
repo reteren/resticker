@@ -11,16 +11,21 @@ use crate::RenderError;
 
 /// Вершинный и пиксельный шейдеры спрайта.
 ///
-/// Раскладка константного буфера: три float4 (упаковка HLSL по 16 байт,
-/// см. урок спайка S0 — float4 после float2 съезжает на границу).
-///   tr    = (cx, cy, w, h)      центр и размер в физических пикселях
-///   misc  = (cos φ, sin φ, opacity, flip_h)
-///   misc2 = (flip_v, screen_w, screen_h, pad)
+/// Раскладка константного буфера: три float4 + два float2 (упаковка HLSL
+/// по 16 байт, см. урок спайка S0 — float4 после float2 съезжает на
+/// границу; пара float2 укладывается ровно в четвёртый 16-байтный слот).
+///   tr        = (cx, cy, w, h)      центр и размер в физических пикселях
+///   misc      = (cos φ, sin φ, opacity, flip_h)
+///   misc2     = (flip_v, screen_w, screen_h, pad)
+///   uv_offset = (ux, uy)            верхний левый угол UV-подпрямоугольника
+///   uv_scale  = (sx, sy)            размер подпрямоугольника в долях текстуры
 pub(crate) const SPRITE_HLSL: &str = r#"
 cbuffer Cb : register(b0) {
     float4 tr;
     float4 misc;
     float4 misc2;
+    float2 uv_offset;
+    float2 uv_scale;
 };
 struct VSOut {
     float4 pos : SV_Position;
@@ -59,8 +64,13 @@ float4 mainPS(VSOut i) : SV_Target {
     // для этого случая не нужен.
     float2 maskUv = i.pos.xy / misc2.yz;
     if (maskTex.Sample(maskSamp, maskUv).r > 0.5) discard;
+    // Подпрямоугольник текстуры (M5a, атлас анимации): finalUV = uv_offset +
+    // rawUV * uv_scale; при идентичных uv_offset/uv_scale — вся текстура,
+    // поведение M1-M4. Применяется к обоим путям: обычная отрисовка и
+    // masked (draw_masked) делят один mainPS.
+    float2 finalUV = uv_offset + i.uv * uv_scale;
     // Текстура уже premultiplied: умножение на opacity корректно и для rgb.
-    return tex0.Sample(samp0, i.uv) * i.opacity;
+    return tex0.Sample(samp0, finalUV) * i.opacity;
 }
 /// Скруглённый прямоугольник в маску перекрытия (M4, ADR-004): один
 /// оклюдер за вызов, `tr` несёт его центр/размер в физических px (тот же VS
@@ -157,14 +167,17 @@ mod tests {
     }
 
     /// Инварианты исходника HLSL, критичные для спрайтового рендера:
-    /// обе точки входа, константный буфер и premultiplied-умножение на opacity.
+    /// обе точки входа, константный буфер, UV-remap и premultiplied-умножение
+    /// на opacity.
     #[test]
     fn sprite_hlsl_contract() {
         assert!(SPRITE_HLSL.contains("mainVS"));
         assert!(SPRITE_HLSL.contains("mainPS"));
         assert!(SPRITE_HLSL.contains("cbuffer Cb"));
+        // M5a: UV-подпрямоугольник (атлас анимации) считается до сэмплинга.
+        assert!(SPRITE_HLSL.contains("float2 finalUV = uv_offset + i.uv * uv_scale;"));
         // Текстура уже premultiplied, поэтому rgb тоже умножается на opacity.
-        assert!(SPRITE_HLSL.contains("tex0.Sample(samp0, i.uv) * i.opacity"));
+        assert!(SPRITE_HLSL.contains("tex0.Sample(samp0, finalUV) * i.opacity"));
     }
 
     /// Инварианты маски (M4, docs/M4_MASK_RENDER_DESIGN.md §4.3): второй
@@ -181,7 +194,7 @@ mod tests {
             .find("discard;")
             .expect("discard по маске должен присутствовать");
         let opacity_mul_pos = SPRITE_HLSL
-            .find("tex0.Sample(samp0, i.uv) * i.opacity")
+            .find("tex0.Sample(samp0, finalUV) * i.opacity")
             .expect("умножение на opacity должно присутствовать");
         assert!(
             discard_pos < opacity_mul_pos,

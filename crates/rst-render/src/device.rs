@@ -5,6 +5,7 @@
 //! любом [`crate::WindowTarget`] (любом мониторе) без перезаливки на GPU.
 
 use std::path::Path;
+use std::time::Duration;
 
 use rst_core::model::{Placement, Rect};
 use windows::Win32::Foundation::HMODULE;
@@ -18,13 +19,16 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::{Interface, PCSTR};
 
+use crate::atlas::{AtlasFrame, TextureAtlas};
 use crate::sprite::Sprite;
 use crate::texture::Texture;
 use crate::window_target::WindowTarget;
 use crate::{RenderError, shader};
 
-/// Константный буфер шейдера спрайта: строго три float4 под HLSL-упаковку
+/// Константный буфер шейдера спрайта: строго четыре float4 под HLSL-упаковку
 /// по 16 байт (урок спайка S0 — float4 после float2 съезжает на границу).
+/// M5a: два float2 (`uv_offset`/`uv_scale`) укладываются ровно в четвёртый
+/// float4-слот (48+16=64 байта) — выравнивание HLSL cbuffer не нарушается.
 #[repr(C)]
 struct SpriteParams {
     /// cx, cy, w, h в физических пикселях.
@@ -33,7 +37,15 @@ struct SpriteParams {
     misc: [f32; 4],
     /// flip_v (±1), screen_w, screen_h, pad.
     misc2: [f32; 4],
+    /// uv_offset (ux, uy) — верхний левый угол UV-подпрямоугольника.
+    uv_offset: [f32; 2],
+    /// uv_scale (sx, sy) — размер подпрямоугольника в долях текстуры.
+    uv_scale: [f32; 2],
 }
+
+/// UV-значения по умолчанию: вся текстура.
+const UV_IDENTITY_OFFSET: [f32; 2] = [0.0, 0.0];
+const UV_IDENTITY_SCALE: [f32; 2] = [1.0, 1.0];
 
 /// Перевод Placement (DIP, координаты центра) в физические пиксели.
 fn placement_to_physical(p: &Placement, scale: f32) -> [f32; 4] {
@@ -292,6 +304,93 @@ impl Device {
         Texture::from_rgba(&self.device, &self.context, data, width, height)
     }
 
+    /// Собрать текстурный атлас анимации (M5a, docs/M5A_ANIMATION_DESIGN.md
+    /// §3): все кадры заливаются в одну текстуру-грид, каждый кадр
+    /// рисуется через `Sprite::with_uv` с его UV-подпрямоугольником — смена
+    /// кадра не трогает GPU-текстуру. Кадры — straight-alpha RGBA8
+    /// одинакового размера `frame_w × frame_h`; раскладка грид
+    /// (`columns = ceil(sqrt(n))`), размер атласа явно проверяется против
+    /// лимита D3D11 feature level 11 (16384 px) — драйверу непроверенный
+    /// размер не передаётся.
+    pub fn create_texture_atlas(
+        &self,
+        frames: &[(Vec<u8>, Duration)],
+        frame_w: u32,
+        frame_h: u32,
+    ) -> Result<TextureAtlas, RenderError> {
+        if frames.is_empty() {
+            return Err(RenderError::InvalidTextureData(
+                "пустой список кадров атласа".to_string(),
+            ));
+        }
+        // Проверка формата каждого кадра до какой-либо работы с GPU —
+        // тот же предикат, что у одиночных текстур.
+        for (i, (data, _)) in frames.iter().enumerate() {
+            if let Err(e) = crate::texture::validate_texture_data(frame_w, frame_h, data.len()) {
+                return Err(RenderError::InvalidTextureData(format!("кадр {i}: {e}")));
+            }
+        }
+
+        let layout = crate::atlas::grid_layout(frames.len(), frame_w, frame_h);
+        // Лимит текстуры D3D11 feature level 11 — 16384×16384 (пикселей).
+        // Число кадров ограничено сверху на слое декодирования (rst-media,
+        // 300), но лимит проверяется здесь — атлас не отдаётся драйверу
+        // непроверенного размера даже на патологическом входе.
+        if layout.atlas_w > 16384 || layout.atlas_h > 16384 {
+            return Err(RenderError::InvalidTextureData(format!(
+                "атлас {}×{} px превышает лимит D3D11 feature level 11 (16384 px): \
+                 {} кадров по {}×{} px",
+                layout.atlas_w,
+                layout.atlas_h,
+                frames.len(),
+                frame_w,
+                frame_h
+            )));
+        }
+
+        // Заливка кадров в ячейки грида: кадр i — в ячейку (i % columns,
+        // i / columns), слева направо, сверху вниз.
+        let row_bytes = frame_w as usize * 4;
+        let mut combined = vec![0u8; layout.atlas_w as usize * layout.atlas_h as usize * 4];
+        for (i, (data, _)) in frames.iter().enumerate() {
+            let col = (i % layout.columns as usize) as u32;
+            let row = (i / layout.columns as usize) as u32;
+            let dst_x = col * frame_w;
+            let dst_y = row * frame_h;
+            for y in 0..frame_h {
+                let src_off = y as usize * row_bytes;
+                let dst_off = ((dst_y + y) as usize * layout.atlas_w as usize + dst_x as usize) * 4;
+                combined[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&data[src_off..src_off + row_bytes]);
+            }
+        }
+
+        // Атлас одно-миповый: автогенерация мипмапов усреднила бы соседние
+        // кадры в нижних мипах (цвет ячейки «протёк» бы в соседнюю).
+        let texture = Texture::from_rgba_atlas(
+            &self.device,
+            &self.context,
+            &combined,
+            layout.atlas_w,
+            layout.atlas_h,
+        )?;
+
+        let frames = frames
+            .iter()
+            .enumerate()
+            .map(|(i, (_, delay))| {
+                let (uv_offset, uv_scale) = crate::atlas::frame_uvs(i, &layout);
+                AtlasFrame {
+                    uv_offset,
+                    uv_scale,
+                    delay: *delay,
+                }
+            })
+            .collect();
+
+        Ok(TextureAtlas { texture, frames })
+    }
+
     /// Отрисовать список спрайтов в цель `target` (порядок списка = порядок
     /// отрисовки, первый — нижний) и представить кадр. Вызывается строго по
     /// требованию (ADR-006): внутреннего цикла и таймеров нет, ноль вызовов =
@@ -368,6 +467,8 @@ impl Device {
                         h as f32,
                         0.0,
                     ],
+                    uv_offset: sprite.uv_offset,
+                    uv_scale: sprite.uv_scale,
                 };
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context
@@ -463,6 +564,10 @@ impl Device {
                     // используются `mainMaskPS`, но mainVS их всё равно читает.
                     misc: [1.0, 0.0, 1.0, 1.0],
                     misc2: [1.0, w as f32, h as f32, 0.0],
+                    // `mainMaskPS` UV не использует — идентичность, как
+                    // у спрайта по умолчанию (docs/M5A_ANIMATION_DESIGN.md §3).
+                    uv_offset: UV_IDENTITY_OFFSET,
+                    uv_scale: UV_IDENTITY_SCALE,
                 };
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context
@@ -556,6 +661,8 @@ impl Device {
                         h as f32,
                         0.0,
                     ],
+                    uv_offset: sprite.uv_offset,
+                    uv_scale: sprite.uv_scale,
                 };
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context
@@ -606,10 +713,12 @@ mod tests {
 
     #[test]
     fn sprite_params_layout_matches_hlsl_packing() {
-        assert_eq!(size_of::<SpriteParams>(), 48);
+        assert_eq!(size_of::<SpriteParams>(), 64);
         assert_eq!(std::mem::offset_of!(SpriteParams, tr), 0);
         assert_eq!(std::mem::offset_of!(SpriteParams, misc), 16);
         assert_eq!(std::mem::offset_of!(SpriteParams, misc2), 32);
+        assert_eq!(std::mem::offset_of!(SpriteParams, uv_offset), 48);
+        assert_eq!(std::mem::offset_of!(SpriteParams, uv_scale), 56);
     }
 
     #[test]
@@ -920,6 +1029,132 @@ mod gpu_tests {
             (0, 255, 255, 255),
             "незамаскированная половина должна показывать спрайт"
         );
+
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn atlas_uv_remaps_to_second_frame() {
+        // SAFETY: окно системного класса Static, как в tests/gpu_smoke.rs —
+        // регистрация своего класса не нужна, все параметры валидны.
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render atlas gpu test"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let target = WindowTarget::new(&device, hwnd, 64, 64).expect("цель создаётся");
+
+        // Атлас 2×1: кадр 0 — красный, кадр 1 — синий, по 8×8 px (ячейки
+        // достаточно велики, чтобы пиксели центра спрайта 64×64 ложились
+        // строго внутрь одной ячейки — никакого фильтра-микширования на
+        // границе кадров в проверяемых точках).
+        let solid = |rgb: [u8; 3]| [rgb[0], rgb[1], rgb[2], 255].repeat(8 * 8);
+        let red = solid([255, 0, 0]);
+        let blue = solid([0, 0, 255]);
+        let delay = Duration::from_millis(100);
+        let atlas = device
+            .create_texture_atlas(&[(red.clone(), delay), (blue.clone(), delay)], 8, 8)
+            .expect("атлас создаётся");
+        assert_eq!(atlas.frames.len(), 2);
+        let placement = Placement {
+            monitor_id: MonitorId(String::new()),
+            cx: 32.0,
+            cy: 32.0,
+            w: 64.0,
+            h: 64.0,
+        };
+
+        // Кадр 0 (красный): uv_offset/uv_scale из метаданных атласа.
+        let f0 = atlas.frames[0];
+        let sprite0 = Sprite::new(
+            atlas.texture.clone(),
+            placement.clone(),
+            Transform::default(),
+        )
+        .with_uv(f0.uv_offset, f0.uv_scale);
+        // Композиционный swapchain (FLIP_SEQUENTIAL, 2 буфера): после
+        // Present() закэшированный RTV может указывать на другой буфер —
+        // второй одинаковый кадр гарантирует, что прочитан именно тот,
+        // что был отрисован (тот же приём, что в M4-тестах выше).
+        device
+            .draw(&target, std::slice::from_ref(&sprite0))
+            .expect("draw кадра 0 не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite0))
+            .expect("draw кадра 0 не падает (второй кадр)");
+
+        // SAFETY: RTV живой, пока жива `target`; ресурс — исходная текстура.
+        let resource: ID3D11Resource = unsafe {
+            target
+                .rtv()
+                .expect("цель ненулевого размера имеет RTV")
+                .GetResource()
+        }
+        .expect("RTV даёт исходный ресурс");
+        let pixels = read_bgra_texture(&device.device, &device.context, &resource, 64, 64);
+        let at = |x: u32, y: u32| {
+            let i = ((y * 64 + x) * 4) as usize;
+            (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3])
+        };
+        // B8G8R8A8: байты в порядке B,G,R,A; премалтипленный непрозрачный
+        // красный — (B=0, G=0, R=255, A=255).
+        for (x, y) in [(16u32, 16u32), (32, 32), (48, 48)] {
+            assert_eq!(
+                at(x, y),
+                (0, 0, 255, 255),
+                "кадр 0 должен быть красным в ({x},{y})"
+            );
+        }
+
+        // Кадр 1 (синий): UV-remap обязан переключить сэмплинг на ячейку
+        // справа — синий, а НЕ красный (т.е. remap реально работает в
+        // шейдере, а не только в юнит-тестах математики раскладки).
+        let f1 = atlas.frames[1];
+        let sprite1 = Sprite::new(atlas.texture.clone(), placement, Transform::default())
+            .with_uv(f1.uv_offset, f1.uv_scale);
+        device
+            .draw(&target, std::slice::from_ref(&sprite1))
+            .expect("draw кадра 1 не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite1))
+            .expect("draw кадра 1 не падает (второй кадр)");
+
+        let resource: ID3D11Resource = unsafe {
+            target
+                .rtv()
+                .expect("цель ненулевого размера имеет RTV")
+                .GetResource()
+        }
+        .expect("RTV даёт исходный ресурс");
+        let pixels = read_bgra_texture(&device.device, &device.context, &resource, 64, 64);
+        let at = |x: u32, y: u32| {
+            let i = ((y * 64 + x) * 4) as usize;
+            (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3])
+        };
+        for (x, y) in [(16u32, 16u32), (32, 32), (48, 48)] {
+            assert_eq!(
+                at(x, y),
+                (255, 0, 0, 255),
+                "кадр 1 должен быть синим в ({x},{y})"
+            );
+        }
 
         unsafe { DestroyWindow(hwnd) }.unwrap();
     }

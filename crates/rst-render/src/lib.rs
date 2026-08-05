@@ -15,6 +15,7 @@
 //!
 //! Маска перекрытия (ADR-004) в этот срез не входит — она веха M4.
 
+mod atlas;
 mod device;
 mod error;
 mod icons;
@@ -28,6 +29,7 @@ mod ui_textures;
 mod widgets;
 mod window_target;
 
+pub use atlas::{AtlasFrame, TextureAtlas};
 pub use device::Device;
 pub use error::RenderError;
 pub use icons::icon_rgba;

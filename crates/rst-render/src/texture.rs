@@ -65,6 +65,31 @@ impl Texture {
         width: u32,
         height: u32,
     ) -> Result<Self, RenderError> {
+        Self::from_rgba_inner(device, context, data, width, height, true)
+    }
+
+    /// Как [`Self::from_rgba`], но БЕЗ мипмапов — для текстурных атласов
+    /// анимации (M5a): автогенерация усреднила бы соседние кадры в нижних
+    /// мипах (цвет ячейки «протёк» бы в соседнюю), поэтому атлас всегда
+    /// одно-миповый (docs/M5A_ANIMATION_DESIGN.md §3).
+    pub(crate) fn from_rgba_atlas(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RenderError> {
+        Self::from_rgba_inner(device, context, data, width, height, false)
+    }
+
+    fn from_rgba_inner(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        with_mips: bool,
+    ) -> Result<Self, RenderError> {
         validate_texture_data(width, height, data.len())?;
         let mut data = data.to_vec();
         premultiply_rgba(&mut data);
@@ -73,7 +98,7 @@ impl Texture {
         // SAFETY: вызов не трогает чужую память; устройство живо.
         let support = unsafe { device.CheckFormatSupport(DXGI_FORMAT_R8G8B8A8_UNORM) }
             .map_err(RenderError::Windows)?;
-        let autogen = support & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN.0 as u32 != 0;
+        let autogen = with_mips && support & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN.0 as u32 != 0;
 
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
@@ -197,7 +222,12 @@ impl Texture {
 
 /// Проверка входных данных текстуры. Вынесена из `from_rgba` отдельной
 /// функцией, чтобы её можно было юнит-тестировать без GPU-устройства.
-fn validate_texture_data(width: u32, height: u32, data_len: usize) -> Result<(), RenderError> {
+/// Переиспользуется `Device::create_texture_atlas` для проверки кадров.
+pub(crate) fn validate_texture_data(
+    width: u32,
+    height: u32,
+    data_len: usize,
+) -> Result<(), RenderError> {
     if width == 0 || height == 0 {
         return Err(RenderError::InvalidTextureData(
             "нулевая ширина или высота".to_string(),
