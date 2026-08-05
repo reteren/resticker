@@ -1,6 +1,7 @@
 //! Системный диалог выбора файла (M2, панель у курсора: кнопка «Загрузить
 //! файл» — `docs/M2_WIRING_PLAN.md`, раздел 12). Обёртка над `IFileOpenDialog`
-//! (COM, `Common Item Dialog`), с фильтром по расширениям изображений.
+//! (COM, `Common Item Dialog`), с фильтром по расширениям изображений и,
+//! начиная с M5b, видео.
 //!
 //! Каждый вызов сам инициализирует и деинициализирует COM на вызывающем
 //! потоке (`CoInitializeEx`/`CoUninitialize`) — диалог модален и живёт ровно
@@ -8,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use rst_core::model::VIDEO_EXTENSIONS;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -34,10 +36,26 @@ const ERROR_CANCELLED_HRESULT: HRESULT = HRESULT(0x800704C7_u32 as i32);
 const IMAGE_FILTER_NAME: &str = "Images";
 const IMAGE_FILTER_SPEC: &str = "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp";
 
-/// Показать системный диалог выбора файла-изображения (`owner_hwnd` — окно-
-/// владелец; `HWND(0)`/`HWND::default()`, если владельца нет). `Ok(None)` —
-/// пользователь отменил выбор, это не ошибка.
-pub fn pick_image_file(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> {
+/// Имя фильтра «видео» (M5b) — маска строится из общего с `add_sticker`
+/// списка [`VIDEO_EXTENSIONS`], чтобы диалог и определение `MediaType` не
+/// разошлись.
+const VIDEO_FILTER_NAME: &str = "Videos";
+
+fn video_filter_spec() -> String {
+    VIDEO_EXTENSIONS
+        .iter()
+        .map(|ext| format!("*.{ext}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Показать системный диалог выбора файла-изображения или видео
+/// (`owner_hwnd` — окно-владелец; `HWND(0)`/`HWND::default()`, если владельца
+/// нет). `Ok(None)` — пользователь отменил выбор, это не ошибка. Диалог
+/// открывается на фильтре «Images» (индекс 1) — видео выбирается
+/// переключением фильтра в самом диалоге, тем же способом, что и раньше для
+/// любого не первого по списку расширения.
+pub fn pick_media_file(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> {
     // SAFETY: инициализация COM на вызывающем потоке для длительности одного
     // модального диалога; деинициализация — в конце этой же функции, на том
     // же потоке, независимо от исхода (см. `result` ниже).
@@ -53,26 +71,43 @@ pub fn pick_image_file(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> 
 
 fn show_dialog(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> {
     // SAFETY: `CLSID_FILE_OPEN_DIALOG` — валидный CLSID общего системного
-    // диалога; COM уже инициализирован вызывающей `pick_image_file`.
+    // диалога; COM уже инициализирован вызывающей `pick_media_file`.
     let dialog: IFileOpenDialog =
         unsafe { CoCreateInstance(&CLSID_FILE_OPEN_DIALOG, None, CLSCTX_INPROC_SERVER) }?;
 
-    let filter_name: Vec<u16> = IMAGE_FILTER_NAME
+    let image_filter_name: Vec<u16> = IMAGE_FILTER_NAME
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let filter_spec: Vec<u16> = IMAGE_FILTER_SPEC
+    let image_filter_spec: Vec<u16> = IMAGE_FILTER_SPEC
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let filters = [COMDLG_FILTERSPEC {
-        pszName: PCWSTR(filter_name.as_ptr()),
-        pszSpec: PCWSTR(filter_spec.as_ptr()),
-    }];
-    // SAFETY: `filters` содержит указатели в `filter_name`/`filter_spec`,
-    // оба живут до конца этой функции — дольше, чем нужен вызов.
+    let video_filter_name: Vec<u16> = VIDEO_FILTER_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let video_filter_spec_owned = video_filter_spec();
+    let video_filter_spec: Vec<u16> = video_filter_spec_owned
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let filters = [
+        COMDLG_FILTERSPEC {
+            pszName: PCWSTR(image_filter_name.as_ptr()),
+            pszSpec: PCWSTR(image_filter_spec.as_ptr()),
+        },
+        COMDLG_FILTERSPEC {
+            pszName: PCWSTR(video_filter_name.as_ptr()),
+            pszSpec: PCWSTR(video_filter_spec.as_ptr()),
+        },
+    ];
+    // SAFETY: `filters` содержит указатели в `image_filter_name`/
+    // `image_filter_spec`/`video_filter_name`/`video_filter_spec`, все живут
+    // до конца этой функции — дольше, чем нужен вызов.
     unsafe { dialog.SetFileTypes(&filters) }?;
-    // SAFETY: индексация фильтров у `IFileDialog` с единицы (не с нуля).
+    // SAFETY: индексация фильтров у `IFileDialog` с единицы (не с нуля) —
+    // 1 открывает диалог на фильтре «Images» по умолчанию.
     unsafe { dialog.SetFileTypeIndex(1) }?;
 
     let owner = if owner_hwnd.is_invalid() {
@@ -146,6 +181,17 @@ mod tests {
     }
 
     #[test]
+    fn video_filter_spec_covers_video_extensions() {
+        let spec = video_filter_spec();
+        for ext in VIDEO_EXTENSIONS {
+            assert!(
+                spec.contains(&format!("*.{ext}")),
+                "фильтр не содержит расширение {ext}"
+            );
+        }
+    }
+
+    #[test]
     fn filter_strings_are_null_terminated_when_encoded() {
         // То же преобразование, что и в `show_dialog`, — конечный элемент
         // должен быть 0 (PCWSTR читает до первого нуля).
@@ -159,10 +205,11 @@ mod tests {
 
     #[test]
     #[ignore = "открывает реальный системный диалог; запуск вручную: cargo test -p rst-win32 file_dialog -- --ignored"]
-    fn pick_image_file_manual_smoke() {
-        // Ручная проверка: диалог должен открыться с фильтром «Images» и
-        // вернуть выбранный путь либо `None` при отмене.
-        let result = pick_image_file(HWND::default());
+    fn pick_media_file_manual_smoke() {
+        // Ручная проверка: диалог должен открыться с фильтром «Images» (и
+        // доступным переключением на «Videos») и вернуть выбранный путь либо
+        // `None` при отмене.
+        let result = pick_media_file(HWND::default());
         assert!(result.is_ok(), "{result:?}");
     }
 }

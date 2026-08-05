@@ -232,6 +232,12 @@ pub enum MediaType {
     Video,
 }
 
+/// Расширения файлов, которые `rst-video`/FFmpeg открывает как видео (M5b) —
+/// общий список между диалогом выбора файла (`rst_win32::file_dialog`) и
+/// определением `MediaType` при добавлении стикера (`add_sticker`), чтобы
+/// они не разошлись.
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mkv", "mov", "avi"];
+
 /// Как искать окно для стикера-окна (CONFIG.md, «Совпадение окон»):
 /// указывается process_name и/или title_pattern ('*' — подстановка).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

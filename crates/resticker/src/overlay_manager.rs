@@ -30,12 +30,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use rst_audio::{AudioMixer, AudioSource};
 use rst_core::AnimationClock;
 use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{
     Config, MediaType, MonitorId, OverlapRule, Placement, Rect, Sticker, StickerSource, Transform,
-    VisibilityMode,
+    VIDEO_EXTENSIONS, VisibilityMode,
 };
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
@@ -48,9 +49,10 @@ use rst_media::animation as media_animation;
 use rst_media::paste;
 use rst_render::{
     Box2D, Button, Checkbox, Device, Icon, Key, NumericField, Panel, PointerEvent, Primitive,
-    RenderError, SelectionBox, Slider, Sprite, Texture, TextureAtlas, WidgetId, WindowTarget,
-    edit_overlay, marquee_visuals, rasterize, solid_sprite, theme,
+    RenderError, SelectionBox, Slider, Sprite, Texture, TextureAtlas, VideoTextures, WidgetId,
+    WindowTarget, edit_overlay, marquee_visuals, rasterize, solid_sprite, theme,
 };
+use rst_video::VideoSource;
 use rst_win32::clipboard::{self, ClipboardImage};
 use rst_win32::file_dialog;
 use rst_win32::hotkey::HotkeyCombo;
@@ -440,6 +442,15 @@ enum OverlayMessage {
 /// (M3_SESSION_SLEEP_REVIEW.md, пункт 2.2).
 const LOSS_TICK_PERIOD: Duration = Duration::from_secs(1);
 
+/// Период опроса `VideoSource::try_recv_frame`/`try_recv_audio_samples` при
+/// хотя бы одном играющем видео (M5b, docs/M5B_VIDEO_DESIGN.md §6) —
+/// переиспользует планировщик анимации (`anim_deadline_tx`/`AnimationTick`,
+/// M5a §5), просто как ещё один источник ближайшего дедлайна, а не отдельный
+/// поток: декодер сам держит темп по PTS (`rst_video::decoder::Pacing`),
+/// координатору не нужна точность лучше «часто достаточно, чтобы не
+/// заметить» — 60 Гц с запасом покрывает типичную частоту кадров видео.
+const VIDEO_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
 /// Ручка для отправки команд оверлей-потоку; `Drop` останавливает поток.
 pub struct OverlayHandle {
     tx: Sender<OverlayMessage>,
@@ -596,6 +607,13 @@ struct EditState {
     /// `run()` забирает его в `animations` сразу после обработки текущего
     /// сообщения, тем же паттерном, что `pending_open_picker`.
     pending_animation: Option<(Uuid, TextureAtlas)>,
+    /// Видео только что добавленного стикера (M5b, docs/M5B_VIDEO_DESIGN.md
+    /// §6) — тот же паттерн, что `pending_animation`: `add_sticker` открывает
+    /// `VideoSource`/`AudioSource` (нужен `Device`/`AudioMixer`, которых нет
+    /// в его вызывающем коде на этой глубине) и кладёт готовый `VideoPlayback`
+    /// сюда вместо прямой записи в `videos` (локальная переменная `run()`);
+    /// цикл `run()` забирает его сразу после обработки текущего сообщения.
+    pending_video: Option<(Uuid, VideoPlayback)>,
     /// Текущая рамка марки для отрисовки (`anchor_x, anchor_y, cur_x, cur_y`,
     /// DIP) — `None`, если марка не тянется в этот момент.
     marquee: Option<(f64, f64, f64, f64)>,
@@ -835,6 +853,22 @@ impl StickerAnimation {
     }
 }
 
+/// Видео одного стикера (M5b, docs/M5B_VIDEO_DESIGN.md §6): декодер-поток
+/// (`rst_video::VideoSource`) + источник звука в общем микшере процесса.
+/// Как и `StickerAnimation` — чисто runtime-состояние `run()`, не персистится
+/// (переживает вход/выход из режима редактирования, восстанавливается заново
+/// на старте/`resync_sprites`/`recover_device`).
+///
+/// `audio: None` — устройство вывода звука не открылось при старте
+/// (`AudioMixer::new()` вернул `Err`, см. `run()`): видео всё равно должно
+/// открываться и играть (пользовательское решение §0 — «никогда не
+/// отказывать»), просто без звука. Декодер отбрасывает нечитаемые порции
+/// звука сам (`try_send`, не блокирует), поэтому это безопасно.
+struct VideoPlayback {
+    source: VideoSource,
+    audio: Option<AudioSource>,
+}
+
 fn run(
     config_path: PathBuf,
     mut cfg: Config,
@@ -927,12 +961,32 @@ fn run(
     // рестарта процесса навсегда завис бы статичным кадром 0: без записи
     // в `animations` часы для него просто никогда бы не завелись (найдено
     // независимым ревью сшивки).
+    // Микшер звука (M5b, docs/M5B_VIDEO_DESIGN.md §4/§6) — один на процесс,
+    // как и `Device`. Неудача (нет устройства вывода/оно занято) не фатальна
+    // для всего оверлея — видео должно открываться и играть в любом случае
+    // (пользовательское решение §0), просто без звука (см. доккомент
+    // `VideoPlayback::audio`); поэтому `Option`, а не пробрасываем `Err` из
+    // `run()` целиком, как для `Device`.
+    let audio_mixer = match AudioMixer::new() {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!(error = %e, "не удалось открыть аудиоустройство — видео будут играть без звука");
+            None
+        }
+    };
+
     let mut sprites: Vec<(Uuid, Sprite)> = Vec::new();
     let mut animations: HashMap<Uuid, StickerAnimation> = HashMap::new();
+    let mut videos: HashMap<Uuid, VideoPlayback> = HashMap::new();
     for sticker in &cfg.stickers {
         if let Some((sprite, anim)) = load_sticker_sprite(&device, sticker) {
             sprites.push((sticker.id, sprite));
             animations.insert(sticker.id, anim);
+        } else if let Some((sprite, playback)) =
+            load_sticker_video(&device, sticker, audio_mixer.as_ref())
+        {
+            sprites.push((sticker.id, sprite));
+            videos.insert(sticker.id, playback);
         } else if let Some(sprite) = load_static_sprite(&device, sticker) {
             sprites.push((sticker.id, sprite));
         }
@@ -1131,6 +1185,7 @@ fn run(
         window_picker: None,
         pending_open_picker: None,
         pending_animation: None,
+        pending_video: None,
         marquee: None,
         marquee_started: false,
         toolbar: None,
@@ -1172,6 +1227,8 @@ fn run(
             &cfg,
             &mut ui_cache,
             &mut animations,
+            &mut videos,
+            audio_mixer.as_ref(),
         ) {
             redraw_all(
                 &device,
@@ -1211,6 +1268,7 @@ fn run(
                         false,
                         ms.scale,
                         &primary_id,
+                        audio_mixer.as_ref(),
                     );
                 }
                 need_redraw = true;
@@ -1230,6 +1288,8 @@ fn run(
                     &mut cfg,
                     &mut sprites,
                     &mut animations,
+                    &mut videos,
+                    audio_mixer.as_ref(),
                     &renderer,
                     &config_path,
                     &monitor_geometry,
@@ -1667,6 +1727,8 @@ fn run(
                     &window_snapshot,
                     &mut occluder_cache,
                     &mut animations,
+                    &mut videos,
+                    audio_mixer.as_ref(),
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Key { .. }) => {}
@@ -1695,6 +1757,8 @@ fn run(
                     &window_snapshot,
                     &mut occluder_cache,
                     &mut animations,
+                    &mut videos,
+                    audio_mixer.as_ref(),
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
@@ -1747,6 +1811,36 @@ fn run(
                         need_redraw = true;
                     }
                 }
+                // Видео (M5b, docs/M5B_VIDEO_DESIGN.md §6): декодер сам держит
+                // темп по PTS в своём потоке, координатор здесь только
+                // выкачивает уже готовые кадры/звук неблокирующе. Кадры
+                // копятся в очереди на 2-3 — берём ТОЛЬКО последний
+                // (остальные устарели к моменту показа), а звук отдаём
+                // микшеру целиком, по порядку, ни одной порции не пропуская.
+                for (id, playback) in videos.iter_mut() {
+                    let mut latest = None;
+                    while let Some(frame) = playback.source.try_recv_frame() {
+                        latest = Some(frame);
+                    }
+                    if let Some(frame) = latest {
+                        if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| sid == id) {
+                            if let Some(video) = &mut sprite.video {
+                                if let Err(e) = device
+                                    .update_video_textures(video, &frame.y, &frame.u, &frame.v)
+                                {
+                                    tracing::warn!(error = %e, sticker = %id, "не удалось обновить видеотекстуры");
+                                } else {
+                                    need_redraw = true;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(audio) = &playback.audio {
+                        while let Some(chunk) = playback.source.try_recv_audio_samples() {
+                            audio.push_samples(&chunk.samples);
+                        }
+                    }
+                }
             }
         }
         // Атлас только что добавленной анимации (M5a §5, EditState::
@@ -1762,11 +1856,19 @@ fn run(
                 },
             );
         }
-        // Стикер мог быть удалён (тулбар/`Delete`/undo-redo) — прунить раз
+        // `VideoPlayback` только что добавленного видеостикера (M5b, то же
+        // паттерн — см. доккомент `EditState::pending_video`).
+        if let Some((id, playback)) = edit.pending_video.take() {
+            videos.insert(id, playback);
+        }
+        // Стикер мог быть удалён (тулбар/`Delete`/undo-редо) — прунить раз
         // за итерацию, тем же дешёвым паттерном, что гейт `mask_needed`
         // ниже, а не в каждой из точек мутации `cfg.stickers` по отдельности.
         if !animations.is_empty() {
             animations.retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
+        }
+        if !videos.is_empty() {
+            videos.retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
         }
         // Ближайший дедлайн среди анимаций, которым сейчас положено тикать —
         // пересчитывается после каждого сообщения (не только `AnimationTick`:
@@ -1775,6 +1877,14 @@ fn run(
         // анимаций или окклюдеры). Не шлём планировщику, пока сессия
         // заблокирована (см. `SessionLocked`) — и не шлём, если значение не
         // изменилось, чтобы не будить поток-планировщик впустую.
+        //
+        // Видео (M5b) участвует тем же дедлайном: пока играет хоть одно
+        // видео, планировщику нужен ближайший тик не позже, чем через
+        // `VIDEO_POLL_INTERVAL` — иначе `try_recv_frame` не вызывался бы
+        // вовсе между несвязанными UI-событиями, и видео визуально
+        // подвисало бы. На паузе у видео нет дедлайна вообще (новых кадров
+        // не будет, опрашивать нечего) — тот же принцип «не тикать вникуда»,
+        // что и у анимации.
         let next_anim_deadline = if session_locked {
             None
         } else {
@@ -1787,9 +1897,20 @@ fn run(
                 })
                 .min()
         };
-        if next_anim_deadline != last_anim_deadline {
-            last_anim_deadline = next_anim_deadline;
-            let _ = anim_deadline_tx.send(next_anim_deadline);
+        let next_video_deadline = if session_locked {
+            None
+        } else if videos.values().any(|v| !v.source.is_paused()) {
+            Some(Instant::now() + VIDEO_POLL_INTERVAL)
+        } else {
+            None
+        };
+        let next_tick_deadline = [next_anim_deadline, next_video_deadline]
+            .into_iter()
+            .flatten()
+            .min();
+        if next_tick_deadline != last_anim_deadline {
+            last_anim_deadline = next_tick_deadline;
+            let _ = anim_deadline_tx.send(next_tick_deadline);
         }
         // Открытие панели выбора окон отложено до этой точки — кликом по
         // `TB_LAYERS` в `handle_toolbar_up`, у которого нет `window_snapshot`
@@ -1839,6 +1960,8 @@ fn run(
                 &cfg,
                 &mut ui_cache,
                 &mut animations,
+                &mut videos,
+                audio_mixer.as_ref(),
             ) {
                 device_needs_recovery = false;
                 redraw_all(
@@ -1871,6 +1994,8 @@ fn toggle_edit_mode(
     cfg: &mut Config,
     sprites: &mut Vec<(Uuid, Sprite)>,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
     renderer: &Renderer,
     config_path: &Path,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
@@ -1897,7 +2022,7 @@ fn toggle_edit_mode(
     // следующем клике тулбара (docs/M2_SLICE6_REVIEW.md, пункт 2.1).
     if let Some(before) = edit.ui_pending_snapshot.take() {
         *cfg = before;
-        resync_sprites(renderer, cfg, sprites, animations);
+        resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
     }
     edit.pointer_owner = PointerOwner::None;
     // Открытый модал не переживает выход из режима — как и незавершённый
@@ -1906,6 +2031,7 @@ fn toggle_edit_mode(
     edit.window_picker = None;
     edit.pending_open_picker = None;
     edit.pending_animation = None;
+    edit.pending_video = None;
     edit.active = !edit.active;
     overlay.set_click_through(!edit.active);
     if !edit.active {
@@ -1938,8 +2064,11 @@ fn resync_sprites(
     cfg: &Config,
     sprites: &mut Vec<(Uuid, Sprite)>,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
 ) {
     sprites.retain(|(id, _)| cfg.stickers.iter().any(|s| s.id == *id));
+    videos.retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
     for sticker in &cfg.stickers {
         if let Some((_, sprite)) = sprites.iter_mut().find(|(id, _)| *id == sticker.id) {
             sprite.placement = sticker.placement.clone();
@@ -1952,10 +2081,17 @@ fn resync_sprites(
         // `None` (не анимация/ошибка декода) — обычная статика через
         // `load_static_sprite`, той же логикой, что старт процесса и
         // `recover_device` (иначе именно этот путь молча терял анимацию —
-        // найдено независимым ревью сшивки).
+        // найдено независимым ревью сшивки). Видео (M5b) — той же логикой,
+        // отдельной веткой (взаимоисключающие `MediaType`, `load_sticker_video`
+        // сама возвращает `None` для не-видео).
         if let Some((sprite, anim)) = load_sticker_sprite(renderer.device, sticker) {
             sprites.push((sticker.id, sprite));
             animations.insert(sticker.id, anim);
+        } else if let Some((sprite, playback)) =
+            load_sticker_video(renderer.device, sticker, audio_mixer)
+        {
+            sprites.push((sticker.id, sprite));
+            videos.insert(sticker.id, playback);
         } else if let Some(sprite) = load_static_sprite(renderer.device, sticker) {
             sprites.push((sticker.id, sprite));
         }
@@ -2027,6 +2163,84 @@ fn load_sticker_sprite(device: &Device, sticker: &Sticker) -> Option<(Sprite, St
     None
 }
 
+/// Пустые (чёрные) видеотекстуры нужного размера — до первого декодированного
+/// кадра (декодер работает в своём потоке и не гарантирует кадр сразу же,
+/// как `VideoSource::open*` вернулся, docs/M5B_VIDEO_DESIGN.md §6): спрайт
+/// нужно чем-то залить уже сейчас, `VideoTick` заменит их первым же реальным
+/// кадром. Нулевые Y/U/V после BT.709-конверсии в шейдере дают чёрный —
+/// тот же приемлемый плейсхолдер, что и «чёрный фон» для альфа-видео (§0).
+fn blank_video_textures(
+    device: &Device,
+    width: u32,
+    height: u32,
+) -> Result<VideoTextures, RenderError> {
+    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+    let y = vec![0u8; (width * height) as usize];
+    let u = vec![0u8; (cw * ch) as usize];
+    let v = vec![0u8; (cw * ch) as usize];
+    device.create_video_textures(&y, &u, &v, width, height)
+}
+
+/// Открыть видеопоток стикера (M5b, docs/M5B_VIDEO_DESIGN.md §6): декодер
+/// `rst-video` + источник звука общего микшера процесса, если он есть
+/// (`mixer: None` — устройство вывода не открылось при старте, видео всё
+/// равно играет, просто без звука, см. доккомент `VideoPlayback::audio`).
+/// Открытие видео с альфа-каналом никогда не отклоняется — альфа-плоскость
+/// декодер просто не читает (пользовательское решение §0).
+fn load_sticker_video(
+    device: &Device,
+    sticker: &Sticker,
+    mixer: Option<&AudioMixer>,
+) -> Option<(Sprite, VideoPlayback)> {
+    let path = sticker_image_path(&sticker.source)?;
+    let is_video = matches!(
+        &sticker.source,
+        StickerSource::File {
+            media_type: MediaType::Video,
+            ..
+        }
+    );
+    if !is_video {
+        return None;
+    }
+    let opened = match mixer {
+        Some(m) => VideoSource::open_with_audio_target(path, m.sample_rate(), m.channels()),
+        None => VideoSource::open(path),
+    };
+    let source = match opened {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "не удалось открыть видео");
+            return None;
+        }
+    };
+    let (width, height) = source.dimensions();
+    let textures = match blank_video_textures(device, width, height) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "не удалось создать видеотекстуры");
+            return None;
+        }
+    };
+    let audio = mixer.map(|m| {
+        let a = m.add_source(sticker.id);
+        a.set_volume(sticker.playback.volume as f32);
+        a
+    });
+    if sticker.playback.paused {
+        source.pause();
+    } else {
+        source.play();
+    }
+    let sprite = Sprite::new(
+        textures.y.clone(),
+        sticker.placement.clone(),
+        sticker.transform,
+    )
+    .with_video(textures);
+    Some((sprite, VideoPlayback { source, audio }))
+}
+
 /// Загрузить статичную текстуру стикера (без анимации) — общий хвост между
 /// [`load_sticker_sprite`] на неудаче/не-анимации и всеми точками, которым
 /// сама анимация не нужна.
@@ -2086,6 +2300,8 @@ fn perform_undo(
     window_snapshot: &[WindowInfo],
     occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
 ) -> bool {
     let Some(prev) = edit.undo_stack.pop() else {
         return false;
@@ -2100,7 +2316,7 @@ fn perform_undo(
     edit.ui_pending_snapshot = None;
     edit.pointer_owner = PointerOwner::None;
     edit.redo_stack.push(std::mem::replace(cfg, prev));
-    resync_sprites(renderer, cfg, sprites, animations);
+    resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
     edit.selection.prune(&cfg.stickers);
     if let Err(e) = config::save(cfg, config_path) {
         tracing::warn!(error = %e, "не удалось сохранить config.json после отмены");
@@ -2125,6 +2341,8 @@ fn perform_redo(
     window_snapshot: &[WindowInfo],
     occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
 ) -> bool {
     let Some(next) = edit.redo_stack.pop() else {
         return false;
@@ -2137,7 +2355,7 @@ fn perform_redo(
         edit.undo_stack.remove(0);
     }
     edit.undo_stack.push(std::mem::replace(cfg, next));
-    resync_sprites(renderer, cfg, sprites, animations);
+    resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
     edit.selection.prune(&cfg.stickers);
     if let Err(e) = config::save(cfg, config_path) {
         tracing::warn!(error = %e, "не удалось сохранить config.json после повтора");
@@ -2161,6 +2379,8 @@ fn begin_delete(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
     center: (f64, f64),
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
     monitor_id: &MonitorId,
@@ -2182,7 +2402,7 @@ fn begin_delete(
             let _ = ops::delete(cfg, id);
         }
         edit.selection.prune(&cfg.stickers);
-        resync_sprites(renderer, cfg, sprites, animations);
+        resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после удаления");
         }
@@ -2213,6 +2433,8 @@ fn handle_key(
     window_snapshot: &[WindowInfo],
     occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
 ) -> bool {
     // История/удаление/дублирование во время активного жеста (сцены или
     // панели — ползунок прозрачности тоже держит указатель) мутировали бы
@@ -2303,6 +2525,8 @@ fn handle_key(
                 cfg,
                 sprites,
                 animations,
+                videos,
+                audio_mixer,
                 renderer,
                 config_path,
                 monitor_geometry,
@@ -2320,6 +2544,8 @@ fn handle_key(
                 window_snapshot,
                 occluder_cache,
                 animations,
+                videos,
+                audio_mixer,
             );
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
@@ -2335,6 +2561,8 @@ fn handle_key(
                 window_snapshot,
                 occluder_cache,
                 animations,
+                videos,
+                audio_mixer,
             );
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
@@ -2350,6 +2578,8 @@ fn handle_key(
                 window_snapshot,
                 occluder_cache,
                 animations,
+                videos,
+                audio_mixer,
             );
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
@@ -2368,6 +2598,8 @@ fn handle_key(
                 config_path,
                 sprites,
                 animations,
+                videos,
+                audio_mixer,
                 center,
                 monitor_geometry,
                 monitor_id,
@@ -2384,7 +2616,7 @@ fn handle_key(
                     new_ids.push(new_id);
                 }
             }
-            resync_sprites(renderer, cfg, sprites, animations);
+            resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
             edit.selection.clear();
             for id in new_ids {
                 edit.selection.select(id);
@@ -2404,6 +2636,7 @@ fn handle_key(
             edit,
             scale,
             monitor_id,
+            audio_mixer,
         ),
         _ => false,
     }
@@ -2443,6 +2676,7 @@ fn paste_from_clipboard(
     edit: &mut EditState,
     scale: f32,
     monitor_id: &MonitorId,
+    audio_mixer: Option<&AudioMixer>,
 ) -> bool {
     let image = match clipboard::read_image() {
         Ok(Some(image)) => image,
@@ -2480,6 +2714,7 @@ fn paste_from_clipboard(
                     false,
                     scale,
                     monitor_id,
+                    audio_mixer,
                 ) {
                     added = true;
                 }
@@ -2507,6 +2742,7 @@ fn paste_from_clipboard(
                         true,
                         scale,
                         monitor_id,
+                        audio_mixer,
                     ) {
                         commit_undo_snapshot(edit, before);
                         true
@@ -3421,6 +3657,8 @@ fn handle_toolbar_up(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
     pos: (f64, f64),
     overlay_size: (u32, u32),
     scale: f32,
@@ -3513,7 +3751,7 @@ fn handle_toolbar_up(
     if clicked(edit, toolbar::TB_DUPLICATE) {
         commit_undo_snapshot(edit, cfg.clone());
         if let Ok(new_id) = ops::duplicate(cfg, id) {
-            resync_sprites(renderer, cfg, sprites, animations);
+            resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
             edit.selection.click(Some(new_id));
         }
         if let Err(e) = config::save(cfg, config_path) {
@@ -3531,10 +3769,35 @@ fn handle_toolbar_up(
             config_path,
             sprites,
             animations,
+            videos,
+            audio_mixer,
             center,
             monitor_geometry,
             monitor_id,
         );
+    }
+    // Play/pause (M5b): иконка кнопки отражает действие (см. build_toolbar),
+    // а состояние — `sticker.playback.paused`, источник истины. Живой
+    // `VideoSource` синхронизируется здесь ЖЕ, а не наоборот (доккомент
+    // `VideoPlayback`) — `videos.get` может быть `None`, если видео не
+    // открылось (не блокирует переключение флага в конфиге).
+    if clicked(edit, toolbar::TB_PLAY_PAUSE) {
+        commit_undo_snapshot(edit, cfg.clone());
+        if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
+            sticker.playback.paused = !sticker.playback.paused;
+            if let Some(playback) = videos.get(&id) {
+                if sticker.playback.paused {
+                    playback.source.pause();
+                } else {
+                    playback.source.play();
+                }
+            }
+        }
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после паузы/воспроизведения видео");
+        }
+        rebuild_ui_panels(edit, cfg, monitor_geometry);
+        return true;
     }
     true
 }
@@ -3555,8 +3818,9 @@ fn add_sticker_from_dialog(
     edit: &mut EditState,
     scale: f32,
     monitor_id: &MonitorId,
+    audio_mixer: Option<&AudioMixer>,
 ) {
-    match file_dialog::pick_image_file(overlay.hwnd()) {
+    match file_dialog::pick_media_file(overlay.hwnd()) {
         Ok(Some(path)) => {
             let before = cfg.clone();
             if add_sticker(
@@ -3570,6 +3834,7 @@ fn add_sticker_from_dialog(
                 false,
                 scale,
                 monitor_id,
+                audio_mixer,
             ) {
                 commit_undo_snapshot(edit, before);
             }
@@ -3590,6 +3855,8 @@ fn handle_cursor_panel_up(
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
     pos: (f64, f64),
     overlay_size: (u32, u32),
     scale: f32,
@@ -3616,6 +3883,7 @@ fn handle_cursor_panel_up(
             edit,
             scale,
             monitor_id,
+            audio_mixer,
         );
         let screen = screen_dip_rect(overlay_size, scale);
         rebuild_cursor_panel(edit, cfg, &screen);
@@ -3646,6 +3914,8 @@ fn handle_cursor_panel_up(
             cfg,
             sprites,
             animations,
+            videos,
+            audio_mixer,
             renderer,
             config_path,
             monitor_geometry,
@@ -3690,6 +3960,47 @@ fn poll_toolbar_opacity_live(
     }
 }
 
+/// Опросить ползунок громкости тулбара (M5b) на каждом `MouseMove`, пока
+/// перетаскивание держит его — тот же паттерн живого применения, что у
+/// прозрачности (`poll_toolbar_opacity_live`): снимок для undo коммитит общий
+/// код `handle_toolbar_up` на `MouseUp` (генерически, по `ui_pending_snapshot`,
+/// не завязан на конкретный виджет); здесь — только живое применение к
+/// `sticker.playback.volume` и реальному `AudioSource`, чтобы пользователь
+/// слышал результат перетаскивания сразу, а не после отпускания.
+fn poll_toolbar_volume_live(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    videos: &HashMap<Uuid, VideoPlayback>,
+) {
+    let Some(id) = single_selected_id(&edit.selection) else {
+        return;
+    };
+    let value = {
+        let Some(panel) = &mut edit.toolbar else {
+            return;
+        };
+        let Some(slider) = panel.widget_mut::<Slider>(toolbar::TB_VOLUME) else {
+            return;
+        };
+        let Some(v) = slider.take_changed() else {
+            return;
+        };
+        v
+    };
+    if edit.ui_pending_snapshot.is_none() {
+        edit.ui_pending_snapshot = Some(cfg.clone());
+    }
+    let volume = f64::from(value.min(100)) / 100.0;
+    if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
+        sticker.playback.volume = volume;
+    }
+    if let Some(playback) = videos.get(&id) {
+        if let Some(audio) = &playback.audio {
+            audio.set_volume(volume as f32);
+        }
+    }
+}
+
 /// Обработать событие мыши в режиме редактирования. Возвращает `true`, если
 /// нужна перерисовка (docs/M2_INTEGRATION_PLAN.md, раздел 6/8).
 #[allow(clippy::too_many_arguments)]
@@ -3710,6 +4021,8 @@ fn handle_input(
     window_snapshot: &[WindowInfo],
     occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
 ) -> bool {
     let monitor = DipRect::new(
         0.0,
@@ -3905,6 +4218,7 @@ fn handle_input(
                         });
                     }
                     poll_toolbar_opacity_live(edit, cfg, sprites);
+                    poll_toolbar_volume_live(edit, cfg, videos);
                     return true;
                 }
                 PointerOwner::WindowPicker => {
@@ -4042,7 +4356,7 @@ fn handle_input(
                         let _ = ops::delete(cfg, *id);
                     }
                     edit.selection.prune(&cfg.stickers);
-                    resync_sprites(renderer, cfg, sprites, animations);
+                    resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
                     if let Err(e) = config::save(cfg, config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить config.json после удаления через диалог");
                     }
@@ -4089,6 +4403,8 @@ fn handle_input(
                         config_path,
                         sprites,
                         animations,
+                        videos,
+                        audio_mixer,
                         (dip_x, dip_y),
                         overlay_size,
                         scale,
@@ -4105,6 +4421,8 @@ fn handle_input(
                         config_path,
                         sprites,
                         animations,
+                        videos,
+                        audio_mixer,
                         (dip_x, dip_y),
                         overlay_size,
                         scale,
@@ -4271,7 +4589,7 @@ fn handle_input(
             ) {
                 if let Some(before) = edit.ui_pending_snapshot.take() {
                     *cfg = before;
-                    resync_sprites(renderer, cfg, sprites, animations);
+                    resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
                 }
                 edit.pointer_owner = PointerOwner::None;
                 rebuild_ui_panels(edit, cfg, monitor_geometry);
@@ -4797,6 +5115,8 @@ fn recover_device(
     cfg: &Config,
     ui_cache: &mut UiTextureCache,
     animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
 ) -> bool {
     tracing::warn!("D3D-устройство потеряно — пересоздаю устройство и все GPU-ресурсы");
     let new_device = match Device::new() {
@@ -4846,12 +5166,42 @@ fn recover_device(
     // вместе с ним. Фаза анимации (текущий кадр) намеренно НЕ сохраняется
     // через потерю устройства — редкое событие (сброс GPU-драйвера),
     // рестарт с кадра 0 неотличим на глаз от короткого сбоя рендера.
+    //
+    // Видео (M5b) — иначе: декодер-поток (`VideoSource`) и звук
+    // (`AudioSource`) живут независимо от D3D-устройства и потерю не
+    // замечают вообще, `videos` НЕ чистится — только GPU-текстуры кадра
+    // (`VideoTextures`) пересоздаются на новом устройстве, файл не
+    // переоткрывается (в отличие от атласа анимации, у видео нет
+    // фиксированного набора кадров, которые можно перезалить один раз;
+    // переоткрытие потеряло бы текущую позицию воспроизведения без нужды).
     sprites.clear();
     animations.clear();
+    videos.retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
     for sticker in &cfg.stickers {
         if let Some((sprite, anim)) = load_sticker_sprite(&new_device, sticker) {
             sprites.push((sticker.id, sprite));
             animations.insert(sticker.id, anim);
+        } else if let Some(playback) = videos.get(&sticker.id) {
+            let (w, h) = playback.source.dimensions();
+            match blank_video_textures(&new_device, w, h) {
+                Ok(textures) => {
+                    let sprite = Sprite::new(
+                        textures.y.clone(),
+                        sticker.placement.clone(),
+                        sticker.transform,
+                    )
+                    .with_video(textures);
+                    sprites.push((sticker.id, sprite));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, sticker = %sticker.id, "не удалось пересоздать видеотекстуры после потери устройства");
+                }
+            }
+        } else if let Some((sprite, playback)) =
+            load_sticker_video(&new_device, sticker, audio_mixer)
+        {
+            sprites.push((sticker.id, sprite));
+            videos.insert(sticker.id, playback);
         } else if let Some(sprite) = load_static_sprite(&new_device, sticker) {
             sprites.push((sticker.id, sprite));
         }
@@ -4880,7 +5230,35 @@ fn add_sticker(
     pasted: bool,
     scale: f32,
     monitor_id: &MonitorId,
+    audio_mixer: Option<&AudioMixer>,
 ) -> bool {
+    // Видео (M5b, docs/M5B_VIDEO_DESIGN.md §6) — отдельная ветка целиком, до
+    // попытки декодировать как изображение/анимацию, и решается по
+    // расширению (у видеоконтейнеров нет общего с изображениями декодера,
+    // который мог бы просто вернуть `None`, как для анимации). Вставка из
+    // буфера (`pasted`) никогда не несёт видео — `ClipboardImage` их не
+    // возвращает, `CF_HDROP`-пути тоже отфильтрованы `is_supported_image`
+    // раньше, чем дойти сюда.
+    if !pasted {
+        let is_video = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| VIDEO_EXTENSIONS.iter().any(|v| v.eq_ignore_ascii_case(ext)));
+        if is_video {
+            return add_video_sticker(
+                overlay,
+                renderer,
+                cfg,
+                config_path,
+                sprites,
+                edit,
+                path,
+                scale,
+                monitor_id,
+                audio_mixer,
+            );
+        }
+    }
     // Анимация — только для обычных файлов (M5a, docs/M5A_ANIMATION_DESIGN.md
     // §5): вставка из буфера (`pasted`) материализует растровые данные
     // (CF_DIBV5) как одиночный PNG в `StickerSource::Pasted`, который вообще
@@ -4971,6 +5349,80 @@ fn add_sticker(
     if let Some(atlas) = atlas {
         edit.pending_animation = Some((id, atlas));
     }
+    true
+}
+
+/// Добавить видеостикер (M5b, docs/M5B_VIDEO_DESIGN.md §6) — открытие
+/// `VideoSource`/добавление `AudioSource` идёт до создания `Sticker`
+/// (нужны реальные размеры кадра для `placement`), тем же порядком, что и
+/// декодирование картинки/анимации в `add_sticker`. Видео с альфа-каналом
+/// никогда не отклоняется (§0) — сам декодер альфа-плоскость не читает.
+/// `VideoPlayback` кладётся в `edit.pending_video`, а не напрямую в `videos`
+/// (локальная переменная цикла `run()`, недоступная на этой глубине вызова)
+/// — тот же паттерн, что `pending_animation`.
+#[allow(clippy::too_many_arguments)]
+fn add_video_sticker(
+    overlay: &OverlayWindow,
+    renderer: &mut Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    edit: &mut EditState,
+    path: PathBuf,
+    scale: f32,
+    monitor_id: &MonitorId,
+    audio_mixer: Option<&AudioMixer>,
+) -> bool {
+    let opened = match audio_mixer {
+        Some(m) => VideoSource::open_with_audio_target(&path, m.sample_rate(), m.channels()),
+        None => VideoSource::open(&path),
+    };
+    let source = match opened {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "не удалось открыть видео");
+            return false;
+        }
+    };
+    let (w, h) = source.dimensions();
+    let textures = match blank_video_textures(renderer.device, w, h) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "не удалось создать видеотекстуры");
+            return false;
+        }
+    };
+    let (screen_w, screen_h) = overlay.size();
+    let (center_x, center_y) = (
+        screen_w as f64 / scale as f64 / 2.0,
+        screen_h as f64 / scale as f64 / 2.0,
+    );
+    let sticker = Sticker::new_file(
+        path,
+        MediaType::Video,
+        monitor_id.clone(),
+        center_x,
+        center_y,
+        w as f64,
+        h as f64,
+    );
+    let id = sticker.id;
+    let sprite = Sprite::new(
+        textures.y.clone(),
+        sticker.placement.clone(),
+        sticker.transform,
+    )
+    .with_video(textures);
+    // Новый стикер всегда со свежим `PlaybackSettings::default()` (играет,
+    // громкость 1.0) — то же стартовое состояние, что и у только что
+    // созданного `AudioSource`/`VideoSource`, явно применять нечего.
+    let audio = audio_mixer.map(|m| m.add_source(id));
+    cfg.stickers.push(sticker);
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, "не удалось сохранить config.json после добавления стикера");
+    }
+    sprites.push((id, sprite));
+    edit.pending_video = Some((id, VideoPlayback { source, audio }));
     true
 }
 

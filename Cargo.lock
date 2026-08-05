@@ -2790,9 +2790,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "rst-audio",
  "rst-core",
  "rst-media",
  "rst-render",
+ "rst-video",
  "rst-win32",
  "tauri",
  "tauri-build",
