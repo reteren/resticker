@@ -1793,12 +1793,8 @@ fn run(
                     let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) else {
                         continue;
                     };
-                    if !animation_should_tick(
-                        sticker,
-                        edit.active,
-                        &occluder_cache,
-                        &monitor_bounds,
-                    ) {
+                    if !sticker_should_tick(sticker, edit.active, &occluder_cache, &monitor_bounds)
+                    {
                         continue;
                     }
                     let delays = anim.frame_delays();
@@ -1870,6 +1866,37 @@ fn run(
         if !videos.is_empty() {
             videos.retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
         }
+        // Синхронизация Config → живые VideoSource/AudioSource (M5b) —
+        // единая точка входа вместо разбросанных вызовов source.play()/
+        // pause()/audio.set_volume() по местам мутации cfg (тулбар, undo/
+        // redo, Esc-откат, CaptureLost): раньше откат cfg (Ctrl+Z после
+        // паузы тулбаром, Esc после драга громкости) восстанавливал
+        // playback.paused/volume в конфиге, но не толкал их в живые
+        // источники — тулбар показывал одно состояние, видео/звук вели
+        // себя по другому (независимое ревью сшивки, находка 1). Играть
+        // должно ТОЛЬКО когда пользователь не поставил паузу, стикер сейчас
+        // видим (то же «не декодировать невидимое», что у анимации,
+        // `sticker_should_tick`) и сессия не заблокирована — иначе
+        // перекрытый/скрытый стикер продолжал бы декодировать, играть звук
+        // и держать координатор на `VIDEO_POLL_INTERVAL`-пробуждениях
+        // впустую (то же ревью, находка 2).
+        for (id, playback) in videos.iter_mut() {
+            let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) else {
+                continue;
+            };
+            let should_play = !session_locked
+                && !sticker.playback.paused
+                && sticker_should_tick(sticker, edit.active, &occluder_cache, &monitor_bounds);
+            let currently_playing = !playback.source.is_paused();
+            if should_play && !currently_playing {
+                playback.source.play();
+            } else if !should_play && currently_playing {
+                playback.source.pause();
+            }
+            if let Some(audio) = &playback.audio {
+                audio.set_volume(sticker.playback.volume as f32);
+            }
+        }
         // Ближайший дедлайн среди анимаций, которым сейчас положено тикать —
         // пересчитывается после каждого сообщения (не только `AnimationTick`:
         // добавление/удаление стикера, скрытие/показ, любая мутация правила
@@ -1892,7 +1919,7 @@ fn run(
                 .iter()
                 .filter_map(|(id, anim)| {
                     let sticker = cfg.stickers.iter().find(|s| s.id == *id)?;
-                    animation_should_tick(sticker, edit.active, &occluder_cache, &monitor_bounds)
+                    sticker_should_tick(sticker, edit.active, &occluder_cache, &monitor_bounds)
                         .then(|| anim.clock.next_deadline(&anim.frame_delays()))
                 })
                 .min()
@@ -3108,14 +3135,17 @@ fn sticker_fully_covered(placement: &Placement, rotation: f64, scale: f32, rects
         .any(|r| rect_contains(&r, &px))
 }
 
-/// Должна ли анимация стикера сейчас тикать (M5a, ARCHITECTURE.md §4.3 —
-/// не декодировать невидимое): `false` для скрытого (`!visible`) или
-/// полностью перекрытого маской стикера — тот же консервативный предикат,
-/// что отсечение в `redraw()` (`sticker_fully_covered`), но не привязанный к
-/// конкретному монитору/кадру рендера — планировщик анимации глобален для
-/// `run()`. В режиме редактирования маска выключена (M4) — тикает всегда,
-/// пока видим.
-fn animation_should_tick(
+/// Видим ли стикер прямо сейчас (M5a/M5b, ARCHITECTURE.md §4.3 — не
+/// декодировать невидимое): `false` для скрытого (`!visible`) или полностью
+/// перекрытого маской стикера — тот же консервативный предикат, что
+/// отсечение в `redraw()` (`sticker_fully_covered`), но не привязанный к
+/// конкретному монитору/кадру рендера. В режиме редактирования маска
+/// выключена (M4) — тикает всегда, пока видим. Общий вход для планировщика
+/// анимации (M5a — продвигать часы) и синхронизации play/pause видео (M5b —
+/// декодер должен играть звук и жечь CPU только пока есть смысл); был
+/// специфичен только под анимацию (`animation_should_tick`), переименован
+/// при добавлении второго вызывающего.
+fn sticker_should_tick(
     sticker: &Sticker,
     edit_active: bool,
     occluder_cache: &HashMap<MonitorId, Vec<OccluderSet>>,
@@ -3777,21 +3807,18 @@ fn handle_toolbar_up(
         );
     }
     // Play/pause (M5b): иконка кнопки отражает действие (см. build_toolbar),
-    // а состояние — `sticker.playback.paused`, источник истины. Живой
-    // `VideoSource` синхронизируется здесь ЖЕ, а не наоборот (доккомент
-    // `VideoPlayback`) — `videos.get` может быть `None`, если видео не
-    // открылось (не блокирует переключение флага в конфиге).
+    // а состояние — `sticker.playback.paused`, единственный источник истины.
+    // Живой `VideoSource` НЕ трогается здесь напрямую — единая
+    // синхронизация cfg → живые источники в `run()` (после каждого
+    // сообщения, тот же проход, что видимость/окклюдеры) применит его сама
+    // на этой же итерации; раньше прямой вызов `source.play()/pause()`
+    // отсюда был одним из нескольких мест, которые был обязаны знать о
+    // живом источнике, и путь отката (Ctrl+Z) о нём не знал — тулбар и
+    // реальное состояние расходились (независимое ревью сшивки).
     if clicked(edit, toolbar::TB_PLAY_PAUSE) {
         commit_undo_snapshot(edit, cfg.clone());
         if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
             sticker.playback.paused = !sticker.playback.paused;
-            if let Some(playback) = videos.get(&id) {
-                if sticker.playback.paused {
-                    playback.source.pause();
-                } else {
-                    playback.source.play();
-                }
-            }
         }
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после паузы/воспроизведения видео");
@@ -3964,14 +3991,14 @@ fn poll_toolbar_opacity_live(
 /// перетаскивание держит его — тот же паттерн живого применения, что у
 /// прозрачности (`poll_toolbar_opacity_live`): снимок для undo коммитит общий
 /// код `handle_toolbar_up` на `MouseUp` (генерически, по `ui_pending_snapshot`,
-/// не завязан на конкретный виджет); здесь — только живое применение к
-/// `sticker.playback.volume` и реальному `AudioSource`, чтобы пользователь
-/// слышал результат перетаскивания сразу, а не после отпускания.
-fn poll_toolbar_volume_live(
-    edit: &mut EditState,
-    cfg: &mut Config,
-    videos: &HashMap<Uuid, VideoPlayback>,
-) {
+/// не завязан на конкретный виджет); здесь — только `sticker.playback.volume`.
+/// Реальный `AudioSource` НЕ трогается напрямую — единая синхронизация cfg →
+/// живые источники в `run()` (после каждого сообщения, включая это
+/// `MouseMove`) применит громкость на этой же итерации, до следующего
+/// redraw — так же слышно сразу, но без второго места, которое обязано
+/// помнить о живом источнике (независимое ревью сшивки, находка про откат
+/// драга громкости через `Esc`, который применял cfg, но не звук).
+fn poll_toolbar_volume_live(edit: &mut EditState, cfg: &mut Config) {
     let Some(id) = single_selected_id(&edit.selection) else {
         return;
     };
@@ -3993,11 +4020,6 @@ fn poll_toolbar_volume_live(
     let volume = f64::from(value.min(100)) / 100.0;
     if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
         sticker.playback.volume = volume;
-    }
-    if let Some(playback) = videos.get(&id) {
-        if let Some(audio) = &playback.audio {
-            audio.set_volume(volume as f32);
-        }
     }
 }
 
@@ -4218,7 +4240,7 @@ fn handle_input(
                         });
                     }
                     poll_toolbar_opacity_live(edit, cfg, sprites);
-                    poll_toolbar_volume_live(edit, cfg, videos);
+                    poll_toolbar_volume_live(edit, cfg);
                     return true;
                 }
                 PointerOwner::WindowPicker => {
