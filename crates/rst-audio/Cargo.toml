@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# cpal — единый выходной поток WASAPI на процесс (M5B_VIDEO_DESIGN.md, раздел 4);
+# микшер работает в формате устройства, декодер ресемплирует заранее.
+cpal = "0.18"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true
