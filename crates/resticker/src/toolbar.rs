@@ -1,13 +1,13 @@
 //! Тулбар выделения (SPEC.md 3.6, docs/M2_UI_NOTES.md §8): сборка панели из
 //! виджетов rst-render и её позиционирование. Одиночное выделение — ползунок
-//! прозрачности + числовое поле + 5 кнопок; мультивыделение (SPEC 3.6) —
-//! только 5 кнопок, ползунок и поле отсутствуют
+//! прозрачности + числовое поле + 6 кнопок; мультивыделение (SPEC 3.6) —
+//! только 6 кнопок, ползунок и поле отсутствуют
 //! (docs/M2_MULTISELECT_TOOLBAR_NOTES.md, §2).
 //!
 //! Модуль только конструирует [`Panel`]: роутинг событий, действия кнопок
-//! и перерисовка — у ядра редактирования (overlay_manager). Кнопка
-//! «Слои видимости» (SPEC 3.6, п. 3) сюда не входит: панель выбора окон —
-//! веха M4.
+//! и перерисовка — у ядра редактирования (overlay_manager). Кнопка «Слои
+//! видимости» открывает панель выбора окон (SPEC 3.6, п. 3) — её сборка
+//! и состояние живут в [`crate::window_picker`] (docs/M4_WINDOW_PICKER_DESIGN.md).
 
 use rst_core::hittest::DipRect;
 use rst_render::{Box2D, Button, Icon, NumericField, Panel, Slider, WidgetId, theme};
@@ -17,6 +17,7 @@ use rst_render::{Box2D, Button, Icon, NumericField, Panel, Slider, WidgetId, the
 pub const TB_PANEL: WidgetId = 0;
 pub const TB_SLIDER: WidgetId = 1;
 pub const TB_FIELD: WidgetId = 2;
+pub const TB_LAYERS: WidgetId = 8;
 pub const TB_EYE: WidgetId = 3;
 pub const TB_ORDER_UP: WidgetId = 4;
 pub const TB_ORDER_DOWN: WidgetId = 5;
@@ -35,19 +36,19 @@ pub const TOOLBAR_SLIDER_W: f64 = 96.0;
 pub const TOOLBAR_FIELD_W: f64 = 40.0;
 /// Высота тулбара: кнопка + двойной отступ, DIP.
 pub const TOOLBAR_HEIGHT: f64 = theme::BUTTON_SIZE + 2.0 * TOOLBAR_PAD;
-/// Ширина тулбара в одиночном режиме: отступы + ползунок + поле + 5 кнопок
+/// Ширина тулбара в одиночном режиме: отступы + ползунок + поле + 6 кнопок
 /// + зазоры, DIP.
 pub const TOOLBAR_WIDTH: f64 = 2.0 * TOOLBAR_PAD
     + TOOLBAR_SLIDER_W
     + TOOLBAR_WIDGET_GAP
     + TOOLBAR_FIELD_W
     + TOOLBAR_WIDGET_GAP
-    + 5.0 * theme::BUTTON_SIZE
-    + 4.0 * TOOLBAR_WIDGET_GAP;
-/// Ширина тулбара в мульти-режиме: отступы + только 5 кнопок + зазоры
+    + 6.0 * theme::BUTTON_SIZE
+    + 5.0 * TOOLBAR_WIDGET_GAP;
+/// Ширина тулбара в мульти-режиме: отступы + только 6 кнопок + зазоры
 /// (без слайдера и поля — SPEC 3.6), DIP.
 pub const TOOLBAR_WIDTH_MULTI: f64 =
-    2.0 * TOOLBAR_PAD + 5.0 * theme::BUTTON_SIZE + 4.0 * TOOLBAR_WIDGET_GAP;
+    2.0 * TOOLBAR_PAD + 6.0 * theme::BUTTON_SIZE + 5.0 * TOOLBAR_WIDGET_GAP;
 
 /// Верхняя координата Y тулбара (SPEC 3.6): под рамкой; если снизу до низа
 /// экрана не хватает [`TOOLBAR_HEIGHT`] — над рамкой. Третий случай SPEC
@@ -63,9 +64,10 @@ fn toolbar_top(bounds: &DipRect, screen_h: f64) -> f64 {
 }
 
 /// Собрать тулбар выделения: в одиночном режиме (`opacity: Some(v)`) —
-/// ползунок прозрачности, зеркалирующее числовое поле и пять кнопок
-/// (SPEC 3.6: глаз, выше, ниже, дублировать, удалить); в мульти-режиме
-/// (`opacity: None`) — только пять кнопок (SPEC 3.6; docs/M2_MULTISELECT_TOOLBAR_NOTES.md, §2).
+/// ползунок прозрачности, зеркалирующее числовое поле и шесть кнопок
+/// (SPEC 3.6: слои видимости, глаз, выше, ниже, дублировать, удалить);
+/// в мульти-режиме (`opacity: None`) — только шесть кнопок (SPEC 3.6;
+/// docs/M2_MULTISELECT_TOOLBAR_NOTES.md, §2).
 ///
 /// `bounds` — ось-выровненный bbox выделения в DIP (для одиночного —
 /// aabb рамки выделения, для мульти — union `selection.bounds()`); вычисляет
@@ -112,6 +114,7 @@ pub fn build_toolbar(bounds: &DipRect, opacity: Option<f64>, screen_h: f64) -> P
     }
 
     let buttons = [
+        (TB_LAYERS, Icon::Layers),
         (TB_EYE, Icon::Eye),
         (TB_ORDER_UP, Icon::OrderUp),
         (TB_ORDER_DOWN, Icon::OrderDown),
@@ -155,10 +158,10 @@ mod tests {
 
     #[test]
     fn toolbar_centered_horizontally_on_bbox() {
-        // Рамка x ∈ [860, 1060] → центр 960; рамка тулбара x ∈ [806, 1114].
+        // Рамка x ∈ [860, 1060] → центр 960; рамка тулбара x ∈ [790, 1130].
         let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.0), SCREEN_H);
-        assert!(p.hit_test((807.0, 476.0)), "левый край тулбара");
-        assert!(!p.hit_test((805.0, 476.0)));
+        assert!(p.hit_test((791.0, 476.0)), "левый край тулбара");
+        assert!(!p.hit_test((789.0, 476.0)));
     }
 
     #[test]
@@ -222,7 +225,14 @@ mod tests {
             "в мульти-режиме числового поля нет (SPEC 3.6)"
         );
         // Кнопки на месте — панель не пустая.
-        for id in [TB_EYE, TB_ORDER_UP, TB_ORDER_DOWN, TB_DUPLICATE, TB_DELETE] {
+        for id in [
+            TB_LAYERS,
+            TB_EYE,
+            TB_ORDER_UP,
+            TB_ORDER_DOWN,
+            TB_DUPLICATE,
+            TB_DELETE,
+        ] {
             assert!(p.widget::<Button>(id).is_some(), "кнопка {id} есть");
         }
     }
@@ -250,9 +260,10 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_five_buttons_in_spec_order() {
+    fn toolbar_six_buttons_in_spec_order() {
         let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.0), SCREEN_H);
         let expected = [
+            (TB_LAYERS, Icon::Layers),
             (TB_EYE, Icon::Eye),
             (TB_ORDER_UP, Icon::OrderUp),
             (TB_ORDER_DOWN, Icon::OrderDown),
@@ -266,6 +277,7 @@ mod tests {
         let centers = [
             p.widget::<Slider>(TB_SLIDER).unwrap().bounds().cx,
             p.widget::<NumericField>(TB_FIELD).unwrap().bounds().cx,
+            p.widget::<Button>(TB_LAYERS).unwrap().bounds().cx,
             p.widget::<Button>(TB_EYE).unwrap().bounds().cx,
             p.widget::<Button>(TB_ORDER_UP).unwrap().bounds().cx,
             p.widget::<Button>(TB_ORDER_DOWN).unwrap().bounds().cx,
@@ -285,6 +297,7 @@ mod tests {
         let p = build_toolbar(&bounds, None, SCREEN_H);
 
         let expected = [
+            (TB_LAYERS, Icon::Layers),
             (TB_EYE, Icon::Eye),
             (TB_ORDER_UP, Icon::OrderUp),
             (TB_ORDER_DOWN, Icon::OrderDown),
@@ -295,15 +308,22 @@ mod tests {
             assert_eq!(button_icon(&p, id), icon);
         }
         // Тот же порядок слева направо, без слайдера/поля слева.
-        let centers: Vec<f64> = [TB_EYE, TB_ORDER_UP, TB_ORDER_DOWN, TB_DUPLICATE, TB_DELETE]
-            .map(|id| p.widget::<Button>(id).unwrap().bounds().cx)
-            .to_vec();
+        let centers: Vec<f64> = [
+            TB_LAYERS,
+            TB_EYE,
+            TB_ORDER_UP,
+            TB_ORDER_DOWN,
+            TB_DUPLICATE,
+            TB_DELETE,
+        ]
+        .map(|id| p.widget::<Button>(id).unwrap().bounds().cx)
+        .to_vec();
         assert!(
             centers.windows(2).all(|w| w[0] < w[1]),
             "кнопки слева направо"
         );
         // Строка кнопок центрирована под bounds.
-        let mid = (centers[0] + centers[4]) / 2.0;
+        let mid = (centers[0] + centers[5]) / 2.0;
         assert!(
             (mid - bounds.x - bounds.w / 2.0).abs() < 1e-9,
             "центр кнопок {mid} != центр bounds {}",
