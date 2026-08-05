@@ -1,19 +1,12 @@
-//! Чистая логика панели выбора окон («Слои видимости», SPEC.md §4.2;
-//! docs/M4_WINDOW_PICKER_DESIGN.md §2-4): предикаты и решения без рендера +
-//! билдер панели (дизайн §7.1, шаг 5). Роутинг событий и открытие — шаги 6-7,
-//! отдельными срезами. rst-render нужен только билдеру (Panel/Checkbox/Button/
-//! Primitive); предикаты §2-4 остаются чистыми.
+//! Логика панели выбора окон («Слои видимости», SPEC.md §4.2;
+//! docs/M4_WINDOW_PICKER_DESIGN.md §1-4): предикаты, решения и билдер панели.
+//! Подключена в `overlay_manager.rs` (план §7.1, шаг 7): `EditState.window_picker`,
+//! кнопка `TB_LAYERS` в тулбаре, роутинг указателя/клавиатуры, отрисовка.
 //!
 //! Главный инвариант (§2.1): состояние «выбран ли чекбокс» определяется тем
 //! же предикатом [`rst_core::occluders::rule_matches`], которым маска решает
 //! про окклюдера, — пересборка панели из `Sticker.visibility` никогда не
 //! разойдётся с фактическим поведением маски.
-//!
-//! Модуль пока никем не вызывается: сшивка (кнопка тулбара, `EditState`) —
-//! отдельные шаги плана §7.1 (6-7), придут следующими срезами. `dead_code`
-//! снят до сшивки, чтобы `clippy -D warnings` оставался зелёным; после
-//! подключения атрибут удалить.
-#![allow(dead_code)]
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -433,25 +426,6 @@ fn all_windows_checked(visibility: &VisibilityRule, snapshot: &[WindowInfo]) -> 
     snapshot
         .iter()
         .all(|w| !window_can_express_rule(w) || window_is_checked(visibility, w))
-}
-
-/// Индекс группы по WidgetId чекбокса процесса (`None` — это не чекбокс
-/// процесса). Группа — индекс в `group_by_process(snapshot)`, `None`-группа
-/// «процесс неизвестен» чекбокса не имеет (см. [`build_picker_panel`]).
-pub fn picker_id_to_process(id: WidgetId) -> Option<usize> {
-    (PICKER_ROW_PROCESS_BASE..PICKER_ROW_WINDOW_BASE)
-        .contains(&id)
-        .then(|| (id - PICKER_ROW_PROCESS_BASE) as usize)
-}
-
-/// (Индекс группы, индекс окна в группе) по WidgetId чекбокса окна.
-pub fn picker_id_to_window(id: WidgetId) -> Option<(usize, usize)> {
-    (PICKER_ROW_WINDOW_BASE..PICKER_ROW_WINDOW_BASE + 0x1000_0000)
-        .contains(&id)
-        .then(|| {
-            let v = id - PICKER_ROW_WINDOW_BASE;
-            ((v >> 16) as usize, (v & 0xffff) as usize)
-        })
 }
 
 /// Надпись строки списка + слот-плейсхолдер иконки (дизайн §6): один виджет
@@ -1286,25 +1260,5 @@ mod tests {
             picker_frame(),
         );
         assert!(picker_texts(&all.panel).contains(&"Снять все".to_string()));
-    }
-
-    #[test]
-    fn widget_id_decoders() {
-        assert_eq!(picker_id_to_process(PICKER_ROW_PROCESS_BASE + 3), Some(3));
-        assert_eq!(
-            picker_id_to_process(PICKER_ROW_PROCESS_BASE + 3 + LABEL_FLAG),
-            None
-        );
-        assert_eq!(picker_id_to_process(PICKER_BTN_SELECT_ALL), None);
-        assert_eq!(
-            picker_id_to_window(PICKER_ROW_WINDOW_BASE + (2u32 << 16) + 5),
-            Some((2, 5))
-        );
-        assert_eq!(picker_id_to_window(PICKER_ROW_WINDOW_BASE), Some((0, 0)));
-        assert_eq!(
-            picker_id_to_window(PICKER_ROW_WINDOW_BASE + (2u32 << 16) + 5 + LABEL_FLAG),
-            None
-        );
-        assert_eq!(picker_id_to_window(PICKER_BTN_SELECT_ALL), None);
     }
 }

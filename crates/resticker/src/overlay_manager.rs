@@ -45,9 +45,9 @@ use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::paste;
 use rst_render::{
-    Box2D, Button, Device, Icon, Key, NumericField, Panel, PointerEvent, Primitive, RenderError,
-    SelectionBox, Slider, Sprite, Texture, WidgetId, WindowTarget, edit_overlay, marquee_visuals,
-    rasterize, solid_sprite, theme,
+    Box2D, Button, Checkbox, Device, Icon, Key, NumericField, Panel, PointerEvent, Primitive,
+    RenderError, SelectionBox, Slider, Sprite, Texture, WidgetId, WindowTarget, edit_overlay,
+    marquee_visuals, rasterize, solid_sprite, theme,
 };
 use rst_win32::clipboard::{self, ClipboardImage};
 use rst_win32::file_dialog;
@@ -61,7 +61,7 @@ use rst_win32::window_enum::{WindowInfo, WindowRect};
 use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker};
 use uuid::Uuid;
 
-use crate::{confirm_dialog, cursor_panel, toolbar};
+use crate::{confirm_dialog, cursor_panel, toolbar, window_picker};
 
 /// Мост к `Device`/`WindowTarget` (M3 step 2 разделил `rst_render::Renderer`
 /// на процесс-wide устройство и цель на монитор, M3_PREP_NOTES.md §4.2).
@@ -558,6 +558,19 @@ struct EditState {
     /// Открытый модал подтверждения удаления (`begin_delete`); пока `Some`,
     /// модал блокирует и сцену, и историю (docs/M2_WIRING_PLAN.md, раздел 7).
     confirm: Option<ConfirmState>,
+    /// Открытая панель выбора окон (M4, docs/M4_WINDOW_PICKER_DESIGN.md §1,
+    /// §7.7): в отличие от `confirm`, НЕ модальна для мыши — клик мимо неё
+    /// уходит в сцену как обычно (позволяет двигать стикер, не закрывая
+    /// панель). Клавиатура блокируется, кроме `Esc`, — как у `confirm`
+    /// (см. `handle_key`): панель редактирует ОДИН конкретный стикер, и
+    /// хоткеи вроде `Delete`/`Ctrl+D`, сработавшие по текущему выделению
+    /// параллельно с открытой панелью, были бы путающими.
+    window_picker: Option<WindowPickerState>,
+    /// Установлен кликом по `TB_LAYERS` (`handle_toolbar_up`) — открытие
+    /// нуждается в `window_snapshot`, которого нет в `handle_toolbar_up`
+    /// (дизайн §5.2); фактическое открытие происходит в цикле `run()`,
+    /// где снимок под рукой, сразу после обработки текущего сообщения.
+    pending_open_picker: Option<Uuid>,
     /// Текущая рамка марки для отрисовки (`anchor_x, anchor_y, cur_x, cur_y`,
     /// DIP) — `None`, если марка не тянется в этот момент.
     marquee: Option<(f64, f64, f64, f64)>,
@@ -603,6 +616,7 @@ enum PointerOwner {
     None,
     Toolbar,
     CursorPanel,
+    WindowPicker,
     Scene,
 }
 
@@ -618,6 +632,24 @@ struct ConfirmState {
     /// Монитор, вызвавший удаление (M3) — модал рисуется только в кадре
     /// этого монитора; остальные стикеры к удалению могут жить на других
     /// мониторах, это не меняет, где показывается сам диалог.
+    monitor_id: MonitorId,
+}
+
+/// Открытая панель выбора окон (M4, docs/M4_WINDOW_PICKER_DESIGN.md §1):
+/// правит `VisibilityRule` РОВНО ОДНОГО стикера (`sticker_id`). Панель
+/// хранится собранной (не пересобирается на каждый кадр) — как `toolbar`/
+/// `cursor_panel`/`ConfirmState.panel` — чтобы `Panel` могла держать
+/// hover/armed-состояние своих чекбоксов между кадрами; `rebuild_window_picker`
+/// перестраивает её заново при мутации `cfg` или новом снимке окон.
+struct WindowPickerState {
+    sticker_id: Uuid,
+    panel: Panel,
+    /// Сколько строк списка пропущено сверху (виртуализация, дизайн §7.4).
+    scroll: usize,
+    /// Монитор, на котором рисуется панель (тот же, что у тулбара, — панель
+    /// открывается его кнопкой). Хит-тест и отрисовка — только на нём же,
+    /// как у `toolbar`/`cursor_panel`/`confirm` (M3, docs/M3_STEP4_REVIEW.md,
+    /// пункт 2.1).
     monitor_id: MonitorId,
 }
 
@@ -1006,6 +1038,8 @@ fn run(
         redo_stack: Vec::new(),
         pending_snapshot: None,
         confirm: None,
+        window_picker: None,
+        pending_open_picker: None,
         marquee: None,
         marquee_started: false,
         toolbar: None,
@@ -1557,6 +1591,7 @@ fn run(
                     &monitor_geometry,
                     &monitor_bounds,
                     &mut loss_tracker,
+                    &window_snapshot,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
@@ -1571,13 +1606,34 @@ fn run(
                 tracing::debug!(count = windows.len(), "снимок окон обновлён");
                 window_snapshot = windows;
                 occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
+                // Открытая панель выбора окон показывает СТАРЫЙ снимок —
+                // пересобрать её тем же новым снимком (M4_WINDOW_PICKER_DESIGN.md
+                // §5): список окон должен обновляться в реальном времени
+                // (SPEC 4.2), не только при переключении чекбоксов.
+                rebuild_window_picker(&mut edit, &cfg, &window_snapshot, &monitor_geometry);
                 need_redraw = true;
             }
         }
+        // Открытие панели выбора окон отложено до этой точки — кликом по
+        // `TB_LAYERS` в `handle_toolbar_up`, у которого нет `window_snapshot`
+        // (дизайн §5.2); здесь, в цикле `run()`, снимок уже под рукой.
+        if let Some(sticker_id) = edit.pending_open_picker.take() {
+            open_window_picker(
+                &mut edit,
+                &cfg,
+                &window_snapshot,
+                &monitor_geometry,
+                sticker_id,
+            );
+            need_redraw = true;
+        }
         // Гейт хуков трекера — раз за итерацию, дёшево (см. комментарий у
         // объявления `last_mask_needed`); переключается только при реальном
-        // изменении, не на каждой итерации подряд.
-        let new_mask_needed = mask_needed(&cfg);
+        // изменении, не на каждой итерации подряд. Пока открыта панель
+        // выбора окон, снимок обязан оставаться живым независимо от
+        // `mask_needed(cfg)` (дизайн §5.1) — иначе если ВСЕ стикеры сейчас
+        // `Always`, трекер спит, и список окон в панели не наполнится вовсе.
+        let new_mask_needed = mask_needed(&cfg) || edit.window_picker.is_some();
         if new_mask_needed != last_mask_needed {
             last_mask_needed = new_mask_needed;
             if let Some(tracker) = &window_tracker {
@@ -1668,6 +1724,8 @@ fn toggle_edit_mode(
     // Открытый модал не переживает выход из режима — как и незавершённый
     // жест выше, он относится к сеансу редактирования, а не к самому кадру.
     edit.confirm = None;
+    edit.window_picker = None;
+    edit.pending_open_picker = None;
     edit.active = !edit.active;
     overlay.set_click_through(!edit.active);
     if !edit.active {
@@ -1883,7 +1941,7 @@ fn handle_key(
     // незавершённый жест/драг перед выходом.
     let pointer_busy = matches!(
         edit.pointer_owner,
-        PointerOwner::Toolbar | PointerOwner::CursorPanel
+        PointerOwner::Toolbar | PointerOwner::CursorPanel | PointerOwner::WindowPicker
     );
     if (edit.gesture.is_some() || pointer_busy) && vk != VK_ESCAPE {
         return false;
@@ -1895,6 +1953,20 @@ fn handle_key(
     if edit.confirm.is_some() {
         return if vk == VK_ESCAPE {
             edit.confirm = None;
+            true
+        } else {
+            false
+        };
+    }
+    // Панель выбора окон не модальна для мыши (докс §7.7 — клик мимо неё
+    // уходит в сцену), но клавиатуру блокирует, кроме `Esc`: панель правит
+    // ОДИН конкретный стикер, и хоткеи вроде `Delete`/`Ctrl+D`, сработавшие
+    // по текущему выделению параллельно с открытой панелью, были бы
+    // путающими (тот же стикер мог бы исчезнуть/задублироваться прямо
+    // из-под панели, которая его редактирует).
+    if edit.window_picker.is_some() {
+        return if vk == VK_ESCAPE {
+            edit.window_picker = None;
             true
         } else {
             false
@@ -2715,6 +2787,181 @@ fn rebuild_ui_panels(
         }
         None => edit.cursor_panel = None,
     }
+    // Панель выбора окон редактирует ОДИН конкретный стикер (открыта его
+    // кнопкой тулбара) — если выделение сменилось на другой стикер (или
+    // снялось, или стало множественным), панель больше не отражает то, что
+    // выбрано, и должна закрыться (M4_WINDOW_PICKER_DESIGN.md §1). Снимок
+    // окон здесь не нужен — закрытие, а не пересборка содержимого.
+    if let Some(state) = &edit.window_picker {
+        if single_selected_id(&edit.selection) != Some(state.sticker_id) {
+            edit.window_picker = None;
+        }
+    }
+}
+
+/// Открыть панель выбора окон для стикера `sticker_id` (клик по `TB_LAYERS`,
+/// обработанный в `run()` через `pending_open_picker` — сам клик происходит
+/// в `handle_toolbar_up`, у которого нет `window_snapshot`, дизайн §5.2).
+/// Монитор панели — монитор тулбара (панель открыта его кнопкой); если
+/// стикер уже не существует или его монитор пропал, панель просто не
+/// откроется.
+fn open_window_picker(
+    edit: &mut EditState,
+    cfg: &Config,
+    window_snapshot: &[WindowInfo],
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    sticker_id: Uuid,
+) {
+    let Some(monitor_id) = toolbar_monitor(&edit.selection, cfg).cloned() else {
+        return;
+    };
+    edit.window_picker = Some(WindowPickerState {
+        sticker_id,
+        // Плейсхолдер — `rebuild_window_picker` ниже строит настоящую
+        // панель немедленно, до первой отрисовки.
+        panel: Panel::new(
+            window_picker::PICKER_PANEL_ID,
+            Box2D {
+                cx: 0.0,
+                cy: 0.0,
+                w: 1.0,
+                h: 1.0,
+                rotation: 0.0,
+            },
+        ),
+        scroll: 0,
+        monitor_id,
+    });
+    rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+}
+
+/// Пересобрать панель выбора окон (мутация `cfg`, влияющая на правило
+/// видимости редактируемого стикера, или новый снимок окон —
+/// `OverlayMessage::Windows(Changed)`). Центрирована на экране своего
+/// монитора, как модал подтверждения — точное позиционирование относительно
+/// кнопки тулбара дизайн-доком не зафиксировано (M4_WINDOW_PICKER_DESIGN.md
+/// §7.7 не решает вопрос до конца), а центр экрана всегда на виду и не
+/// требует расчёта места под кнопкой на всех вариантах тулбара.
+fn rebuild_window_picker(
+    edit: &mut EditState,
+    cfg: &Config,
+    window_snapshot: &[WindowInfo],
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) {
+    let Some(state) = &mut edit.window_picker else {
+        return;
+    };
+    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == state.sticker_id) else {
+        // Стикер удалён/пропал, пока панель была открыта.
+        edit.window_picker = None;
+        return;
+    };
+    let Some(&(w, h, scale)) = monitor_geometry.get(&state.monitor_id) else {
+        edit.window_picker = None;
+        return;
+    };
+    let visibility = sticker.visibility.clone();
+    let screen = screen_dip_rect((w, h), scale);
+    let frame = Box2D {
+        cx: screen.w / 2.0,
+        cy: screen.h / 2.0,
+        w: window_picker::PICKER_WIDTH,
+        h: window_picker::PICKER_HEIGHT,
+        rotation: 0.0,
+    };
+    let mut result =
+        window_picker::build_picker_panel(&visibility, window_snapshot, state.scroll, frame);
+    // Снимок окон мог сжаться (окна закрылись) — скролл, валидный раньше,
+    // теперь может указывать за конец списка и строить пустую страницу;
+    // кламп и один повторный билд чинят это без падения (`build_picker_panel`
+    // сам по себе не паникует на `scroll` за пределами `total_rows` — просто
+    // не строит ни одной строки).
+    if result.total_rows > 0 && state.scroll >= result.total_rows {
+        state.scroll = result.total_rows - 1;
+        result =
+            window_picker::build_picker_panel(&visibility, window_snapshot, state.scroll, frame);
+    } else if result.total_rows == 0 {
+        state.scroll = 0;
+    }
+    state.panel = result.panel;
+}
+
+/// Опросить действия панели выбора окон после `Up` (M4_WINDOW_PICKER_DESIGN.md
+/// §1, §4): «Выбрать все» и чекбоксы процессов — каждое переключение своим
+/// шагом истории, как у тулбара. Чекбоксы окон всегда disabled (дизайн §7.6)
+/// и здесь не опрашиваются — выбор только на уровне процесса.
+fn handle_window_picker_up(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    window_snapshot: &[WindowInfo],
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    pos: (f64, f64),
+) -> bool {
+    let Some(state) = &mut edit.window_picker else {
+        return true;
+    };
+    state.panel.pointer_event(PointerEvent::Up { pos });
+    let sticker_id = state.sticker_id;
+    if !cfg.stickers.iter().any(|s| s.id == sticker_id) {
+        // Стикер удалён, пока панель была открыта, — закрыть её.
+        edit.window_picker = None;
+        return true;
+    }
+
+    let select_all_clicked = edit
+        .window_picker
+        .as_mut()
+        .and_then(|s| {
+            s.panel
+                .widget_mut::<Button>(window_picker::PICKER_BTN_SELECT_ALL)
+        })
+        .is_some_and(Button::take_click);
+    if select_all_clicked {
+        commit_undo_snapshot(edit, cfg.clone());
+        let sticker = cfg
+            .stickers
+            .iter_mut()
+            .find(|s| s.id == sticker_id)
+            .expect("наличие стикера проверено выше");
+        sticker.visibility = window_picker::toggle_select_all(&sticker.visibility, window_snapshot);
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после «выбрать все» в панели выбора окон");
+        }
+        rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+        return true;
+    }
+
+    let groups = window_picker::group_by_process(window_snapshot);
+    for (g, group) in groups.iter().enumerate() {
+        let toggled = edit
+            .window_picker
+            .as_mut()
+            .and_then(|s| {
+                s.panel
+                    .widget_mut::<Checkbox>(window_picker::PICKER_ROW_PROCESS_BASE + g as WidgetId)
+            })
+            .and_then(Checkbox::take_changed)
+            .is_some();
+        if !toggled {
+            continue;
+        }
+        commit_undo_snapshot(edit, cfg.clone());
+        let sticker = cfg
+            .stickers
+            .iter_mut()
+            .find(|s| s.id == sticker_id)
+            .expect("наличие стикера проверено выше");
+        if let Some(new_rule) = window_picker::toggle_process_group(&sticker.visibility, group) {
+            sticker.visibility = new_rule;
+        }
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после переключения процесса в панели выбора окон");
+        }
+        rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+        return true;
+    }
+    true
 }
 
 /// Решить целевую видимость и применить её всем стикерам батчем (общая
@@ -2840,6 +3087,17 @@ fn handle_toolbar_up(
             .is_some_and(Button::take_click)
     };
 
+    if clicked(edit, toolbar::TB_LAYERS) {
+        // Открытие нуждается в `window_snapshot`, которого здесь нет —
+        // откладываем через флаг, обрабатываемый в цикле `run()` сразу после
+        // текущего сообщения (дизайн §5.2). Повторный клик — переключатель:
+        // если панель уже открыта (для любого стикера — в т.ч. этого же),
+        // закрыть её сразу же, без похода в `run()`.
+        if edit.window_picker.take().is_none() {
+            edit.pending_open_picker = Some(id);
+        }
+        return true;
+    }
     if clicked(edit, toolbar::TB_EYE) {
         commit_undo_snapshot(edit, cfg.clone());
         let _ = ops::toggle_visibility(cfg, id);
@@ -3058,6 +3316,7 @@ fn handle_input(
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     loss_tracker: &mut MonitorLossTracker,
+    window_snapshot: &[WindowInfo],
 ) -> bool {
     let monitor = DipRect::new(
         0.0,
@@ -3082,6 +3341,25 @@ fn handle_input(
                     });
                 }
                 return true;
+            }
+            // Панель выбора окон открыта из тулбара — она выше него по
+            // z-order (docs/M4_WINDOW_PICKER_DESIGN.md §1), поэтому и в
+            // хит-тесте раньше него. НЕ модальна: если клик мимо панели
+            // (`consumed == false`), просто идём дальше к панели у
+            // курсора/тулбару/сцене — в отличие от модала выше, ранний
+            // `return` здесь только на реальном попадании (дизайн §7.7).
+            if let Some(state) = &mut edit.window_picker {
+                if state.monitor_id == *monitor_id
+                    && state
+                        .panel
+                        .pointer_event(PointerEvent::Down {
+                            pos: (dip_x, dip_y),
+                        })
+                        .consumed
+                {
+                    edit.pointer_owner = PointerOwner::WindowPicker;
+                    return true;
+                }
             }
             // Приоритет top-down по z-order: панель у курсора выше тулбара
             // на экране (redraw рисует её позже), поэтому и в хит-тесте она
@@ -3236,6 +3514,14 @@ fn handle_input(
                     poll_toolbar_opacity_live(edit, cfg, sprites);
                     return true;
                 }
+                PointerOwner::WindowPicker => {
+                    if let Some(state) = &mut edit.window_picker {
+                        state.panel.pointer_event(PointerEvent::Move {
+                            pos: (dip_x, dip_y),
+                        });
+                    }
+                    return true;
+                }
                 PointerOwner::Scene if dragging => {
                     let need_redraw = apply_gesture(
                         cfg,
@@ -3285,6 +3571,20 @@ fn handle_input(
                         .redraw;
                 }
             }
+            let picker_here = edit
+                .window_picker
+                .as_ref()
+                .is_some_and(|s| s.monitor_id == *monitor_id);
+            if picker_here {
+                if let Some(state) = &mut edit.window_picker {
+                    need_redraw |= state
+                        .panel
+                        .pointer_event(PointerEvent::Move {
+                            pos: (dip_x, dip_y),
+                        })
+                        .redraw;
+                }
+            }
             let over_panel = edit
                 .cursor_panel
                 .as_ref()
@@ -3293,7 +3593,12 @@ fn handle_input(
                     && edit
                         .toolbar
                         .as_ref()
-                        .is_some_and(|p| p.hit_test((dip_x, dip_y))));
+                        .is_some_and(|p| p.hit_test((dip_x, dip_y))))
+                || (picker_here
+                    && edit
+                        .window_picker
+                        .as_ref()
+                        .is_some_and(|s| s.panel.hit_test((dip_x, dip_y))));
             if over_panel {
                 overlay.post_cursor_shape(CursorShape::Arrow);
             } else {
@@ -3410,6 +3715,17 @@ fn handle_input(
                         scale,
                         monitor_id,
                         monitor_geometry,
+                    );
+                }
+                PointerOwner::WindowPicker => {
+                    edit.pointer_owner = PointerOwner::None;
+                    return handle_window_picker_up(
+                        edit,
+                        cfg,
+                        config_path,
+                        window_snapshot,
+                        monitor_geometry,
+                        (dip_x, dip_y),
                     );
                 }
                 PointerOwner::Scene | PointerOwner::None => {}
@@ -3562,6 +3878,16 @@ fn handle_input(
                 }
                 edit.pointer_owner = PointerOwner::None;
                 rebuild_ui_panels(edit, cfg, monitor_geometry);
+                return true;
+            }
+            if edit.pointer_owner == PointerOwner::WindowPicker {
+                // Панель выбора окон не ведёт живой драг (нет ползунков —
+                // только чекбоксы/кнопка, коммит целиком на `Up`), откатывать
+                // `cfg` нечего — только снять зависший armed/hover чекбокса
+                // пересборкой (тот же приём, что выше для тулбара/панели у
+                // курсора).
+                edit.pointer_owner = PointerOwner::None;
+                rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
                 return true;
             }
             edit.pointer_owner = PointerOwner::None;
@@ -3898,6 +4224,18 @@ fn redraw(
         if edit.cursor_monitor == *monitor_id {
             let mut prims = Vec::new();
             cursor_panel.draw(&mut prims);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
+    }
+
+    // Панель выбора окон — открыта из тулбара, поверх него, но под модалом
+    // (M4_WINDOW_PICKER_DESIGN.md §1), только на своём «домашнем» мониторе.
+    if let Some(state) = &edit.window_picker {
+        if state.monitor_id == *monitor_id {
+            let mut prims = Vec::new();
+            state.panel.draw(&mut prims);
             primitives_to_sprites(
                 &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
             );
