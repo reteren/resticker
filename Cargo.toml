@@ -8,9 +8,16 @@ members = [
     "crates/rst-render",
     "crates/rst-media",
     "crates/rst-audio",
+    "crates/rst-video",
 ]
 # Спайк S0 — самостоятельный выбрасываемый крейт, в воркспейс не входит.
 exclude = ["spike"]
+
+# Запатченная копия ffmpeg-sys-next (bindgen 0.70 → 0.72): 0.70 не видит
+# forward-объявленные структуры FFmpeg на libclang 21/22 (пустые биндинги).
+# Патч — только версия bindgen, см. vendor/ffmpeg-sys-next/Cargo.toml.
+[patch.crates-io]
+ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }
 
 [workspace.package]
 version = "0.1.0"

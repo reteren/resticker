@@ -1,0 +1,21 @@
+[package]
+name = "rst-video"
+description = "FFmpeg software video decode for resticker stickers (demux/decode/resample, no GPU)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Сырые FFI-биндинги FFmpeg (bindgen на этапе сборки). Версия 7.1.x соответствует
+# пресобранному FFmpeg release/7.1 (libavcodec-61 / libavformat-61 / libavutil-59 /
+# libswresample-5, W:/ffmpeg_build/install). Сборка FFmpeg LGPL-only: swscale,
+# avdevice, avfilter отключены — соответствующие features не включаем.
+# Крейт ищет пресобранный FFmpeg по переменной окружения FFMPEG_DIR
+# (см. build.rs и README.md).
+ffmpeg-sys-next = { version = "=7.1.3", default-features = false, features = ["avformat", "avcodec", "swresample"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
