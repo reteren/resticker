@@ -160,10 +160,38 @@ struct VideoStream {
 struct AudioStream {
     ctx: CodecCtx,
     index: c_int,
-    /// Ресемплер на целевой формат (f32 stereo 48k); пересоздаётся при
-    /// смене формата/частоты/раскладки кадров.
+    /// Ресемплер на целевой формат ([`AudioTarget`]); пересоздаётся при
+    /// смене формата/частоты/раскладки кадров ВХОДНОГО потока (целевой
+    /// формат при этом не меняется — задан один раз в `Pipeline::open`).
     swr: Option<SwrCtx>,
     swr_in: Option<(u32, AVSampleFormat, AVChannelLayout)>,
+}
+
+/// Целевой формат ресемплера звука — то, подо что реально настроено
+/// устройство вывода (`rst_audio::AudioMixer::sample_rate`/`channels`), а
+/// не жёстко зашитое значение. Найдено независимым ревью: раньше
+/// декодер всегда ресемплировал в 48 000 Гц/стерео, а микшер писал сэмплы
+/// в буфер устройства как есть, без ресемплинга — на устройстве с другой
+/// частотой (44.1kHz USB-DAC и т.п.) или раскладкой каналов (5.1) звук
+/// звучал бы на неверной скорости/с испорченными каналами. Теперь
+/// координатор передаёт реальный формат устройства при открытии файла
+/// ([`crate::VideoSource::open_with_audio_target`]);
+/// [`AUDIO_TARGET_SAMPLE_RATE`]/[`AUDIO_TARGET_CHANNELS`] остаются дефолтом
+/// для простого [`crate::VideoSource::open`] (тесты, вызывающий код без
+/// живого микшера под рукой).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AudioTarget {
+    pub rate: u32,
+    pub channels: u16,
+}
+
+impl Default for AudioTarget {
+    fn default() -> Self {
+        Self {
+            rate: AUDIO_TARGET_SAMPLE_RATE,
+            channels: AUDIO_TARGET_CHANNELS as u16,
+        }
+    }
 }
 
 /// Декодирующий конвейер одного файла. Все поля — состояние одного потока.
@@ -171,6 +199,7 @@ pub(crate) struct Pipeline {
     fmt: FmtCtx,
     video: VideoStream,
     audio: Option<AudioStream>,
+    audio_target: AudioTarget,
     /// Переиспользуемый буфер пакета для av_read_frame.
     packet: Packet,
     video_frame: Frame,
@@ -202,8 +231,11 @@ impl Pipeline {
     /// Открыть файл, найти видеопоток (и аудио, если есть), создать декодеры
     /// и проверить первый кадр (формат пикселя и реальные размеры) — чтобы
     /// `VideoSource::open` падал с понятной ошибкой на неподдерживаемом
-    /// формате, а не посреди воспроизведения.
-    pub(crate) fn open(path: &Path) -> Result<Self, VideoError> {
+    /// формате, а не посреди воспроизведения. `audio_target` — формат,
+    /// под который звук ресемплируется (обычно реальный формат устройства
+    /// вывода — `AudioTarget::default()`, если вызывающему коду он
+    /// неизвестен).
+    pub(crate) fn open(path: &Path, audio_target: AudioTarget) -> Result<Self, VideoError> {
         let fmt = FmtCtx::open(path)?;
 
         // --- Видеопоток ---
@@ -308,6 +340,7 @@ impl Pipeline {
                 tb_den: v_stream.time_base.den,
             },
             audio,
+            audio_target,
             packet: Packet(alloc_checked(
                 unsafe { av_packet_alloc() },
                 "av_packet_alloc",
@@ -390,6 +423,20 @@ impl Pipeline {
             let ret = unsafe { av_read_frame(self.fmt.0, self.packet.0) };
             if ret == AVERROR_EOF {
                 self.eof_seen = true;
+                // Сигнал «данных больше нет» декодерам (NULL-пакет — штатный
+                // способ FFmpeg перевести декодер в режим дренажа): без него
+                // кадры, задержанные в reorder-буфере (B-кадры), никогда не
+                // выйдут через avcodec_receive_frame — тот вернёт EAGAIN
+                // вместо буферизованных кадров, и следующий loop_restart
+                // (avcodec_flush_buffers) их уничтожит. Найдено независимым
+                // ревью: каждое зацикливание теряло хвост в ~1-5 кадров.
+                // SAFETY: контексты живы; NULL — валидный аргумент send_packet
+                // в режиме дренажа.
+                unsafe { avcodec_send_packet(self.video.ctx.0, null_mut()) };
+                if let Some(audio) = self.audio.as_ref() {
+                    // SAFETY: контекст жив.
+                    unsafe { avcodec_send_packet(audio.ctx.0, null_mut()) };
+                }
                 // Выкачиваем остатки декодеров (переупорядоченные B-кадры).
                 if let Some(frame) = self.pull_video_frame()? {
                     return Ok(Event::Video(frame));
@@ -613,15 +660,16 @@ impl Pipeline {
             None => true,
         };
         if swr_needs_recreate {
-            audio.swr = Some(create_swr(in_rate, in_fmt, &in_layout)?);
+            audio.swr = Some(create_swr(in_rate, in_fmt, &in_layout, self.audio_target)?);
             audio.swr_in = Some((in_rate, in_fmt, in_layout));
         }
 
+        let target_channels = self.audio_target.channels as usize;
         // SAFETY: swr — созданный/проверенный контекст; данные кадра живы до
         // unref ниже; out-буфер наш на весь вызов.
         let swr = audio.swr.as_ref().expect("swr только что создан").0;
-        let out_cap = swr_out_count(nb_samples as usize, in_rate, AUDIO_TARGET_SAMPLE_RATE);
-        let mut out = vec![0.0f32; out_cap * AUDIO_TARGET_CHANNELS];
+        let out_cap = swr_out_count(nb_samples as usize, in_rate, self.audio_target.rate);
+        let mut out = vec![0.0f32; out_cap * target_channels];
         let mut out_planes: [*mut u8; 1] = [out.as_mut_ptr().cast()];
         let in_planes = frame.data.as_ptr() as *const *const u8;
         let n = unsafe {
@@ -638,7 +686,7 @@ impl Pipeline {
             unsafe { av_frame_unref(self.audio_frame.0) };
             return Err(VideoError::Decode(format!("swr_convert: {}", ff_err(n))));
         }
-        out.truncate((n as usize) * AUDIO_TARGET_CHANNELS);
+        out.truncate((n as usize) * target_channels);
         // SAFETY: данные скопированы в out; кадр больше не нужен.
         unsafe { av_frame_unref(self.audio_frame.0) };
         Ok(Some(AudioChunkOut { samples: out }))
@@ -715,24 +763,29 @@ fn create_swr(
     in_rate: u32,
     in_fmt: AVSampleFormat,
     in_layout: &AVChannelLayout,
+    target: AudioTarget,
 ) -> Result<SwrCtx, VideoError> {
     let mut swr: *mut SwrContext = null_mut();
-    let out_layout = AVChannelLayout {
-        order: AVChannelOrder::AV_CHANNEL_ORDER_NATIVE,
-        nb_channels: AUDIO_TARGET_CHANNELS as c_int,
-        // SAFETY: union-инициализация; mask для NATIVE-порядка не читается.
-        u: AVChannelLayout__bindgen_ty_1 {
-            mask: AV_CH_FRONT_LEFT | AV_CH_FRONT_RIGHT,
-        },
+    // Стандартная раскладка на N каналов (моно/стерео/5.1/…) — не хардкодим
+    // стерео-маску: целевой формат теперь приходит от реального устройства
+    // вывода (`AudioTarget`), которое не обязательно стерео.
+    let mut out_layout = AVChannelLayout {
+        order: AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC,
+        nb_channels: 0,
+        u: AVChannelLayout__bindgen_ty_1 { mask: 0 },
         opaque: null_mut(),
     };
+    // SAFETY: out_layout — валидный (пусть и незаполненный) AVChannelLayout;
+    // av_channel_layout_default заполняет его стандартной раскладкой на
+    // channels каналов и не требует предварительной инициализации полей.
+    unsafe { av_channel_layout_default(&mut out_layout, i32::from(target.channels)) };
     // SAFETY: swr — out-параметр; раскладки живут на время вызова.
     let ret = unsafe {
         swr_alloc_set_opts2(
             &mut swr,
             &out_layout,
             AVSampleFormat::AV_SAMPLE_FMT_FLT,
-            AUDIO_TARGET_SAMPLE_RATE as c_int,
+            target.rate as c_int,
             in_layout,
             in_fmt,
             in_rate as c_int,

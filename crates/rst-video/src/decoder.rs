@@ -21,7 +21,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
@@ -89,10 +88,11 @@ pub(crate) fn decoder_thread(
     audio_tx: SyncSender<AudioChunkOut>,
     info_tx: mpsc::Sender<Result<VideoInfo, VideoError>>,
     shared: Arc<Shared>,
+    audio_target: crate::pipeline::AudioTarget,
 ) {
     // Открытие и проверка первого кадра (формат пикселя/размеры) — здесь, в
     // потоке: все FFmpeg-вызовы одного файла живут на одной нити.
-    let mut pipe = match Pipeline::open(&path) {
+    let mut pipe = match Pipeline::open(&path, audio_target) {
         Ok(pipe) => pipe,
         Err(e) => {
             let _ = info_tx.send(Err(e));
@@ -117,8 +117,17 @@ pub(crate) fn decoder_thread(
 
     loop {
         // 1. Команды (и только команды — пакеты не читаются).
+        let was_paused = paused;
         if drain_commands(&ctl_rx, &mut paused, &mut pending_seek, &shared) {
             break; // Shutdown
+        }
+        if was_paused && !paused {
+            // Возобновление с паузы: старый якорь датирован до-паузным
+            // моментом — без сброса все кадры после паузы длительностью P
+            // отдаются мгновенно "вдогонку", видео пропускает P секунд
+            // контента. Найдено независимым ревью: докком `Pacing` обещал
+            // сброс "и возобновления с паузы", код его не делал.
+            pacing.reset();
         }
 
         // 2. Перемотка — до чтения новых пакетов (безопасная точка: между
@@ -138,8 +147,12 @@ pub(crate) fn decoder_thread(
         if paused {
             match ctl_rx.recv_timeout(PAUSE_POLL) {
                 Ok(cmd) => {
+                    let was_paused = paused;
                     if apply_command(cmd, &mut paused, &mut pending_seek, &shared) {
                         break; // Shutdown
+                    }
+                    if was_paused && !paused {
+                        pacing.reset();
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -151,7 +164,19 @@ pub(crate) fn decoder_thread(
         // 4. Один шаг декода.
         match pipe.next() {
             Ok(Event::Video(frame)) => {
-                pace_to(&mut pacing, frame.pts);
+                // pace_to прерывается командой из ctl_rx, а не спит напролёт
+                // весь остаток (найдено независимым ревью: иначе Shutdown/
+                // Pause/Seek задерживались бы на весь PACE_SLICE-остаток —
+                // секунды/минуты на файле с аномальным скачком PTS).
+                if let Some(cmd) = pace_to(&mut pacing, frame.pts, &ctl_rx) {
+                    if apply_command(cmd, &mut paused, &mut pending_seek, &shared) {
+                        break; // Shutdown
+                    }
+                    // Кадр уже декодирован — не выбрасываем проделанную
+                    // работу, отправляем как обычно; если команда была
+                    // Pause/Seek, она подхватится на следующей итерации
+                    // цикла (шаг 2/3 выше).
+                }
                 // Полная очередь — кадр отбрасывается: координатор медленнее
                 // реального времени, пропуск кадров — корректное поведение
                 // (очередь несёт самые свежие кадры, см. доку модуля).
@@ -231,23 +256,40 @@ fn apply_command(
 /// Задержать выдачу кадра до его тайминга: `anchor + pts` — момент показа.
 /// Кадры до первого (после сброса якоря) отдаются сразу, якорь при этом
 /// выставляется так, что таймлайн не прыгает: `anchor = now - pts`.
-fn pace_to(pacing: &mut Pacing, pts: Duration) {
+///
+/// Прерывается командой из `ctl_rx`: если во время ожидания приходит
+/// Play/Pause/Seek/Shutdown, возвращает её НЕМЕДЛЕННО (не потребляя остаток
+/// ожидания) — вызывающий код обязан применить её через `apply_command`.
+/// Раньше спал `thread::sleep`-срезами вслепую, не проверяя канал команд —
+/// независимое ревью нашло, что это давало задержку Shutdown/Pause/Seek на
+/// весь оставшийся сон (секунды-минуты на файле с аномальным скачком PTS),
+/// хотя докомментарий заявлял «≤ 100 мс». `recv_timeout` вместо
+/// `thread::sleep` даёт то же ограничение сверху (`PACE_SLICE`), но
+/// просыпается сразу, как только команда реально приходит.
+fn pace_to(pacing: &mut Pacing, pts: Duration, ctl_rx: &Receiver<Control>) -> Option<Control> {
     let anchor = match pacing.anchor {
         Some(anchor) => anchor,
         None => {
             let now = Instant::now();
             pacing.anchor = Some(now.checked_sub(pts).unwrap_or(now));
-            return;
+            return None;
         }
     };
     let target = anchor + pts;
     let mut remaining = target.saturating_duration_since(Instant::now());
-    // Сон срезами ≤ 100 мс: команды доезжают с задержкой ≤ 100 мс.
     while !remaining.is_zero() {
         let slice = remaining.min(PACE_SLICE);
-        thread::sleep(slice);
+        match ctl_rx.recv_timeout(slice) {
+            Ok(cmd) => return Some(cmd),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // Отправитель (VideoSource) исчез без явного Shutdown — не должно
+            // происходить в штатной работе (Drop всегда шлёт Shutdown), но
+            // трактуем как Shutdown защитно, а не зависаем в ожидании.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(Control::Shutdown),
+        }
         remaining = remaining.saturating_sub(slice);
     }
+    None
 }
 
 /// Статические данные открытого файла (отправляются из потока в `open`).

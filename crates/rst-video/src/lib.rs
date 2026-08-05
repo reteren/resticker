@@ -92,11 +92,34 @@ pub struct VideoSource {
 }
 
 impl VideoSource {
+    /// Открыть файл с ресемплингом звука под дефолтный целевой формат
+    /// ([`AUDIO_TARGET_SAMPLE_RATE`]/[`AUDIO_TARGET_CHANNELS`]) — удобно для
+    /// тестов и вызывающего кода без живого микшера под рукой. Продакшен-код
+    /// координатора должен использовать [`Self::open_with_audio_target`] с
+    /// реальным форматом устройства вывода (`rst_audio::AudioMixer::
+    /// sample_rate`/`channels`) — иначе на устройстве с другой частотой/
+    /// раскладкой каналов звук будет играть на неверной скорости или с
+    /// испорченными каналами (найдено независимым ревью сшивки).
+    pub fn open(path: &Path) -> Result<Self, VideoError> {
+        Self::open_with_audio_target(path, AUDIO_TARGET_SAMPLE_RATE, AUDIO_TARGET_CHANNELS as u16)
+    }
+
     /// Открыть файл, найти видеопоток и проверить первый кадр (формат
     /// пикселя YUV420P, размеры) — `Err` возвращается с понятной причиной,
     /// если файл не видео, кодек не собран или формат пикселя не
     /// поддерживается. Блокирует до готовности декодера (обычно миллисекунды).
-    pub fn open(path: &Path) -> Result<Self, VideoError> {
+    /// Звук ресемплируется в `audio_sample_rate`/`audio_channels` — обычно
+    /// реальный формат устройства вывода, чтобы микшер (`rst-audio`) не
+    /// ресемплировал сам (design §4).
+    pub fn open_with_audio_target(
+        path: &Path,
+        audio_sample_rate: u32,
+        audio_channels: u16,
+    ) -> Result<Self, VideoError> {
+        let audio_target = pipeline::AudioTarget {
+            rate: audio_sample_rate,
+            channels: audio_channels,
+        };
         let (info_tx, info_rx) = mpsc::channel();
         let (ctl_tx, ctl_rx) = mpsc::channel();
         let (frame_tx, frame_rx) = mpsc::sync_channel(decoder::FRAME_QUEUE_CAPACITY);
@@ -118,6 +141,7 @@ impl VideoSource {
                     audio_tx,
                     info_tx,
                     thread_shared,
+                    audio_target,
                 );
             })
             .map_err(|e| VideoError::Decode(format!("не удалось создать поток-декодер: {e}")))?;
