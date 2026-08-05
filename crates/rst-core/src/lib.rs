@@ -6,6 +6,7 @@
 //! никаких зависимостей от Windows или рендера, вся логика покрывается
 //! юнит-тестами на любой ОС.
 
+pub mod animation_clock;
 pub mod config;
 mod error;
 pub mod hittest;
@@ -20,4 +21,5 @@ pub mod snap;
 pub mod transform_ops;
 pub mod undo;
 
+pub use animation_clock::AnimationClock;
 pub use error::CoreError;
