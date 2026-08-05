@@ -335,6 +335,13 @@ pub fn build_picker_panel(
     let process_label_left = process_cb_cx + theme::CHECKBOX_SIZE / 2.0 + PICKER_GAP;
     let window_cb_cx = process_cb_cx + PICKER_WINDOW_INDENT;
     let window_label_left = window_cb_cx + theme::CHECKBOX_SIZE / 2.0 + PICKER_GAP;
+    // Правый край панели — независимое ревью нашло, что панель была первым
+    // местом в конвейере примитивов, где рисуется текст произвольной длины
+    // без клиппинга: длинный заголовок окна/имя процесса иначе просто рисуют
+    // за рамкой. Обрезаем по ширине с многоточием (`truncate_to_width`).
+    let right_edge = frame.cx + frame.w / 2.0 - PICKER_PAD;
+    let process_label_max_w = right_edge - process_label_left;
+    let window_label_max_w = right_edge - window_label_left;
 
     // Список: один проход по всем группам. Реальный индекс строки `row`
     // считаем всегда (total_rows и скролл), виджеты строим только для
@@ -356,6 +363,7 @@ pub fn build_picker_panel(
                 Some(name) => format!("{name} ({})", group.windows.len()),
                 None => format!("Неизвестный процесс ({})", group.windows.len()),
             };
+            let text = truncate_to_width(&text, process_label_max_w);
             panel.add_widget(RowLabel::new(
                 PICKER_ROW_PROCESS_BASE + g as WidgetId + LABEL_FLAG,
                 text_rect(process_label_left, cy, &text),
@@ -373,11 +381,12 @@ pub fn build_picker_panel(
                     Checkbox::standard(id, window_cb_cx, cy, window_is_checked(visibility, window));
                 cb.set_disabled(true);
                 panel.add_widget(cb);
+                let title = truncate_to_width(&window.title, window_label_max_w);
                 panel.add_widget(RowLabel::new(
                     id + LABEL_FLAG,
-                    text_rect(window_label_left, cy, &window.title),
+                    text_rect(window_label_left, cy, &title),
                     icon_rect(icon_cx, cy),
-                    window.title.clone(),
+                    title,
                 ));
                 built += 1;
             }
@@ -395,6 +404,27 @@ pub fn build_picker_panel(
 /// попавших в окно скролла: они укладываются сверху вниз под шапкой).
 fn row_cy(list_top: f64, visible_index: usize) -> f64 {
     list_top + visible_index as f64 * PICKER_ROW_H + PICKER_ROW_H / 2.0
+}
+
+/// Обрезать `text` многоточием, чтобы уместиться в `max_w` DIP (независимое
+/// ревью нашло: конвейер примитивов не клипует текст, а панель — первое
+/// место, где рисуется текст произвольной длины — длинный заголовок окна
+/// или имя процесса иначе просто рисовался бы за правым краем панели).
+/// Считает по символам (`char`), не байтам — заголовки часто кириллические,
+/// обрезка по байтам могла бы разрезать символ пополам.
+fn truncate_to_width(text: &str, max_w: f64) -> String {
+    if text_size(text).0 <= max_w {
+        return text.to_string();
+    }
+    const ELLIPSIS: &str = "...";
+    let chars: Vec<char> = text.chars().collect();
+    for len in (0..chars.len()).rev() {
+        let candidate: String = chars[..len].iter().collect::<String>() + ELLIPSIS;
+        if text_size(&candidate).0 <= max_w {
+            return candidate;
+        }
+    }
+    ELLIPSIS.to_string()
 }
 
 /// Текстовая область надписи: левый край `left`, центр строки `cy`.
@@ -1260,5 +1290,45 @@ mod tests {
             picker_frame(),
         );
         assert!(picker_texts(&all.panel).contains(&"Снять все".to_string()));
+    }
+
+    // --- обрезка длинного текста (независимое ревью, конвейер не клипует) ---
+
+    #[test]
+    fn truncate_to_width_keeps_short_text_intact() {
+        assert_eq!(truncate_to_width("chrome.exe", 500.0), "chrome.exe");
+    }
+
+    #[test]
+    fn truncate_to_width_shortens_with_ellipsis() {
+        let long = "Очень длинный заголовок окна, который явно не влезет";
+        let truncated = truncate_to_width(long, 60.0);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.len() < long.len());
+        assert!(text_size(&truncated).0 <= 60.0);
+    }
+
+    #[test]
+    fn truncate_to_width_handles_cyrillic_by_char_not_byte() {
+        // Кириллица — многобайтовые символы в UTF-8; обрезка по байтам могла
+        // бы разрезать символ пополам и дать невалидную строку/панику.
+        let long = "жжжжжжжжжжжжжжжжжжжжжжжжжжжжжж";
+        let truncated = truncate_to_width(long, 20.0);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.chars().count() < long.chars().count() + 3);
+    }
+
+    #[test]
+    fn build_picker_panel_truncates_long_window_title() {
+        let long_title = "Ж".repeat(200);
+        let snapshot = [window(1, r"C:\Apps\app.exe", &long_title, 1, 1)];
+        let picker = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let texts = picker_texts(&picker.panel);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.ends_with("...") && t.len() < long_title.len()),
+            "длинный заголовок должен быть обрезан с многоточием: {texts:?}"
+        );
     }
 }
