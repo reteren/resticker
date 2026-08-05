@@ -90,26 +90,34 @@ impl AnimationClock {
                 .expect("AnimationClock: суммарная длительность цикла превышает ~584 года"),
         );
         let mut k = self.frame_index;
-        let mut consumed = Duration::ZERO;
         loop {
             let delay = frame_delays[k];
             if delay > rem {
-                // Ещё не время уходить с кадра `k`.
+                // Ещё не время уходить с кадра `k`; `rem` — сколько уже
+                // простояли на кадре `k` в ЭТОМ повторении цикла.
                 break;
             }
             if !delay.is_zero() {
                 rem -= delay;
-                consumed += delay;
             }
             k = (k + 1) % frame_delays.len();
         }
 
-        if k == self.frame_index {
-            return false;
-        }
+        let changed = k != self.frame_index;
         self.frame_index = k;
-        self.frame_started_at += consumed;
-        true
+        // Синхронизируем `frame_started_at` на «сейчас минус сколько уже
+        // простояли на кадре `k`» ВСЕГДА, даже если кадр не изменился
+        // (`changed == false`): иначе, приземлившись после долгой паузы на
+        // ТОТ ЖЕ кадр, что и до паузы, старый якорь остаётся от давнего
+        // цикла — `next_deadline` на нём считает от него и уходит в далёкое
+        // прошлое (планировщик получил бы уже истёкший дедлайн и слал бы
+        // `AnimationTick` в бесконечном цикле без единой смены кадра — баг
+        // найден независимым ревью M5a, воспроизведён отдельной симуляцией).
+        // Для «изменился» кейса это то же самое значение, что раньше давало
+        // `frame_started_at += consumed` — расходится только когда `elapsed`
+        // пересекает границу полного цикла (реальный сценарий паузы).
+        self.frame_started_at = now - rem;
+        changed
     }
 
     /// Ближайший момент, когда `advance` может снова изменить кадр.
@@ -206,8 +214,15 @@ mod tests {
         assert_eq!(clock.frame_index, 2);
         assert_eq!(
             clock.frame_started_at,
-            t0 + Duration::from_millis(200),
-            "кадр 2 занимает [200, 300) внутри цикла; `now` на 50ms глубже в нём"
+            now - Duration::from_millis(50),
+            "кадр 2 занимает [200, 300) внутри ЭТОГО повторения цикла; `now` на \
+             50ms глубже в нём — якорь обязан быть недавним (`now`-относительным), \
+             а не датированным исходным t0 (иначе next_deadline после паузы \
+             уходит в прошлое)"
+        );
+        assert!(
+            clock.next_deadline(&frames) > now,
+            "дедлайн после догонялок обязан быть в будущем относительно `now`"
         );
     }
 
@@ -220,11 +235,49 @@ mod tests {
         assert_eq!(clock.frame_index, 1);
 
         // Ровно целое число циклов (100 лет % 300ms == 0) — снова начало
-        // того же кадра 1: кадр не меняется, `frame_started_at` тоже.
+        // того же кадра 1: `frame_index` не меняется (`advance` возвращает
+        // `false`), но `frame_started_at` обязан пересинхронизироваться на
+        // `now` (мы буквально только что вошли в кадр 1 в ЭТОМ повторении
+        // цикла) — а не остаться на исходном t0+100ms из давнего прошлого.
         let now = t0 + Duration::from_secs(YEARS_100_SECS) + Duration::from_millis(100);
         assert!(!clock.advance(now, &frames));
         assert_eq!(clock.frame_index, 1);
-        assert_eq!(clock.frame_started_at, t0 + Duration::from_millis(100));
+        assert_eq!(clock.frame_started_at, now);
+        assert!(
+            clock.next_deadline(&frames) > now,
+            "дедлайн после догонялок обязан быть в будущем относительно `now`"
+        );
+    }
+
+    /// Регрессия на баг, найденный независимым ревью M5a: пауза, после
+    /// которой часы приземляются на ТОТ ЖЕ кадр, что и до паузы (самый частый
+    /// случай догонялок — не только точное кратное циклу), не должна
+    /// оставлять `next_deadline` в прошлом. Старая реализация обновляла
+    /// `frame_started_at` только в ветке «кадр изменился» — здесь кадр НЕ
+    /// меняется, и без фикса `next_deadline` осталась бы датирована исходным
+    /// `t0`, планировщик получил бы уже истёкший дедлайн и слал бы
+    /// `AnimationTick` бесконечно, ни разу не сменив кадр (busy-loop).
+    #[test]
+    fn next_deadline_after_landing_on_same_frame_is_never_in_the_past() {
+        let t0 = Instant::now();
+        let frames = delays(&[100, 100, 100]);
+        let mut clock = AnimationClock::new(t0);
+        assert!(clock.advance(t0 + Duration::from_millis(100), &frames));
+        assert_eq!(clock.frame_index, 1);
+
+        // 100 лет (кратно 300ms по построению теста выше) + 30ms — рем
+        // внутри кадра 1 (delay 100ms), не ноль: обычный случай «всё ещё на
+        // том же кадре», не только патологический ровно-кратный.
+        let now = t0 + Duration::from_secs(YEARS_100_SECS) + Duration::from_millis(130);
+        assert!(
+            !clock.advance(now, &frames),
+            "кадр не меняется — мы всё ещё в его окне [100,200) этого повторения цикла"
+        );
+        assert_eq!(clock.frame_index, 1);
+        assert!(
+            clock.next_deadline(&frames) > now,
+            "без фикса дедлайн был бы датирован t0 — на ~100 лет в прошлом от `now`"
+        );
     }
 
     #[test]
