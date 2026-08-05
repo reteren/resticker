@@ -1566,6 +1566,9 @@ fn run(
                     ms.scale,
                     &monitor_id,
                     &monitor_geometry,
+                    &monitor_bounds,
+                    &window_snapshot,
+                    &mut occluder_cache,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Key { .. }) => {}
@@ -1592,6 +1595,7 @@ fn run(
                     &monitor_bounds,
                     &mut loss_tracker,
                     &window_snapshot,
+                    &mut occluder_cache,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
@@ -1816,12 +1820,16 @@ fn cleanup_pasted_file(cfg: &Config, id: Uuid) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn perform_undo(
     renderer: &Renderer,
     cfg: &mut Config,
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_snapshot: &[WindowInfo],
+    occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
 ) -> bool {
     let Some(prev) = edit.undo_stack.pop() else {
         return false;
@@ -1841,15 +1849,25 @@ fn perform_undo(
     if let Err(e) = config::save(cfg, config_path) {
         tracing::warn!(error = %e, "не удалось сохранить config.json после отмены");
     }
+    // Снимок — это ВЕСЬ `Config`: откат мог поменять правило видимости любого
+    // стикера (в т.ч. только что изменённое панелью выбора окон), не только
+    // выделение/позиции. Без пересчёта здесь `occluder_cache` остался бы на
+    // правилах ОТКАЧЕННОГО состояния (та же находка ревью, что и в
+    // `handle_window_picker_up`, — см. MEMORY/BUGS.md vault'а).
+    *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn perform_redo(
     renderer: &Renderer,
     cfg: &mut Config,
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
     edit: &mut EditState,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_snapshot: &[WindowInfo],
+    occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
 ) -> bool {
     let Some(next) = edit.redo_stack.pop() else {
         return false;
@@ -1867,6 +1885,8 @@ fn perform_redo(
     if let Err(e) = config::save(cfg, config_path) {
         tracing::warn!(error = %e, "не удалось сохранить config.json после повтора");
     }
+    // См. комментарий в `perform_undo` — то же самое касается повтора.
+    *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
     true
 }
 
@@ -1931,6 +1951,9 @@ fn handle_key(
     scale: f32,
     monitor_id: &MonitorId,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_snapshot: &[WindowInfo],
+    occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
 ) -> bool {
     // История/удаление/дублирование во время активного жеста (сцены или
     // панели — ползунок прозрачности тоже держит указатель) мутировали бы
@@ -2027,17 +2050,44 @@ fn handle_key(
             true
         }
         VK_Z if modifiers.ctrl && modifiers.shift => {
-            let did = perform_redo(renderer, cfg, config_path, sprites, edit);
+            let did = perform_redo(
+                renderer,
+                cfg,
+                config_path,
+                sprites,
+                edit,
+                monitor_bounds,
+                window_snapshot,
+                occluder_cache,
+            );
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
         }
         VK_Z if modifiers.ctrl => {
-            let did = perform_undo(renderer, cfg, config_path, sprites, edit);
+            let did = perform_undo(
+                renderer,
+                cfg,
+                config_path,
+                sprites,
+                edit,
+                monitor_bounds,
+                window_snapshot,
+                occluder_cache,
+            );
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
         }
         VK_Y if modifiers.ctrl => {
-            let did = perform_redo(renderer, cfg, config_path, sprites, edit);
+            let did = perform_redo(
+                renderer,
+                cfg,
+                config_path,
+                sprites,
+                edit,
+                monitor_bounds,
+                window_snapshot,
+                occluder_cache,
+            );
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
         }
@@ -2890,12 +2940,15 @@ fn rebuild_window_picker(
 /// §1, §4): «Выбрать все» и чекбоксы процессов — каждое переключение своим
 /// шагом истории, как у тулбара. Чекбоксы окон всегда disabled (дизайн §7.6)
 /// и здесь не опрашиваются — выбор только на уровне процесса.
+#[allow(clippy::too_many_arguments)]
 fn handle_window_picker_up(
     edit: &mut EditState,
     cfg: &mut Config,
     config_path: &Path,
     window_snapshot: &[WindowInfo],
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
     pos: (f64, f64),
 ) -> bool {
     let Some(state) = &mut edit.window_picker else {
@@ -2928,6 +2981,13 @@ fn handle_window_picker_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после «выбрать все» в панели выбора окон");
         }
+        // Найдено независимым ревью (2026-08-05, см. MEMORY/BUGS.md
+        // vault'а): без пересчёта здесь `occluder_cache` остаётся на
+        // СТАРЫХ правилах видимости этого стикера до следующего
+        // `Windows(Changed)`/`DpiChanged`/`MonitorsChanged` — маска не
+        // отражала бы только что выбранные в панели окна, пока не придёт
+        // не связанное с этим событие трекера.
+        *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
         rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
         return true;
     }
@@ -2958,6 +3018,9 @@ fn handle_window_picker_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения процесса в панели выбора окон");
         }
+        // См. комментарий у «выбрать все» выше — тот же пересчёт нужен и
+        // для точечного переключения одного процесса.
+        *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
         rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
         return true;
     }
@@ -3317,6 +3380,7 @@ fn handle_input(
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     loss_tracker: &mut MonitorLossTracker,
     window_snapshot: &[WindowInfo],
+    occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
 ) -> bool {
     let monitor = DipRect::new(
         0.0,
@@ -3725,6 +3789,8 @@ fn handle_input(
                         config_path,
                         window_snapshot,
                         monitor_geometry,
+                        monitor_bounds,
+                        occluder_cache,
                         (dip_x, dip_y),
                     );
                 }
