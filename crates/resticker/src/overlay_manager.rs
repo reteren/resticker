@@ -30,6 +30,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use rst_core::AnimationClock;
 use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{
@@ -43,11 +44,12 @@ use rst_core::ops;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
+use rst_media::animation as media_animation;
 use rst_media::paste;
 use rst_render::{
     Box2D, Button, Checkbox, Device, Icon, Key, NumericField, Panel, PointerEvent, Primitive,
-    RenderError, SelectionBox, Slider, Sprite, Texture, WidgetId, WindowTarget, edit_overlay,
-    marquee_visuals, rasterize, solid_sprite, theme,
+    RenderError, SelectionBox, Slider, Sprite, Texture, TextureAtlas, WidgetId, WindowTarget,
+    edit_overlay, marquee_visuals, rasterize, solid_sprite, theme,
 };
 use rst_win32::clipboard::{self, ClipboardImage};
 use rst_win32::file_dialog;
@@ -91,6 +93,16 @@ impl Renderer<'_> {
 
     fn load_image(&self, path: &Path) -> Result<Texture, RenderError> {
         self.device.load_image(path)
+    }
+
+    /// Собрать текстурный атлас анимации (M5a) — см. `Device::create_texture_atlas`.
+    fn create_texture_atlas(
+        &self,
+        frames: &[(Vec<u8>, Duration)],
+        frame_w: u32,
+        frame_h: u32,
+    ) -> Result<TextureAtlas, RenderError> {
+        self.device.create_texture_atlas(frames, frame_w, frame_h)
     }
 
     fn draw(&self, sprites: &[Sprite]) -> Result<(), RenderError> {
@@ -403,6 +415,12 @@ enum OverlayMessage {
     /// не привязан к монитору, форвардится тем же паттерном, что и per-monitor
     /// события: поток-мост копирует `WindowEvent` трекера в общий канал.
     Windows(TrackerWindowEvent),
+    /// Будильник планировщика анимации (M5a, docs/M5A_ANIMATION_DESIGN.md §5):
+    /// отправлен потоком-планировщиком, когда истёк ближайший дедлайн кадра
+    /// хотя бы одной анимации. В отличие от `Tick` — переменный интервал, а
+    /// не раз в секунду: планировщик спит ровно до дедлайна, который ему
+    /// последним прислал координатор.
+    AnimationTick,
 }
 
 /// Период тика автомата потери монитора (M3_HOTPLUG_DESIGN.md §1):
@@ -571,6 +589,13 @@ struct EditState {
     /// (дизайн §5.2); фактическое открытие происходит в цикле `run()`,
     /// где снимок под рукой, сразу после обработки текущего сообщения.
     pending_open_picker: Option<Uuid>,
+    /// Атлас только что добавленной анимации (M5a, docs/M5A_ANIMATION_DESIGN.md
+    /// §5) — `add_sticker` собирает атлас (нужен `Renderer`, которого нет в
+    /// `run()`) и кладёт его сюда вместо прямой записи в `animations`
+    /// (локальная переменная `run()`, недоступная на глубине вызова); цикл
+    /// `run()` забирает его в `animations` сразу после обработки текущего
+    /// сообщения, тем же паттерном, что `pending_open_picker`.
+    pending_animation: Option<(Uuid, TextureAtlas)>,
     /// Текущая рамка марки для отрисовки (`anchor_x, anchor_y, cur_x, cur_y`,
     /// DIP) — `None`, если марка не тянется в этот момент.
     marquee: Option<(f64, f64, f64, f64)>,
@@ -792,6 +817,24 @@ fn primitives_to_sprites(
     }
 }
 
+/// Анимация одного стикера (M5a, docs/M5A_ANIMATION_DESIGN.md §5): атлас
+/// кадров на GPU + часы, решающие, какой кадр сейчас показывать. Чисто
+/// runtime-состояние `run()` — не поле `EditState`/`Config`, тем же
+/// паттерном, что `occluder_cache`/`window_snapshot`: переживает вход/выход
+/// из режима редактирования, не персистится.
+struct StickerAnimation {
+    atlas: TextureAtlas,
+    clock: AnimationClock,
+}
+
+impl StickerAnimation {
+    /// Задержки кадров в порядке атласа — вход `AnimationClock::advance`/
+    /// `next_deadline`.
+    fn frame_delays(&self) -> Vec<Duration> {
+        self.atlas.frames.iter().map(|f| f.delay).collect()
+    }
+}
+
 fn run(
     config_path: PathBuf,
     mut cfg: Config,
@@ -964,6 +1007,41 @@ fn run(
         }
     });
 
+    // Планировщик анимации (M5a, docs/M5A_ANIMATION_DESIGN.md §5): тот же
+    // паттерн «поток + канал в общую очередь», что и `Tick`-поток выше, но с
+    // ПЕРЕМЕННЫМ интервалом — спит ровно до ближайшего дедлайна кадра
+    // анимации, а не раз в секунду. `anim_deadline_tx` — отдельный канал
+    // «координатор → планировщик»: координатор пересчитывает ближайший
+    // дедлайн после каждого сообщения (см. конец цикла `for msg in rx`) и
+    // присылает его сюда; `None` — анимаций, которым нужен тик, сейчас нет
+    // (планировщик просто ждёт следующего обновления неопределённо долго).
+    let (anim_deadline_tx, anim_deadline_rx) = mpsc::channel::<Option<Instant>>();
+    let anim_tx = tx.clone();
+    thread::spawn(move || {
+        // Час без обновлений — не магическое ожидание конкретного события, а
+        // периодическая самопроверка на случай гонки «дедлайн уже None,
+        // но канал ещё не закрыт»; ничего не шлёт, если deadline реально None.
+        const IDLE_POLL: Duration = Duration::from_secs(3600);
+        let mut deadline: Option<Instant> = None;
+        loop {
+            let timeout =
+                deadline.map_or(IDLE_POLL, |d| d.saturating_duration_since(Instant::now()));
+            match anim_deadline_rx.recv_timeout(timeout) {
+                Ok(new_deadline) => deadline = new_deadline,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if deadline.is_some() && anim_tx.send(OverlayMessage::AnimationTick).is_err() {
+                        break;
+                    }
+                    // Дедлайн потреблён (сработал или был `IDLE_POLL`-заглушкой)
+                    // — не тикать снова, пока координатор не пришлёт новый
+                    // после обработки этого сообщения.
+                    deadline = None;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
     // Трекер окон (M4_WINDOW_TRACKER_DESIGN.md §6): свой поток + канал, как у
     // OverlayWindow/тика — мост копирует его WindowEvent в общий канал.
     // Неудача запуска не фатальна для всего процесса (стикеры без слоёв
@@ -994,6 +1072,24 @@ fn run(
     if let Some(tracker) = &window_tracker {
         tracker.set_mask_needed(last_mask_needed);
     }
+
+    // Анимации живых стикеров (M5a, docs/M5A_ANIMATION_DESIGN.md §5) —
+    // локальная переменная `run()`, не поле `EditState`/`Config`, тем же
+    // паттерном, что `occluder_cache`: чисто runtime, переживает вход/выход
+    // из режима редактирования. Заводится в `add_sticker` (через
+    // `EditState::pending_animation`, см. докком там), удаляется при
+    // удалении стикера — прунится раз за итерацию цикла ниже, тем же
+    // дешёвым паттерном, что гейт `mask_needed`.
+    let mut animations: HashMap<Uuid, StickerAnimation> = HashMap::new();
+    // Последний дедлайн, отправленный планировщику — чтобы не слать
+    // одинаковое значение на каждой итерации цикла впустую.
+    let mut last_anim_deadline: Option<Instant> = None;
+    // Сессия Windows заблокирована (SPEC.md §9) — пока `true`, часы анимации
+    // не тикают и планировщику не шлётся новый дедлайн: экран блокировки не
+    // виден пользователю, анимировать нечего (тот же принцип, что «не
+    // декодировать невидимое», ARCHITECTURE.md §4.3, просто на уровне всей
+    // сессии, а не одного стикера).
+    let mut session_locked = false;
 
     // Последний снимок окон трекера (M4_OCCLUDERS_DESIGN.md §1) — обычная
     // локальная переменная `run()`, не поле `EditState`: маска перекрытия не
@@ -1040,6 +1136,7 @@ fn run(
         confirm: None,
         window_picker: None,
         pending_open_picker: None,
+        pending_animation: None,
         marquee: None,
         marquee_started: false,
         toolbar: None,
@@ -1080,6 +1177,7 @@ fn run(
             &mut sprites,
             &cfg,
             &mut ui_cache,
+            &mut animations,
         ) {
             redraw_all(
                 &device,
@@ -1114,6 +1212,7 @@ fn run(
                         &mut cfg,
                         &config_path,
                         &mut sprites,
+                        &mut edit,
                         path,
                         false,
                         ms.scale,
@@ -1506,13 +1605,16 @@ fn run(
                 // SPEC.md §9: на экране блокировки стикеры не видны — это
                 // обеспечивает сама ОС (оверлеи принадлежат пользовательской
                 // сессии), кода не требует. Приостановка декодирования видео/
-                // звука из того же пункта — не наш случай сейчас: декодер
-                // появится только в M5 (ROADMAP.md); откладывать
-                // соответствующую логику до тех пор.
+                // звука из того же пункта была не наш случай до M5 — с M5a
+                // анимация уже есть: пока сессия заблокирована, часы не
+                // тикают и планировщику не шлётся новый дедлайн (см. низ
+                // цикла), тем же принципом «не декодировать невидимое».
                 tracing::info!("сессия Windows заблокирована");
+                session_locked = true;
             }
             OverlayMessage::Event(_, OverlayEvent::SessionUnlocked) => {
                 tracing::info!("сессия Windows разблокирована");
+                session_locked = false;
                 reenumerate_monitors(&tx, &primary_id, "разблокировки сессии");
             }
             OverlayMessage::Event(_, OverlayEvent::SystemSuspending) => {
@@ -1617,6 +1719,80 @@ fn run(
                 rebuild_window_picker(&mut edit, &cfg, &window_snapshot, &monitor_geometry);
                 need_redraw = true;
             }
+            OverlayMessage::AnimationTick => {
+                // Планировщик разбудил нас на ближайший известный ему
+                // дедлайн (M5a §5) — продвигаем часы всех анимаций, которым
+                // сейчас положено тикать (видимых и не полностью
+                // перекрытых, ARCHITECTURE.md §4.3); новый спрайт-кадр
+                // пишем прямо в `sprites` — `redraw()` их уже читает
+                // одинаково для статичных и анимированных стикеров (UV по
+                // умолчанию — вся текстура).
+                let now = Instant::now();
+                for (id, anim) in animations.iter_mut() {
+                    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) else {
+                        continue;
+                    };
+                    if !animation_should_tick(
+                        sticker,
+                        edit.active,
+                        &occluder_cache,
+                        &monitor_bounds,
+                    ) {
+                        continue;
+                    }
+                    let delays = anim.frame_delays();
+                    if anim.clock.advance(now, &delays) {
+                        let frame = anim.atlas.frames[anim.clock.frame_index];
+                        if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| sid == id) {
+                            sprite.uv_offset = frame.uv_offset;
+                            sprite.uv_scale = frame.uv_scale;
+                        }
+                        need_redraw = true;
+                    }
+                }
+            }
+        }
+        // Атлас только что добавленной анимации (M5a §5, EditState::
+        // pending_animation) — заводим часы здесь, где под рукой
+        // `animations`; `add_sticker` не может сделать это сам, он не видит
+        // локальную переменную цикла `run()`.
+        if let Some((id, atlas)) = edit.pending_animation.take() {
+            animations.insert(
+                id,
+                StickerAnimation {
+                    atlas,
+                    clock: AnimationClock::new(Instant::now()),
+                },
+            );
+        }
+        // Стикер мог быть удалён (тулбар/`Delete`/undo-redo) — прунить раз
+        // за итерацию, тем же дешёвым паттерном, что гейт `mask_needed`
+        // ниже, а не в каждой из точек мутации `cfg.stickers` по отдельности.
+        if !animations.is_empty() {
+            animations.retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
+        }
+        // Ближайший дедлайн среди анимаций, которым сейчас положено тикать —
+        // пересчитывается после каждого сообщения (не только `AnimationTick`:
+        // добавление/удаление стикера, скрытие/показ, любая мутация правила
+        // видимости панелью/undo/redo — все меняют множество «тикающих»
+        // анимаций или окклюдеры). Не шлём планировщику, пока сессия
+        // заблокирована (см. `SessionLocked`) — и не шлём, если значение не
+        // изменилось, чтобы не будить поток-планировщик впустую.
+        let next_anim_deadline = if session_locked {
+            None
+        } else {
+            animations
+                .iter()
+                .filter_map(|(id, anim)| {
+                    let sticker = cfg.stickers.iter().find(|s| s.id == *id)?;
+                    animation_should_tick(sticker, edit.active, &occluder_cache, &monitor_bounds)
+                        .then(|| anim.clock.next_deadline(&anim.frame_delays()))
+                })
+                .min()
+        };
+        if next_anim_deadline != last_anim_deadline {
+            last_anim_deadline = next_anim_deadline;
+            let _ = anim_deadline_tx.send(next_anim_deadline);
         }
         // Открытие панели выбора окон отложено до этой точки — кликом по
         // `TB_LAYERS` в `handle_toolbar_up`, у которого нет `window_snapshot`
@@ -1665,6 +1841,7 @@ fn run(
                 &mut sprites,
                 &cfg,
                 &mut ui_cache,
+                &mut animations,
             ) {
                 device_needs_recovery = false;
                 redraw_all(
@@ -1730,6 +1907,7 @@ fn toggle_edit_mode(
     edit.confirm = None;
     edit.window_picker = None;
     edit.pending_open_picker = None;
+    edit.pending_animation = None;
     edit.active = !edit.active;
     overlay.set_click_through(!edit.active);
     if !edit.active {
@@ -2211,6 +2389,7 @@ fn paste_from_clipboard(
                     cfg,
                     config_path,
                     sprites,
+                    edit,
                     path,
                     false,
                     scale,
@@ -2237,6 +2416,7 @@ fn paste_from_clipboard(
                         cfg,
                         config_path,
                         sprites,
+                        edit,
                         path.clone(),
                         true,
                         scale,
@@ -2604,6 +2784,45 @@ fn sticker_fully_covered(placement: &Placement, rotation: f64, scale: f32, rects
         .iter()
         .filter_map(inset_for_mask_radius)
         .any(|r| rect_contains(&r, &px))
+}
+
+/// Должна ли анимация стикера сейчас тикать (M5a, ARCHITECTURE.md §4.3 —
+/// не декодировать невидимое): `false` для скрытого (`!visible`) или
+/// полностью перекрытого маской стикера — тот же консервативный предикат,
+/// что отсечение в `redraw()` (`sticker_fully_covered`), но не привязанный к
+/// конкретному монитору/кадру рендера — планировщик анимации глобален для
+/// `run()`. В режиме редактирования маска выключена (M4) — тикает всегда,
+/// пока видим.
+fn animation_should_tick(
+    sticker: &Sticker,
+    edit_active: bool,
+    occluder_cache: &HashMap<MonitorId, Vec<OccluderSet>>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> bool {
+    if !sticker.visible {
+        return false;
+    }
+    if edit_active {
+        return true;
+    }
+    let Some(groups) = occluder_cache.get(&sticker.placement.monitor_id) else {
+        return true;
+    };
+    let Some(group) = groups.iter().find(|g| g.stickers.contains(&sticker.id)) else {
+        return true;
+    };
+    if group.rects.is_empty() {
+        return true;
+    }
+    let scale = monitor_bounds
+        .get(&sticker.placement.monitor_id)
+        .map_or(1.0, |b| b.scale) as f32;
+    !sticker_fully_covered(
+        &sticker.placement,
+        sticker.transform.rotation,
+        scale,
+        &group.rects,
+    )
 }
 
 /// `outer` уменьшенный на [`MASK_CORNER_RADIUS_PX`] со всех сторон — область,
@@ -3240,6 +3459,7 @@ fn add_sticker_from_dialog(
                 cfg,
                 config_path,
                 sprites,
+                edit,
                 path,
                 false,
                 scale,
@@ -4465,6 +4685,7 @@ fn recover_device(
     sprites: &mut Vec<(Uuid, Sprite)>,
     cfg: &Config,
     ui_cache: &mut UiTextureCache,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
 ) -> bool {
     tracing::warn!("D3D-устройство потеряно — пересоздаю устройство и все GPU-ресурсы");
     let new_device = match Device::new() {
@@ -4508,17 +4729,66 @@ fn recover_device(
     // пересоздаёт спрайты из cfg заново). Приемлемая деградация: путь и так
     // залогирован, а `resync_sprites` в этом сеансе обычно случается скоро
     // (docs/M3_DEVICE_RECOVERY_REVIEW.md, пункт 2.2).
+    //
+    // Анимации (M5a) пересобираются здесь целиком заново — `animations`
+    // держал атлас на СТАРОМ (потерянном) устройстве, его `Texture` мертва
+    // вместе с ним. Фаза анимации (текущий кадр) намеренно НЕ сохраняется
+    // через потерю устройства — редкое событие (сброс GPU-драйвера),
+    // рестарт с кадра 0 неотличим на глаз от короткого сбоя рендера.
     sprites.clear();
+    animations.clear();
     for sticker in &cfg.stickers {
-        if let Some(path) = sticker_image_path(&sticker.source) {
-            match new_device.load_image(path) {
-                Ok(texture) => sprites.push((
-                    sticker.id,
-                    Sprite::new(texture, sticker.placement.clone(), sticker.transform),
-                )),
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "не удалось перезагрузить стикер после потери устройства");
+        let Some(path) = sticker_image_path(&sticker.source) else {
+            continue;
+        };
+        let is_animation = matches!(
+            &sticker.source,
+            StickerSource::File {
+                media_type: MediaType::Animation,
+                ..
+            }
+        );
+        if is_animation {
+            match media_animation::decode_animation(path) {
+                Ok(anim) if anim.frames.len() >= 2 => {
+                    let frames: Vec<(Vec<u8>, Duration)> =
+                        anim.frames.into_iter().map(|f| (f.rgba, f.delay)).collect();
+                    match new_device.create_texture_atlas(&frames, anim.width, anim.height) {
+                        Ok(atlas) => {
+                            let f0 = atlas.frames[0];
+                            let sprite = Sprite::new(
+                                atlas.texture.clone(),
+                                sticker.placement.clone(),
+                                sticker.transform,
+                            )
+                            .with_uv(f0.uv_offset, f0.uv_scale);
+                            sprites.push((sticker.id, sprite));
+                            animations.insert(
+                                sticker.id,
+                                StickerAnimation {
+                                    atlas,
+                                    clock: AnimationClock::new(Instant::now()),
+                                },
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), error = %e, "не удалось пересобрать атлас анимации после потери устройства — загружаю как статичное изображение");
+                        }
+                    }
                 }
+                _ => {
+                    tracing::warn!(path = %path.display(), "анимация не переоткрылась после потери устройства — загружаю как статичное изображение");
+                }
+            }
+        }
+        match new_device.load_image(path) {
+            Ok(texture) => sprites.push((
+                sticker.id,
+                Sprite::new(texture, sticker.placement.clone(), sticker.transform),
+            )),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "не удалось перезагрузить стикер после потери устройства");
             }
         }
     }
@@ -4541,17 +4811,55 @@ fn add_sticker(
     cfg: &mut Config,
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
+    edit: &mut EditState,
     path: PathBuf,
     pasted: bool,
     scale: f32,
     monitor_id: &MonitorId,
 ) -> bool {
-    let texture = match renderer.load_image(&path) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "не удалось загрузить выбранное изображение");
-            return false;
+    // Анимация — только для обычных файлов (M5a, docs/M5A_ANIMATION_DESIGN.md
+    // §5): вставка из буфера (`pasted`) материализует растровые данные
+    // (CF_DIBV5) как одиночный PNG в `StickerSource::Pasted`, который вообще
+    // не несёт `MediaType` — там анимации в принципе быть не может.
+    let animation = if pasted {
+        None
+    } else {
+        media_animation::decode_animation(&path)
+            .ok()
+            .filter(|a| a.frames.len() >= 2)
+    };
+
+    let (texture, uv_offset, uv_scale, atlas) = if let Some(anim) = animation {
+        let frames: Vec<(Vec<u8>, Duration)> =
+            anim.frames.into_iter().map(|f| (f.rgba, f.delay)).collect();
+        match renderer.create_texture_atlas(&frames, anim.width, anim.height) {
+            Ok(atlas) => {
+                let f0 = atlas.frames[0];
+                (
+                    atlas.texture.clone(),
+                    f0.uv_offset,
+                    f0.uv_scale,
+                    Some(atlas),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "не удалось собрать атлас анимации — загружаю как статичное изображение");
+                match load_static(renderer, &path) {
+                    Some(t) => (t, [0.0, 0.0], [1.0, 1.0], None),
+                    None => return false,
+                }
+            }
         }
+    } else {
+        match load_static(renderer, &path) {
+            Some(t) => (t, [0.0, 0.0], [1.0, 1.0], None),
+            None => return false,
+        }
+    };
+    let media_type = if atlas.is_some() {
+        MediaType::Animation
+    } else {
+        MediaType::Image
     };
     let (w, h) = (texture.width(), texture.height());
     // `placement` — DIP, а `overlay.size()` — физические пиксели живого
@@ -4577,7 +4885,7 @@ fn add_sticker(
     } else {
         Sticker::new_file(
             path,
-            MediaType::Image,
+            media_type,
             monitor_id.clone(),
             center_x,
             center_y,
@@ -4585,14 +4893,33 @@ fn add_sticker(
             h as f64,
         )
     };
-    let sprite = Sprite::new(texture, sticker.placement.clone(), sticker.transform);
+    let sprite = Sprite::new(texture, sticker.placement.clone(), sticker.transform)
+        .with_uv(uv_offset, uv_scale);
     let id = sticker.id;
     cfg.stickers.push(sticker);
     if let Err(e) = config::save(cfg, config_path) {
         tracing::warn!(error = %e, "не удалось сохранить config.json после добавления стикера");
     }
     sprites.push((id, sprite));
+    // Часы анимации заводятся в `run()` (там живёт `animations`, локальная
+    // переменная цикла, недоступная на этой глубине вызова) — см. доккомент
+    // `EditState::pending_animation`.
+    if let Some(atlas) = atlas {
+        edit.pending_animation = Some((id, atlas));
+    }
     true
+}
+
+/// Загрузить статичное изображение, залогировав неудачу (общий хвост между
+/// путём анимации, у которой не собрался атлас, и обычным путём — M5a).
+fn load_static(renderer: &Renderer, path: &Path) -> Option<Texture> {
+    match renderer.load_image(path) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "не удалось загрузить выбранное изображение");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
