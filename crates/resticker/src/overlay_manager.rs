@@ -921,20 +921,20 @@ fn run(
     // отрисовки берётся из cfg.stickers (по `order`) в `redraw`, а
     // видимость на конкретном мониторе — фильтром по `placement.monitor_id`
     // (М3, там же).
+    //
+    // `animations` заведена уже здесь (а не позже, ближе к остальным
+    // локальным переменным `run()`) — иначе анимированный стикер после
+    // рестарта процесса навсегда завис бы статичным кадром 0: без записи
+    // в `animations` часы для него просто никогда бы не завелись (найдено
+    // независимым ревью сшивки).
     let mut sprites: Vec<(Uuid, Sprite)> = Vec::new();
+    let mut animations: HashMap<Uuid, StickerAnimation> = HashMap::new();
     for sticker in &cfg.stickers {
-        if let Some(path) = sticker_image_path(&sticker.source) {
-            match device.load_image(path) {
-                Ok(texture) => {
-                    sprites.push((
-                        sticker.id,
-                        Sprite::new(texture, sticker.placement.clone(), sticker.transform),
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "не удалось загрузить стикер при старте");
-                }
-            }
+        if let Some((sprite, anim)) = load_sticker_sprite(&device, sticker) {
+            sprites.push((sticker.id, sprite));
+            animations.insert(sticker.id, anim);
+        } else if let Some(sprite) = load_static_sprite(&device, sticker) {
+            sprites.push((sticker.id, sprite));
         }
     }
 
@@ -1073,14 +1073,8 @@ fn run(
         tracker.set_mask_needed(last_mask_needed);
     }
 
-    // Анимации живых стикеров (M5a, docs/M5A_ANIMATION_DESIGN.md §5) —
-    // локальная переменная `run()`, не поле `EditState`/`Config`, тем же
-    // паттерном, что `occluder_cache`: чисто runtime, переживает вход/выход
-    // из режима редактирования. Заводится в `add_sticker` (через
-    // `EditState::pending_animation`, см. докком там), удаляется при
-    // удалении стикера — прунится раз за итерацию цикла ниже, тем же
-    // дешёвым паттерном, что гейт `mask_needed`.
-    let mut animations: HashMap<Uuid, StickerAnimation> = HashMap::new();
+    // `animations` уже заведена выше (сразу после старта, вместе со `sprites`)
+    // — здесь только оставшееся runtime-состояние планировщика M5a.
     // Последний дедлайн, отправленный планировщику — чтобы не слать
     // одинаковое значение на каждой итерации цикла впустую.
     let mut last_anim_deadline: Option<Instant> = None;
@@ -1235,6 +1229,7 @@ fn run(
                     &mut edit,
                     &mut cfg,
                     &mut sprites,
+                    &mut animations,
                     &renderer,
                     &config_path,
                     &monitor_geometry,
@@ -1671,6 +1666,7 @@ fn run(
                     &monitor_bounds,
                     &window_snapshot,
                     &mut occluder_cache,
+                    &mut animations,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Key { .. }) => {}
@@ -1698,6 +1694,7 @@ fn run(
                     &mut loss_tracker,
                     &window_snapshot,
                     &mut occluder_cache,
+                    &mut animations,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
@@ -1873,6 +1870,7 @@ fn toggle_edit_mode(
     edit: &mut EditState,
     cfg: &mut Config,
     sprites: &mut Vec<(Uuid, Sprite)>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
     renderer: &Renderer,
     config_path: &Path,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
@@ -1899,7 +1897,7 @@ fn toggle_edit_mode(
     // следующем клике тулбара (docs/M2_SLICE6_REVIEW.md, пункт 2.1).
     if let Some(before) = edit.ui_pending_snapshot.take() {
         *cfg = before;
-        resync_sprites(renderer, cfg, sprites);
+        resync_sprites(renderer, cfg, sprites, animations);
     }
     edit.pointer_owner = PointerOwner::None;
     // Открытый модал не переживает выход из режима — как и незавершённый
@@ -1935,7 +1933,12 @@ fn commit_undo_snapshot(edit: &mut EditState, snapshot: Config) {
 /// целиком заменили (undo/redo): убрать спрайты стикеров, которых больше
 /// нет, подгрузить текстуры для вернувшихся (undo удаления), синхронизировать
 /// `placement`/`transform` для остальных (undo ресайза/поворота/перемещения).
-fn resync_sprites(renderer: &Renderer, cfg: &Config, sprites: &mut Vec<(Uuid, Sprite)>) {
+fn resync_sprites(
+    renderer: &Renderer,
+    cfg: &Config,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
+) {
     sprites.retain(|(id, _)| cfg.stickers.iter().any(|s| s.id == *id));
     for sticker in &cfg.stickers {
         if let Some((_, sprite)) = sprites.iter_mut().find(|(id, _)| *id == sticker.id) {
@@ -1943,16 +1946,18 @@ fn resync_sprites(renderer: &Renderer, cfg: &Config, sprites: &mut Vec<(Uuid, Sp
             sprite.transform = sticker.transform;
             continue;
         }
-        if let Some(path) = sticker_image_path(&sticker.source) {
-            match renderer.load_image(path) {
-                Ok(texture) => sprites.push((
-                    sticker.id,
-                    Sprite::new(texture, sticker.placement.clone(), sticker.transform),
-                )),
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "не удалось загрузить стикер после undo/redo");
-                }
-            }
+        // Стикер вернулся (undo удаления) или впервые появился (дублирование,
+        // ops::duplicate) — `sprites` не содержит его. Анимация (M5a):
+        // `load_sticker_sprite` сама решает статика это или атлас; на
+        // `None` (не анимация/ошибка декода) — обычная статика через
+        // `load_static_sprite`, той же логикой, что старт процесса и
+        // `recover_device` (иначе именно этот путь молча терял анимацию —
+        // найдено независимым ревью сшивки).
+        if let Some((sprite, anim)) = load_sticker_sprite(renderer.device, sticker) {
+            sprites.push((sticker.id, sprite));
+            animations.insert(sticker.id, anim);
+        } else if let Some(sprite) = load_static_sprite(renderer.device, sticker) {
+            sprites.push((sticker.id, sprite));
         }
     }
 }
@@ -1965,6 +1970,78 @@ fn sticker_image_path(source: &StickerSource) -> Option<&Path> {
         StickerSource::File { path, .. } => Some(path),
         StickerSource::Pasted { path } => Some(path),
         StickerSource::Window { .. } => None,
+    }
+}
+
+/// Загрузить спрайт стикера по текущему `cfg`-состоянию `sticker.source`:
+/// статичная текстура или атлас анимации (M5a) — единая точка входа для
+/// ЛЮБОГО места, материализующего спрайт из `Config` заново (старт
+/// процесса, `resync_sprites` после undo/redo/дублирования/восстановления
+/// удалённого, `recover_device` после потери D3D-устройства). Раньше эта
+/// логика жила только внутри `recover_device` — из-за чего анимация
+/// молча деградировала до статичного кадра 0 во всех остальных точках
+/// (найдено независимым ревью сшивки, docs/M5A_ANIMATION_DESIGN.md §5).
+/// `Some((_, Some(anim)))` — вызывающий код обязан завести запись в
+/// `animations` для `sticker.id`; `Some((_, None))` — обычная статика.
+fn load_sticker_sprite(device: &Device, sticker: &Sticker) -> Option<(Sprite, StickerAnimation)> {
+    let path = sticker_image_path(&sticker.source)?;
+    let is_animation = matches!(
+        &sticker.source,
+        StickerSource::File {
+            media_type: MediaType::Animation,
+            ..
+        }
+    );
+    if is_animation {
+        match media_animation::decode_animation(path) {
+            Ok(anim) if anim.frames.len() >= 2 => {
+                let frames: Vec<(Vec<u8>, Duration)> =
+                    anim.frames.into_iter().map(|f| (f.rgba, f.delay)).collect();
+                match device.create_texture_atlas(&frames, anim.width, anim.height) {
+                    Ok(atlas) => {
+                        let f0 = atlas.frames[0];
+                        let sprite = Sprite::new(
+                            atlas.texture.clone(),
+                            sticker.placement.clone(),
+                            sticker.transform,
+                        )
+                        .with_uv(f0.uv_offset, f0.uv_scale);
+                        return Some((
+                            sprite,
+                            StickerAnimation {
+                                atlas,
+                                clock: AnimationClock::new(Instant::now()),
+                            },
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "не удалось собрать атлас анимации — загружаю как статичное изображение");
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(path = %path.display(), "анимация не декодировалась заново — загружаю как статичное изображение");
+            }
+        }
+    }
+    None
+}
+
+/// Загрузить статичную текстуру стикера (без анимации) — общий хвост между
+/// [`load_sticker_sprite`] на неудаче/не-анимации и всеми точками, которым
+/// сама анимация не нужна.
+fn load_static_sprite(device: &Device, sticker: &Sticker) -> Option<Sprite> {
+    let path = sticker_image_path(&sticker.source)?;
+    match device.load_image(path) {
+        Ok(texture) => Some(Sprite::new(
+            texture,
+            sticker.placement.clone(),
+            sticker.transform,
+        )),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "не удалось загрузить изображение стикера");
+            None
+        }
     }
 }
 
@@ -2008,6 +2085,7 @@ fn perform_undo(
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     window_snapshot: &[WindowInfo],
     occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
 ) -> bool {
     let Some(prev) = edit.undo_stack.pop() else {
         return false;
@@ -2022,7 +2100,7 @@ fn perform_undo(
     edit.ui_pending_snapshot = None;
     edit.pointer_owner = PointerOwner::None;
     edit.redo_stack.push(std::mem::replace(cfg, prev));
-    resync_sprites(renderer, cfg, sprites);
+    resync_sprites(renderer, cfg, sprites, animations);
     edit.selection.prune(&cfg.stickers);
     if let Err(e) = config::save(cfg, config_path) {
         tracing::warn!(error = %e, "не удалось сохранить config.json после отмены");
@@ -2046,6 +2124,7 @@ fn perform_redo(
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     window_snapshot: &[WindowInfo],
     occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
 ) -> bool {
     let Some(next) = edit.redo_stack.pop() else {
         return false;
@@ -2058,7 +2137,7 @@ fn perform_redo(
         edit.undo_stack.remove(0);
     }
     edit.undo_stack.push(std::mem::replace(cfg, next));
-    resync_sprites(renderer, cfg, sprites);
+    resync_sprites(renderer, cfg, sprites, animations);
     edit.selection.prune(&cfg.stickers);
     if let Err(e) = config::save(cfg, config_path) {
         tracing::warn!(error = %e, "не удалось сохранить config.json после повтора");
@@ -2081,6 +2160,7 @@ fn begin_delete(
     cfg: &mut Config,
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
     center: (f64, f64),
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
     monitor_id: &MonitorId,
@@ -2102,7 +2182,7 @@ fn begin_delete(
             let _ = ops::delete(cfg, id);
         }
         edit.selection.prune(&cfg.stickers);
-        resync_sprites(renderer, cfg, sprites);
+        resync_sprites(renderer, cfg, sprites, animations);
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после удаления");
         }
@@ -2132,6 +2212,7 @@ fn handle_key(
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     window_snapshot: &[WindowInfo],
     occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
 ) -> bool {
     // История/удаление/дублирование во время активного жеста (сцены или
     // панели — ползунок прозрачности тоже держит указатель) мутировали бы
@@ -2221,6 +2302,7 @@ fn handle_key(
                 edit,
                 cfg,
                 sprites,
+                animations,
                 renderer,
                 config_path,
                 monitor_geometry,
@@ -2237,6 +2319,7 @@ fn handle_key(
                 monitor_bounds,
                 window_snapshot,
                 occluder_cache,
+                animations,
             );
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
@@ -2251,6 +2334,7 @@ fn handle_key(
                 monitor_bounds,
                 window_snapshot,
                 occluder_cache,
+                animations,
             );
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
@@ -2265,6 +2349,7 @@ fn handle_key(
                 monitor_bounds,
                 window_snapshot,
                 occluder_cache,
+                animations,
             );
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             did
@@ -2282,6 +2367,7 @@ fn handle_key(
                 cfg,
                 config_path,
                 sprites,
+                animations,
                 center,
                 monitor_geometry,
                 monitor_id,
@@ -2298,7 +2384,7 @@ fn handle_key(
                     new_ids.push(new_id);
                 }
             }
-            resync_sprites(renderer, cfg, sprites);
+            resync_sprites(renderer, cfg, sprites, animations);
             edit.selection.clear();
             for id in new_ids {
                 edit.selection.select(id);
@@ -3316,6 +3402,7 @@ fn handle_toolbar_up(
     cfg: &mut Config,
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
     pos: (f64, f64),
     overlay_size: (u32, u32),
     scale: f32,
@@ -3408,7 +3495,7 @@ fn handle_toolbar_up(
     if clicked(edit, toolbar::TB_DUPLICATE) {
         commit_undo_snapshot(edit, cfg.clone());
         if let Ok(new_id) = ops::duplicate(cfg, id) {
-            resync_sprites(renderer, cfg, sprites);
+            resync_sprites(renderer, cfg, sprites, animations);
             edit.selection.click(Some(new_id));
         }
         if let Err(e) = config::save(cfg, config_path) {
@@ -3425,6 +3512,7 @@ fn handle_toolbar_up(
             cfg,
             config_path,
             sprites,
+            animations,
             center,
             monitor_geometry,
             monitor_id,
@@ -3483,6 +3571,7 @@ fn handle_cursor_panel_up(
     cfg: &mut Config,
     config_path: &Path,
     sprites: &mut Vec<(Uuid, Sprite)>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
     pos: (f64, f64),
     overlay_size: (u32, u32),
     scale: f32,
@@ -3538,6 +3627,7 @@ fn handle_cursor_panel_up(
             edit,
             cfg,
             sprites,
+            animations,
             renderer,
             config_path,
             monitor_geometry,
@@ -3601,6 +3691,7 @@ fn handle_input(
     loss_tracker: &mut MonitorLossTracker,
     window_snapshot: &[WindowInfo],
     occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
 ) -> bool {
     let monitor = DipRect::new(
         0.0,
@@ -3933,7 +4024,7 @@ fn handle_input(
                         let _ = ops::delete(cfg, *id);
                     }
                     edit.selection.prune(&cfg.stickers);
-                    resync_sprites(renderer, cfg, sprites);
+                    resync_sprites(renderer, cfg, sprites, animations);
                     if let Err(e) = config::save(cfg, config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить config.json после удаления через диалог");
                     }
@@ -3979,6 +4070,7 @@ fn handle_input(
                         cfg,
                         config_path,
                         sprites,
+                        animations,
                         (dip_x, dip_y),
                         overlay_size,
                         scale,
@@ -3994,6 +4086,7 @@ fn handle_input(
                         cfg,
                         config_path,
                         sprites,
+                        animations,
                         (dip_x, dip_y),
                         overlay_size,
                         scale,
@@ -4160,7 +4253,7 @@ fn handle_input(
             ) {
                 if let Some(before) = edit.ui_pending_snapshot.take() {
                     *cfg = before;
-                    resync_sprites(renderer, cfg, sprites);
+                    resync_sprites(renderer, cfg, sprites, animations);
                 }
                 edit.pointer_owner = PointerOwner::None;
                 rebuild_ui_panels(edit, cfg, monitor_geometry);
@@ -4738,58 +4831,11 @@ fn recover_device(
     sprites.clear();
     animations.clear();
     for sticker in &cfg.stickers {
-        let Some(path) = sticker_image_path(&sticker.source) else {
-            continue;
-        };
-        let is_animation = matches!(
-            &sticker.source,
-            StickerSource::File {
-                media_type: MediaType::Animation,
-                ..
-            }
-        );
-        if is_animation {
-            match media_animation::decode_animation(path) {
-                Ok(anim) if anim.frames.len() >= 2 => {
-                    let frames: Vec<(Vec<u8>, Duration)> =
-                        anim.frames.into_iter().map(|f| (f.rgba, f.delay)).collect();
-                    match new_device.create_texture_atlas(&frames, anim.width, anim.height) {
-                        Ok(atlas) => {
-                            let f0 = atlas.frames[0];
-                            let sprite = Sprite::new(
-                                atlas.texture.clone(),
-                                sticker.placement.clone(),
-                                sticker.transform,
-                            )
-                            .with_uv(f0.uv_offset, f0.uv_scale);
-                            sprites.push((sticker.id, sprite));
-                            animations.insert(
-                                sticker.id,
-                                StickerAnimation {
-                                    atlas,
-                                    clock: AnimationClock::new(Instant::now()),
-                                },
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(path = %path.display(), error = %e, "не удалось пересобрать атлас анимации после потери устройства — загружаю как статичное изображение");
-                        }
-                    }
-                }
-                _ => {
-                    tracing::warn!(path = %path.display(), "анимация не переоткрылась после потери устройства — загружаю как статичное изображение");
-                }
-            }
-        }
-        match new_device.load_image(path) {
-            Ok(texture) => sprites.push((
-                sticker.id,
-                Sprite::new(texture, sticker.placement.clone(), sticker.transform),
-            )),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "не удалось перезагрузить стикер после потери устройства");
-            }
+        if let Some((sprite, anim)) = load_sticker_sprite(&new_device, sticker) {
+            sprites.push((sticker.id, sprite));
+            animations.insert(sticker.id, anim);
+        } else if let Some(sprite) = load_static_sprite(&new_device, sticker) {
+            sprites.push((sticker.id, sprite));
         }
     }
     *ui_cache = UiTextureCache::new();
