@@ -378,6 +378,31 @@ pub struct Origin {
     pub migrated_at: DateTime<Utc>,
 }
 
+/// Пресет — сохранённая полная расстановка стикеров (SPEC.md, раздел 11;
+/// ROADMAP.md M7): только расстановка, без глобальных настроек и хоткеев
+/// (CONFIG.md, «Формат пресета»). Список живёт в `Config.presets`; файл
+/// пресета — та же сериализация (экспорт/импорт, `presets`).
+///
+/// `id` — идентификатор записи в списке пресетов, не часть «расстановки»:
+/// импорт файла пресета всегда создаёт новый id (`presets::import_preset_from_file`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Preset {
+    pub id: Uuid,
+    pub name: String,
+    pub stickers: Vec<Sticker>,
+}
+
+impl Default for Preset {
+    fn default() -> Self {
+        Self {
+            id: Uuid::nil(),
+            name: String::new(),
+            stickers: Vec::new(),
+        }
+    }
+}
+
 /// Корень config.json (CONFIG.md, «Схема config.json»).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -387,6 +412,13 @@ pub struct Config {
     pub hotkeys: Hotkeys,
     pub monitors: Vec<MonitorRecord>,
     pub stickers: Vec<Sticker>,
+    /// Сохранённые пресеты расстановки (SPEC.md, раздел 11).
+    ///
+    /// Обратная совместимость без бампа `CURRENT_SCHEMA_VERSION`: старые
+    /// config.json без этого поля читаются через `#[serde(default)]` на
+    /// структуре — тот же прецедент, что `PlaybackSettings.paused`
+    /// (docs/M4_PREP_NOTES.md: «миграция схемы не нужна (`#[serde(default)]`)»).
+    pub presets: Vec<Preset>,
 }
 
 impl Default for Config {
@@ -397,6 +429,7 @@ impl Default for Config {
             hotkeys: Hotkeys::default(),
             monitors: Vec::new(),
             stickers: Vec::new(),
+            presets: Vec::new(),
         }
     }
 }

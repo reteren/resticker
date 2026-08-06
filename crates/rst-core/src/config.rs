@@ -117,7 +117,7 @@ fn migrate_v0_to_v1(mut value: Value) -> Result<Value, CoreError> {
     };
     obj.insert("schema_version".to_string(), Value::from(1));
     let defaults = serde_json::to_value(Config::default()).map_err(CoreError::Migrate)?;
-    for key in ["settings", "hotkeys", "monitors", "stickers"] {
+    for key in ["settings", "hotkeys", "monitors", "stickers", "presets"] {
         obj.entry(key).or_insert_with(|| defaults[key].clone());
     }
     Ok(value)
