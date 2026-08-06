@@ -8,7 +8,7 @@
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::model::Config;
+use crate::model::{Config, StickerSource};
 
 /// Сдвиг копии при дублировании, DIP (по диагонали вправо-вниз), чтобы
 /// копия не ложилась строго поверх оригинала.
@@ -20,6 +20,10 @@ pub enum OpError {
     /// Стикер с данным id не найден в списке.
     #[error("стикер с id {0} не найден")]
     StickerNotFound(Uuid),
+    /// `relink_file` вызван для стикера, чей источник не `File` (`Pasted`/
+    /// `Window` не поддерживают переуказание пути).
+    #[error("у стикера {0} нет файла для переуказания")]
+    NotFileBacked(Uuid),
 }
 
 /// Индекс стикера по id.
@@ -249,6 +253,75 @@ pub fn set_visible_many(config: &mut Config, ids: &[Uuid], visible: bool) {
     for id in ids {
         if let Some(sticker) = config.stickers.iter_mut().find(|s| s.id == *id) {
             sticker.visible = visible;
+        }
+    }
+}
+
+/// «Сбросить позицию» (окно настроек, вкладка «Стикеры», SPEC.md раздел
+/// 10): вернуть центр стикера в переданную точку (обычно центр его
+/// монитора — координатор решает это по геометрии, здесь только
+/// присваивание), размер/поворот/прозрачность не трогаются.
+pub fn reset_position(
+    config: &mut Config,
+    id: Uuid,
+    center_x: f64,
+    center_y: f64,
+) -> Result<(), OpError> {
+    let i = index_of(config, id).ok_or(OpError::StickerNotFound(id))?;
+    config.stickers[i].placement.cx = center_x;
+    config.stickers[i].placement.cy = center_y;
+    Ok(())
+}
+
+/// «Сбросить размер и поворот» (окно настроек, вкладка «Стикеры», SPEC.md
+/// раздел 10): размер стикера возвращается к натуральному размеру
+/// декодированного изображения/кадра (координатор передаёт его — здесь
+/// нет доступа к GPU-текстуре/декодеру), поворот и отражения — к дефолту.
+/// Позиция (`cx`/`cy`) и прозрачность НЕ трогаются — это отдельное
+/// действие «сбросить позицию» и часть внешнего вида, не размера/поворота.
+pub fn reset_transform_and_size(
+    config: &mut Config,
+    id: Uuid,
+    natural_w: f64,
+    natural_h: f64,
+) -> Result<(), OpError> {
+    let i = index_of(config, id).ok_or(OpError::StickerNotFound(id))?;
+    let sticker = &mut config.stickers[i];
+    sticker.placement.w = natural_w;
+    sticker.placement.h = natural_h;
+    sticker.transform.rotation = crate::model::Transform::default().rotation;
+    sticker.transform.flip_h = crate::model::Transform::default().flip_h;
+    sticker.transform.flip_v = crate::model::Transform::default().flip_v;
+    Ok(())
+}
+
+/// «Переуказать файл» (окно настроек, вкладка «Стикеры», SPEC.md раздел
+/// 10): заменить путь и тип медиа источника у существующего стикера, не
+/// создавая новый (сохраняет id/placement/transform/playback) — размеры
+/// координатор пересчитывает сам после подмены, перезагрузив спрайт той же
+/// логикой, что обычное добавление. `media_type` координатор определяет по
+/// новому файлу заранее (та же проверка расширения, что в `add_sticker`) и
+/// передаёт готовым — здесь нет доступа к `VIDEO_EXTENSIONS`/декодеру.
+/// `Pasted`/`Window`-источники этим действием не переуказываются (SPEC не
+/// описывает такой сценарий для них).
+pub fn relink_file(
+    config: &mut Config,
+    id: Uuid,
+    new_path: std::path::PathBuf,
+    media_type: crate::model::MediaType,
+) -> Result<(), OpError> {
+    let i = index_of(config, id).ok_or(OpError::StickerNotFound(id))?;
+    match &mut config.stickers[i].source {
+        StickerSource::File {
+            path,
+            media_type: mt,
+        } => {
+            *path = new_path;
+            *mt = media_type;
+            Ok(())
+        }
+        StickerSource::Pasted { .. } | StickerSource::Window { .. } => {
+            Err(OpError::NotFileBacked(id))
         }
     }
 }
@@ -793,5 +866,127 @@ mod tests {
         assert_eq!(toggle_visibility(&mut c, id), not_found);
         assert_eq!(duplicate(&mut c, id), Err(OpError::StickerNotFound(id)));
         assert!(c.stickers.is_empty());
+    }
+
+    #[test]
+    fn reset_position_moves_center_keeps_size_and_rotation() {
+        let mut c = cfg(&[0]);
+        let ids = ids(&c);
+        {
+            let s = c.stickers.iter_mut().find(|s| s.id == ids[0]).unwrap();
+            s.placement.cx = 500.0;
+            s.placement.cy = 500.0;
+            s.placement.w = 200.0;
+            s.placement.h = 150.0;
+            s.transform.rotation = 45.0;
+        }
+        reset_position(&mut c, ids[0], 100.0, 80.0).unwrap();
+        let s = get(&c, ids[0]);
+        assert_eq!((s.placement.cx, s.placement.cy), (100.0, 80.0));
+        assert_eq!((s.placement.w, s.placement.h), (200.0, 150.0));
+        assert_eq!(s.transform.rotation, 45.0);
+    }
+
+    #[test]
+    fn reset_position_unknown_id_errors() {
+        let mut c = cfg(&[0]);
+        let id = Uuid::new_v4();
+        assert_eq!(
+            reset_position(&mut c, id, 0.0, 0.0),
+            Err(OpError::StickerNotFound(id))
+        );
+    }
+
+    #[test]
+    fn reset_transform_and_size_restores_natural_size_and_default_rotation_flips() {
+        let mut c = cfg(&[0]);
+        let ids = ids(&c);
+        {
+            let s = c.stickers.iter_mut().find(|s| s.id == ids[0]).unwrap();
+            s.placement.cx = 500.0;
+            s.placement.cy = 500.0;
+            s.placement.w = 999.0;
+            s.placement.h = 999.0;
+            s.transform.rotation = 45.0;
+            s.transform.flip_h = true;
+            s.transform.flip_v = true;
+            s.transform.opacity = 0.3;
+        }
+        reset_transform_and_size(&mut c, ids[0], 64.0, 48.0).unwrap();
+        let s = get(&c, ids[0]);
+        assert_eq!((s.placement.w, s.placement.h), (64.0, 48.0));
+        assert_eq!(
+            (s.placement.cx, s.placement.cy),
+            (500.0, 500.0),
+            "позиция не трогается"
+        );
+        assert_eq!(s.transform.rotation, 0.0);
+        assert!(!s.transform.flip_h);
+        assert!(!s.transform.flip_v);
+        assert_eq!(
+            s.transform.opacity, 0.3,
+            "прозрачность — не часть этого сброса"
+        );
+    }
+
+    #[test]
+    fn reset_transform_and_size_unknown_id_errors() {
+        let mut c = cfg(&[0]);
+        let id = Uuid::new_v4();
+        assert_eq!(
+            reset_transform_and_size(&mut c, id, 1.0, 1.0),
+            Err(OpError::StickerNotFound(id))
+        );
+    }
+
+    #[test]
+    fn relink_file_replaces_path_and_media_type_for_file_source() {
+        let mut c = cfg(&[0]);
+        let ids = ids(&c);
+        let new_path = std::path::PathBuf::from("W:/videos/clip.mp4");
+        relink_file(&mut c, ids[0], new_path.clone(), MediaType::Video).unwrap();
+        match &get(&c, ids[0]).source {
+            StickerSource::File { path, media_type } => {
+                assert_eq!(path, &new_path);
+                assert_eq!(*media_type, MediaType::Video);
+            }
+            other => panic!("ожидался StickerSource::File, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relink_file_rejects_pasted_source() {
+        let mut c = cfg(&[0]);
+        let ids = ids(&c);
+        {
+            let s = c.stickers.iter_mut().find(|s| s.id == ids[0]).unwrap();
+            s.source = StickerSource::Pasted {
+                path: std::path::PathBuf::from("W:/pasted/x.png"),
+            };
+        }
+        assert_eq!(
+            relink_file(
+                &mut c,
+                ids[0],
+                std::path::PathBuf::from("W:/x.mp4"),
+                MediaType::Video
+            ),
+            Err(OpError::NotFileBacked(ids[0]))
+        );
+    }
+
+    #[test]
+    fn relink_file_unknown_id_errors() {
+        let mut c = cfg(&[0]);
+        let id = Uuid::new_v4();
+        assert_eq!(
+            relink_file(
+                &mut c,
+                id,
+                std::path::PathBuf::from("W:/x.png"),
+                MediaType::Image
+            ),
+            Err(OpError::StickerNotFound(id))
+        );
     }
 }

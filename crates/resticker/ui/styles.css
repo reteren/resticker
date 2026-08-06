@@ -1,0 +1,585 @@
+/*
+ * Half-Life 2 / Source VGUI dialog, ported 1:1 from reteren/Reshot's settings
+ * window (src/reshot-tauri/src/styles.css), which itself ports 1:1 from
+ * github.com/arlagonix/half-life-screen (src/components/**\/index.module.scss).
+ * Every colour and border below is that reference verbatim, including
+ * Reshot's own deliberate accent swap (HL2 orange #ff9c00 -> teal #3c9898) —
+ * kept as-is per user request to copy the styling, not re-derive it.
+ */
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 100;
+  src:
+    url("fonts/roboto-cyrillic-100-normal.woff2") format("woff2"),
+    url("fonts/roboto-latin-100-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 300;
+  src:
+    url("fonts/roboto-cyrillic-300-normal.woff2") format("woff2"),
+    url("fonts/roboto-latin-300-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 700;
+  src:
+    url("fonts/roboto-cyrillic-700-normal.woff2") format("woff2"),
+    url("fonts/roboto-latin-700-normal.woff2") format("woff2");
+}
+
+:root {
+  /* --- Modal/index.module.scss --- */
+  --bg: rgba(118, 118, 118, 0.6);
+  --bg-dark: #1a1a1a;
+  --text: white;
+  --accent: #3c9898; /* reference: #ff9c00 */
+  --border-dark: #434343;
+  --border-light: #bbbaba;
+
+  /* --- SettingsModal/index.module.scss --- */
+  --tab-light: #c0bfbf;
+  --tab-dark: #454543;
+
+  /* numberInput */
+  --input-bg: #5a5a5a;
+  --input-dark: #343434;
+  --input-light: #b7b7b7;
+
+  /* Button/index.module.scss */
+  --btn-light: #bbbbbb;
+  --btn-dark: #454545;
+  --btn-bg: #7b7b7b;
+
+  /* Checkbox/index.module.scss */
+  --check-bg: #555555;
+  --check-dark: #424343;
+  --check-light: #bababa;
+
+  font-synthesis: none;
+  text-rendering: optimizeSpeed;
+  -webkit-font-smoothing: none;
+}
+
+::selection {
+  background-color: var(--accent);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+/* ==== Modal shell (.wrapper) ==== */
+
+.wrapper {
+  height: 100%;
+  padding: 16px;
+  background-color: var(--bg);
+  backdrop-filter: blur(4px);
+  border-radius: 8px;
+
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  font-family: "Roboto", sans-serif;
+  font-weight: 100;
+  font-size: 12px;
+  line-height: 125%;
+  color: var(--text);
+  text-align: justify;
+}
+
+.wrapper hr {
+  border: none;
+  border-top: 1px solid var(--border-dark);
+  border-bottom: 1px solid var(--border-light);
+}
+
+.wrapper p {
+  line-height: 150%;
+}
+
+.wrapper a {
+  color: var(--accent);
+  line-height: 150%;
+}
+
+.titlebar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.header {
+  font-family: "Roboto", sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+
+  cursor: move;
+  user-select: none;
+  flex-grow: 1;
+}
+
+.closeButton {
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s ease-in-out;
+  line-height: 0;
+}
+
+.closeButton:hover {
+  background: rgb(0 0 0 / 0.15);
+}
+
+.closeButton > * {
+  display: block;
+}
+
+/* ==== Tabs (SettingsModal) ==== */
+
+.tabsWrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.tabList {
+  display: flex;
+  gap: 1px;
+  align-items: flex-end;
+}
+
+.tab {
+  flex-grow: 1;
+  border-left: 1px solid var(--tab-light);
+  border-top: 1px solid var(--tab-light);
+  border-right: 1px solid var(--tab-dark);
+  border-bottom: 1px solid var(--tab-light);
+  cursor: pointer;
+  user-select: none;
+  text-align: center;
+
+  padding: 4px 16px;
+}
+
+.tab > * {
+  font-family: "Roboto", sans-serif;
+  color: white;
+  font-size: 12px;
+  font-weight: 300;
+}
+
+.tab:not(.active) > * {
+  opacity: 0.5;
+  color: var(--text);
+}
+
+.tab:not(.active):hover > * {
+  opacity: 0.8;
+}
+
+.tab.active {
+  border-bottom-color: transparent;
+  padding-top: 6px;
+}
+
+.content {
+  padding: 16px;
+  border-left: 1px solid var(--tab-light);
+  border-right: 1px solid var(--tab-dark);
+  border-bottom: 1px solid var(--tab-dark);
+  margin-top: -1px;
+  flex-grow: 1;
+  min-height: 300px;
+  overflow: hidden;
+
+  font-weight: 300;
+}
+
+.panel {
+  display: none;
+  gap: 16px;
+  height: 100%;
+}
+
+.panel.active {
+  display: flex;
+}
+
+.panel > * {
+  flex: 1;
+  min-width: 0;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.inputGroup {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.inputLabel {
+  flex-grow: 1;
+}
+
+.hint {
+  opacity: 0.55;
+  font-size: 11px;
+}
+
+.panel kbd {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 300;
+  padding: 1px 5px;
+  white-space: nowrap;
+
+  background-color: var(--btn-bg);
+  border: 1px solid;
+  border-left-color: var(--btn-light);
+  border-top-color: var(--btn-light);
+  border-right-color: var(--btn-dark);
+  border-bottom-color: var(--btn-dark);
+}
+
+/* ==== Inputs ==== */
+
+.numberInput,
+.textInput {
+  height: 24px;
+  background-color: var(--input-bg);
+
+  color: var(--text);
+  padding: 4px;
+  font-family: "Roboto", sans-serif;
+  font-size: 12px;
+  font-weight: 300;
+
+  border-left: 1px solid var(--input-dark);
+  border-top: 1px solid var(--input-dark);
+  border-right: 1px solid var(--input-light);
+  border-bottom: 1px solid var(--input-light);
+
+  outline: none;
+}
+
+.numberInput {
+  max-width: 60px;
+}
+
+.textInput {
+  min-width: 0;
+}
+
+.column > .textInput {
+  width: 100%;
+}
+
+.pathRow .textInput {
+  flex: 1;
+}
+
+/* Захват хоткея: то же поле, что textInput, но кликабельное целиком и без
+   курсора ввода — реальный текст пишет JS, а не пользователь. */
+.hotkeyInput {
+  cursor: pointer;
+  user-select: none;
+}
+
+.hotkeyInput.recording {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* Checkbox: bespoke box, the native input only carries state. */
+
+.checkboxWrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkboxWrapper input {
+  position: absolute;
+  opacity: 0;
+  cursor: pointer;
+  height: 0;
+  width: 0;
+}
+
+.checkmark {
+  height: 12px;
+  width: 12px;
+  flex: none;
+  position: relative;
+  background-color: var(--check-bg);
+
+  border-left: 1px solid var(--check-dark);
+  border-top: 1px solid var(--check-dark);
+  border-right: 1px solid var(--check-light);
+  border-bottom: 1px solid var(--check-light);
+}
+
+.checkboxWrapper input:checked ~ .checkmark {
+  background: var(--check-bg)
+    url("data:image/svg+xml;utf8,<svg width='8' height='7' viewBox='0 0 8 7' fill='none' xmlns='http://www.w3.org/2000/svg'><path d='M1 2.5L3 5L7 1' stroke='white' stroke-width='2'/></svg>");
+  background-size: 80% 80%;
+  background-repeat: no-repeat;
+  background-position: center center;
+}
+
+/* ==== Button ==== */
+
+.button {
+  border: 1px solid black;
+
+  border-left-color: var(--btn-light);
+  border-top-color: var(--btn-light);
+  border-right-color: var(--btn-dark);
+  border-bottom-color: var(--btn-dark);
+
+  background-color: var(--btn-bg);
+  padding: 0 4px;
+  user-select: none;
+
+  min-height: 24px;
+  min-width: 70px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  font-family: "Roboto", sans-serif;
+  font-weight: 300;
+  font-size: 12px;
+  color: var(--text);
+
+  cursor: pointer;
+}
+
+.button:active:not(:disabled) {
+  border-left-color: var(--btn-dark);
+  border-top-color: var(--btn-dark);
+  border-right-color: var(--btn-light);
+  border-bottom-color: var(--btn-light);
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  color: black;
+  font-weight: 300;
+}
+
+.button.compact {
+  min-width: 0;
+  padding: 0 8px;
+  flex: none;
+}
+
+.button.danger {
+  color: #ffb0b0;
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.status {
+  font-size: 11px;
+  opacity: 0.75;
+  min-height: 14px;
+  flex-grow: 1;
+  text-align: left;
+}
+
+/*
+ * ==== Controls the reference does not define ====
+ * resticker needs a slider (FPS limit) and a scrollable list (sticker list),
+ * built strictly from the existing bevel vocabulary: raised = Button borders
+ * (light top-left / dark bottom-right), inset = numberInput borders.
+ */
+
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex-grow: 1;
+  min-width: 0;
+  height: 12px;
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+}
+
+.slider::-webkit-slider-runnable-track {
+  height: 6px;
+  background-color: var(--input-bg);
+  border-left: 1px solid var(--input-dark);
+  border-top: 1px solid var(--input-dark);
+  border-right: 1px solid var(--input-light);
+  border-bottom: 1px solid var(--input-light);
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 18px;
+  margin-top: -7px;
+
+  background-color: var(--btn-bg);
+  border: 1px solid black;
+  border-left-color: var(--btn-light);
+  border-top-color: var(--btn-light);
+  border-right-color: var(--btn-dark);
+  border-bottom-color: var(--btn-dark);
+}
+
+.slider:active::-webkit-slider-thumb {
+  border-left-color: var(--btn-dark);
+  border-top-color: var(--btn-dark);
+  border-right-color: var(--btn-light);
+  border-bottom-color: var(--btn-light);
+}
+
+.sliderValue {
+  width: 34px;
+  flex: none;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.pathRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Список стикеров: та же врезанная (inset) рамка, что у numberInput/select,
+   строки — плоские, разделены hr-подобной линией, без карточек/теней —
+   словарь HL2 не знает таких элементов. */
+.stickerList {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background-color: var(--input-bg);
+  border-left: 1px solid var(--input-dark);
+  border-top: 1px solid var(--input-dark);
+  border-right: 1px solid var(--input-light);
+  border-bottom: 1px solid var(--input-light);
+}
+
+.stickerList::-webkit-scrollbar {
+  width: 10px;
+}
+
+.stickerList::-webkit-scrollbar-track {
+  background-color: var(--input-bg);
+  border-top: 1px solid var(--input-dark);
+  border-left: 1px solid var(--input-dark);
+}
+
+.stickerList::-webkit-scrollbar-thumb {
+  background-color: var(--btn-bg);
+  border: 1px solid;
+  border-left-color: var(--btn-light);
+  border-top-color: var(--btn-light);
+  border-right-color: var(--btn-dark);
+  border-bottom-color: var(--btn-dark);
+}
+
+.stickerList::-webkit-scrollbar-thumb:hover {
+  background-color: var(--accent);
+}
+
+.stickerRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--input-dark);
+}
+
+.stickerRow:last-child {
+  border-bottom: none;
+}
+
+.stickerThumb {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  object-fit: contain;
+  background-color: var(--bg-dark);
+  border-left: 1px solid var(--input-dark);
+  border-top: 1px solid var(--input-dark);
+  border-right: 1px solid var(--input-light);
+  border-bottom: 1px solid var(--input-light);
+}
+
+.stickerInfo {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stickerName {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stickerMeta {
+  font-size: 11px;
+  opacity: 0.55;
+}
+
+.stickerRow.disabled .stickerName,
+.stickerRow.disabled .stickerMeta {
+  opacity: 0.4;
+}
+
+.stickerActions {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+
+.emptyHint {
+  padding: 16px;
+  opacity: 0.55;
+  text-align: center;
+}

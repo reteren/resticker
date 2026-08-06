@@ -35,8 +35,8 @@ use rst_core::AnimationClock;
 use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{
-    Config, MediaType, MonitorId, OverlapRule, Placement, Rect, Sticker, StickerSource, Transform,
-    VIDEO_EXTENSIONS, VisibilityMode,
+    Config, Hotkeys, MediaType, MonitorId, OverlapRule, Placement, Rect, Settings, Sticker,
+    StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode,
 };
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
@@ -184,6 +184,7 @@ fn create_monitor_state(
     edit_hotkey: Option<HotkeyCombo>,
     toggle_all_hotkey: Option<HotkeyCombo>,
     edit_active: bool,
+    hide_from_capture: bool,
 ) -> Option<MonitorState> {
     let (overlay, events) = match OverlayWindow::create_on_monitor(
         info.bounds_px,
@@ -199,6 +200,7 @@ fn create_monitor_state(
     if edit_active {
         overlay.set_interactive(true);
     }
+    apply_capture_affinity(&overlay, hide_from_capture, &info.id);
     let (width, height) = overlay.size();
     let mut target = match WindowTarget::new(device, overlay.hwnd(), width, height) {
         Ok(t) => t,
@@ -237,6 +239,28 @@ fn create_monitor_state(
         scale,
         broken: false,
     })
+}
+
+/// Применить настройку «Скрывать от захвата экрана» (SPEC.md, раздел 8) к
+/// окну монитора и залогировать, если `SetWindowDisplayAffinity` не
+/// сработал вообще ИЛИ сработал, но `GetWindowDisplayAffinity` не
+/// подтвердил применение (на отдельных сборках Windows 11 флаг применяется
+/// нестабильно — SPEC явно требует проверять результат, а не считать
+/// успех вызова достаточным доказательством).
+fn apply_capture_affinity(overlay: &OverlayWindow, hide: bool, monitor_id: &MonitorId) {
+    match overlay.set_capture_affinity(hide) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                monitor = %monitor_id.0,
+                hide,
+                "SetWindowDisplayAffinity не подтверждён GetWindowDisplayAffinity — на этой сборке Windows настройка «скрывать от захвата экрана» может не работать"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(monitor = %monitor_id.0, hide, error = %e, "не удалось применить SetWindowDisplayAffinity");
+        }
+    }
 }
 
 /// Изменилась ли геометрия монитора относительно закэшированной на
@@ -392,6 +416,23 @@ const ROTATE_RING_MAX_DIP: f64 = 24.0;
 
 pub enum OverlayCommand {
     AddSticker(PathBuf),
+    /// Заменить `cfg.settings` целиком (окно настроек, вкладка «Общие») —
+    /// координатор остаётся единственным писателем `config.json`
+    /// (докком `add_sticker`/`OverlayHandle`): Tauri-поток не трогает диск
+    /// напрямую, чтобы не гонять запись параллельно с координатором.
+    UpdateSettings(Settings),
+    /// Заменить `cfg.hotkeys` целиком (вкладка «Управление»). Применяется
+    /// только к `config.json` — живая перерегистрация `RegisterHotKey` в
+    /// этом срезе не реализована (хоткеи регистрируются один раз при
+    /// создании окна монитора), эффект — после перезапуска resticker.
+    UpdateHotkeys(Hotkeys),
+    SetStickerEnabled(Uuid, bool),
+    DeleteSticker(Uuid),
+    ResetStickerPosition(Uuid),
+    ResetStickerTransform(Uuid),
+    RelinkSticker(Uuid, PathBuf),
+    ResetAllStickers,
+    DeleteAllStickers,
     Shutdown,
 }
 
@@ -1002,9 +1043,15 @@ fn run(
         } else {
             (None, None)
         };
-        if let Some(ms) =
-            create_monitor_state(&device, &tx, info, edit_hotkey, this_toggle_all, false)
-        {
+        if let Some(ms) = create_monitor_state(
+            &device,
+            &tx,
+            info,
+            edit_hotkey,
+            this_toggle_all,
+            false,
+            cfg.settings.hide_from_capture,
+        ) {
             monitors_map.insert(info.id.clone(), ms);
         }
     }
@@ -1273,6 +1320,208 @@ fn run(
                 }
                 need_redraw = true;
             }
+            // Окно настроек (Tauri): все команды ниже держат координатор
+            // единственным писателем `config.json` (доккомент
+            // `OverlayCommand`) — Tauri-поток только читает диск напрямую
+            // и шлёт команды, применение и сохранение — всегда здесь.
+            OverlayMessage::Command(OverlayCommand::UpdateSettings(settings)) => {
+                let old_hide_from_capture = cfg.settings.hide_from_capture;
+                cfg.settings = settings;
+                if let Err(e) = config::save(&cfg, &config_path) {
+                    tracing::warn!(error = %e, "не удалось сохранить config.json после изменения общих настроек");
+                }
+                if cfg.settings.hide_from_capture != old_hide_from_capture {
+                    for (monitor_id, ms) in monitors_map.iter() {
+                        apply_capture_affinity(
+                            &ms.overlay,
+                            cfg.settings.hide_from_capture,
+                            monitor_id,
+                        );
+                    }
+                }
+                // «Не перекрывать панель задач» и правила видимости читаются
+                // заново при следующем пересчёте — но без реального события
+                // от трекера окон его бы не было ещё долго; пересчитываем
+                // сразу, тем же путём, что `Windows(Changed)`.
+                occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
+                need_redraw = true;
+            }
+            OverlayMessage::Command(OverlayCommand::UpdateHotkeys(hotkeys)) => {
+                cfg.hotkeys = hotkeys;
+                if let Err(e) = config::save(&cfg, &config_path) {
+                    tracing::warn!(error = %e, "не удалось сохранить config.json после изменения хоткеев");
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::SetStickerEnabled(id, enabled)) => {
+                ops::set_visible_many(&mut cfg, &[id], enabled);
+                if let Err(e) = config::save(&cfg, &config_path) {
+                    tracing::warn!(error = %e, "не удалось сохранить config.json после включения/выключения стикера");
+                }
+                occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
+                need_redraw = true;
+            }
+            OverlayMessage::Command(OverlayCommand::DeleteSticker(id)) => {
+                cleanup_pasted_file(&cfg, id);
+                let _ = ops::delete(&mut cfg, id);
+                edit.selection.prune(&cfg.stickers);
+                if let Some(ms) = monitors_map.get_mut(&primary_id) {
+                    let renderer = Renderer {
+                        device: &device,
+                        target: &mut ms.target,
+                    };
+                    resync_sprites(
+                        &renderer,
+                        &cfg,
+                        &mut sprites,
+                        &mut animations,
+                        &mut videos,
+                        audio_mixer.as_ref(),
+                    );
+                }
+                if let Err(e) = config::save(&cfg, &config_path) {
+                    tracing::warn!(error = %e, "не удалось сохранить config.json после удаления стикера");
+                }
+                occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
+                rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
+                need_redraw = true;
+            }
+            OverlayMessage::Command(OverlayCommand::ResetStickerPosition(id)) => {
+                if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                    let monitor_id = sticker.placement.monitor_id.clone();
+                    if let Some(&(w, h, scale)) = monitor_geometry.get(&monitor_id) {
+                        let center = (w as f64 / scale as f64 / 2.0, h as f64 / scale as f64 / 2.0);
+                        let _ = ops::reset_position(&mut cfg, id, center.0, center.1);
+                        if let Some(placement) = cfg
+                            .stickers
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.placement.clone())
+                        {
+                            if let Some((_, sprite)) =
+                                sprites.iter_mut().find(|(sid, _)| *sid == id)
+                            {
+                                sprite.placement = placement;
+                            }
+                        }
+                        if let Err(e) = config::save(&cfg, &config_path) {
+                            tracing::warn!(error = %e, "не удалось сохранить config.json после сброса позиции стикера");
+                        }
+                        need_redraw = true;
+                    }
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::ResetStickerTransform(id)) => {
+                if let Some((natural_w, natural_h)) = sticker_natural_size(&sprites, id) {
+                    let _ = ops::reset_transform_and_size(&mut cfg, id, natural_w, natural_h);
+                    if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                        let (placement, transform) = (sticker.placement.clone(), sticker.transform);
+                        if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| *sid == id) {
+                            sprite.placement = placement;
+                            sprite.transform = transform;
+                        }
+                    }
+                    if let Err(e) = config::save(&cfg, &config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить config.json после сброса размера/поворота стикера");
+                    }
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::RelinkSticker(id, new_path)) => {
+                let is_video = new_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| {
+                        VIDEO_EXTENSIONS.iter().any(|v| v.eq_ignore_ascii_case(ext))
+                    });
+                let media_type = if is_video {
+                    MediaType::Video
+                } else {
+                    media_animation::decode_animation(&new_path)
+                        .ok()
+                        .filter(|a| a.frames.len() >= 2)
+                        .map_or(MediaType::Image, |_| MediaType::Animation)
+                };
+                if ops::relink_file(&mut cfg, id, new_path, media_type).is_ok() {
+                    sprites.retain(|(sid, _)| *sid != id);
+                    animations.remove(&id);
+                    videos.remove(&id);
+                    if let Some(ms) = monitors_map.get_mut(&primary_id) {
+                        let renderer = Renderer {
+                            device: &device,
+                            target: &mut ms.target,
+                        };
+                        resync_sprites(
+                            &renderer,
+                            &cfg,
+                            &mut sprites,
+                            &mut animations,
+                            &mut videos,
+                            audio_mixer.as_ref(),
+                        );
+                    }
+                    if let Err(e) = config::save(&cfg, &config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить config.json после переуказания файла стикера");
+                    }
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::ResetAllStickers) => {
+                let ids: Vec<Uuid> = cfg.stickers.iter().map(|s| s.id).collect();
+                for id in ids {
+                    if let Some((natural_w, natural_h)) = sticker_natural_size(&sprites, id) {
+                        let _ = ops::reset_transform_and_size(&mut cfg, id, natural_w, natural_h);
+                    }
+                    let monitor_id = cfg
+                        .stickers
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map(|s| s.placement.monitor_id.clone());
+                    if let Some(monitor_id) = monitor_id {
+                        if let Some(&(w, h, scale)) = monitor_geometry.get(&monitor_id) {
+                            let _ = ops::reset_position(
+                                &mut cfg,
+                                id,
+                                w as f64 / scale as f64 / 2.0,
+                                h as f64 / scale as f64 / 2.0,
+                            );
+                        }
+                    }
+                }
+                if let Some(ms) = monitors_map.get_mut(&primary_id) {
+                    let renderer = Renderer {
+                        device: &device,
+                        target: &mut ms.target,
+                    };
+                    resync_sprites(
+                        &renderer,
+                        &cfg,
+                        &mut sprites,
+                        &mut animations,
+                        &mut videos,
+                        audio_mixer.as_ref(),
+                    );
+                }
+                if let Err(e) = config::save(&cfg, &config_path) {
+                    tracing::warn!(error = %e, "не удалось сохранить config.json после сброса всех стикеров");
+                }
+                need_redraw = true;
+            }
+            OverlayMessage::Command(OverlayCommand::DeleteAllStickers) => {
+                for id in cfg.stickers.iter().map(|s| s.id).collect::<Vec<_>>() {
+                    cleanup_pasted_file(&cfg, id);
+                }
+                cfg.stickers.clear();
+                edit.selection.clear();
+                sprites.clear();
+                animations.clear();
+                videos.clear();
+                if let Err(e) = config::save(&cfg, &config_path) {
+                    tracing::warn!(error = %e, "не удалось сохранить config.json после удаления всех стикеров");
+                }
+                occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
+                rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
+                need_redraw = true;
+            }
             OverlayMessage::Command(OverlayCommand::Shutdown) => break,
             OverlayMessage::Event(monitor_id, OverlayEvent::ToggleEditMode) => {
                 let Some(ms) = monitors_map.get_mut(&monitor_id) else {
@@ -1438,9 +1687,15 @@ fn run(
                     // он пропал совсем, ниже его не найдёт (не в new_infos) —
                     // снос уже случился, воссоздавать нечего.
                     if let Some(info) = new_infos.iter().find(|m| m.id == primary_id) {
-                        if let Some(ms) =
-                            create_monitor_state(&device, &tx, info, None, None, edit.active)
-                        {
+                        if let Some(ms) = create_monitor_state(
+                            &device,
+                            &tx,
+                            info,
+                            None,
+                            None,
+                            edit.active,
+                            cfg.settings.hide_from_capture,
+                        ) {
                             monitors_map.insert(info.id.clone(), ms);
                         }
                     }
@@ -1452,6 +1707,7 @@ fn run(
                             Some(hotkey),
                             toggle_all_hotkey,
                             edit.active,
+                            cfg.settings.hide_from_capture,
                         ) {
                             monitors_map.insert(info.id.clone(), ms);
                         }
@@ -1482,6 +1738,7 @@ fn run(
                         edit_hotkey,
                         this_toggle_all,
                         edit.active,
+                        cfg.settings.hide_from_capture,
                     ) {
                         monitors_map.insert(info.id.clone(), ms);
                     }
@@ -2134,6 +2391,33 @@ fn sticker_image_path(source: &StickerSource) -> Option<&Path> {
         StickerSource::Pasted { path } => Some(path),
         StickerSource::Window { .. } => None,
     }
+}
+
+/// Натуральный размер уже загруженного спрайта стикера (окно настроек,
+/// «сбросить размер и поворот», SPEC.md раздел 10): для видео (M5b) —
+/// размеры плоскости Y (полное разрешение кадра), иначе — размеры обычной
+/// текстуры/атласа (M5a/статика). Читает уже загруженный `Sprite`, а не
+/// декодирует файл заново — дешёвый путь, у координатора текстура и так
+/// уже на GPU. `None`, если стикер сейчас не материализован (спрайт не
+/// загрузился — например, файл недоступен).
+fn sticker_natural_size(sprites: &[(Uuid, Sprite)], id: Uuid) -> Option<(f64, f64)> {
+    let (_, sprite) = sprites.iter().find(|(sid, _)| *sid == id)?;
+    let (w, h) = match &sprite.video {
+        Some(video) => (video.y.width() as f64, video.y.height() as f64),
+        // `sprite.texture` для анимации (M5a) — весь текстурный атлас
+        // (сетка кадров), не размер одного кадра; `uv_scale` — доля
+        // атласа на кадр (1/columns, 1/rows), домножение даёт настоящий
+        // натуральный размер. Для статики `uv_scale == [1.0, 1.0]`
+        // (дефолт `Sprite::new`) — домножение безвредный no-op, той же
+        // формулой не пришлось заводить отдельную ветку (найдено
+        // независимым ревью: без домножения «сбросить размер и поворот»
+        // растягивало анимированный стикер на N кадров по ширине).
+        None => (
+            sprite.texture.width() as f64 * sprite.uv_scale[0] as f64,
+            sprite.texture.height() as f64 * sprite.uv_scale[1] as f64,
+        ),
+    };
+    Some((w, h))
 }
 
 /// Загрузить спрайт стикера по текущему `cfg`-состоянию `sticker.source`:
@@ -5325,7 +5609,16 @@ fn add_sticker(
     } else {
         MediaType::Image
     };
-    let (w, h) = (texture.width(), texture.height());
+    // Для анимации (M5a) `texture` — весь атлас (сетка кадров), не размер
+    // одного кадра; `uv_scale` — доля атласа на кадр, домножение даёт
+    // настоящий натуральный размер (для статики `uv_scale == [1.0, 1.0]`,
+    // no-op). Раньше стикер заводился растянутым на N кадров по ширине/
+    // высоте — найдено независимым ревью сшивки окна настроек при
+    // проверке `sticker_natural_size`, тот же баг был и здесь.
+    let (w, h) = (
+        texture.width() as f64 * uv_scale[0] as f64,
+        texture.height() as f64 * uv_scale[1] as f64,
+    );
     // `placement` — DIP, а `overlay.size()` — физические пиксели живого
     // GetWindowRect (M3): нужно делить на масштаб, иначе на не-100% DPI
     // центр вставки уходит от реального центра экрана
@@ -5338,14 +5631,7 @@ fn add_sticker(
     // M3: реальный device interface path монитора, откуда пришло добавление
     // (перетаскивание/вставка/диалог на конкретном окне) — `monitor_id`.
     let sticker = if pasted {
-        Sticker::new_pasted(
-            path,
-            monitor_id.clone(),
-            center_x,
-            center_y,
-            w as f64,
-            h as f64,
-        )
+        Sticker::new_pasted(path, monitor_id.clone(), center_x, center_y, w, h)
     } else {
         Sticker::new_file(
             path,
@@ -5353,8 +5639,8 @@ fn add_sticker(
             monitor_id.clone(),
             center_x,
             center_y,
-            w as f64,
-            h as f64,
+            w,
+            h,
         )
     };
     let sprite = Sprite::new(texture, sticker.placement.clone(), sticker.transform)

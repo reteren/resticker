@@ -3,108 +3,191 @@
   <head>
     <meta charset="utf-8" />
     <title>resticker — настройки</title>
-    <style>
-      body {
-        margin: 0;
-        font-family: system-ui, sans-serif;
-        background: #1e1e28;
-        color: #e8e8ec;
-      }
-      nav {
-        display: flex;
-        border-bottom: 1px solid #33333f;
-      }
-      nav button {
-        flex: 1;
-        padding: 0.75rem;
-        background: none;
-        border: none;
-        color: inherit;
-        font: inherit;
-        cursor: pointer;
-      }
-      nav button.active {
-        background: #2a2a38;
-        border-bottom: 2px solid #ff8c00;
-      }
-      section {
-        display: none;
-        padding: 1.5rem;
-      }
-      section.active {
-        display: block;
-      }
-      button.action {
-        font: inherit;
-        padding: 0.5rem 1rem;
-        background: #ff8c00;
-        color: #1e1e28;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-      }
-      button.action:disabled {
-        opacity: 0.6;
-        cursor: default;
-      }
-      #sticker-status {
-        margin-top: 0.75rem;
-        opacity: 0.75;
-        font-size: 0.9rem;
-      }
-    </style>
+    <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <!-- M0: пустой каркас вкладок (SPEC.md, раздел 3); M1 добавляет
-         единственное действие — добавить стикер. Остальное — следующие вехи. -->
-    <nav id="tabs">
-      <button data-tab="stickers" class="active">Стикеры</button>
-      <button data-tab="presets">Пресеты</button>
-      <button data-tab="control">Управление</button>
-      <button data-tab="general">Общие</button>
-    </nav>
-    <section id="stickers" class="active">
-      <button class="action" id="add-sticker">Добавить стикер…</button>
-      <div id="sticker-status"></div>
-    </section>
-    <section id="presets"></section>
-    <section id="control"></section>
-    <section id="general"></section>
-    <script>
-      document.getElementById('tabs').addEventListener('click', (e) => {
-        const tab = e.target.dataset.tab;
-        if (!tab) return;
-        for (const b of document.querySelectorAll('nav button')) {
-          b.classList.toggle('active', b.dataset.tab === tab);
-        }
-        for (const s of document.querySelectorAll('section')) {
-          s.classList.toggle('active', s.id === tab);
-        }
-      });
+    <!-- Оболочка окна — 1:1 стилистика reteren/Reshot (Half-Life 2 / Source
+         VGUI): затемнённая панель, перетаскиваемый заголовок, вкладки,
+         подвал с OK/Отмена/Применить. -->
+    <section class="wrapper">
+      <strong class="titlebar" data-tauri-drag-region>
+        <h2 class="header" data-tauri-drag-region>resticker · настройки</h2>
+        <button class="closeButton" id="close" title="Закрыть">
+          <img src="close.svg" width="16" height="16" alt="Закрыть" />
+        </button>
+      </strong>
 
-      const addButton = document.getElementById('add-sticker');
-      const status = document.getElementById('sticker-status');
-      addButton.addEventListener('click', async () => {
-        const { open } = window.__TAURI__.dialog;
-        const { invoke } = window.__TAURI__.core;
-        addButton.disabled = true;
-        try {
-          const path = await open({
-            multiple: false,
-            filters: [
-              { name: 'Изображение', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp'] },
-            ],
-          });
-          if (path) {
-            await invoke('add_sticker', { path });
-            status.textContent = `Добавлено: ${path}`;
-          }
-        } catch (err) {
-          status.textContent = `Ошибка: ${err}`;
-        } finally {
-          addButton.disabled = false;
-        }
-      });
-    </script>
+      <div class="tabsWrap">
+        <header class="tabList" id="tabs">
+          <div class="tab active" data-tab="stickers"><h3>Стикеры</h3></div>
+          <div class="tab" data-tab="presets"><h3>Пресеты</h3></div>
+          <div class="tab" data-tab="control"><h3>Управление</h3></div>
+          <div class="tab" data-tab="general"><h3>Общие</h3></div>
+        </header>
+
+        <section class="content">
+          <!-- ==== Стикеры ==== -->
+          <div class="panel active" data-panel="stickers">
+            <div class="column">
+              <div class="inputGroup">
+                <p class="inputLabel">Список стикеров</p>
+                <button class="button compact" id="add-sticker">Добавить…</button>
+              </div>
+              <div class="stickerList" id="sticker-list">
+                <p class="emptyHint">Загрузка…</p>
+              </div>
+              <div class="inputGroup">
+                <button class="button compact" id="reset-all-stickers">Сбросить всё</button>
+                <button class="button compact danger" id="delete-all-stickers">Удалить всё</button>
+                <span class="status" id="sticker-status"></span>
+              </div>
+            </div>
+          </div>
+
+          <!-- ==== Пресеты ==== -->
+          <div class="panel" data-panel="presets">
+            <div class="column">
+              <p class="emptyHint">
+                Пресеты (сохранение и загрузка расстановки стикеров) ещё в разработке — см.
+                ROADMAP.md, веха M7.
+              </p>
+            </div>
+          </div>
+
+          <!-- ==== Управление ==== -->
+          <div class="panel" data-panel="control">
+            <div class="column">
+              <p>Глобальные хоткеи:</p>
+
+              <label class="inputGroup">
+                <p class="inputLabel">Режим редактирования</p>
+                <input
+                  type="text"
+                  class="textInput hotkeyInput"
+                  id="hotkey-edit"
+                  readonly
+                  style="max-width: 160px"
+                />
+              </label>
+
+              <div class="inputGroup">
+                <p class="inputLabel">Показать/скрыть все стикеры</p>
+                <input
+                  type="text"
+                  class="textInput hotkeyInput"
+                  id="hotkey-toggle-all"
+                  readonly
+                  placeholder="Не задан"
+                  style="max-width: 160px"
+                />
+                <button class="button compact" id="clear-hotkey-toggle-all">×</button>
+              </div>
+
+              <div class="inputGroup">
+                <p class="inputLabel">Заглушить всё</p>
+                <input
+                  type="text"
+                  class="textInput hotkeyInput"
+                  id="hotkey-mute-all"
+                  readonly
+                  placeholder="Не задан"
+                  style="max-width: 160px"
+                />
+                <button class="button compact" id="clear-hotkey-mute-all">×</button>
+              </div>
+
+              <p class="hint">Клик по полю, затем нажмите комбинацию клавиш.</p>
+              <p class="hint">Изменения хоткеев применяются после перезапуска resticker.</p>
+            </div>
+
+            <div class="column">
+              <p class="hint">
+                «Режим редактирования» — обязательная комбинация (нельзя очистить). Остальные два —
+                опциональны.
+              </p>
+            </div>
+          </div>
+
+          <!-- ==== Общие ==== -->
+          <div class="panel" data-panel="general">
+            <div class="column">
+              <p>Запуск:</p>
+
+              <label class="checkboxWrapper">
+                <input type="checkbox" id="autostart" />
+                <span class="checkmark"></span>
+                <span>Автозапуск с Windows</span>
+              </label>
+
+              <label class="checkboxWrapper">
+                <input type="checkbox" id="silent-start" />
+                <span class="checkmark"></span>
+                <span>Тихий старт (не открывать настройки)</span>
+              </label>
+
+              <label class="checkboxWrapper">
+                <input type="checkbox" id="tray-icon" />
+                <span class="checkmark"></span>
+                <span>Иконка в трее</span>
+              </label>
+
+              <hr />
+              <p>Диалоги:</p>
+
+              <label class="checkboxWrapper">
+                <input type="checkbox" id="skip-delete-confirmation" />
+                <span class="checkmark"></span>
+                <span>Не спрашивать подтверждение при удалении</span>
+              </label>
+            </div>
+
+            <div class="column">
+              <p>Экран:</p>
+
+              <label class="checkboxWrapper">
+                <input type="checkbox" id="hide-from-capture" />
+                <span class="checkmark"></span>
+                <span>Скрывать стикеры от захвата экрана</span>
+              </label>
+              <p class="hint">
+                На отдельных сборках Windows 11 работает нестабильно — резульат применения
+                проверяется, при неудаче будет предупреждение в логе.
+              </p>
+
+              <label class="checkboxWrapper">
+                <input type="checkbox" id="never-overlap-taskbar" />
+                <span class="checkmark"></span>
+                <span>Не перекрывать панель задач</span>
+              </label>
+
+              <hr />
+              <p>Производительность:</p>
+
+              <div class="inputGroup">
+                <p class="inputLabel">Лимит FPS оверлея</p>
+                <input
+                  type="range"
+                  class="slider"
+                  id="battery-fps-limit"
+                  min="5"
+                  max="60"
+                  step="1"
+                />
+                <span class="sliderValue" id="battery-fps-limit-value">30</span>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="footer">
+        <span class="status" id="status"></span>
+        <button class="button" id="apply">Применить</button>
+        <button class="button" id="ok">ОК</button>
+        <button class="button" id="cancel">Отмена</button>
+      </div>
+    </section>
+
+    <script src="main.js"></script>
   </body>
 </html>

@@ -15,7 +15,14 @@
         "width": 900,
         "height": 600,
         "visible": false,
-        "center": true
+        "center": true,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "windowEffects": {
+          "effects": ["acrylic"]
+        }
       }
     ],
     "security": {

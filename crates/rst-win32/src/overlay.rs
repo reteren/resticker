@@ -34,12 +34,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA,
-    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, MSG, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR,
+    GetMessageW, GetSystemMetrics, GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect, MSG,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+    SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR,
     WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK,
     WTS_SESSION_UNLOCK,
@@ -302,6 +303,29 @@ impl OverlayWindow {
     /// которое инициировало переключение.
     pub fn set_interactive(&self, interactive: bool) {
         self.set_exstyle_bits(!interactive);
+    }
+
+    /// Скрыть/показать окно для захвата экрана (SPEC.md, раздел 8):
+    /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`/`WDA_NONE`.
+    /// Возвращает `Ok(true)`, если проверка (`GetWindowDisplayAffinity`)
+    /// подтвердила, что аффинити реально применилась — на отдельных сборках
+    /// Windows 11 вызов может «молча» не сработать (SPEC: «программа
+    /// СЛЕДУЕТ проверять результат и предупреждать»); `Ok(false)` — вызов
+    /// не вернул ошибку, но проверка показала иное значение; `Err` — сам
+    /// вызов `SetWindowDisplayAffinity` завершился с ошибкой.
+    pub fn set_capture_affinity(&self, hide: bool) -> Result<bool, Win32Error> {
+        let wanted = if hide {
+            WDA_EXCLUDEFROMCAPTURE
+        } else {
+            WDA_NONE
+        };
+        // SAFETY: hwnd — наше живое окно; аффинити окна можно менять с
+        // любого потока.
+        unsafe { SetWindowDisplayAffinity(self.hwnd, wanted) }?;
+        let mut actual: u32 = 0;
+        // SAFETY: `actual` — валидный out-параметр на весь вызов.
+        unsafe { GetWindowDisplayAffinity(self.hwnd, &mut actual) }?;
+        Ok(actual == wanted.0)
     }
 
     /// Общая часть `set_click_through`/`set_interactive`: переключить
@@ -952,6 +976,34 @@ mod tests {
             "выход восстанавливает клик-прозрачность"
         );
         assert_ne!(restored & WS_EX_NOACTIVATE.0, 0);
+    }
+
+    #[test]
+    fn set_capture_affinity_round_trips_and_verifies() {
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None)
+                .expect("создание оверлея");
+
+        let hidden = overlay
+            .set_capture_affinity(true)
+            .expect("SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)");
+        assert!(
+            hidden,
+            "GetWindowDisplayAffinity должен подтвердить применение"
+        );
+        // SAFETY: чтение аффинити своего же окна.
+        let mut actual: u32 = 0;
+        unsafe { GetWindowDisplayAffinity(overlay.hwnd(), &mut actual) }
+            .expect("GetWindowDisplayAffinity");
+        assert_eq!(actual, WDA_EXCLUDEFROMCAPTURE.0);
+
+        let shown = overlay
+            .set_capture_affinity(false)
+            .expect("SetWindowDisplayAffinity(WDA_NONE)");
+        assert!(shown, "снятие аффинити тоже должно подтверждаться");
+        unsafe { GetWindowDisplayAffinity(overlay.hwnd(), &mut actual) }
+            .expect("GetWindowDisplayAffinity");
+        assert_eq!(actual, WDA_NONE.0);
     }
 
     #[test]

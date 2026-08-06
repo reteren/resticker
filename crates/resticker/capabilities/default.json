@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Capability for the settings window",
   "windows": ["settings"],
-  "permissions": ["core:default", "dialog:default", "dialog:allow-open"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "dialog:default",
+    "dialog:allow-open"
+  ]
 }

@@ -16,7 +16,9 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 use anyhow::Context;
+use rst_core::model::{Config, Hotkeys, Settings};
 use tauri::{Manager, WindowEvent};
+use uuid::Uuid;
 
 use overlay_manager::{CoordinatorRequest, OverlayCommand, OverlayHandle};
 use rst_win32::tray::{self, MenuItem, TrayEvent, TrayIcon};
@@ -29,6 +31,101 @@ const MENU_EXIT: u32 = 3;
 #[tauri::command]
 fn add_sticker(path: String, overlay: tauri::State<OverlayHandle>) {
     overlay.send(OverlayCommand::AddSticker(PathBuf::from(path)));
+}
+
+/// Прочитать текущий `config.json` для окна настроек. Читается прямо с
+/// диска (не запрашивается у координатора) — координатор сохраняет его
+/// сразу после каждой своей мутации `cfg` (add_sticker/drag/undo и т.д.),
+/// поэтому свежий файл на диске и есть текущее состояние; отдельный
+/// query-канал в координатор не нужен ради этого чтения (README M2_WIRING).
+#[tauri::command]
+fn get_config(config_path: tauri::State<PathBuf>) -> Result<Config, String> {
+    rst_core::config::load(&config_path)
+        .map(|loaded| loaded.config)
+        .map_err(|e| e.to_string())
+}
+
+/// Заменить `cfg.settings` целиком (вкладка «Общие») — координатор
+/// остаётся единственным писателем `config.json` (доккомент
+/// `OverlayCommand::UpdateSettings`).
+#[tauri::command]
+fn update_settings(settings: Settings, overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::UpdateSettings(settings));
+}
+
+/// Заменить `cfg.hotkeys` целиком (вкладка «Управление») — применяется
+/// после перезапуска resticker (доккомент `OverlayCommand::UpdateHotkeys`).
+#[tauri::command]
+fn update_hotkeys(hotkeys: Hotkeys, overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::UpdateHotkeys(hotkeys));
+}
+
+fn parse_id(id: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_sticker_enabled(
+    id: String,
+    enabled: bool,
+    overlay: tauri::State<OverlayHandle>,
+) -> Result<(), String> {
+    overlay.send(OverlayCommand::SetStickerEnabled(parse_id(&id)?, enabled));
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_sticker(id: String, overlay: tauri::State<OverlayHandle>) -> Result<(), String> {
+    overlay.send(OverlayCommand::DeleteSticker(parse_id(&id)?));
+    Ok(())
+}
+
+#[tauri::command]
+fn reset_sticker_position(id: String, overlay: tauri::State<OverlayHandle>) -> Result<(), String> {
+    overlay.send(OverlayCommand::ResetStickerPosition(parse_id(&id)?));
+    Ok(())
+}
+
+#[tauri::command]
+fn reset_sticker_transform(id: String, overlay: tauri::State<OverlayHandle>) -> Result<(), String> {
+    overlay.send(OverlayCommand::ResetStickerTransform(parse_id(&id)?));
+    Ok(())
+}
+
+#[tauri::command]
+fn relink_sticker(
+    id: String,
+    path: String,
+    overlay: tauri::State<OverlayHandle>,
+) -> Result<(), String> {
+    overlay.send(OverlayCommand::RelinkSticker(
+        parse_id(&id)?,
+        PathBuf::from(path),
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn reset_all_stickers(overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::ResetAllStickers);
+}
+
+#[tauri::command]
+fn delete_all_stickers(overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::DeleteAllStickers);
+}
+
+/// Показать файл в проводнике (SPEC.md, раздел 10 — «показать в
+/// проводнике»). Не трогает `cfg`/координатор — чисто читающее действие
+/// над файловой системой, `explorer.exe` сам подсвечивает файл в открытом
+/// окне папки.
+#[tauri::command]
+fn reveal_in_explorer(path: String) -> Result<(), String> {
+    std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn config_path() -> anyhow::Result<PathBuf> {
@@ -79,6 +176,10 @@ fn main() -> anyhow::Result<()> {
     .context("инициализация иконки трея")?;
 
     let silent_start = cfg.settings.silent_start;
+    // Для окна настроек (`get_config`) — читает диск напрямую, не через
+    // координатор, поэтому нужен свой клон пути ДО того, как `cfg_path`
+    // уйдёт во владение `overlay_manager::start`.
+    let cfg_path_for_settings = cfg_path.clone();
     // Обратный канал координатор → main (docs/M2_WIRING_PLAN.md, раздел 12):
     // `Sender` уходит в координатор (оверлей-поток), `Receiver` читает поток
     // из `setup` ниже.
@@ -89,7 +190,21 @@ fn main() -> anyhow::Result<()> {
         .plugin(tauri_plugin_dialog::init())
         .manage(tray_icon)
         .manage(overlay_handle)
-        .invoke_handler(tauri::generate_handler![add_sticker])
+        .manage(cfg_path_for_settings)
+        .invoke_handler(tauri::generate_handler![
+            add_sticker,
+            get_config,
+            update_settings,
+            update_hotkeys,
+            set_sticker_enabled,
+            delete_sticker,
+            reset_sticker_position,
+            reset_sticker_transform,
+            relink_sticker,
+            reset_all_stickers,
+            delete_all_stickers,
+            reveal_in_explorer,
+        ])
         .setup(move |app| {
             if !silent_start {
                 if let Some(w) = app.get_webview_window("settings") {
