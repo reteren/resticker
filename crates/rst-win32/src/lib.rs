@@ -13,6 +13,7 @@ pub mod input;
 pub mod monitors;
 pub mod overlay;
 pub mod tray;
+pub mod virtual_desktops;
 pub mod window_enum;
 mod window_icon;
 pub mod window_pick;
