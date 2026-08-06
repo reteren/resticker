@@ -2796,6 +2796,7 @@ dependencies = [
  "rst-render",
  "rst-video",
  "rst-win32",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

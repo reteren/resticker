@@ -42,6 +42,7 @@ use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
 use rst_core::occluders::{self, OccluderCandidate, OccluderSet};
 use rst_core::ops;
+use rst_core::presets;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
@@ -54,6 +55,7 @@ use rst_render::{
     marquee_visuals, rasterize, solid_sprite, theme,
 };
 use rst_video::VideoSource;
+use rst_win32::Win32Error;
 use rst_win32::clipboard::{self, ClipboardImage};
 use rst_win32::file_dialog;
 use rst_win32::hotkey::HotkeyCombo;
@@ -438,6 +440,29 @@ pub enum OverlayCommand {
     RelinkSticker(Uuid, PathBuf),
     ResetAllStickers,
     DeleteAllStickers,
+    /// «Показать/скрыть все стикеры» с главного потока Tauri (пункт меню
+    /// трея) — та же логика, что у глобального хоткея
+    /// [`OverlayEvent::ToggleAllStickers`] и `BTN_TOGGLE_ALL` панели у
+    /// курсора, просто с другого источника (меню трея живёт вне оверлей-
+    /// потока, `OverlayEvent` ему недоступен).
+    ToggleAllStickers,
+    /// Сохранить текущую расстановку стикеров как новый пресет (M7,
+    /// SPEC.md §11) — снимок `cfg.stickers`, имя из настроек.
+    SavePreset(String),
+    /// Применить пресет по id: заменяет `cfg.stickers` на его стикеры
+    /// (только существующие источники — `rst_core::presets::apply_preset`),
+    /// пересобирает спрайты/анимации/видео заново. Недостающие элементы
+    /// (см. `ApplyPresetOutcome::missing`) уходят обратно в Tauri через
+    /// [`CoordinatorRequest::PresetMissingElements`].
+    ApplyPreset(Uuid),
+    RenamePreset(Uuid, String),
+    DeletePreset(Uuid),
+    /// Экспортировать пресет в отдельный JSON-файл по выбранному пути
+    /// (диалог сохранения — на стороне Tauri, сюда приходит готовый путь).
+    ExportPreset(Uuid, PathBuf),
+    /// Импортировать пресет из файла (диалог открытия — на стороне Tauri) —
+    /// добавляет в `cfg.presets` со свежим id (`presets::import_preset_from_file`).
+    ImportPreset(PathBuf),
     Shutdown,
 }
 
@@ -448,6 +473,19 @@ pub enum OverlayCommand {
 pub enum CoordinatorRequest {
     /// Открыть окно настроек (кнопка `BTN_SETTINGS` панели у курсора).
     OpenSettings,
+    /// Применение пресета (M7) оставило часть стикеров неприменённой —
+    /// их источник недоступен (`StickerSource::File`, путь не существует).
+    /// Main.rs форвардит это событием Tauri (`preset-missing-elements`) в
+    /// окно настроек; текст диалога — на стороне UI (CONFIG.md, «Загрузка
+    /// с недостающими элементами»).
+    PresetMissingElements(Vec<(Uuid, PathBuf)>),
+    /// Показать баллонное уведомление трея (`TrayIcon::show_balloon`) —
+    /// иконка трея живёт на главном потоке Tauri (`.manage()`), оверлей-
+    /// поток её не видит, поэтому запрос идёт через тот же обратный канал,
+    /// что `OpenSettings`. Используется для предупреждений, которые раньше
+    /// уходили только в лог (`HotkeyConflict`, `PinAccessDenied`) — SPEC.md
+    /// требует показать их пользователю, не только записать в файл лога.
+    ShowNotification { title: String, body: String },
 }
 
 /// Сообщение объединённого канала координатора: команда от Tauri, событие от
@@ -1613,6 +1651,105 @@ fn run(
                 rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
                 need_redraw = true;
             }
+            OverlayMessage::Command(OverlayCommand::ToggleAllStickers) => {
+                // Тот же путь, что `OverlayEvent::ToggleAllStickers` (хоткей)
+                // ниже — источник другой (меню трея, главный поток Tauri),
+                // эффект и переисок панели у курсора идентичны.
+                let before = cfg.clone();
+                if converge_all_stickers_visibility(&mut cfg) {
+                    commit_undo_snapshot(&mut edit, before);
+                    if let Err(e) = config::save(&cfg, &config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить config.json после «показать/скрыть все» из трея");
+                    }
+                    if let Some(&(w, h, s)) = monitor_geometry.get(&edit.cursor_monitor) {
+                        let screen = screen_dip_rect((w, h), s);
+                        rebuild_cursor_panel(&mut edit, &cfg, &screen);
+                    }
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::SavePreset(name)) => {
+                let preset = presets::save_preset(&cfg, name);
+                cfg.presets.push(preset);
+                if let Err(e) = config::save(&cfg, &config_path) {
+                    tracing::warn!(error = %e, "не удалось сохранить config.json после сохранения пресета");
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::ApplyPreset(id)) => {
+                match presets::apply_preset(&mut cfg, id) {
+                    Ok(outcome) => {
+                        edit.selection.clear();
+                        if let Some(ms) = monitors_map.get_mut(&primary_id) {
+                            let renderer = Renderer {
+                                device: &device,
+                                target: &mut ms.target,
+                            };
+                            resync_sprites(
+                                &renderer,
+                                &cfg,
+                                &mut sprites,
+                                &mut animations,
+                                &mut videos,
+                                audio_mixer.as_ref(),
+                            );
+                        }
+                        if let Err(e) = config::save(&cfg, &config_path) {
+                            tracing::warn!(error = %e, "не удалось сохранить config.json после применения пресета");
+                        }
+                        occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
+                        rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
+                        if !outcome.missing.is_empty() {
+                            let _ = edit
+                                .coordinator_tx
+                                .send(CoordinatorRequest::PresetMissingElements(outcome.missing));
+                        }
+                        need_redraw = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(preset = %id, error = %e, "не удалось применить пресет")
+                    }
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::RenamePreset(id, name)) => {
+                match presets::rename_preset(&mut cfg, id, name) {
+                    Ok(()) => {
+                        if let Err(e) = config::save(&cfg, &config_path) {
+                            tracing::warn!(error = %e, "не удалось сохранить config.json после переименования пресета");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(preset = %id, error = %e, "не удалось переименовать пресет")
+                    }
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::DeletePreset(id)) => {
+                match presets::delete_preset(&mut cfg, id) {
+                    Ok(()) => {
+                        if let Err(e) = config::save(&cfg, &config_path) {
+                            tracing::warn!(error = %e, "не удалось сохранить config.json после удаления пресета");
+                        }
+                    }
+                    Err(e) => tracing::warn!(preset = %id, error = %e, "не удалось удалить пресет"),
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::ExportPreset(id, path)) => {
+                if let Err(e) = presets::export_preset_to_file(&cfg, id, &path) {
+                    tracing::warn!(preset = %id, path = %path.display(), error = %e, "не удалось экспортировать пресет");
+                }
+            }
+            OverlayMessage::Command(OverlayCommand::ImportPreset(path)) => {
+                match presets::import_preset_from_file(&mut cfg, &path) {
+                    Ok(preset) => {
+                        tracing::info!(preset = %preset.id, path = %path.display(), "пресет импортирован");
+                        if let Err(e) = config::save(&cfg, &config_path) {
+                            tracing::warn!(error = %e, "не удалось сохранить config.json после импорта пресета");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "не удалось импортировать пресет");
+                    }
+                }
+            }
             OverlayMessage::Command(OverlayCommand::Shutdown) => break,
             OverlayMessage::Event(monitor_id, OverlayEvent::ToggleEditMode) => {
                 let Some(ms) = monitors_map.get_mut(&monitor_id) else {
@@ -1732,10 +1869,16 @@ fn run(
             }
             OverlayMessage::Event(_, OverlayEvent::HotkeyConflict(combo)) => {
                 // Окно продолжает работать без входа в режим редактирования;
-                // предупредить пользователя UI-уведомлением — отдельная
-                // задача (нужен канал в Tauri/трей), пока — хотя бы в лог,
-                // а не тихая потеря события.
+                // тост трея (`ShowNotification`) — тот же канал, что M6 уже
+                // использует для `PinAccessDenied` (общая инфраструктура,
+                // не задача-заглушка «на потом»).
                 tracing::warn!(combo = %combo, "хоткей режима редактирования уже занят другим приложением");
+                let _ = edit.coordinator_tx.send(CoordinatorRequest::ShowNotification {
+                    title: "Хоткей уже занят".to_string(),
+                    body: format!(
+                        "Комбинация {combo} уже используется другим приложением — вход в режим редактирования недоступен."
+                    ),
+                });
             }
             OverlayMessage::Event(_, OverlayEvent::MonitorsChanged(new_infos)) => {
                 // Диффинг — всегда против ЖИВОГО состояния (`monitors_map`),
@@ -2516,8 +2659,8 @@ fn resync_sprites(
 }
 
 /// Путь к изображению стикера для загрузки текстуры: есть у `File` и
-/// `Pasted` (оба ссылаются на файл на диске), нет у `Window` (M6, ещё не
-/// реализован).
+/// `Pasted` (оба ссылаются на файл на диске), нет у `Window` (M6 — стикер-
+/// окно ничего не рендерит, SPEC.md §5.2, `sync_window_stickers`).
 fn sticker_image_path(source: &StickerSource) -> Option<&Path> {
     match source {
         StickerSource::File { path, .. } => Some(path),
@@ -4762,6 +4905,7 @@ fn handle_input(
                         monitor_id,
                         window_pins,
                         pinned_stickers,
+                        &edit.coordinator_tx,
                         hwnd,
                     );
                 }
@@ -6034,6 +6178,7 @@ fn add_window_sticker(
     monitor_id: &MonitorId,
     window_pins: &mut WindowPins,
     pinned_stickers: &mut HashMap<usize, Uuid>,
+    coordinator_tx: &Sender<CoordinatorRequest>,
     hwnd: usize,
 ) {
     let Some(win) = window_snapshot.iter().find(|w| w.hwnd == hwnd) else {
@@ -6067,6 +6212,17 @@ fn add_window_sticker(
         }
         Err(e) => {
             tracing::warn!(hwnd, error = %e, "не удалось закрепить стикер-окно");
+            // UIPI (SPEC.md §5.3): показать пользователю, не только в лог —
+            // единственная реальная причина отказа, за которой стоит явное
+            // действие («перезапустите от администратора»), остальные
+            // ошибки pin() (PinWindowGone/AlreadyPinned) — гонки момента
+            // клика, тостом их не сопровождаем.
+            if matches!(e, Win32Error::PinAccessDenied) {
+                let _ = coordinator_tx.send(CoordinatorRequest::ShowNotification {
+                    title: "Не удалось закрепить окно".to_string(),
+                    body: e.to_string(),
+                });
+            }
         }
     }
 }

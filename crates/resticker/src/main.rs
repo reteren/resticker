@@ -17,7 +17,7 @@ use std::sync::mpsc;
 
 use anyhow::Context;
 use rst_core::model::{Config, Hotkeys, Settings};
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 use uuid::Uuid;
 
 use overlay_manager::{CoordinatorRequest, OverlayCommand, OverlayHandle};
@@ -115,6 +115,65 @@ fn delete_all_stickers(overlay: tauri::State<OverlayHandle>) {
     overlay.send(OverlayCommand::DeleteAllStickers);
 }
 
+/// M7 (SPEC.md §11): сохранить текущую расстановку стикеров как новый
+/// пресет.
+#[tauri::command]
+fn save_preset(name: String, overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::SavePreset(name));
+}
+
+/// Применить пресет. Недостающие элементы (SPEC §11, «Загрузка с
+/// недостающими элементами») координатор пришлёт отдельно, событием
+/// `preset-missing-elements` в окно настроек (см. `CoordinatorRequest`
+/// обработчик в `main`) — этот вызов ничего не возвращает синхронно,
+/// координатор — единственный писатель `cfg`, а Tauri-поток не может
+/// дождаться результата без отдельного request/reply канала, которого
+/// здесь нет (тот же принцип, что у всех остальных мутирующих команд).
+#[tauri::command]
+fn apply_preset(id: String, overlay: tauri::State<OverlayHandle>) -> Result<(), String> {
+    overlay.send(OverlayCommand::ApplyPreset(parse_id(&id)?));
+    Ok(())
+}
+
+#[tauri::command]
+fn rename_preset(
+    id: String,
+    name: String,
+    overlay: tauri::State<OverlayHandle>,
+) -> Result<(), String> {
+    overlay.send(OverlayCommand::RenamePreset(parse_id(&id)?, name));
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_preset(id: String, overlay: tauri::State<OverlayHandle>) -> Result<(), String> {
+    overlay.send(OverlayCommand::DeletePreset(parse_id(&id)?));
+    Ok(())
+}
+
+/// `path` — уже выбранный пользователем путь (диалог сохранения — на
+/// стороне JS, `tauri_plugin_dialog`, тот же паттерн, что у остальных
+/// путевых команд этого файла). Предупреждение про персональные данные в
+/// файле (SPEC §11) — обязанность UI-слоя ДО вызова этой команды, здесь не
+/// дублируется.
+#[tauri::command]
+fn export_preset(
+    id: String,
+    path: String,
+    overlay: tauri::State<OverlayHandle>,
+) -> Result<(), String> {
+    overlay.send(OverlayCommand::ExportPreset(
+        parse_id(&id)?,
+        PathBuf::from(path),
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn import_preset(path: String, overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::ImportPreset(PathBuf::from(path)));
+}
+
 /// Показать файл в проводнике (SPEC.md, раздел 10 — «показать в
 /// проводнике»). Не трогает `cfg`/координатор — чисто читающее действие
 /// над файловой системой, `explorer.exe` сам подсвечивает файл в открытом
@@ -204,6 +263,12 @@ fn main() -> anyhow::Result<()> {
             reset_all_stickers,
             delete_all_stickers,
             reveal_in_explorer,
+            save_preset,
+            apply_preset,
+            rename_preset,
+            delete_preset,
+            export_preset,
+            import_preset,
         ])
         .setup(move |app| {
             if !silent_start {
@@ -223,9 +288,9 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         TrayEvent::MenuItem(MENU_TOGGLE_VISIBLE) => {
-                            // Массовый переключатель видимости — M2 (тулбар/состояние
-                            // редактирования); пункт меню уже есть, поведение — позже.
-                            tracing::info!("показать/скрыть все: пока no-op, реализация в M2");
+                            handle
+                                .state::<OverlayHandle>()
+                                .send(OverlayCommand::ToggleAllStickers);
                         }
                         TrayEvent::MenuItem(MENU_EXIT) => handle.exit(0),
                         TrayEvent::MenuItem(_) => {}
@@ -244,6 +309,25 @@ fn main() -> anyhow::Result<()> {
                             if let Some(w) = coordinator_handle.get_webview_window("settings") {
                                 let _ = w.show();
                                 let _ = w.set_focus();
+                            }
+                        }
+                        // M7: применение пресета оставило часть стикеров
+                        // неприменённой (SPEC.md §11) — форвардим списком
+                        // события фронтенду окна настроек; текст диалога —
+                        // ответственность JS (main.js уже слушает
+                        // 'preset-missing-elements').
+                        CoordinatorRequest::PresetMissingElements(missing) => {
+                            // Фронтенд (main.js) ждёт объект `{missing: [...]}`,
+                            // не голый массив — `event.payload.missing`.
+                            let payload = serde_json::json!({ "missing": missing });
+                            let _ =
+                                coordinator_handle.emit_to("settings", "preset-missing-elements", payload);
+                        }
+                        CoordinatorRequest::ShowNotification { title, body } => {
+                            if let Err(e) =
+                                coordinator_handle.state::<TrayIcon>().show_balloon(&title, &body)
+                            {
+                                tracing::warn!(error = %e, "не удалось показать баллон-уведомление трея");
                             }
                         }
                     }
