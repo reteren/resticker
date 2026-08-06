@@ -207,6 +207,27 @@ pub fn toggle_select_all(visibility: &VisibilityRule, snapshot: &[WindowInfo]) -
     }
 }
 
+/// Пресет «только рабочий стол» (ROADMAP.md M4): ровно
+/// `{mode: OverlapAllowlist, rules: []}` — пустой allow-list семантически
+/// тождествен `Desktop` (occluders.rs, тест
+/// `allowlist_empty_rules_is_desktop_equivalent`).
+///
+/// Не новая бизнес-логика — переиспользует существующий путь «Снять все»:
+/// [`toggle_select_all`] с пустым снимком заведомо идёт в ветку «всё
+/// выбрано» (пустое «все» истинно по определению) и чистит правила — тот же
+/// результат, что у кнопки «Снять все». Единственная правка — режим
+/// безусловно `OverlapAllowlist`: переключатель «Снять все» сохраняет
+/// текущий режим, а в `Always` при пустом снимке вернул бы `{Always, []}` —
+/// обратная семантика (Always — «всегда виден», не «только рабочий стол»;
+/// дизайн §2.3).
+pub fn apply_desktop_only_preset(visibility: &VisibilityRule) -> VisibilityRule {
+    let cleared = toggle_select_all(visibility, &[]);
+    VisibilityRule {
+        mode: VisibilityMode::OverlapAllowlist,
+        rules: cleared.rules,
+    }
+}
+
 /// [`WindowInfo`] → [`OccluderCandidate`] (rst-core не зависит от rst-win32,
 /// перевод — на стороне координатора, как и в `refresh_occlusion`).
 fn candidate(window: &WindowInfo) -> OccluderCandidate {
@@ -238,6 +259,16 @@ fn short_exe_name(window: &WindowInfo) -> Option<String> {
 pub const PICKER_PANEL_ID: WidgetId = 200;
 /// Кнопка «Выбрать все» в шапке (SPEC §4.2, дизайн §4).
 pub const PICKER_BTN_SELECT_ALL: WidgetId = 201;
+/// Кнопка-пресет «Только рабочий стол» в шапке (ROADMAP.md M4): выставляет
+/// ровно `{mode: OverlapAllowlist, rules: []}` — то же правило, что даёт
+/// «Снять все», но с постоянной узнаваемой подписью (дизайн §2.3: пустой
+/// allow-list семантически тождествен `Desktop`).
+pub const PICKER_BTN_DESKTOP_ONLY: WidgetId = 202;
+
+/// Подпись кнопки-пресета «Только рабочий стол» — постоянна, не зависит от
+/// состояния списка правил (в отличие от подписи переключателя «Выбрать
+/// все»/«Снять все»).
+const DESKTOP_ONLY_LABEL: &str = "Только рабочий стол";
 
 // Схема WidgetId строк (число строк динамическое — малых констант, как у
 // фиксированного тулбара, недостаточно):
@@ -259,7 +290,8 @@ const LABEL_FLAG: WidgetId = 0x8000_0000;
 pub const PICKER_VISIBLE_ROWS: usize = 10;
 /// Ширина панели, DIP.
 pub const PICKER_WIDTH: f64 = 320.0;
-/// Высота шапки с кнопкой «Выбрать все», DIP.
+/// Высота шапки (кнопки «Выбрать все»/«Снять все» и «Только рабочий
+/// стол»), DIP.
 pub const PICKER_HEADER_H: f64 = 40.0;
 /// Высота строки списка, DIP (равна `theme::BUTTON_SIZE` — колонка иконок
 /// проектировалась квадратом этого размера, дизайн §6).
@@ -293,11 +325,13 @@ pub struct PickerPanel {
 /// `frame` — рамка панели (полностью определяет вызывающий слой; типовой
 /// размер — [`PICKER_WIDTH`]×[`PICKER_HEIGHT`]).
 ///
-/// Шапка (кнопка «Выбрать все», дизайн §4) видима всегда; скролл сдвигает
-/// только список под ней. Надпись кнопки отражает предстоящее действие
-/// («Выбрать все»/«Снять все»), как `BTN_TOGGLE_ALL` в cursor_panel.rs.
-/// Чекбокс процесса кликабелен; чекбоксы окон всегда disabled — окна только
-/// отображение, выбор лишь на уровне процесса (дизайн §7.6).
+/// Шапка (переключатель «Выбрать все»/«Снять все» + кнопка-пресет «Только
+/// рабочий стол», дизайн §4, ROADMAP.md M4) видима всегда; скролл сдвигает
+/// только список под ней. Надпись переключателя отражает предстоящее действие
+/// («Выбрать все»/«Снять все»), как `BTN_TOGGLE_ALL` в cursor_panel.rs;
+/// подпись пресета постоянна. Чекбокс процесса кликабелен; чекбоксы окон
+/// всегда disabled — окна только отображение, выбор лишь на уровне процесса
+/// (дизайн §7.6).
 pub fn build_picker_panel(
     visibility: &VisibilityRule,
     snapshot: &[WindowInfo],
@@ -310,25 +344,36 @@ pub fn build_picker_panel(
 
     // Шапка: «Выбрать все» — переключатель (SPEC §4.2); надпись — предстоящее
     // действие («выбрать» или «снять»), как BTN_TOGGLE_ALL в cursor_panel.rs.
+    // Рядом — кнопка-пресет «Только рабочий стол» (ROADMAP.md M4): то же
+    // правило, что у «Снять все» ({mode: OverlapAllowlist, rules: []}),
+    // постоянная подпись вместо чтения состояния списка.
     let all_checked = all_windows_checked(visibility, snapshot);
-    let label = if all_checked {
+    let toggle_label = if all_checked {
         "Снять все"
     } else {
         "Выбрать все"
     };
-    let (tw, _) = text_size(label);
-    let btn_w = tw + 2.0 * theme::BUTTON_PAD + 8.0;
-    panel.add_widget(Button::new(
-        PICKER_BTN_SELECT_ALL,
-        Box2D {
-            cx: left + btn_w / 2.0,
-            cy: top + PICKER_PAD + PICKER_HEADER_H / 2.0,
-            w: btn_w,
-            h: theme::BUTTON_SIZE,
-            rotation: 0.0,
-        },
-        ButtonContent::Label(label.to_string()),
-    ));
+    let header_y = top + PICKER_PAD + PICKER_HEADER_H / 2.0;
+    let mut btn_cx = left;
+    for (id, text) in [
+        (PICKER_BTN_SELECT_ALL, toggle_label),
+        (PICKER_BTN_DESKTOP_ONLY, DESKTOP_ONLY_LABEL),
+    ] {
+        let (tw, _) = text_size(text);
+        let btn_w = tw + 2.0 * theme::BUTTON_PAD + 8.0;
+        panel.add_widget(Button::new(
+            id,
+            Box2D {
+                cx: btn_cx + btn_w / 2.0,
+                cy: header_y,
+                w: btn_w,
+                h: theme::BUTTON_SIZE,
+                rotation: 0.0,
+            },
+            ButtonContent::Label(text.to_string()),
+        ));
+        btn_cx += btn_w + PICKER_GAP;
+    }
 
     let groups = group_by_process(snapshot);
     let list_top = top + PICKER_PAD + PICKER_HEADER_H;
@@ -1050,6 +1095,84 @@ mod tests {
         assert!(cleared.rules.is_empty());
     }
 
+    // --- пресет «только рабочий стол» (ROADMAP.md M4) ---
+
+    #[test]
+    fn desktop_only_preset_clears_rules_and_pins_allowlist() {
+        let snapshot = [
+            window(1, r"C:\Apps\chrome.exe", "Chrome", 100, 1),
+            window(2, "", "Настройки", 200, 2),
+        ];
+        let v = allowlist(vec![
+            rule(Some("chrome.exe"), None),
+            rule(None, Some("Настройки")),
+        ]);
+        let preset = apply_desktop_only_preset(&v);
+        assert_eq!(preset.mode, VisibilityMode::OverlapAllowlist);
+        assert!(preset.rules.is_empty());
+        assert!(
+            snapshot.iter().all(|w| !window_is_checked(&preset, w)),
+            "после пресета ничего не выбрано"
+        );
+    }
+
+    #[test]
+    fn desktop_only_preset_equals_select_all_clear_branch() {
+        // «Снять все» (клик по переключателю в состоянии «всё выбрано»)
+        // даёт то же правило — пресет просто делает его доступным одной
+        // кнопкой с постоянной подписью.
+        let snapshot = [
+            window(1, r"C:\Apps\chrome.exe", "Chrome", 100, 1),
+            window(2, "", "Настройки", 200, 2),
+        ];
+        let all = toggle_select_all(&allowlist(vec![]), &snapshot);
+        let cleared = toggle_select_all(&all, &snapshot);
+        let preset = apply_desktop_only_preset(&all);
+        assert_eq!(preset, cleared, "пресет == результат «Снять все»");
+        assert_eq!(preset.mode, VisibilityMode::OverlapAllowlist);
+        assert!(preset.rules.is_empty());
+    }
+
+    #[test]
+    fn desktop_only_preset_from_always_is_allowlist_not_always() {
+        // Крайний случай: «Снять все» в `Always` при пустом снимке сохранило
+        // бы {Always, []} (Always — «всегда виден», обратная семантика);
+        // пресет обязан дать ровно {OverlapAllowlist, []} (дизайн §2.3).
+        let v = VisibilityRule {
+            mode: VisibilityMode::Always,
+            rules: vec![],
+        };
+        let preset = apply_desktop_only_preset(&v);
+        assert_eq!(preset.mode, VisibilityMode::OverlapAllowlist);
+        assert!(preset.rules.is_empty());
+    }
+
+    #[test]
+    fn desktop_only_preset_from_any_mode_is_allowlist() {
+        for mode in [
+            VisibilityMode::Always,
+            VisibilityMode::Desktop,
+            VisibilityMode::NeverOverlap,
+            VisibilityMode::OverlapAllowlist,
+        ] {
+            let v = VisibilityRule {
+                mode,
+                rules: vec![rule(Some("stale.exe"), None)],
+            };
+            let preset = apply_desktop_only_preset(&v);
+            assert_eq!(preset.mode, VisibilityMode::OverlapAllowlist, "{mode:?}");
+            assert!(preset.rules.is_empty(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn desktop_only_preset_is_idempotent() {
+        let v = allowlist(vec![rule(Some("chrome.exe"), None)]);
+        let once = apply_desktop_only_preset(&v);
+        let twice = apply_desktop_only_preset(&once);
+        assert_eq!(once, twice);
+    }
+
     // --- билдер панели (дизайн §1, §3-4, §6, §7.3-7.4) ---
 
     fn picker_frame() -> Box2D {
@@ -1105,9 +1228,13 @@ mod tests {
         let p = build_picker_panel(&allowlist(vec![]), &[], 0, picker_frame());
         assert_eq!(p.total_rows, 0);
         assert!(p.panel.widget::<Button>(PICKER_BTN_SELECT_ALL).is_some());
+        assert!(p.panel.widget::<Button>(PICKER_BTN_DESKTOP_ONLY).is_some());
         // Пустой снимок: «всё выбрано» (пустое «все» истинно) — кнопка
-        // предлагает снять.
-        assert_eq!(picker_texts(&p.panel), vec!["Снять все"]);
+        // предлагает снять; рядом — пресет «Только рабочий стол».
+        assert_eq!(
+            picker_texts(&p.panel),
+            vec!["Снять все".to_string(), DESKTOP_ONLY_LABEL.to_string()]
+        );
         assert!(
             p.panel
                 .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE)
@@ -1374,6 +1501,68 @@ mod tests {
             picker_frame(),
         );
         assert!(picker_texts(&all.panel).contains(&"Снять все".to_string()));
+    }
+
+    #[test]
+    fn desktop_only_button_present_in_both_toggle_states() {
+        let snapshot = [window(1, r"C:\Apps\app.exe", "t", 1, 1)];
+        let partial = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        assert!(
+            partial
+                .panel
+                .widget::<Button>(PICKER_BTN_DESKTOP_ONLY)
+                .is_some()
+        );
+        let texts = picker_texts(&partial.panel);
+        assert!(texts.contains(&"Выбрать все".to_string()));
+        assert!(texts.contains(&DESKTOP_ONLY_LABEL.to_string()));
+
+        let all = build_picker_panel(
+            &allowlist(vec![rule(Some("app.exe"), None)]),
+            &snapshot,
+            0,
+            picker_frame(),
+        );
+        assert!(
+            all.panel
+                .widget::<Button>(PICKER_BTN_DESKTOP_ONLY)
+                .is_some()
+        );
+        let texts = picker_texts(&all.panel);
+        assert!(texts.contains(&"Снять все".to_string()));
+        assert!(texts.contains(&DESKTOP_ONLY_LABEL.to_string()));
+    }
+
+    #[test]
+    fn desktop_only_button_sits_next_to_toggle_all_within_panel() {
+        let p = build_picker_panel(&allowlist(vec![]), &[], 0, picker_frame());
+        let frame = p.panel.frame();
+        let toggle = p
+            .panel
+            .widget::<Button>(PICKER_BTN_SELECT_ALL)
+            .unwrap()
+            .bounds();
+        let desktop = p
+            .panel
+            .widget::<Button>(PICKER_BTN_DESKTOP_ONLY)
+            .unwrap()
+            .bounds();
+        assert!(
+            desktop.cx > toggle.cx + toggle.w / 2.0,
+            "пресет справа от переключателя, а не поверх"
+        );
+        assert!(
+            desktop.cx - desktop.w / 2.0 >= frame.cx - frame.w / 2.0,
+            "кнопка не левее рамки панели"
+        );
+        assert!(
+            desktop.cx + desktop.w / 2.0 <= frame.cx + frame.w / 2.0,
+            "кнопка не правее рамки панели"
+        );
+        assert!(
+            (desktop.cy - toggle.cy).abs() < 1e-9,
+            "обе кнопки в одном ряду шапки"
+        );
     }
 
     // --- обрезка длинного текста (независимое ревью, конвейер не клипует) ---

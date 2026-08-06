@@ -65,6 +65,10 @@ const EDIT_HOTKEY_ID: i32 = 1;
 /// (M2b7, `hotkeys.toggle_all_stickers` в конфиге).
 const TOGGLE_ALL_HOTKEY_ID: i32 = 2;
 
+/// Идентификатор глобального хоткея «заглушить все стикеры» (M5d,
+/// `hotkeys.mute_all` в конфиге, `AudioMixer::set_muted`).
+const MUTE_ALL_HOTKEY_ID: i32 = 3;
+
 /// Координатор → поток оверлея: сменить форму курсора (зона под курсором
 /// меняется на его стороне, хит-тест — не Win32, ARCHITECTURE.md 5.3);
 /// `wParam` — форма, закодированная [`cursor_shape_to_wparam`].
@@ -106,6 +110,8 @@ pub enum OverlayEvent {
     ToggleEditMode,
     /// Глобальный хоткей «показать/скрыть все стикеры» нажат (M2b7).
     ToggleAllStickers,
+    /// Глобальный хоткей «заглушить все стикеры» нажат (M5d).
+    ToggleMuteAll,
     /// Глобальный хоткей не удалось зарегистрировать: комбинация уже занята
     /// другим приложением. Строка — каноничный вид комбинации из конфига
     /// (ARCHITECTURE.md, раздел 5.1). Окно продолжает работать — недоступны
@@ -177,7 +183,9 @@ impl OverlayWindow {
     /// — окно основного монитора), `None` — для остальных, они создаются
     /// без регистрации и без конфликтов. `toggle_all_hotkey` — опциональный
     /// хоткей «показать/скрыть все стикеры» (M2b7): `None`, когда в конфиге
-    /// пусто или комбинация не парсится. Конфликт регистрации — не паника:
+    /// пусто или комбинация не парсится. `mute_all_hotkey` — тот же паттерн
+    /// для «заглушить все стикеры» (M5d, `hotkeys.mute_all`). Конфликт
+    /// регистрации — не паника:
     /// окно работает, а наружу уходит событие
     /// [`OverlayEvent::HotkeyConflict`]. Возвращает управление, когда окно
     /// гарантированно создано, и приёмник событий мыши/клавиатуры/хоткеев —
@@ -187,6 +195,7 @@ impl OverlayWindow {
         bounds_px: Rect,
         edit_hotkey: Option<HotkeyCombo>,
         toggle_all_hotkey: Option<HotkeyCombo>,
+        mute_all_hotkey: Option<HotkeyCombo>,
     ) -> Result<(Self, Receiver<OverlayEvent>), Win32Error> {
         let (ready_tx, ready_rx) = mpsc::channel::<ReadyResult>();
         let (event_tx, event_rx) = mpsc::channel::<OverlayEvent>();
@@ -198,6 +207,7 @@ impl OverlayWindow {
                 bounds_px,
                 edit_hotkey,
                 toggle_all_hotkey,
+                mute_all_hotkey,
             )
         });
 
@@ -236,6 +246,7 @@ impl OverlayWindow {
             },
             Some(edit_hotkey),
             toggle_all_hotkey,
+            None,
         )
     }
 
@@ -430,6 +441,7 @@ fn run_message_loop(
     bounds_px: Rect,
     edit_hotkey: Option<HotkeyCombo>,
     toggle_all_hotkey: Option<HotkeyCombo>,
+    mute_all_hotkey: Option<HotkeyCombo>,
 ) {
     let hwnd = match create_window(bounds_px) {
         Ok(v) => v,
@@ -467,6 +479,24 @@ fn run_message_loop(
                 tracing::warn!(
                     error = %e,
                     "не удалось зарегистрировать хоткей «показать/скрыть все стикеры»"
+                );
+                if let Some(event) = hotkey_conflict_event(&e) {
+                    let _ = event_tx.send(event);
+                }
+                None
+            }
+        },
+        None => None,
+    };
+    // «Заглушить все стикеры» — опциональный хоткей, тот же паттерн, что
+    // и «показать/скрыть все стикеры» выше (M5d).
+    let _mute_all = match mute_all_hotkey {
+        Some(combo) => match RegisteredHotkey::register(MUTE_ALL_HOTKEY_ID, combo) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "не удалось зарегистрировать хоткей «заглушить все стикеры»"
                 );
                 if let Some(event) = hotkey_conflict_event(&e) {
                     let _ = event_tx.send(event);
@@ -519,6 +549,8 @@ fn run_message_loop(
                 let _ = hotkey_tx.send(OverlayEvent::ToggleEditMode);
             } else if id == TOGGLE_ALL_HOTKEY_ID {
                 let _ = hotkey_tx.send(OverlayEvent::ToggleAllStickers);
+            } else if id == MUTE_ALL_HOTKEY_ID {
+                let _ = hotkey_tx.send(OverlayEvent::ToggleMuteAll);
             }
             continue;
         }
@@ -881,7 +913,7 @@ mod tests {
     #[test]
     fn create_then_drop_destroys_window() {
         let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None)
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None)
                 .expect("создание оверлея");
         let hwnd = overlay.hwnd();
         assert!(!hwnd.0.is_null());
@@ -901,8 +933,8 @@ mod tests {
 
     #[test]
     fn window_uses_given_bounds() {
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None)
+            .expect("создание оверлея");
 
         // Позиция и размер окна — ровно границы монитора, не (0, 0) и не
         // системный экран (docs/M3_PREP_NOTES.md, раздел 3.1).
@@ -921,8 +953,8 @@ mod tests {
 
     #[test]
     fn set_bounds_moves_and_resizes_window() {
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None)
+            .expect("создание оверлея");
         assert_eq!(overlay.size(), (1280, 1024));
 
         let moved = Rect {
@@ -949,7 +981,7 @@ mod tests {
     #[test]
     fn set_click_through_toggles_exstyle_bits() {
         let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None)
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None)
                 .expect("создание оверлея");
         // SAFETY: чтение стиля своего же окна.
         let initial = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
@@ -981,7 +1013,7 @@ mod tests {
     #[test]
     fn set_capture_affinity_round_trips_and_verifies() {
         let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None)
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None)
                 .expect("создание оверлея");
 
         let hidden = overlay
@@ -1011,8 +1043,8 @@ mod tests {
         // M3: окна других мониторов используют set_interactive, а не
         // set_click_through, чтобы не бороться за фокус — но сами биты
         // WS_EX_TRANSPARENT|WS_EX_NOACTIVATE переключаются одинаково.
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None)
+            .expect("создание оверлея");
 
         overlay.set_interactive(true);
         let editing = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
@@ -1071,10 +1103,10 @@ mod tests {
         // на машине разработчика/CI (F22 не используется другими тестами).
         let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F22").expect("валидная комбинация");
         let (_first, _first_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None)
+            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None, None)
                 .expect("первое окно");
         let (_second, second_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None)
+            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None, None)
                 .expect("второе окно");
 
         // Хоткей регистрируется на pump-потоке до сигнала готовности, поэтому
@@ -1095,10 +1127,10 @@ mod tests {
         // с `None` — без регистрации и без события HotkeyConflict.
         let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F21").expect("валидная комбинация");
         let (_first, _first_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None)
+            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None, None)
                 .expect("первое окно");
         let (_second, second_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("второе окно");
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, None).expect("второе окно");
 
         match second_events.recv_timeout(Duration::from_millis(300)) {
             Err(RecvTimeoutError::Timeout) => {}
@@ -1115,11 +1147,15 @@ mod tests {
         // У второго окна другой edit-хоткей (F19), чтобы конфликт пришёл
         // именно от toggle_all, а не от режима редактирования.
         let edit2 = HotkeyCombo::parse("Ctrl+Alt+Shift+F19").expect("валидная комбинация");
-        let (_first, _first_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), Some(toggle))
-                .expect("первое окно");
+        let (_first, _first_events) = OverlayWindow::create_on_monitor(
+            test_bounds(),
+            Some(test_hotkey()),
+            Some(toggle),
+            None,
+        )
+        .expect("первое окно");
         let (_second, second_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(edit2), Some(toggle))
+            OverlayWindow::create_on_monitor(test_bounds(), Some(edit2), Some(toggle), None)
                 .expect("второе окно");
 
         // Тот же паттерн, что и для edit-хоткея: конфликт — событие, а не
@@ -1132,9 +1168,30 @@ mod tests {
     }
 
     #[test]
+    fn second_window_with_same_mute_all_hotkey_reports_conflict() {
+        // Тот же паттерн, что и toggle_all выше, для третьего хоткея (M5d).
+        // Экзотическая комбинация — не конфликтует с реальными приложениями
+        // и с другими тестами (F18; F19/F20/F21/F22/F23/F24 заняты соседними
+        // тестами).
+        let mute = HotkeyCombo::parse("Ctrl+Alt+Shift+F18").expect("валидная комбинация");
+        let (_first, _first_events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, Some(mute))
+                .expect("первое окно");
+        let (_second, second_events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, Some(mute))
+                .expect("второе окно");
+
+        match second_events.recv_timeout(Duration::from_secs(5)) {
+            Ok(OverlayEvent::HotkeyConflict(s)) => assert_eq!(s, "Ctrl+Alt+Shift+F18"),
+            Ok(other) => panic!("ожидался HotkeyConflict, получено: {other:?}"),
+            Err(e) => panic!("второе окно не прислало HotkeyConflict: {e}"),
+        }
+    }
+
+    #[test]
     fn dpi_changed_applies_recommended_rect_and_reports_event() {
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None)
+            .expect("создание оверлея");
 
         // Как в настоящем WM_DPICHANGED: wParam — новый DPI (младшее слово —
         // dpiX, старшее — dpiY, тут мусор, чтобы проверить что берём LOWORD),
@@ -1176,8 +1233,8 @@ mod tests {
 
     #[test]
     fn dpi_changed_with_zero_dpi_is_ignored() {
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None)
+            .expect("создание оверлея");
         let before = overlay.size();
         // Нулевой DPI в wParam быть не должен; окно не трогаем (и lParam
         // с нулевым указателем не читаем).
@@ -1250,8 +1307,8 @@ mod tests {
         // Сообщения шлём реальному окну вручную — диспетчеризация от wndproc
         // до канала событий проверяется целиком; системная регистрация
         // (WTSRegisterSessionNotification) здесь не участвует.
-        let (overlay, events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None).expect("создание оверлея");
+        let (overlay, events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None)
+            .expect("создание оверлея");
         // SAFETY: hwnd — наше живое окно; порядок сообщений в очереди окна
         // гарантируется (FIFO), значит и порядок событий в канале.
         unsafe {

@@ -183,6 +183,7 @@ fn create_monitor_state(
     info: &monitors::MonitorInfo,
     edit_hotkey: Option<HotkeyCombo>,
     toggle_all_hotkey: Option<HotkeyCombo>,
+    mute_all_hotkey: Option<HotkeyCombo>,
     edit_active: bool,
     hide_from_capture: bool,
 ) -> Option<MonitorState> {
@@ -190,6 +191,7 @@ fn create_monitor_state(
         info.bounds_px,
         edit_hotkey,
         toggle_all_hotkey,
+        mute_all_hotkey,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -978,6 +980,14 @@ fn run(
         .toggle_all_stickers
         .as_deref()
         .and_then(|s| HotkeyCombo::parse(s).ok());
+    // «Заглушить все стикеры» (M5d) — тот же опциональный паттерн, что и
+    // toggle_all_hotkey выше: `AudioMixer::set_muted` уже существует, не
+    // хватало только регистрации самого хоткея.
+    let mute_all_hotkey = cfg
+        .hotkeys
+        .mute_all
+        .as_deref()
+        .and_then(|s| HotkeyCombo::parse(s).ok());
 
     // M3: окно на каждый подключённый монитор, а не один захардкоженный
     // основной (M3_PREP_NOTES.md, раздел 5). Перечисление — при старте;
@@ -1062,6 +1072,10 @@ fn run(
             None
         }
     };
+    // Глобальный «заглушить все» (M5d, `OverlayEvent::ToggleMuteAll`) —
+    // рантайм-состояние хоткея, не персистентное (в отличие от громкости
+    // на стикер, конфиг ничего не хранит про этот тумблер).
+    let mut audio_muted = false;
 
     let mut sprites: Vec<(Uuid, Sprite)> = Vec::new();
     let mut animations: HashMap<Uuid, StickerAnimation> = HashMap::new();
@@ -1085,10 +1099,10 @@ fn run(
     // раздел 3.3), остальные создаются без него, чтобы не конфликтовать.
     let mut monitors_map: HashMap<MonitorId, MonitorState> = HashMap::new();
     for info in &monitor_infos {
-        let (edit_hotkey, this_toggle_all) = if info.id == primary_id {
-            (Some(hotkey), toggle_all_hotkey)
+        let (edit_hotkey, this_toggle_all, this_mute_all) = if info.id == primary_id {
+            (Some(hotkey), toggle_all_hotkey, mute_all_hotkey)
         } else {
-            (None, None)
+            (None, None, None)
         };
         if let Some(ms) = create_monitor_state(
             &device,
@@ -1096,6 +1110,7 @@ fn run(
             info,
             edit_hotkey,
             this_toggle_all,
+            this_mute_all,
             false,
             cfg.settings.hide_from_capture,
         ) {
@@ -1626,6 +1641,17 @@ fn run(
                     need_redraw = true;
                 }
             }
+            OverlayMessage::Event(_, OverlayEvent::ToggleMuteAll) => {
+                // Глобальный хоткей «заглушить все» (M5d, SPEC.md §7.1):
+                // `AudioMixer::set_muted` уже существовал (используется
+                // приглушением невидимых стикеров), не хватало только
+                // подключения хоткея. Рантайм-тумблер, ничего не пишем в
+                // config.json.
+                audio_muted = !audio_muted;
+                if let Some(mixer) = audio_mixer.as_ref() {
+                    mixer.set_muted(audio_muted);
+                }
+            }
             OverlayMessage::Event(monitor_id, OverlayEvent::DpiChanged { dpi, size }) => {
                 // Окно уже переехало на рекомендованный прямоугольник
                 // (rst_win32::overlay::handle_dpi_changed) — здесь досчитываем
@@ -1740,6 +1766,7 @@ fn run(
                             info,
                             None,
                             None,
+                            None,
                             edit.active,
                             cfg.settings.hide_from_capture,
                         ) {
@@ -1753,6 +1780,7 @@ fn run(
                             info,
                             Some(hotkey),
                             toggle_all_hotkey,
+                            mute_all_hotkey,
                             edit.active,
                             cfg.settings.hide_from_capture,
                         ) {
@@ -1773,10 +1801,11 @@ fn run(
                     if monitors_map.contains_key(&info.id) {
                         continue;
                     }
-                    let (edit_hotkey, this_toggle_all) = if info.id == new_primary_id {
-                        (Some(hotkey), toggle_all_hotkey)
+                    let (edit_hotkey, this_toggle_all, this_mute_all) = if info.id == new_primary_id
+                    {
+                        (Some(hotkey), toggle_all_hotkey, mute_all_hotkey)
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
                     if let Some(ms) = create_monitor_state(
                         &device,
@@ -1784,6 +1813,7 @@ fn run(
                         info,
                         edit_hotkey,
                         this_toggle_all,
+                        this_mute_all,
                         edit.active,
                         cfg.settings.hide_from_capture,
                     ) {
@@ -3907,6 +3937,33 @@ fn handle_window_picker_up(
         // `Windows(Changed)`/`DpiChanged`/`MonitorsChanged` — маска не
         // отражала бы только что выбранные в панели окна, пока не придёт
         // не связанное с этим событие трекера.
+        *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
+        rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+        return true;
+    }
+
+    let desktop_only_clicked = edit
+        .window_picker
+        .as_mut()
+        .and_then(|s| {
+            s.panel
+                .widget_mut::<Button>(window_picker::PICKER_BTN_DESKTOP_ONLY)
+        })
+        .is_some_and(Button::take_click);
+    if desktop_only_clicked {
+        commit_undo_snapshot(edit, cfg.clone());
+        let sticker = cfg
+            .stickers
+            .iter_mut()
+            .find(|s| s.id == sticker_id)
+            .expect("наличие стикера проверено выше");
+        sticker.visibility = window_picker::apply_desktop_only_preset(&sticker.visibility);
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после пресета «только рабочий стол»");
+        }
+        // Тот же пересчёт, что и после «выбрать все» выше — тот же класс
+        // бага (occluder_cache остаётся на старых правилах видимости до
+        // следующего несвязанного события трекера).
         *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
         rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
         return true;
