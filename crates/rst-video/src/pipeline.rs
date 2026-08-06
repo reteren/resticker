@@ -6,6 +6,14 @@
 //! `decoder.rs`): контексты не передаются между потоками, поэтому
 //! потокобезопасность контекстов FFmpeg не требуется.
 //!
+//! Поддерживаемые выходные форматы пикселей (M5e): YUV420P (обычное видео),
+//! YUVA420P (VP9 с альфой), YUVA444P10LE (ProRes 4444 — понижается до 8 бит
+//! на CPU при распаковке) и packed RGB с qtrle (конвертируется в YUVA420P
+//! на CPU — в сборке FFmpeg нет swscale, дизайн M5b §1). Форматы с альфой
+//! декодируются строго программно ([`crate::format::VideoPixelFormat::
+//! hwaccel_compatible`] — предикат, отсекающий их от будущего аппаратного
+//! пути M5c).
+//!
 //! Тайминги показа — зона вызывающего кода (координатора), контракт
 //! (docs/M5B_VIDEO_DESIGN.md §2): кадры отдаются с корректным PTS
 //! относительно начала потока; решение «показывать сейчас или ждать» —
@@ -18,9 +26,15 @@ use std::ptr::{null, null_mut};
 use std::time::Duration;
 
 use ffmpeg_sys_next::*;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::core::Interface;
 
 use crate::error::VideoError;
-use crate::format::{pts_to_duration, swr_out_count, yuv420p_plane_sizes};
+use crate::format::{
+    VideoPixelFormat, classify_pixel_format, downconvert_10bit_le, pts_to_duration,
+    rgb_packed_to_yuva420p, swr_out_count,
+};
+use crate::hwaccel::{self, HwDecode};
 
 /// Целевой формат ресемплера звука: f32, стерео, 48000 Гц (фиксированный,
 /// docs/M5B_VIDEO_DESIGN.md §4 — микшер работает в одном формате и не
@@ -35,11 +49,24 @@ pub const AUDIO_TARGET_CHANNELS: usize = 2;
 const AVERROR_EAGAIN: c_int = -11;
 
 /// Один кадр видео: плоскости YUV420P (straight, плотно упакованные) и PTS.
+/// Для прозрачных форматов (M5e) — ещё и 4-я плоскость `alpha` (полное
+/// разрешение, 8 бит) и реальные размеры плоскостей U/V (`u_width`/
+/// `u_height`): 4:2:0 — половина по каждой оси, 4:4:4 — полное разрешение.
 #[derive(Debug)]
 pub struct VideoFrameOut {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+    /// Альфа-плоскость, `width × height` байт (полное разрешение — так у
+    /// всех поддерживаемых альфа-форматов), если исходный формат несёт
+    /// альфу (YUVA420P/YUVA444P10LE/qtrle); `None` — непрозрачное видео
+    /// (YUV420P).
+    pub alpha: Option<Vec<u8>>,
+    /// Ширина плоскостей U/V (пикселей): 4:2:0 — `ceil(width/2)`, 4:4:4 —
+    /// `width`. Текстуры хромы в rst-render создаются по этим размерам.
+    pub u_width: u32,
+    /// Высота плоскостей U/V: 4:2:0 — `ceil(height/2)`, 4:4:4 — `height`.
+    pub u_height: u32,
     pub width: u32,
     pub height: u32,
     pub pts: Duration,
@@ -51,10 +78,79 @@ pub struct AudioChunkOut {
     pub samples: Vec<f32>,
 }
 
+/// Один аппаратный кадр (M5c, ROADMAP.md): элемент NV12-массив-текстуры
+/// декодера на ОБЩЕМ с рендером `ID3D11Device` — без readback на CPU.
+///
+/// Владение:
+/// - `texture` — COM-ссылка на массив-текстуру пула (добавочная, пул
+///   держит свою; `Drop` обёртки делает `Release`).
+/// - `pool_buf` — `AVBufferRef` на элемент пула: поверхность НЕ возвращается
+///   в пул (декодер её не переиспользует), пока жив кадр. Снятие ссылки
+///   можно делать с любого потока — пул защищён мьютексом, refcount
+///   атомарный (`av_buffer.c`); декодер при исчерпании пула ждёт
+///   освобождения (деградация до «поверхности закончились», но никогда —
+///   до порчи кадра).
+/// - `frames_ctx` — `AVBufferRef` на frames-контекст, СОЗДАВШИЙ кадр: пока
+///   жив хоть один кадр, контекст (и его пул) не уничтожаются — тот же
+///   инвариант, что у штатных кадров FFmpeg (`AVFrame->hw_frames_ctx`).
+///   Найдено на железе: без этой ссылки teardown декодера при живых кадрах
+///   освобождал пул, и поздний release элемента прыгал в освобождённую
+///   память (ip == addr, call через битый указатель).
+///
+/// `unsafe impl Send`: кадр создан на декодер-потоке, потребляется
+/// потоком рендера; все операции в `Drop` потокобезопасны (см. выше).
+pub struct HwVideoFrameOut {
+    /// Текстура декодера (массив-текстура NV12; элемент — `array_index`).
+    pub texture: ID3D11Texture2D,
+    /// Индекс элемента в массиве (AVFrame->data[1] как intptr_t).
+    pub array_index: u32,
+    /// Размеры текстуры (выровненные: 16/32/128 px) — видимая область
+    /// `width`×`height` занимает их левый верхний угол.
+    pub tex_width: u32,
+    pub tex_height: u32,
+    /// Видимая область кадра (coded, после кропа декодером).
+    pub width: u32,
+    pub height: u32,
+    pub pts: Duration,
+    /// Удержание элемента пула (см. док структуры).
+    pub(crate) pool_buf: *mut AVBufferRef,
+    /// Удержание frames-контекста (см. док структуры).
+    pub(crate) frames_ctx: *mut AVBufferRef,
+}
+
+// SAFETY: см. док структуры — все операции владения потокобезопасны.
+unsafe impl Send for HwVideoFrameOut {}
+
+impl Drop for HwVideoFrameOut {
+    fn drop(&mut self) {
+        // SAFETY: ссылки живы (единственные из наших); unref потокобезопасен.
+        unsafe {
+            av_buffer_unref(&mut self.pool_buf);
+            av_buffer_unref(&mut self.frames_ctx);
+        }
+    }
+}
+
+impl std::fmt::Debug for HwVideoFrameOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HwVideoFrameOut")
+            .field("array_index", &self.array_index)
+            .field("tex", &format!("{}x{}", self.tex_width, self.tex_height))
+            .field("visible", &format!("{}x{}", self.width, self.height))
+            .field("pts", &self.pts)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Событие декодера (docs/M5B_VIDEO_DESIGN.md §2, потоковая природа).
 pub(crate) enum Event {
     /// Готовый видеокадр.
     Video(VideoFrameOut),
+    /// Готовый аппаратный кадр (M5c): NV12-текстура на общем D3D11-девайсе,
+    /// zero-copy. В hw-режиме программные кадры не производятся; для
+    /// совместимости (старый `try_recv_frame`) декодер-поток конвертирует
+    /// их в `Event::Video` через readback ([`Pipeline::hw_to_yuv`]).
+    VideoHw(HwVideoFrameOut),
     /// Готовая порция звука.
     Audio(AudioChunkOut),
     /// Пакет обработан, выхода нет — декодер-поток читает следующий пакет.
@@ -216,6 +312,16 @@ pub(crate) struct Pipeline {
     /// Размеры первого кадра (валидированы в open).
     width: u32,
     height: u32,
+    /// Пиксельный формат выходных кадров (M5e): YUV420P или один из
+    /// альфа-форматов. Определяется первым декодированным кадром
+    /// (`probe_first_video_frame`); формат кодек не меняет на протяжении
+    /// потока — после перемоток/перезапусков значения остаются валидными.
+    video_fmt: VideoPixelFormat,
+    /// Аппаратный декод (M5c): `Some` — hwaccel D3D11VA активен, кадры
+    /// выходят как [`HwVideoFrameOut`] (NV12-текстуры на общем девайсе);
+    /// `None` — программный путь. `HwDecode` владеет FFmpeg-контекстами
+    /// устройства/кадров и держит их живыми до закрытия пайплайна.
+    hw: Option<HwDecode>,
 }
 
 /// Декодер для потока: указатель из av_find_best_stream или поиск по codec_id.
@@ -236,6 +342,44 @@ impl Pipeline {
     /// вывода — `AudioTarget::default()`, если вызывающему коду он
     /// неизвестен).
     pub(crate) fn open(path: &Path, audio_target: AudioTarget) -> Result<Self, VideoError> {
+        Self::open_inner(path, audio_target, None)
+    }
+
+    /// Как [`Self::open`], но с аппаратным декодом D3D11VA (M5c): hwaccel
+    /// включается на ОБЩЕМ с рендером `ID3D11Device`, кадры выходят как
+    /// [`Event::VideoHw`] (NV12-текстуры, zero-copy). **Ключевое требование
+    /// ROADMAP — корректный fallback**: при ЛЮБОЙ ошибке инициализации
+    /// (нет железа/драйвера, кодек не поддерживает d3d11va, формат кадра не
+    /// NV12, память) или ошибке открытия/первого кадра в hw-режиме файл
+    /// переоткрывается программно — существующий программный путь остаётся
+    /// дефолтом при любом сомнении.
+    pub(crate) fn open_with_hw(
+        path: &Path,
+        audio_target: AudioTarget,
+        device: &ID3D11Device,
+    ) -> Result<Self, VideoError> {
+        match Self::open_inner(path, audio_target, Some(device)) {
+            Ok(pipe) => Ok(pipe),
+            Err(e) => {
+                tracing::warn!(
+                    ?path,
+                    error = %e,
+                    "аппаратный декод не удался — переоткрываю программно"
+                );
+                Self::open_inner(path, audio_target, None)
+            }
+        }
+    }
+
+    /// Общий путь открытия: `hw_device: None` — чистый программный декод
+    /// (поведение M5b/M5e, ничего не меняется); `Some` — попытка включить
+    /// d3d11va с безусловным внутренним fallback на программный путь при
+    /// любой ошибке инициализации hw (см. [`Self::open_with_hw`]).
+    fn open_inner(
+        path: &Path,
+        audio_target: AudioTarget,
+        hw_device: Option<&ID3D11Device>,
+    ) -> Result<Self, VideoError> {
         let fmt = FmtCtx::open(path)?;
 
         // --- Видеопоток ---
@@ -265,15 +409,68 @@ impl Pipeline {
                 name: codec_name(v_par.codec_id),
             });
         }
-        let v_ctx = CodecCtx(new_codec_ctx(codec, v_par)?);
+        let mut v_ctx = CodecCtx(new_codec_ctx(codec, v_par)?);
+
+        // Аппаратный декод (M5c): hw-контексты на ОБЩЕМ ID3D11Device.
+        // При любой ошибке инициализации — warn + программный путь (контекст
+        // остаётся чистым, `hw` — None). Форматы с альфой (M5e) hwaccel не
+        // отдаёт: для них avcodec_open2 с hw_frames_ctx провалится, и ниже
+        // сработает переоткрытие без hw — единая точка fallback.
+        let mut hw: Option<HwDecode> = None;
+        if let Some(device) = hw_device {
+            match hwaccel::enable(v_ctx.0, codec, device) {
+                Ok(state) => {
+                    tracing::debug!(?path, "D3D11VA: hwaccel включён");
+                    hw = Some(state);
+                }
+                Err(reason) => {
+                    tracing::warn!(?path, reason, "D3D11VA недоступен — программный декод");
+                }
+            }
+        }
+        if hw.is_some() {
+            // Frame-threading выносит init декодера (get_format → hwaccel →
+            // ff_decode_get_hw_frames_ctx) на контексты-воркеры, которые
+            // пересоздают frames-контекст (наш — с SHADER_RESOURCE — они
+            // отбрасывают: см. pthread_frame.c update_context_*). Для
+            // аппаратного пути декодируем в один поток — hwaccel и рендер
+            // делят ОДИН кодек-контекст (тот же приём, что у VLC d3d11va).
+            // SAFETY: контекст жив; thread_count читается в avcodec_open2.
+            unsafe {
+                (*v_ctx.0).thread_count = 1;
+            }
+        }
+
         // SAFETY: контекст инициализирован; codec — валидный указатель;
-        // опции не передаём.
+        // опции не передаём. В hw-режиме в контексте уже выставлены
+        // hw_device_ctx/hw_frames_ctx.
         let ret = unsafe { avcodec_open2(v_ctx.0, codec, null_mut()) };
         if ret < 0 {
-            return Err(VideoError::Decode(format!(
-                "avcodec_open2(видео): {}",
-                ff_err(ret)
-            )));
+            if hw.is_some() {
+                // Кодек/поток несовместимы с hw-путём (например, alpha-поток):
+                // освобождаем hw-контексты и переоткрываем программно —
+                // это и есть fallback ROADMAP («при любом сомнении»).
+                tracing::warn!(
+                    ?path,
+                    "avcodec_open2(hw): {} — переоткрываю программно",
+                    ff_err(ret)
+                );
+                drop(v_ctx); // hw-ссылки контекста освобождаются здесь
+                hw = None;
+                v_ctx = CodecCtx(new_codec_ctx(codec, v_par)?);
+                let ret = unsafe { avcodec_open2(v_ctx.0, codec, null_mut()) };
+                if ret < 0 {
+                    return Err(VideoError::Decode(format!(
+                        "avcodec_open2(видео): {}",
+                        ff_err(ret)
+                    )));
+                }
+            } else {
+                return Err(VideoError::Decode(format!(
+                    "avcodec_open2(видео): {}",
+                    ff_err(ret)
+                )));
+            }
         }
 
         // --- Аудиопоток (опционален) ---
@@ -359,23 +556,55 @@ impl Pipeline {
             duration,
             width: 0,
             height: 0,
+            video_fmt: VideoPixelFormat::Yuv420p,
+            hw,
             fmt,
         };
         pipe.probe_first_video_frame(path)?;
+        // Пул NV12 создан get_format-колбэком при первом кадре — берём свою
+        // ссылку (для readback-пути) и запоминаем размеры текстур. v_ctx уже
+        // передан в pipe (video.ctx) — используем указатель из него.
+        if let Some(hw) = pipe.hw.as_mut() {
+            hwaccel::attach_frames_ctx(hw, pipe.video.ctx.0);
+        }
         Ok(pipe)
     }
 
-    /// Декодировать до первого видеокадра: проверить формат пикселя (YUV420P
-    /// обязателен — конвертации в этом крейте нет, сборка FFmpeg без swscale)
-    /// и реальные размеры кадра. Кадр отбрасывается; состояние конвейера
-    /// остаётся консистентным (пара первых аудио-порций при этом теряется —
-    /// незаметно, идёт до первого видеокадра).
+    /// Декодировать до первого видеокадра: проверить формат пикселя
+    /// (YUV420P, YUVA420P, YUVA444P10LE или packed RGB qtrle — см.
+    /// [`crate::format::VideoPixelFormat`]; в hw-режиме — D3D11) и реальные
+    /// размеры кадра. Кадр отбрасывается; состояние конвейера остаётся
+    /// консистентным (пара первых аудио-порций при этом теряется — незаметно,
+    /// идёт до первого видеокадра).
+    ///
+    /// В hw-режиме размеры текстуры (выровненные) известны из frames-контекста,
+    /// а видимая область — из `avctx->width/height` (первый кадр несёт полный
+    /// SPS/PPS): hw-кадры докладывают выровненные размеры, рендер без
+    /// видимой области показал бы чёрные полосы выравнивания.
     fn probe_first_video_frame(&mut self, path: &Path) -> Result<(), VideoError> {
         for _ in 0..64 {
             match self.next()? {
                 Event::Video(frame) => {
                     self.width = frame.width;
                     self.height = frame.height;
+                    return Ok(());
+                }
+                Event::VideoHw(_) => {
+                    // SAFETY: первый кадр получен — декодер заполнил
+                    // avctx->width/height кодовой (crop-нутой) областью.
+                    let (w, h) = unsafe {
+                        (
+                            (*self.video.ctx.0).width as u32,
+                            (*self.video.ctx.0).height as u32,
+                        )
+                    };
+                    if w == 0 || h == 0 {
+                        return Err(VideoError::Decode(
+                            "hw-кадр без размеров видимой области".into(),
+                        ));
+                    }
+                    self.width = w;
+                    self.height = h;
                     return Ok(());
                 }
                 Event::Eof => break,
@@ -393,8 +622,8 @@ impl Pipeline {
         // Готовые кадры декодеров выкачиваются раньше чтения новых пакетов.
         // Порядок важен и после EOF: переупорядоченные B-кадры хвоста файла
         // должны выйти наружу, прежде чем будет отдан Event::Eof.
-        if let Some(frame) = self.pull_video_frame()? {
-            return Ok(Event::Video(frame));
+        if let Some(frame) = self.pull_video()? {
+            return Ok(frame);
         }
         if let Some(chunk) = self.pull_audio_chunk()? {
             return Ok(Event::Audio(chunk));
@@ -438,8 +667,8 @@ impl Pipeline {
                     unsafe { avcodec_send_packet(audio.ctx.0, null_mut()) };
                 }
                 // Выкачиваем остатки декодеров (переупорядоченные B-кадры).
-                if let Some(frame) = self.pull_video_frame()? {
-                    return Ok(Event::Video(frame));
+                if let Some(frame) = self.pull_video()? {
+                    return Ok(frame);
                 }
                 if let Some(chunk) = self.pull_audio_chunk()? {
                     return Ok(Event::Audio(chunk));
@@ -463,13 +692,24 @@ impl Pipeline {
                     return Ok(Event::Idle);
                 }
             }
-            if let Some(frame) = self.pull_video_frame()? {
-                return Ok(Event::Video(frame));
+            if let Some(frame) = self.pull_video()? {
+                return Ok(frame);
             }
             if let Some(chunk) = self.pull_audio_chunk()? {
                 return Ok(Event::Audio(chunk));
             }
             // Пакет без выхода — читаем следующий.
+        }
+    }
+
+    /// Выкачать готовый видеокадр в формате текущего режима: программный
+    /// (`Event::Video`, YUV-плоскости) или аппаратный (`Event::VideoHw`,
+    /// NV12-текстура на общем D3D11-девайсе — M5c).
+    fn pull_video(&mut self) -> Result<Option<Event>, VideoError> {
+        if self.hw.is_some() {
+            self.pull_video_hw_frame().map(|o| o.map(Event::VideoHw))
+        } else {
+            self.pull_video_frame().map(|o| o.map(Event::Video))
         }
     }
 
@@ -522,9 +762,33 @@ impl Pipeline {
         self.audio.is_some()
     }
 
+    /// Несёт ли видео альфа-канал (YUVA420P/YUVA444P10LE/qtrle): выходные
+    /// кадры содержат 4-ю плоскость `alpha`, рендер обязан умножать цвет
+    /// на альфу (premultiplied). Определено первым декодированным кадром.
+    pub(crate) fn has_alpha(&self) -> bool {
+        self.video_fmt.has_alpha()
+    }
+
+    /// Будет ли файл декодироваться программно: `true` для форматов, которые
+    /// аппаратный декодер (M5c) не отдаёт — с альфой и qtrle (hwaccel
+    /// альфа-канал игнорирует, 4:4:4 10-бит не поддерживает); для
+    /// YUV420P `false` (аппаратно-совместим — после M5c пойдёт на d3d11va,
+    /// сейчас всё равно программно). Единый предикат —
+    /// [`VideoPixelFormat::hwaccel_compatible`], им же будущий аппаратный
+    /// путь отсекает альфа-форматы.
+    pub(crate) fn software_decode(&self) -> bool {
+        !self.video_fmt.hwaccel_compatible()
+    }
+
     /// Размеры видеокадра (валидированы первым декодированным кадром).
     pub(crate) fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Активен ли аппаратный декод (M5c): `true` — кадры выходят как
+    /// [`Event::VideoHw`] (NV12-текстуры на общем с рендером D3D11-девайсе).
+    pub(crate) fn hw_accel(&self) -> bool {
+        self.hw.is_some()
     }
 
     // --- внутренности ---
@@ -566,58 +830,285 @@ impl Pipeline {
             return Ok(None);
         }
         let fmt = frame.format;
-        if fmt != AVPixelFormat::AV_PIX_FMT_YUV420P as c_int {
+        let Some((pix_fmt, rgb)) = classify_pixel_format(fmt) else {
             let name = pixel_fmt_name(fmt);
             // SAFETY: кадр больше не нужен.
             unsafe { av_frame_unref(self.video_frame.0) };
             return Err(VideoError::UnsupportedPixelFormat { name });
+        };
+        let pts = pts_to_duration(
+            frame.best_effort_timestamp,
+            self.video.tb_num,
+            self.video.tb_den,
+        );
+        let (u_width, u_height) = pix_fmt.chroma_dims(width as u32, height as u32);
+        let sizes = pix_fmt.plane_sizes(width as u32, height as u32);
+        let mut y = vec![0u8; sizes.y];
+        let mut u = vec![0u8; sizes.u];
+        let mut v = vec![0u8; sizes.v];
+        let mut alpha = sizes.alpha.map(|n| vec![0u8; n]);
+        // SAFETY: `frame.data`/`frame.linesize` — буферы живого кадра, формат
+        // проверен классификатором выше; строки могут быть паддированы
+        // (linesize шире данных) — копируем построчно ровно нужную ширину.
+        unsafe {
+            let src = frame.data;
+            let ls = frame.linesize;
+            match (pix_fmt, rgb) {
+                (VideoPixelFormat::Yuv420p, _) => {
+                    copy_plane_rows_8(src[0], ls[0], width as usize, height, &mut y);
+                    copy_plane_rows_8(src[1], ls[1], u_width as usize, u_height as i32, &mut u);
+                    copy_plane_rows_8(src[2], ls[2], u_width as usize, u_height as i32, &mut v);
+                }
+                (VideoPixelFormat::Yuva420p, _) => {
+                    copy_plane_rows_8(src[0], ls[0], width as usize, height, &mut y);
+                    copy_plane_rows_8(src[1], ls[1], u_width as usize, u_height as i32, &mut u);
+                    copy_plane_rows_8(src[2], ls[2], u_width as usize, u_height as i32, &mut v);
+                    // Альфа — полное разрешение (4-я плоскость кадра).
+                    copy_plane_rows_8(
+                        src[3],
+                        ls[3],
+                        width as usize,
+                        height,
+                        alpha.as_mut().expect("YUVA420P несёт альфу"),
+                    );
+                }
+                (VideoPixelFormat::Yuva444p10le, _) => {
+                    // 10-бит в 16-бит LE контейнере: строки вдвое шире,
+                    // затем понижение до 8 бит на CPU (упрощение M5e).
+                    let sample_bytes = pix_fmt.source_bytes_per_sample();
+                    let mut staged = vec![0u8; (width as usize) * (height as usize) * sample_bytes];
+                    for (plane, out) in [
+                        (0usize, &mut y),
+                        (1, &mut u),
+                        (2, &mut v),
+                        (3, alpha.as_mut().expect("YUVA444P10LE несёт альфу")),
+                    ] {
+                        copy_plane_rows_16_le(
+                            src[plane],
+                            ls[plane],
+                            width,
+                            height,
+                            sample_bytes,
+                            &mut staged,
+                        );
+                        downconvert_10bit_le(&mut staged);
+                        let out_len = out.len();
+                        out.copy_from_slice(&staged[..out_len]);
+                    }
+                }
+                (VideoPixelFormat::Rgb32, Some(rgb_fmt)) => {
+                    // Packed RGB с qtrle-декодера: одна межстрочная плоскость,
+                    // конверсия в YUVA420P на CPU (swscale в сборке отключён).
+                    let row_bytes = width as usize * rgb_fmt.bytes_per_pixel();
+                    let mut packed = vec![0u8; row_bytes * height as usize];
+                    copy_plane_rows_8(src[0], ls[0], row_bytes, height, &mut packed);
+                    let (py, pu, pv, pa) =
+                        rgb_packed_to_yuva420p(&packed, width as u32, height as u32, rgb_fmt);
+                    y = py;
+                    u = pu;
+                    v = pv;
+                    alpha = Some(pa);
+                }
+                (VideoPixelFormat::Rgb32, None) => {
+                    unreachable!("classify_pixel_format всегда даёт RgbPacked для Rgb32")
+                }
+            }
+            av_frame_unref(self.video_frame.0);
+        }
+        self.video_fmt = pix_fmt;
+        Ok(Some(VideoFrameOut {
+            y,
+            u,
+            v,
+            alpha,
+            u_width,
+            u_height,
+            width: width as u32,
+            height: height as u32,
+            pts,
+        }))
+    }
+
+    /// Выкачать готовый АППАРАТНЫЙ видеокадр (M5c, hw-режим): NV12-элемент
+    /// массив-текстуры декодера, без readback на CPU. None — EAGAIN/EOF.
+    ///
+    /// Формат кадра обязан быть `AV_PIX_FMT_D3D11` (контракт hwaccel при
+    /// выставленном `hw_frames_ctx`); иное — ошибка: первый кадр вызовет
+    /// fallback на программный путь (`open_with_hw`), поздний — перезапуск
+    /// цикла декодер-потоком (существующее лечение битых участков).
+    fn pull_video_hw_frame(&mut self) -> Result<Option<HwVideoFrameOut>, VideoError> {
+        // SAFETY: контекст/кадр живы; receive перезаполняет кадр.
+        let ret = unsafe { avcodec_receive_frame(self.video.ctx.0, self.video_frame.0) };
+        if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
+            return Ok(None);
+        }
+        if ret < 0 {
+            return Err(VideoError::Decode(format!(
+                "avcodec_receive_frame(видео, hw): {}",
+                ff_err(ret)
+            )));
+        }
+        // SAFETY: receive вернул 0 — кадр заполнен.
+        let frame = unsafe { &*self.video_frame.0 };
+        if frame.format != AVPixelFormat::AV_PIX_FMT_D3D11 as c_int {
+            let name = pixel_fmt_name(frame.format);
+            // SAFETY: кадр больше не нужен.
+            unsafe { av_frame_unref(self.video_frame.0) };
+            return Err(VideoError::UnsupportedPixelFormat { name });
+        }
+        let tex_width = frame.width;
+        let tex_height = frame.height;
+        if tex_width <= 0 || tex_height <= 0 {
+            // SAFETY: кадр больше не нужен.
+            unsafe { av_frame_unref(self.video_frame.0) };
+            return Ok(None);
         }
         let pts = pts_to_duration(
             frame.best_effort_timestamp,
             self.video.tb_num,
             self.video.tb_den,
         );
-        let (ys, us, vs) = yuv420p_plane_sizes(width as u32, height as u32);
-        let mut y = vec![0u8; ys];
-        let mut u = vec![0u8; us];
-        let mut v = vec![0u8; vs];
-        // SAFETY: data/linesize — буферы кадра, размеры плоскостей проверены
-        // выше (YUV420P); строки в linesize могут быть шире w (паддинг) —
-        // копируем построчно ровно w/ceil(w/2) байт.
-        unsafe {
-            let src = frame.data;
-            let ls = frame.linesize;
-            for row in 0..height as usize {
-                std::ptr::copy_nonoverlapping(
-                    src[0].add(row * ls[0] as usize),
-                    y.as_mut_ptr().add(row * width as usize),
-                    width as usize,
-                );
-            }
-            let cw = (width as usize).div_ceil(2);
-            let ch = (height as usize).div_ceil(2);
-            for row in 0..ch {
-                std::ptr::copy_nonoverlapping(
-                    src[1].add(row * ls[1] as usize),
-                    u.as_mut_ptr().add(row * cw),
-                    cw,
-                );
-                std::ptr::copy_nonoverlapping(
-                    src[2].add(row * ls[2] as usize),
-                    v.as_mut_ptr().add(row * cw),
-                    cw,
-                );
-            }
-            av_frame_unref(self.video_frame.0);
+        // Контракт AV_PIX_FMT_D3D11 (hwcontext.h/ffmpeg docs): data[0] —
+        // ID3D11Texture2D*, data[1] — индекс элемента массива (intptr_t).
+        // SAFETY: данные кадра валидны до unref ниже; извлекаем текстуру
+        // (добавочная COM-ссылка — `from_raw` забирает одну ссылку, `clone`
+        // добавляет вторую, drop обёртки возвращает первую пулу) и ссылку
+        // на элемент пула (удерживает поверхность от переиспользования,
+        // пока кадр жив — см. док `HwVideoFrameOut`).
+        let texture = unsafe {
+            let owned = ID3D11Texture2D::from_raw(frame.data[0].cast());
+            let extra = owned.clone();
+            drop(owned);
+            extra
+        };
+        let array_index = frame.data[1] as usize as u32;
+        // Элемент пула + frames-контекст (см. док HwVideoFrameOut: контекст
+        // жив, пока жив хоть один кадр — тот же инвариант, что у штатных
+        // кадров FFmpeg).
+        let pool_buf = unsafe { av_buffer_ref(frame.buf[0]) };
+        let frames_ctx = unsafe { av_buffer_ref(frame.hw_frames_ctx) };
+        // SAFETY: кадр больше не нужен (данные извлечены).
+        unsafe { av_frame_unref(self.video_frame.0) };
+        if pool_buf.is_null() || frames_ctx.is_null() {
+            return Err(VideoError::Decode(
+                "av_buffer_ref(элемент пула/frames-контекст): не хватило памяти".into(),
+            ));
         }
-        Ok(Some(VideoFrameOut {
+        // Выровненные размеры текстуры — из frames-контекста (инициализирован
+        // при включении hw); видимая область — из кодовых размеров кадра
+        // (выставлены в probe, для первого кадра — кадр отбрасывается там).
+        let (tex_w, tex_h) = self
+            .hw
+            .as_ref()
+            .map(|h| (h.tex_width, h.tex_height))
+            .expect("hw-режим подразумевает активный HwDecode");
+        Ok(Some(HwVideoFrameOut {
+            texture,
+            array_index,
+            tex_width: tex_w,
+            tex_height: tex_h,
+            width: self.width,
+            height: self.height,
+            pts,
+            pool_buf,
+            frames_ctx,
+        }))
+    }
+
+    /// Программная копия аппаратного кадра (readback, M5c): NV12-текстура →
+    /// YUV420P-плоскости на CPU (`av_hwframe_transfer_data` + разделение
+    /// interleaved UV). Нужен только для совместимости старого
+    /// `VideoSource::try_recv_frame` в hw-режиме; zero-copy потребители
+    /// (`try_recv_hw_frame`) этот вызов не делают.
+    pub(crate) fn hw_to_yuv(
+        &mut self,
+        hw_frame: &HwVideoFrameOut,
+    ) -> Result<VideoFrameOut, VideoError> {
+        let width = self.width as i32;
+        let height = self.height as i32;
+        if width <= 0 || height <= 0 {
+            return Err(VideoError::Decode(
+                "hw_to_yuv: размеры не выставлены".into(),
+            ));
+        }
+        // Реконструкция исходного D3D11-кадра (трансферу нужен AVFrame с
+        // hw_frames_ctx) и приёмник NV12 видимой области.
+        let src = Frame(alloc_checked(
+            unsafe { av_frame_alloc() },
+            "av_frame_alloc",
+        )?);
+        let dst = Frame(alloc_checked(
+            unsafe { av_frame_alloc() },
+            "av_frame_alloc",
+        )?);
+        // SAFETY: поля кадра заполняются по контракту AV_PIX_FMT_D3D11;
+        // ссылки (элемент пула, frames-контекст) живут на время вызова.
+        let ret = unsafe {
+            let s = &mut *src.0;
+            s.format = AVPixelFormat::AV_PIX_FMT_D3D11 as c_int;
+            s.width = hw_frame.tex_width as c_int;
+            s.height = hw_frame.tex_height as c_int;
+            s.data[0] = hw_frame.texture.as_raw().cast();
+            s.data[1] = hw_frame.array_index as usize as *mut u8;
+            s.buf[0] = av_buffer_ref(hw_frame.pool_buf);
+            // frames-контекст — из самого кадра (держится ссылкой в кадре;
+            // после перезапуска декодера может отличаться от HwDecode).
+            s.hw_frames_ctx = av_buffer_ref(hw_frame.frames_ctx);
+            let d = &mut *dst.0;
+            d.format = AVPixelFormat::AV_PIX_FMT_NV12 as c_int;
+            d.width = width;
+            d.height = height;
+            let ret = av_frame_get_buffer(dst.0, 32);
+            if ret < 0 {
+                av_frame_unref(src.0);
+                av_frame_unref(dst.0);
+                return Err(VideoError::Decode(format!(
+                    "av_frame_get_buffer(NV12): {}",
+                    ff_err(ret)
+                )));
+            }
+            let ret = av_hwframe_transfer_data(dst.0, src.0, 0);
+            av_frame_unref(src.0);
+            ret
+        };
+        if ret < 0 {
+            // SAFETY: кадр больше не нужен.
+            unsafe { av_frame_unref(dst.0) };
+            return Err(VideoError::Decode(format!(
+                "av_hwframe_transfer_data: {}",
+                ff_err(ret)
+            )));
+        }
+        let (w, h) = (width as usize, height as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let mut y = vec![0u8; w * h];
+        let mut u = vec![0u8; cw * ch];
+        let mut v = vec![0u8; cw * ch];
+        // SAFETY: dst — валидный NV12-кадр; строки паддированы (linesize ≥
+        // данных) — копируем построчно, UV разделяем попарно.
+        unsafe {
+            let d = &*dst.0;
+            copy_plane_rows_8(d.data[0], d.linesize[0], w, height, &mut y);
+            for row in 0..ch {
+                let src_row = d.data[1].add(row * d.linesize[1] as usize);
+                for px in 0..cw {
+                    u[row * cw + px] = *src_row.add(2 * px);
+                    v[row * cw + px] = *src_row.add(2 * px + 1);
+                }
+            }
+            av_frame_unref(dst.0);
+        }
+        Ok(VideoFrameOut {
             y,
             u,
             v,
-            width: width as u32,
-            height: height as u32,
-            pts,
-        }))
+            alpha: None,
+            u_width: cw as u32,
+            u_height: ch as u32,
+            width: self.width,
+            height: self.height,
+            pts: hw_frame.pts,
+        })
     }
 
     /// Выкачать готовый аудиокадр, ресемплировать в f32 stereo 48k и отдать
@@ -730,6 +1221,65 @@ impl Pipeline {
         self.pending_idx
             .and_then(|idx| self.codec_ctx_for(idx))
             .unwrap_or(self.video.ctx.0)
+    }
+}
+
+/// Построчно скопировать 8-битную плоскость кадра: `width_bytes` байт на
+/// строку, `height` строк; строки в исходнике могут быть паддированы
+/// (linesize шире данных) — копируется ровно `width_bytes`.
+///
+/// # SAFETY
+///
+/// `src` — валидный буфер плоскости живого кадра с шагом строки `linesize`
+/// (≥ `width_bytes`); `dst` — ровно `width_bytes × height` байт.
+unsafe fn copy_plane_rows_8(
+    src: *const u8,
+    linesize: c_int,
+    width_bytes: usize,
+    height: i32,
+    dst: &mut [u8],
+) {
+    for row in 0..height as usize {
+        // SAFETY: контракт функции — см. док.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add(row * linesize as usize),
+                dst.as_mut_ptr().add(row * width_bytes),
+                width_bytes,
+            );
+        }
+    }
+}
+
+/// Как [`copy_plane_rows_8`], но для multi-byte LE плоскостей (10-бит в
+/// 16-бит контейнере, ProRes 4444): `width` сэмплов на строку =
+/// `width × sample_bytes`. Копирует всю плоскость в `staged` (ровно
+/// `width × height × sample_bytes` байт); понижение до 8 бит делает
+/// вызывающий код.
+///
+/// # SAFETY
+///
+/// `src` — валидный буфер плоскости живого кадра с шагом строки `linesize`
+/// (≥ `width × sample_bytes`); `staged` — ровно `width × height ×
+/// sample_bytes` байт.
+unsafe fn copy_plane_rows_16_le(
+    src: *const u8,
+    linesize: c_int,
+    width: i32,
+    height: i32,
+    sample_bytes: usize,
+    staged: &mut [u8],
+) {
+    let width_bytes = width as usize * sample_bytes;
+    for row in 0..height as usize {
+        // SAFETY: контракт функции — см. док.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add(row * linesize as usize),
+                staged.as_mut_ptr().add(row * width_bytes),
+                width_bytes,
+            );
+        }
     }
 }
 

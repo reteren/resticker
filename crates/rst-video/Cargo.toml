@@ -16,6 +16,15 @@ license.workspace = true
 ffmpeg-sys-next = { version = "=7.1.3", default-features = false, features = ["avformat", "avcodec", "swresample"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# M5c: аппаратный декод D3D11VA — принимаем ID3D11Device рендера, внедряем его
+# в FFmpeg hw-контекст (AddRef/Release через умные указатели) и включаем
+# multithread-protection на общем девайсе (ID3D10Multithread — Direct3D10).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D10",
+    "Win32_Graphics_Direct3D11",
+] }
 
 [lints]
 workspace = true

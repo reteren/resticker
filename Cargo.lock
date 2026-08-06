@@ -2868,6 +2868,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "rst-core",
+ "rst-video",
  "thiserror 2.0.19",
  "tracing",
  "windows 0.62.2",
@@ -2880,6 +2881,7 @@ dependencies = [
  "ffmpeg-sys-next",
  "thiserror 2.0.19",
  "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]

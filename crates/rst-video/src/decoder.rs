@@ -24,9 +24,10 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
 use crate::error::VideoError;
-use crate::pipeline::{AudioChunkOut, Event, Pipeline, VideoFrameOut};
+use crate::pipeline::{AudioChunkOut, Event, HwVideoFrameOut, Pipeline, VideoFrameOut};
 
 /// Ёмкость очереди видеокадров (design §2: очередь на 2-3 кадра).
 pub(crate) const FRAME_QUEUE_CAPACITY: usize = 3;
@@ -85,14 +86,24 @@ pub(crate) fn decoder_thread(
     path: std::path::PathBuf,
     ctl_rx: Receiver<Control>,
     frame_tx: SyncSender<VideoFrameOut>,
+    hw_frame_tx: SyncSender<HwVideoFrameOut>,
     audio_tx: SyncSender<AudioChunkOut>,
     info_tx: mpsc::Sender<Result<VideoInfo, VideoError>>,
     shared: Arc<Shared>,
     audio_target: crate::pipeline::AudioTarget,
+    hw_device: Option<ID3D11Device>,
 ) {
     // Открытие и проверка первого кадра (формат пикселя/размеры) — здесь, в
-    // потоке: все FFmpeg-вызовы одного файла живут на одной нити.
-    let mut pipe = match Pipeline::open(&path, audio_target) {
+    // потоке: все FFmpeg-вызовы одного файла живут на одной нити. В hw-режиме
+    // устройство передаётся в `Pipeline::open_with_hw` (hw-контексты
+    // создаются на ОБЩЕМ с рендером ID3D11Device — zero-copy требует одного
+    // девайса, docs/ROADMAP M5c); при любой ошибке — программный fallback
+    // внутри open_with_hw, файл воспроизводится как раньше.
+    let pipe = match &hw_device {
+        Some(device) => Pipeline::open_with_hw(&path, audio_target, device),
+        None => Pipeline::open(&path, audio_target),
+    };
+    let mut pipe = match pipe {
         Ok(pipe) => pipe,
         Err(e) => {
             let _ = info_tx.send(Err(e));
@@ -104,6 +115,9 @@ pub(crate) fn decoder_thread(
         height: pipe.dimensions().1,
         duration: pipe.duration(),
         has_audio: pipe.has_audio(),
+        has_alpha: pipe.has_alpha(),
+        software_decode: pipe.software_decode(),
+        hw: pipe.hw_accel(),
     };
     if info_tx.send(Ok(info)).is_err() {
         // `VideoSource::open` нас не ждёт (отменил открытие) — выходим.
@@ -181,6 +195,32 @@ pub(crate) fn decoder_thread(
                 // реального времени, пропуск кадров — корректное поведение
                 // (очередь несёт самые свежие кадры, см. доку модуля).
                 let _ = frame_tx.try_send(frame);
+            }
+            Ok(Event::VideoHw(frame)) => {
+                // Аппаратный кадр (M5c): zero-copy путь — NV12-текстура на
+                // общем D3D11-девайсе; плюс readback-копия для совместимости
+                // старого `try_recv_frame` (координатор до перехода на
+                // hw-путь пользуется YUV-очередью). Readback дёшев (≈1.5 МБ
+                // memcpy на кадр 1080p), но zero-copy потребители его не
+                // делают.
+                if let Some(cmd) = pace_to(&mut pacing, frame.pts, &ctl_rx) {
+                    if apply_command(cmd, &mut paused, &mut pending_seek, &shared) {
+                        break; // Shutdown
+                    }
+                }
+                let pts = frame.pts;
+                let readback = pipe.hw_to_yuv(&frame);
+                let _ = hw_frame_tx.try_send(frame);
+                match readback {
+                    Ok(yuv) => {
+                        let _ = frame_tx.try_send(yuv);
+                    }
+                    Err(e) => {
+                        // Readback — совместимость, его сбой не должен ломать
+                        // zero-copy путь (кадр уже отправлен).
+                        warn!(?path, pts = ?pts, "readback hw-кадра не удался: {e}");
+                    }
+                }
             }
             Ok(Event::Audio(chunk)) => {
                 // Звук не блокируем: полная очередь — пропуск порции (редко:
@@ -299,4 +339,14 @@ pub(crate) struct VideoInfo {
     pub height: u32,
     pub duration: Option<Duration>,
     pub has_audio: bool,
+    /// Несёт ли видео альфа-канал (M5e): кадры содержат 4-ю плоскость.
+    pub has_alpha: bool,
+    /// Декодируется ли программно (для форматов с альфой — всегда; ср.
+    /// `VideoPixelFormat::hwaccel_compatible`).
+    pub software_decode: bool,
+    /// Активен ли аппаратный декод (M5c): `true` — кадры доступны через
+    /// `VideoSource::try_recv_hw_frame` (NV12-текстуры на общем D3D11-девайсе,
+    /// zero-copy); старый `try_recv_frame` при этом тоже работает
+    /// (readback-копия, см. док декодер-потока).
+    pub hw: bool,
 }

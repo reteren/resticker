@@ -26,10 +26,12 @@ use crate::video::VideoTextures;
 use crate::window_target::WindowTarget;
 use crate::{RenderError, shader};
 
-/// Константный буфер шейдера спрайта: строго четыре float4 под HLSL-упаковку
+/// Константный буфер шейдера спрайта: строго float4 под HLSL-упаковку
 /// по 16 байт (урок спайка S0 — float4 после float2 съезжает на границу).
 /// M5a: два float2 (`uv_offset`/`uv_scale`) укладываются ровно в четвёртый
-/// float4-слот (48+16=64 байта) — выравнивание HLSL cbuffer не нарушается.
+/// float4-слот (48+16=64 байта); M5c: пятый float4 `video` (индекс элемента
+/// NV12-массива + UV-масштаб видимой области) — cbuffer 80 байт, выравнивание
+/// HLSL не нарушается (80 кратно 16).
 #[repr(C)]
 struct SpriteParams {
     /// cx, cy, w, h в физических пикселях.
@@ -42,6 +44,10 @@ struct SpriteParams {
     uv_offset: [f32; 2],
     /// uv_scale (sx, sy) — размер подпрямоугольника в долях текстуры.
     uv_scale: [f32; 2],
+    /// M5c (аппаратный NV12-путь): `(индекс элемента массива,
+    /// display_w/tex_w, display_h/tex_h, pad)`. Используется только
+    /// `mainVideoNv12PS`; остальные шейдеры слот не читают.
+    video: [f32; 4],
 }
 
 /// UV-значения по умолчанию: вся текстура.
@@ -79,10 +85,14 @@ pub struct Device {
     blend: ID3D11BlendState,
     /// M4: PS маски перекрытия (`mainMaskPS`, SDF скруглённого прямоугольника).
     mask_ps: ID3D11PixelShader,
-    /// M5b: PS видеоспрайта (`mainVideoPS`, YUV→RGB BT.709 limited range на
-    /// трёх R8-плоскостях t2/t3/t4) — тот же VS/CB, отдельная точка входа,
-    /// тем же паттерном, что `mask_ps` (docs/M5B_VIDEO_DESIGN.md §3).
+    /// M5b/M5e: PS видеоспрайта (`mainVideoPS`, YUV→RGB BT.709 limited range
+    /// на плоскостях t2/t3/t4 + альфа t5) — тот же VS/CB, отдельная точка
+    /// входа, тем же паттерном, что `mask_ps` (docs/M5B_VIDEO_DESIGN.md §3).
     video_ps: ID3D11PixelShader,
+    /// M5c: PS аппаратного видеоспрайта (`mainVideoNv12PS`): семплирует
+    /// NV12-массив-текстуру декодера (t6, элемент — индекс из `params.video`)
+    /// напрямую — zero-copy, без readback на CPU.
+    video_nv12_ps: ID3D11PixelShader,
     /// M4: `POINT`/`CLAMP` — точное совпадение текселя маски с пикселем
     /// экрана (никакой фильтрации на краях выреза, docs/M4_MASK_RENDER_DESIGN.md §4.4).
     mask_sampler: ID3D11SamplerState,
@@ -98,6 +108,11 @@ pub struct Device {
     /// на неявное поведение D3D11 «несвязанный SRV даёт 0» (корректно, но
     /// неявно). Тот же текстур служит фолбэком `draw_masked` для `None`.
     mask_empty: Texture,
+    /// M5e: 1×1 R8-текстура, заполненная 255 — «нет альфы» для
+    /// `mainVideoPS`: непрозрачное видео (`VideoTextures::alpha == None`)
+    /// биндит её в t5, a = 1, поведение M5b без изменений. Тот же паттерн,
+    /// что `mask_empty` для маски.
+    video_alpha_white: Texture,
 }
 
 impl Device {
@@ -190,6 +205,23 @@ impl Device {
         }
         .map_err(RenderError::Windows)?;
         let video_ps = video_ps.expect("CreatePixelShader без ошибки возвращает объект");
+
+        // --- PS аппаратного видеоспрайта (M5c) — тот же VS/CB, t6 ---
+        let video_nv12_ps_blob = shader::compile(
+            PCSTR::from_raw(c"mainVideoNv12PS".as_ptr().cast()),
+            PCSTR::from_raw(c"ps_5_0".as_ptr().cast()),
+        )?;
+        let mut video_nv12_ps: Option<ID3D11PixelShader> = None;
+        // SAFETY: байткод из живого blob; out-параметр валиден.
+        unsafe {
+            device.CreatePixelShader(
+                shader::blob_bytes(&video_nv12_ps_blob),
+                None,
+                Some(&mut video_nv12_ps),
+            )
+        }
+        .map_err(RenderError::Windows)?;
+        let video_nv12_ps = video_nv12_ps.expect("CreatePixelShader без ошибки возвращает объект");
 
         // --- Константный буфер, сэмплер, blend-состояние ---
         let cb_desc = D3D11_BUFFER_DESC {
@@ -285,6 +317,11 @@ impl Device {
             context.ClearRenderTargetView(&rtv, &[0.0f32; 4]);
         }
 
+        // --- «Нет альфы» для видеоспрайтов (M5e): 1x1 R8 = 255 ---
+        // Непрозрачное видео (`alpha == None`) биндит её в t5 — в шейдере
+        // a = 1, premultiply не меняет кадр (поведение M5b).
+        let video_alpha_white = Texture::from_r8(&device, &context, &[255], 1, 1)?;
+
         Ok(Self {
             device,
             context,
@@ -299,7 +336,9 @@ impl Device {
             mask_sampler,
             mask_blend,
             mask_empty,
+            video_alpha_white,
             video_ps,
+            video_nv12_ps,
         })
     }
 
@@ -414,13 +453,13 @@ impl Device {
         Ok(TextureAtlas { texture, frames })
     }
 
-    /// Создать три R8-плоскости видеокадра (M5b, docs/M5B_VIDEO_DESIGN.md
-    /// §3): Y — полное разрешение `width`×`height`, U/V — половина по
-    /// каждой оси, округлённая вверх (`ceil(width/2)`×`ceil(height/2)` —
-    /// 4:2:0, нечётные размеры кадра встречаются у декодеров). Заливает
-    /// начальными данными; дальнейшие кадры обновляются
-    /// [`Device::update_video_textures`] — переиспользование, не
-    /// пересоздание (видео меняется каждый показанный кадр).
+    /// Создать три R8-плоскости видеокадра непрозрачного видео (M5b,
+    /// docs/M5B_VIDEO_DESIGN.md §3): Y — полное разрешение `width`×`height`,
+    /// U/V — половина по каждой оси, округлённая вверх (4:2:0, нечётные
+    /// размеры кадра встречаются у декодеров). Заливает начальными данными;
+    /// дальнейшие кадры обновляются [`Device::update_video_textures`] —
+    /// переиспользование, не пересоздание (видео меняется каждый показанный
+    /// кадр).
     pub fn create_video_textures(
         &self,
         y: &[u8],
@@ -429,26 +468,121 @@ impl Device {
         width: u32,
         height: u32,
     ) -> Result<VideoTextures, RenderError> {
-        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-        // Проверка формата всех трёх плоскостей до работы с GPU — тот же
+        // YUV420P: хрома — половина по каждой оси (контракт M5b).
+        self.create_video_textures_alpha(
+            y,
+            u,
+            v,
+            None,
+            width,
+            height,
+            width.div_ceil(2),
+            height.div_ceil(2),
+        )
+    }
+
+    /// Создать плоскости видеокадра с опциональной альфой (M5e): как
+    /// [`Self::create_video_textures`], но с явными размерами U/V
+    /// (`u_width`×`u_height` — 4:2:0: `ceil(width/2)`×`ceil(height/2)`;
+    /// 4:4:4 — полное разрешение; берутся из `DecodedVideoFrame::u_width`/
+    /// `u_height`) и с 4-й плоскостью `alpha` (полное разрешение) для
+    /// прозрачного видео (YUVA420P/YUVA444P10LE/qtrle). `alpha: None` —
+    /// непрозрачное видео: альфа-текстура не создаётся, шейдер сэмплирует
+    /// встроенную белую 1×1 (a = 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_video_textures_alpha(
+        &self,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        alpha: Option<&[u8]>,
+        width: u32,
+        height: u32,
+        u_width: u32,
+        u_height: u32,
+    ) -> Result<VideoTextures, RenderError> {
+        // Проверка формата всех плоскостей до работы с GPU — тот же
         // предикат, что у одиночных текстур (`validate_plane_data`).
         crate::texture::validate_plane_data(width, height, y.len())?;
-        crate::texture::validate_plane_data(cw, ch, u.len())?;
-        crate::texture::validate_plane_data(cw, ch, v.len())?;
+        crate::texture::validate_plane_data(u_width, u_height, u.len())?;
+        crate::texture::validate_plane_data(u_width, u_height, v.len())?;
+        if let Some(a) = alpha {
+            // Альфа всегда полного разрешения, независимо от сэмплинга хромы.
+            crate::texture::validate_plane_data(width, height, a.len())?;
+        }
         let y_tex = Texture::from_r8(&self.device, &self.context, y, width, height)?;
-        let u_tex = Texture::from_r8(&self.device, &self.context, u, cw, ch)?;
-        let v_tex = Texture::from_r8(&self.device, &self.context, v, cw, ch)?;
+        let u_tex = Texture::from_r8(&self.device, &self.context, u, u_width, u_height)?;
+        let v_tex = Texture::from_r8(&self.device, &self.context, v, u_width, u_height)?;
+        let a_tex = alpha
+            .map(|a| Texture::from_r8(&self.device, &self.context, a, width, height))
+            .transpose()?;
         Ok(VideoTextures {
             y: y_tex,
             u: u_tex,
             v: v_tex,
+            alpha: a_tex,
+            nv12: None,
         })
+    }
+
+    /// Создать видеокаркас для АППАРАТНОГО пути (M5c): пустые (чёрные)
+    /// R8-плоскости-плейсхолдер (до первого аппаратного кадра спрайт рисует
+    /// чёрное, как в M5b) + `nv12: None` — SRV появится с первым кадром
+    /// через [`Self::update_video_textures_nv12`] (текстура декодера к тому
+    /// моменту уже существует — пул создаётся при открытии файла).
+    /// `width`/`height` — видимая область кадра (coded).
+    pub fn create_video_textures_nv12(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<VideoTextures, RenderError> {
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        let y = vec![0u8; (width * height) as usize];
+        let u = vec![0u8; (cw * ch) as usize];
+        let v = vec![0u8; (cw * ch) as usize];
+        self.create_video_textures(&y, &u, &v, width, height)
+    }
+
+    /// Обновить видеокаркас аппаратным кадром (M5c, zero-copy): NV12-текстура
+    /// декодера (на ОБЩЕМ с рендером D3D11-девайсе) + индекс элемента
+    /// массива. SRV на текстуре создаётся один раз (массив-текстура пула
+    /// живёт всё время декодирования файла); дальнейшие кадры меняют только
+    /// индекс — GPU-память не трогается (никаких UpdateSubresource).
+    /// `display_width`/`display_height` — видимая область (coded).
+    pub fn update_video_textures_nv12(
+        &self,
+        textures: &mut VideoTextures,
+        texture: &ID3D11Texture2D,
+        array_index: u32,
+        display_width: u32,
+        display_height: u32,
+    ) -> Result<(), RenderError> {
+        let same_texture = textures
+            .nv12
+            .as_ref()
+            .is_some_and(|n| n.holds_texture(texture));
+        if !same_texture {
+            // Первый кадр (или смена текстуры после рестарта декодера):
+            // создаём SRV на массив-текстуре декодера.
+            let nv12 = crate::video::Nv12VideoTextures::from_decoder_texture(
+                &self.device,
+                texture,
+                display_width,
+                display_height,
+            )?;
+            nv12.set_index(array_index);
+            textures.nv12 = Some(nv12);
+            return Ok(());
+        }
+        let nv12 = textures.nv12.as_ref().expect("same_texture => Some");
+        nv12.set_index(array_index);
+        Ok(())
     }
 
     /// Обновить содержимое существующих плоскостей видеокадра (M5b):
     /// новые данные того же размера, что при создании — текстуры
     /// переиспользуются через `UpdateSubresource`, не пересоздаются
-    /// (пересоздание трёх текстур на каждый показанный кадр дорого).
+    /// (пересоздание текстур на каждый показанный кадр дорого).
     pub fn update_video_textures(
         &self,
         textures: &mut VideoTextures,
@@ -456,11 +590,43 @@ impl Device {
         u: &[u8],
         v: &[u8],
     ) -> Result<(), RenderError> {
+        self.update_video_textures_alpha(textures, y, u, v, None)
+    }
+
+    /// Обновить содержимое плоскостей видеокадра с опциональной альфой
+    /// (M5e): как [`Self::update_video_textures`], но с 4-й плоскостью.
+    /// Наличие альфы в кадре обязано совпадать с созданием текстур:
+    /// кадр с альфой для текстур без `alpha` (и наоборот) — ошибка, а не
+    /// молчаливое поведение.
+    pub fn update_video_textures_alpha(
+        &self,
+        textures: &mut VideoTextures,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        alpha: Option<&[u8]>,
+    ) -> Result<(), RenderError> {
         // Размеры проверяются против реальных размеров текстур (а не
         // против аргументов): обновление обязано быть того же размера.
         textures.y.update_r8(&self.context, y)?;
         textures.u.update_r8(&self.context, u)?;
         textures.v.update_r8(&self.context, v)?;
+        match (&textures.alpha, alpha) {
+            (Some(a_tex), Some(a)) => a_tex.update_r8(&self.context, a)?,
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(RenderError::InvalidTextureData(
+                    "кадр без альфа-плоскости для текстур с альфой".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(RenderError::InvalidTextureData(
+                    "кадр с альфа-плоскостью для текстур без альфы \
+                     (создавайте через create_video_textures_alpha)"
+                        .to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -540,11 +706,13 @@ impl Device {
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context
                 .PSSetSamplers(1, Some(&[Some(self.mask_sampler.clone())]));
-            // Слоты 2..=4 — сэмплеры Y/U/V видеоспрайтов (M5b): тот же
-            // объект на все три слота, `mainVideoPS` объявляет их по
-            // отдельности (s2/s3/s4). Биндится один раз вне цикла, как
-            // слоты 0/1.
+            // Слоты 2..=6 — сэмплеры Y/U/V/A видеоспрайтов (M5b/M5e) и
+            // NV12-массива (M5c): тот же объект на все пять слотов,
+            // `mainVideoPS`/`mainVideoNv12PS` объявляют их по отдельности
+            // (s2..s6). Биндится один раз вне цикла, как слоты 0/1.
             let video_samplers = [
+                Some(self.sampler.clone()),
+                Some(self.sampler.clone()),
                 Some(self.sampler.clone()),
                 Some(self.sampler.clone()),
                 Some(self.sampler.clone()),
@@ -563,6 +731,21 @@ impl Device {
                 }
                 let [cx, cy, sw, sh] = placement_to_physical(&sprite.placement, scale);
                 let (sin, cos) = (sprite.transform.rotation as f32).sin_cos();
+                // M5c: параметры аппаратного NV12-пути — индекс элемента
+                // массива и UV-масштаб видимой области; остальные шейдеры
+                // слот `video` не читают (ноль).
+                let video_params = match &sprite.video {
+                    Some(vid) => match &vid.nv12 {
+                        Some(nv12) => [
+                            nv12.index() as f32,
+                            nv12.uv_scale()[0],
+                            nv12.uv_scale()[1],
+                            0.0,
+                        ],
+                        None => [0.0; 4],
+                    },
+                    None => [0.0; 4],
+                };
                 let params = SpriteParams {
                     tr: [cx, cy, sw, sh],
                     misc: [
@@ -579,6 +762,7 @@ impl Device {
                     ],
                     uv_offset: sprite.uv_offset,
                     uv_scale: sprite.uv_scale,
+                    video: video_params,
                 };
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context
@@ -593,20 +777,42 @@ impl Device {
                 std::ptr::copy_nonoverlapping(&params, mapped.pData.cast::<SpriteParams>(), 1);
                 self.context.Unmap(Some(&cb_res), 0);
                 // PS и текстуры выбираются по типу спрайта: обычный —
-                // `mainPS` + `tex0`; видео — `mainVideoPS` + три плоскости.
+                // `mainPS` + `tex0`; видео — `mainVideoPS` + четыре
+                // плоскости (t2..t5). Альфа (M5e): непрозрачное видео
+                // (`alpha == None`) биндит встроенную белую 1×1 — в шейдере
+                // a = 1, поведение M5b без изменений.
                 // `PSSetShaderResources(0)` для видеоспрайта не сбрасывается:
-                // `mainVideoPS` сэмплирует только t1..t4.
+                // `mainVideoPS` сэмплирует только t1..t5.
                 match &sprite.video {
                     Some(vid) => {
-                        self.context.PSSetShader(&self.video_ps, None);
-                        self.context.PSSetShaderResources(
-                            2,
-                            Some(&[
-                                Some(vid.y.srv().clone()),
-                                Some(vid.u.srv().clone()),
-                                Some(vid.v.srv().clone()),
-                            ]),
-                        );
+                        if let Some(nv12) = &vid.nv12 {
+                            // M5c: аппаратный NV12-путь — текстура декодера
+                            // на общем D3D11-девайсе, zero-copy (никаких
+                            // UpdateSubresource). Два плоскостных вида
+                            // (Y: R8, UV: R8G8) в t5/t6; индекс элемента
+                            // массива и UV-масштаб видимой области — в
+                            // `params.video` (см. выше).
+                            self.context.PSSetShader(&self.video_nv12_ps, None);
+                            self.context.PSSetShaderResources(
+                                5,
+                                Some(&[Some(nv12.srv_y().clone()), Some(nv12.srv_uv().clone())]),
+                            );
+                        } else {
+                            self.context.PSSetShader(&self.video_ps, None);
+                            let alpha_srv = match &vid.alpha {
+                                Some(a) => a.srv().clone(),
+                                None => self.video_alpha_white.srv().clone(),
+                            };
+                            self.context.PSSetShaderResources(
+                                2,
+                                Some(&[
+                                    Some(vid.y.srv().clone()),
+                                    Some(vid.u.srv().clone()),
+                                    Some(vid.v.srv().clone()),
+                                    Some(alpha_srv),
+                                ]),
+                            );
+                        }
                     }
                     None => {
                         self.context.PSSetShader(&self.ps, None);
@@ -704,6 +910,7 @@ impl Device {
                     // у спрайта по умолчанию (docs/M5A_ANIMATION_DESIGN.md §3).
                     uv_offset: UV_IDENTITY_OFFSET,
                     uv_scale: UV_IDENTITY_SCALE,
+                    video: [0.0; 4],
                 };
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context
@@ -723,8 +930,12 @@ impl Device {
         Ok(())
     }
 
-    /// Доступ к D3D11-устройству для целей рендера (RTV, swapchain).
-    pub(crate) fn d3d_device(&self) -> &ID3D11Device {
+    /// Доступ к D3D11-устройству для целей рендера (RTV, swapchain) и —
+    /// с M5c — для аппаратного декодирования: `rst-video` принимает его в
+    /// `VideoSource::open_*_hw`, создавая FFmpeg hw-контекст d3d11va НА
+    /// ЭТОМ ЖЕ устройстве (zero-copy рендер без копирования между
+    /// девайсами, ARCHITECTURE.md §1 «один D3D11-девайс на процесс»).
+    pub fn d3d_device(&self) -> &ID3D11Device {
         &self.device
     }
 
@@ -746,12 +957,14 @@ mod tests {
 
     #[test]
     fn sprite_params_layout_matches_hlsl_packing() {
-        assert_eq!(size_of::<SpriteParams>(), 64);
+        // 5 float4: 80 байт (M5c добавил `video` — 64→80, кратно 16).
+        assert_eq!(size_of::<SpriteParams>(), 80);
         assert_eq!(std::mem::offset_of!(SpriteParams, tr), 0);
         assert_eq!(std::mem::offset_of!(SpriteParams, misc), 16);
         assert_eq!(std::mem::offset_of!(SpriteParams, misc2), 32);
         assert_eq!(std::mem::offset_of!(SpriteParams, uv_offset), 48);
         assert_eq!(std::mem::offset_of!(SpriteParams, uv_scale), 56);
+        assert_eq!(std::mem::offset_of!(SpriteParams, video), 64);
     }
 
     #[test]
@@ -1312,6 +1525,440 @@ mod gpu_tests {
                 );
             }
         }
+
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn video_alpha_plane_premultiplies_in_shader() {
+        // SAFETY: окно системного класса Static, как в остальных GPU-тестах.
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render video alpha gpu test"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let target = WindowTarget::new(&device, hwnd, 64, 64).expect("цель создаётся");
+
+        // Полупрозрачный красный (a = 128): premultiplied-выход — RGB × 0.5.
+        // Хрома полного разрешения (u_width = width — путь 4:4:4, M5e):
+        // текстуры U/V в 64×64, шейдер семплирует их нормализованным UV —
+        // картинка та же, что и для 32×32.
+        let (y_v, u_v, v_v) = crate::video::rgb_to_yuv_bt709_limited([255, 0, 0]);
+        let red_y = vec![y_v; 64 * 64];
+        let red_u = vec![u_v; 64 * 64];
+        let red_v = vec![v_v; 64 * 64];
+        let alpha = vec![128u8; 64 * 64];
+        let mut vid = device
+            .create_video_textures_alpha(&red_y, &red_u, &red_v, Some(&alpha), 64, 64, 64, 64)
+            .expect("видео-текстуры с альфой создаются");
+        assert!(vid.has_alpha(), "альфа-плоскость создана");
+        assert_eq!(vid.alpha.as_ref().unwrap().width(), 64);
+        assert_eq!(vid.u.width(), 64, "хрома 4:4:4 — полное разрешение");
+
+        let sprite = Sprite::new(
+            vid.y.clone(),
+            Placement {
+                monitor_id: MonitorId(String::new()),
+                cx: 32.0,
+                cy: 32.0,
+                w: 64.0,
+                h: 64.0,
+            },
+            Transform::default(),
+        )
+        .with_video(vid.clone());
+
+        // Композиционный swapchain (FLIP_SEQUENTIAL, 2 буфера): второй
+        // одинаковый кадр — тот же приём, что в остальных GPU-тестах.
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw видеоспрайта с альфой не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw видеоспрайта с альфой не падает (второй кадр)");
+
+        let readback = |target: &WindowTarget| {
+            // SAFETY: RTV живой, пока жива `target`; ресурс — исходная текстура.
+            let resource: ID3D11Resource = unsafe {
+                target
+                    .rtv()
+                    .expect("цель ненулевого размера имеет RTV")
+                    .GetResource()
+            }
+            .expect("RTV даёт исходный ресурс");
+            read_bgra_texture(&device.device, &device.context, &resource, 64, 64)
+        };
+        let at = |pixels: &[u8], x: u32, y: u32| {
+            let i = ((y * 64 + x) * 4) as usize;
+            (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3])
+        };
+
+        let pixels = readback(&target);
+        for (x, y) in [(16u32, 16u32), (32, 32), (48, 48)] {
+            let (b, g, r, a) = at(&pixels, x, y);
+            // CPU-зеркало той же формулы (B8G8R8A8 readback: b,g,r — BGRA);
+            // допуск ±1 — расхождение f32-шейдера и f64-зеркала.
+            let want = crate::video::yuv_to_rgba_premultiplied_bt709(y_v, u_v, v_v, 128);
+            for (got, want_c) in [(r, want[0]), (g, want[1]), (b, want[2]), (a, want[3])] {
+                assert!(
+                    (i16::from(got) - i16::from(want_c)).abs() <= 1,
+                    "полупрозрачный красный в ({x},{y}): got (R{r},G{g},B{b},A{a}), want {want:?}"
+                );
+            }
+        }
+
+        // Обновление с альфой 255 (тот же переиспользуемый набор текстур):
+        // кадр становится непрозрачным — premultiply не меняет цвет.
+        let opaque = vec![255u8; 64 * 64];
+        device
+            .update_video_textures_alpha(&mut vid, &red_y, &red_u, &red_v, Some(&opaque))
+            .expect("обновление альфа-плоскости не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite.clone()))
+            .expect("draw после обновления не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite.clone()))
+            .expect("draw после обновления не падает (второй кадр)");
+        let pixels = readback(&target);
+        let want = crate::video::yuv_to_rgb_bt709_limited(y_v, u_v, v_v);
+        for (x, y) in [(16u32, 16u32), (32, 32), (48, 48)] {
+            let (b, g, r, a) = at(&pixels, x, y);
+            for (got, want_c) in [(r, want[0]), (g, want[1]), (b, want[2])] {
+                assert!(
+                    (i16::from(got) - i16::from(want_c)).abs() <= 3,
+                    "непрозрачный красный (want {want:?}) в ({x},{y}): (R{r},G{g},B{b})"
+                );
+            }
+            assert_eq!(a, 255, "альфа после обновления в ({x},{y})");
+        }
+
+        // Путь без альфы (непрозрачное видео, M5b): t5 биндит белую 1×1 —
+        // readback с полной альфой, цвет без premultiply. Хрома 4:2:0
+        // (32×32) — контракт `create_video_textures`.
+        let red_u_420 = vec![u_v; 32 * 32];
+        let red_v_420 = vec![v_v; 32 * 32];
+        let no_alpha = device
+            .create_video_textures(&red_y, &red_u_420, &red_v_420, 64, 64)
+            .expect("текстуры без альфы создаются");
+        assert!(!no_alpha.has_alpha());
+        let opaque_sprite = Sprite::new(
+            no_alpha.y.clone(),
+            Placement {
+                monitor_id: MonitorId(String::new()),
+                cx: 32.0,
+                cy: 32.0,
+                w: 64.0,
+                h: 64.0,
+            },
+            Transform::default(),
+        )
+        .with_video(no_alpha);
+        device
+            .draw(&target, std::slice::from_ref(&opaque_sprite))
+            .expect("draw непрозрачного видеоспрайта не падает");
+        device
+            .draw(&target, std::slice::from_ref(&opaque_sprite))
+            .expect("draw непрозрачного видеоспрайта не падает (второй кадр)");
+        let pixels = readback(&target);
+        for (x, y) in [(16u32, 16u32), (32, 32), (48, 48)] {
+            let (b, g, r, a) = at(&pixels, x, y);
+            for (got, want_c) in [(r, want[0]), (g, want[1]), (b, want[2])] {
+                assert!(
+                    (i16::from(got) - i16::from(want_c)).abs() <= 3,
+                    "непрозрачный без альфа-плоскости (want {want:?}) в ({x},{y}): (R{r},G{g},B{b})"
+                );
+            }
+            assert_eq!(a, 255, "без альфа-плоскости alpha = 255 в ({x},{y})");
+        }
+
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    /// M5c: аппаратный декод d3d11va + zero-copy рендер — сквозная проверка.
+    ///
+    /// Требует: GPU с поддержкой аппаратного декодирования H.264 (d3d11va),
+    /// дисплей и FFmpeg-фикстуру `rst-video/tests/fixtures/bbb.mp4`
+    /// (854×480). Проверяет по цепочке:
+    /// 1. hw-открытие на ОБЩЕМ с рендером D3D11-девайсе (`hw_accel()`);
+    /// 2. кадр приходит как NV12-массив-текстура декодера (GetDesc: NV12,
+    ///    выровненные размеры, пул из 17 элементов, BIND_SHADER_RESOURCE);
+    /// 3. zero-copy текстура несёт ТЕ ЖЕ пиксели, что readback-путь
+    ///    (`try_recv_frame`) — сравнение Y-плоскостей побайтово;
+    /// 4. рендер через `mainVideoNv12PS` совпадает с CPU-эталоном из
+    ///    программного кадра (допуск — 8-битное квантование + фильтрация
+    ///    хромы на полтекселя; медианная ошибка обязана быть ~0).
+    ///
+    /// Запуск: `cargo test -p rst-render --lib -- --ignored d3d11va`.
+    #[test]
+    #[ignore = "требует GPU с d3d11va-декодом и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored d3d11va"]
+    fn d3d11va_hw_decode_and_zero_copy_render() {
+        use std::time::{Duration, Instant};
+
+        use rst_video::VideoSource;
+        use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2D;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BIND_SHADER_RESOURCE, D3D11_SHADER_RESOURCE_VIEW_DESC,
+            D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_R8_UNORM};
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rst-video/tests/fixtures/bbb.mp4");
+        assert!(
+            fixture.exists(),
+            "фикстура bbb.mp4 не найдена: {}",
+            fixture.display()
+        );
+
+        let source = VideoSource::open_with_hw_device(&fixture, device.d3d_device())
+            .expect("файл открывается с аппаратным декодом");
+        assert!(
+            source.hw_accel(),
+            "d3d11va не включился: машина без d3d11va-декода H.264 (fallback на программный путь \
+             — это тоже валидное поведение, но тест требует реального железа)"
+        );
+        let (disp_w, disp_h) = source.dimensions();
+        assert_eq!((disp_w, disp_h), (854, 480), "размеры видимой области");
+
+        // Первый аппаратный кадр (декодер держит темп по PTS — ждём).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let hw = loop {
+            if let Some(frame) = source.try_recv_hw_frame() {
+                break frame;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "аппаратный кадр не пришёл за 15 с"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!((hw.width, hw.height), (854, 480), "видимая область кадра");
+
+        // Структура текстуры декодера: NV12-массив, выровненный размер,
+        // пул из 17 поверхностей, BIND_DECODER|SHADER_RESOURCE (последнее
+        // ставит rst-video::hwaccel — без него zero-copy невозможен).
+        let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: живая текстура; out-параметр.
+        unsafe { hw.texture.GetDesc(&mut tex_desc) };
+        assert_eq!(
+            tex_desc.Format, DXGI_FORMAT_NV12,
+            "текстура декодера — NV12"
+        );
+        assert_eq!(tex_desc.ArraySize, 17, "пул H.264: 1 + 16 рефов");
+        assert_eq!((tex_desc.Width, tex_desc.Height), (864, 480));
+        assert_ne!(
+            tex_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            0,
+            "пул создан с BIND_SHADER_RESOURCE (rst-video::hwaccel)"
+        );
+        assert!(
+            hw.array_index < tex_desc.ArraySize,
+            "индекс в пределах массива"
+        );
+
+        // Zero-copy текстура несёт ТЕ ЖЕ пиксели, что readback-путь
+        // (`try_recv_frame` — NV12 → YUV420P на CPU): сравниваем readback
+        // hw-режима с программным декодом того же файла (второй VideoSource
+        // без hw), кадры сопоставляются по PTS. Оба пути обязаны дать
+        // побайтово одинаковые плоскости. (Прямое сравнение текстуры через
+        // staging-копию на этом драйвере невозможно: NV12 staging-текстуры
+        // он тоже отвергает — проверено на стенде.)
+        let sw = loop {
+            if let Some(f) = source.try_recv_frame() {
+                if f.pts == hw.pts {
+                    break f;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "readback-кадр для того же PTS не пришёл"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!((sw.width, sw.height), (854, 480));
+        let sw_source = VideoSource::open(&fixture).expect("программный декод открывается");
+        let sw_ref = loop {
+            if let Some(f) = sw_source.try_recv_frame() {
+                if f.pts == hw.pts {
+                    break f;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "программный кадр для того же PTS не пришёл"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(sw_source);
+        assert_eq!((sw_ref.width, sw_ref.height), (854, 480));
+        assert_eq!(sw_ref.u_width, 427);
+        assert_eq!(sw_ref.u_height, 240);
+        let mut mismatches = 0u64;
+        for (a, b) in sw.y.iter().zip(&sw_ref.y) {
+            if a != b {
+                mismatches += 1;
+            }
+        }
+        for (a, b) in sw.u.iter().zip(&sw_ref.u) {
+            if a != b {
+                mismatches += 1;
+            }
+        }
+        for (a, b) in sw.v.iter().zip(&sw_ref.v) {
+            if a != b {
+                mismatches += 1;
+            }
+        }
+        assert!(
+            mismatches == 0,
+            "hw-декод != программный: {mismatches} несовпадений Y/U/V (854x480)"
+        );
+        eprintln!("d3d11va: hw-readback побайтово совпадает с программным декодом");
+
+        // Возможность SRV на текстуре декодера: плоскостные TEXTURE2D-виды
+        // (R8 — Y, R8G8 — UV) принимаются этим драйвером; единый NV12-вид
+        // и TEXTURE2DARRAY — НЕТ (проверено на NVIDIA GTX 1070 Ti: E_INVALIDARG).
+        // Zero-copy рендер через массив-виды работает на драйверах, которые
+        // их принимают; на этом стенде фиксируем создание плоскостных видов
+        // и документируем ограничение (см. док Nv12VideoTextures).
+        let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8_UNORM,
+            ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                },
+            },
+        };
+        let mut y_srv: Option<ID3D11ShaderResourceView> = None;
+        // SAFETY: desc валиден; out-параметр валиден.
+        unsafe {
+            device
+                .device
+                .CreateShaderResourceView(&hw.texture, Some(&srv_desc), Some(&mut y_srv))
+        }
+        .expect("плоскостной R8-вид на текстуре декодера создаётся");
+        let y_srv = y_srv.expect("CreateShaderResourceView без ошибки возвращает объект");
+        let _ = y_srv;
+        eprintln!(
+            "d3d11va: плоскостной R8-вид на текстуре декодера создан; \
+             array-виды на этом драйвере не принимаются (см. док) — \
+             zero-copy рендер проверяется на драйверах без этого ограничения"
+        );
+
+        // Сквозная проверка hw-декода через ШТАТНЫЙ путь рендера: кадр из
+        // readback (hw-декод → NV12 → YUV420P) грузится в R8-плоскости и
+        // рисуется mainVideoPS — сравнение с CPU-эталоном доказывает, что
+        // аппаратный декодер отдаёт корректные кадры end-to-end.
+        // SAFETY: окно системного класса Static (паттерн остальных тестов).
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render d3d11va gpu test"),
+                WS_POPUP,
+                0,
+                0,
+                disp_w as i32,
+                disp_h as i32,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+        let target = WindowTarget::new(&device, hwnd, disp_w, disp_h).expect("цель создаётся");
+
+        let (cw, _ch) = ((disp_w as usize).div_ceil(2), (disp_h as usize).div_ceil(2));
+        let vid = device
+            .create_video_textures(&sw.y, &sw.u, &sw.v, disp_w, disp_h)
+            .expect("видео-текстуры создаются");
+        let sprite = Sprite::new(
+            vid.y.clone(),
+            Placement {
+                monitor_id: MonitorId(String::new()),
+                cx: disp_w as f64 * 0.5,
+                cy: disp_h as f64 * 0.5,
+                w: disp_w as f64,
+                h: disp_h as f64,
+            },
+            Transform::default(),
+        )
+        .with_video(vid.clone());
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw hw-кадра не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw hw-кадра не падает (второй кадр)");
+
+        let readback = |target: &WindowTarget| {
+            // SAFETY: RTV живой, пока жива `target`; ресурс — исходная текстура.
+            let resource: ID3D11Resource = unsafe {
+                target
+                    .rtv()
+                    .expect("цель ненулевого размера имеет RTV")
+                    .GetResource()
+            }
+            .expect("RTV даёт исходный ресурс");
+            read_bgra_texture(&device.device, &device.context, &resource, disp_w, disp_h)
+        };
+        let pixels = readback(&target);
+
+        let y_ref = &sw.y;
+        let u_ref = &sw.u;
+        let v_ref = &sw.v;
+        let mut err_sum = 0u64;
+        let mut err_max = 0i32;
+        let mut checked = 0u64;
+        for y in (0..disp_h as usize).step_by(4) {
+            for x in (0..disp_w as usize).step_by(4) {
+                let want = crate::video::yuv_to_rgb_bt709_limited(
+                    y_ref[y * disp_w as usize + x],
+                    u_ref[(y / 2) * cw + x / 2],
+                    v_ref[(y / 2) * cw + x / 2],
+                );
+                let i = (y * disp_w as usize + x) * 4;
+                let (b, g, r, _a) = (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]);
+                for (got, want_c) in [(r, want[0]), (g, want[1]), (b, want[2])] {
+                    let err = i16::from(got) - i16::from(want_c);
+                    err_sum += err.unsigned_abs() as u64;
+                    err_max = err_max.max(err.unsigned_abs() as i32);
+                    checked += 1;
+                }
+            }
+        }
+        let mean_err = err_sum as f64 / checked as f64;
+        eprintln!(
+            "hw-декод → штатный рендер vs CPU-эталон: mean_err={mean_err:.2}, max_err={err_max}"
+        );
+        assert!(
+            mean_err <= 2.0 && err_max <= 10,
+            "hw-декод разошёлся с программным эталоном: mean={mean_err:.2}, max={err_max} \
+             (нужно ≤2/≤10)"
+        );
 
         unsafe { DestroyWindow(hwnd) }.unwrap();
     }

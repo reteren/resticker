@@ -1,11 +1,13 @@
 //! Крейт `rst-video`: программный декод видео через FFmpeg (M5b,
-//! docs/M5B_VIDEO_DESIGN.md §2) — демукс + декод + ресемплинг звука, без GPU
-//! и окон.
+//! docs/M5B_VIDEO_DESIGN.md §2) — демукс + декод + ресемплинг звука; с M5c —
+//! опциональный аппаратный декод D3D11VA (кадры как NV12-текстуры на общем
+//! с рендером `ID3D11Device`, zero-copy). GPU-зависимостей нет: hw-девайс
+//! приходит извне, весь FFmpeg-код живёт на декодер-потоке.
 //!
 //! Разделение ответственности, как в M5a: декодирование — здесь, в изоляции
-//! от GPU; `rst-render` (задача B этого среза) получает плоскости Y/U/V и
-//! конвертирует в шейдере; микшер звука (задача C, `rst-audio`/cpal) берёт
-//! готовые f32-сэмплы.
+//! от GPU; `rst-render` (задача B этого среза) получает плоскости Y/U/V
+//! (+ опциональную альфу, M5e) и конвертирует в шейдере; микшер звука
+//! (задача C, `rst-audio`/cpal) берёт готовые f32-сэмплы.
 //!
 //! # Модель
 //!
@@ -17,11 +19,25 @@
 //! или ждать» этот крейт не принимает. Декодер сам держит темп, близкий к
 //! PTS, чтобы не декодировать всё видео разом.
 //!
+//! # Аппаратный декод (M5c)
+//!
+//! [`VideoSource::open_with_hw_device`]/[`VideoSource::open_with_audio_target_hw`]
+//! принимают `ID3D11Device` рендера: hwaccel D3D11VA создаётся НА ЭТОМ ЖЕ
+//! устройстве (иначе GPU-текстуру нельзя рендерить без дорогого копирования
+//! между девайсами). При любой ошибке инициализации или несовместимости
+//! файла (нет железа, кодек без d3d11va, не-NV12 формат, alpha-поток) —
+//! безусловный fallback на программный путь: файл открывается и играет как
+//! без hw (ROADMAP M5c: «корректный fallback ... остаётся дефолтом при
+//! любом сомнении»). Кадры hw-режима отдаются через
+//! [`VideoSource::try_recv_hw_frame`] (NV12-текстура + индекс массива,
+//! без readback); старый [`VideoSource::try_recv_frame`] в hw-режиме тоже
+//! работает (readback-копия для совместимости).
+//!
 //! # Безопасность
 //!
-//! Все unsafe-вызовы FFmpeg инкапсулированы во внутреннем модуле `pipeline`:
-//! публичный API — полностью безопасный Rust, FFmpeg-контексты живут только
-//! на декодер-потоке.
+//! Все unsafe-вызовы FFmpeg инкапсулированы во внутренних модулях
+//! `pipeline`/`hwaccel`: публичный API — полностью безопасный Rust,
+//! FFmpeg-контексты живут только на декодер-потоке.
 //!
 //! # Сборка и рантайм
 //!
@@ -34,6 +50,7 @@
 mod decoder;
 mod error;
 mod format;
+mod hwaccel;
 mod pipeline;
 
 pub use error::VideoError;
@@ -46,19 +63,32 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use decoder::{Control, Shared, VideoInfo};
-use pipeline::{AudioChunkOut, VideoFrameOut};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 
-/// Один кадр видео: плоскости YUV420P (straight alpha, плотно упакованные)
-/// и PTS относительно начала потока.
+use decoder::{Control, Shared, VideoInfo};
+use pipeline::{AudioChunkOut, HwVideoFrameOut, VideoFrameOut};
+
+/// Один кадр видео: плоскости YUV420P (straight alpha, плотно упакованные),
+/// опциональная альфа-плоскость (M5e) и PTS относительно начала потока.
 #[derive(Debug)]
 pub struct DecodedVideoFrame {
     /// Плоскость Y (яркость), `width × height` байт.
     pub y: Vec<u8>,
-    /// Плоскость U, `ceil(width/2) × ceil(height/2)` байт (4:2:0).
+    /// Плоскость U, `u_width × u_height` байт (4:2:0 — половина по каждой
+    /// оси, 4:4:4 — полное разрешение).
     pub u: Vec<u8>,
-    /// Плоскость V, `ceil(width/2) × ceil(height/2)` байт (4:2:0).
+    /// Плоскость V, `u_width × u_height` байт.
     pub v: Vec<u8>,
+    /// Альфа-плоскость `width × height` байт (полное разрешение), если
+    /// исходный формат несёт альфу (YUVA420P/YUVA444P10LE/qtrle); `None` —
+    /// непрозрачное видео (YUV420P). Цвет обязан умножаться на альфу
+    /// (premultiplied — контракт всего рендера, ARCHITECTURE.md).
+    pub alpha: Option<Vec<u8>>,
+    /// Ширина плоскостей U/V в пикселях (4:2:0 — `ceil(width/2)`, 4:4:4 —
+    /// `width`): по ним создаются текстуры хромы в rst-render.
+    pub u_width: u32,
+    /// Высота плоскостей U/V (4:2:0 — `ceil(height/2)`, 4:4:4 — `height`).
+    pub u_height: u32,
     /// Ширина кадра в пикселях.
     pub width: u32,
     /// Высота кадра в пикселях.
@@ -76,6 +106,56 @@ pub struct DecodedAudioSamples {
     pub samples: Vec<f32>,
 }
 
+/// Один АППАРАТНЫЙ кадр (M5c): NV12-элемент массив-текстуры декодера на
+/// ОБЩЕМ с рендером `ID3D11Device`. Рендер может семплировать текстуру
+/// напрямую (`array_index` в шейдере) — readback на CPU не происходит
+/// (zero-copy, ROADMAP M5c). Кадр удерживает элемент пула декодера и его
+/// frames-контекст: поверхность не переиспользуется и контекст не
+/// уничтожается, пока кадр жив (см. док `rst_video::pipeline::
+/// HwVideoFrameOut`). `Drop` снимает ссылки с ЛЮБОГО потока (refcounts
+/// атомарны, пул под мьютексом).
+pub struct HwDecodedVideoFrame {
+    /// Текстура декодера (NV12-массив; элемент — [`Self::array_index`]).
+    pub texture: ID3D11Texture2D,
+    /// Индекс элемента в массив-текстуре (для `Texture2DArray` в шейдере).
+    pub array_index: u32,
+    /// Размеры текстуры (выровненные до 16/32/128 px) — видимая область
+    /// `width`×`height` занимает её левый верхний угол; рендер компенсирует
+    /// это UV-масштабом.
+    pub tex_width: u32,
+    pub tex_height: u32,
+    /// Видимая область кадра (coded, после кропа декодером).
+    pub width: u32,
+    pub height: u32,
+    /// Момент кадра от начала потока.
+    pub pts: Duration,
+    /// Удержание элемента пула + frames-контекста (см. док структуры).
+    pool_buf: *mut ffmpeg_sys_next::AVBufferRef,
+    frames_ctx: *mut ffmpeg_sys_next::AVBufferRef,
+}
+
+impl Drop for HwDecodedVideoFrame {
+    fn drop(&mut self) {
+        // SAFETY: ссылки живут (единственные из наших); unref потокобезопасен
+        // (refcount атомарный, пул под мьютексом — av_buffer.c).
+        unsafe {
+            ffmpeg_sys_next::av_buffer_unref(&mut self.pool_buf);
+            ffmpeg_sys_next::av_buffer_unref(&mut self.frames_ctx);
+        }
+    }
+}
+
+impl std::fmt::Debug for HwDecodedVideoFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HwDecodedVideoFrame")
+            .field("array_index", &self.array_index)
+            .field("tex", &format!("{}x{}", self.tex_width, self.tex_height))
+            .field("visible", &format!("{}x{}", self.width, self.height))
+            .field("pts", &self.pts)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Дескриптор открытого видеофайла: демукс/декод идут в отдельном потоке,
 /// кадры и звук — через неблокирующие очереди.
 ///
@@ -86,6 +166,9 @@ pub struct VideoSource {
     shared: Arc<Shared>,
     ctl: mpsc::Sender<Control>,
     frame_rx: mpsc::Receiver<VideoFrameOut>,
+    /// Очередь аппаратных кадров (M5c, zero-copy): NV12-текстуры на общем
+    /// D3D11-девайсе. Наполняется только в hw-режиме (`open_*_hw`).
+    hw_frame_rx: mpsc::Receiver<HwVideoFrameOut>,
     audio_rx: mpsc::Receiver<AudioChunkOut>,
     thread: Option<thread::JoinHandle<()>>,
     info: VideoInfo,
@@ -105,9 +188,10 @@ impl VideoSource {
     }
 
     /// Открыть файл, найти видеопоток и проверить первый кадр (формат
-    /// пикселя YUV420P, размеры) — `Err` возвращается с понятной причиной,
-    /// если файл не видео, кодек не собран или формат пикселя не
-    /// поддерживается. Блокирует до готовности декодера (обычно миллисекунды).
+    /// пикселя — YUV420P/YUVA420P/YUVA444P10LE/qtrle, размеры) — `Err`
+    /// возвращается с понятной причиной, если файл не видео, кодек не
+    /// собран или формат пикселя не поддерживается. Блокирует до готовности
+    /// декодера (обычно миллисекунды).
     /// Звук ресемплируется в `audio_sample_rate`/`audio_channels` — обычно
     /// реальный формат устройства вывода, чтобы микшер (`rst-audio`) не
     /// ресемплировал сам (design §4).
@@ -116,6 +200,49 @@ impl VideoSource {
         audio_sample_rate: u32,
         audio_channels: u16,
     ) -> Result<Self, VideoError> {
+        Self::open_inner(path, audio_sample_rate, audio_channels, None)
+    }
+
+    /// Открыть файл с АППАРАТНЫМ декодом (M5c, ROADMAP): d3d11va hwaccel
+    /// создаётся на `device` — ОБЩЕМ D3D11-устройстве рендера (`rst-render`
+    /// создаёт одно на процесс, ARCHITECTURE.md §1), иначе GPU-текстуры
+    /// декодера нельзя семплировать без дорогого копирования между
+    /// девайсами. Звук — под дефолтный целевой формат (см. [`Self::open`]).
+    ///
+    /// **Fallback**: при любой ошибке инициализации hw (нет железа/драйвера,
+    /// кодек без d3d11va, не-NV12, alpha-поток) или при любом сбое открытия
+    /// файла в hw-режиме открытие повторяется программно — файл играет как
+    /// без hw; ошибкой возвращается только случай, когда и программный путь
+    /// не смог. Проверка аппаратного пути в заголовке: [`Self::hw_accel`].
+    pub fn open_with_hw_device(path: &Path, device: &ID3D11Device) -> Result<Self, VideoError> {
+        Self::open_inner(
+            path,
+            AUDIO_TARGET_SAMPLE_RATE,
+            AUDIO_TARGET_CHANNELS as u16,
+            Some(device),
+        )
+    }
+
+    /// Как [`Self::open_with_hw_device`], но звук ресемплируется под
+    /// `audio_sample_rate`/`audio_channels` (обычно реальный формат
+    /// устройства вывода — см. [`Self::open_with_audio_target`]).
+    pub fn open_with_audio_target_hw(
+        path: &Path,
+        audio_sample_rate: u32,
+        audio_channels: u16,
+        device: &ID3D11Device,
+    ) -> Result<Self, VideoError> {
+        Self::open_inner(path, audio_sample_rate, audio_channels, Some(device))
+    }
+
+    /// Общий путь открытия; `hw_device: Some` — аппаратный декод с
+    /// безусловным fallback на программный (см. [`Self::open_with_hw_device`]).
+    fn open_inner(
+        path: &Path,
+        audio_sample_rate: u32,
+        audio_channels: u16,
+        hw_device: Option<&ID3D11Device>,
+    ) -> Result<Self, VideoError> {
         let audio_target = pipeline::AudioTarget {
             rate: audio_sample_rate,
             channels: audio_channels,
@@ -123,6 +250,7 @@ impl VideoSource {
         let (info_tx, info_rx) = mpsc::channel();
         let (ctl_tx, ctl_rx) = mpsc::channel();
         let (frame_tx, frame_rx) = mpsc::sync_channel(decoder::FRAME_QUEUE_CAPACITY);
+        let (hw_frame_tx, hw_frame_rx) = mpsc::sync_channel(decoder::FRAME_QUEUE_CAPACITY);
         let (audio_tx, audio_rx) = mpsc::sync_channel(decoder::AUDIO_QUEUE_CAPACITY);
         let shared = Arc::new(Shared {
             paused: std::sync::atomic::AtomicBool::new(false),
@@ -131,6 +259,9 @@ impl VideoSource {
 
         let thread_path = path.to_path_buf();
         let thread_shared = Arc::clone(&shared);
+        // Девайс живёт в VideoSource (AddRef), декодер-поток получает свою
+        // ссылку на время жизни потока.
+        let thread_hw_device = hw_device.cloned();
         let thread = thread::Builder::new()
             .name("rst-video-decoder".into())
             .spawn(move || {
@@ -138,10 +269,12 @@ impl VideoSource {
                     thread_path,
                     ctl_rx,
                     frame_tx,
+                    hw_frame_tx,
                     audio_tx,
                     info_tx,
                     thread_shared,
                     audio_target,
+                    thread_hw_device,
                 );
             })
             .map_err(|e| VideoError::Decode(format!("не удалось создать поток-декодер: {e}")))?;
@@ -164,6 +297,7 @@ impl VideoSource {
             shared,
             ctl: ctl_tx,
             frame_rx,
+            hw_frame_rx,
             audio_rx,
             thread: Some(thread),
             info,
@@ -229,10 +363,55 @@ impl VideoSource {
             y: f.y,
             u: f.u,
             v: f.v,
+            alpha: f.alpha,
+            u_width: f.u_width,
+            u_height: f.u_height,
             width: f.width,
             height: f.height,
             pts: f.pts,
         })
+    }
+
+    /// Последний готовый АППАРАТНЫЙ кадр (M5c, zero-copy, неблокирующе):
+    /// NV12-текстура на общем с рендером D3D11-девайсе — семплируется
+    /// шейдером напрямую, без readback на CPU. Только в hw-режиме
+    /// (`open_*_hw` и [`Self::hw_accel`] == true); иначе всегда `None`.
+    /// Возвращённый кадр удерживает элемент пула декодера и frames-контекст
+    /// — держать его дольше пары кадров нельзя (пул конечен, декодер
+    /// встанет в ожидание), а ДО закрытия источника кадры стоит отпустить
+    /// (см. док [`Self::try_recv_frame`]).
+    pub fn try_recv_hw_frame(&self) -> Option<HwDecodedVideoFrame> {
+        self.hw_frame_rx
+            .try_recv()
+            .ok()
+            .map(|mut f: HwVideoFrameOut| {
+                // Ссылки пула/контекста ПЕРЕХОДЯТ в публичный кадр: элемент не
+                // переиспользуется и frames-контекст не уничтожается, пока кадр
+                // жив (см. док структуры). f дропается с нулевыми указателями.
+                let texture = f.texture.clone(); // COM AddRef
+                let pool_buf = std::mem::replace(&mut f.pool_buf, std::ptr::null_mut());
+                let frames_ctx = std::mem::replace(&mut f.frames_ctx, std::ptr::null_mut());
+                HwDecodedVideoFrame {
+                    texture,
+                    array_index: f.array_index,
+                    tex_width: f.tex_width,
+                    tex_height: f.tex_height,
+                    width: f.width,
+                    height: f.height,
+                    pts: f.pts,
+                    pool_buf,
+                    frames_ctx,
+                }
+            })
+    }
+
+    /// Активен ли аппаратный декод (M5c): `true` — кадры отдаются через
+    /// [`Self::try_recv_hw_frame`] (zero-copy NV12); старый
+    /// [`Self::try_recv_frame`] при этом тоже работает (readback-копия).
+    /// `false` — файл декодируется программно (не запрошен hw, несовместимый
+    /// формат/кодек, нет железа — сработал fallback).
+    pub fn hw_accel(&self) -> bool {
+        self.info.hw
     }
 
     /// Готовая порция звука (неблокирующе): f32 interleaved стерео 48 кГц.
@@ -255,6 +434,24 @@ impl VideoSource {
         self.info.has_audio
     }
 
+    /// Несёт ли видео альфа-канал (M5e): YUVA420P (WebM/VP9), YUVA444P10LE
+    /// (ProRes 4444) или qtrle. Если да — кадры содержат
+    /// [`DecodedVideoFrame::alpha`], и рендер обязан умножать цвет на альфу
+    /// (premultiplied — контракт всего проекта, ARCHITECTURE.md).
+    pub fn has_alpha(&self) -> bool {
+        self.info.has_alpha
+    }
+
+    /// Будет ли файл декодироваться программно: `true` для файлов с альфой
+    /// (YUVA420P/YUVA444P10LE/qtrle) — аппаратные декодеры альфа-канал не
+    /// отдают, такие файлы обязаны идти мимо hwaccel (ARCHITECTURE.md §4.4;
+    /// после M5c это сохранится); `false` для обычного YUV420P (сейчас
+    /// тоже декодируется программно — аппаратного пути нет). UI может
+    /// честно показывать «программный декод» для таких файлов (ROADMAP M5e).
+    pub fn software_decode(&self) -> bool {
+        self.info.software_decode
+    }
+
     /// Размеры видеокадра (из первого декодированного кадра).
     pub fn dimensions(&self) -> (u32, u32) {
         (self.info.width, self.info.height)
@@ -268,6 +465,15 @@ impl VideoSource {
 
 impl Drop for VideoSource {
     fn drop(&mut self) {
+        // Очереди кадров дренируются ДО Shutdown: декодер-поток при
+        // завершении освобождает пул NV12 (frames-контекст) — если в очереди
+        // останутся живые аппаратные кадры с удержаниями пула, их поздний
+        // release наткнётся на освобождённый пул (найдено на железе: double
+        // release текстуры декодера, ip == addr). Дренаж здесь + снятие
+        // ссылок в `HwDecodedVideoFrame` (см. док) гарантируют, что к
+        // моменту освобождения контекста живых удержаний нет.
+        while self.hw_frame_rx.try_recv().is_ok() {}
+        while self.frame_rx.try_recv().is_ok() {}
         // Shutdown доезжает максимум за 100 мс (срезы сна пайсинга) — join
         // гарантированно завершается, поток не имеет бесконечных ожиданий.
         let _ = self.ctl.send(Control::Shutdown);
@@ -284,6 +490,7 @@ impl std::fmt::Debug for VideoSource {
             .field("height", &self.info.height)
             .field("duration", &self.info.duration)
             .field("has_audio", &self.info.has_audio)
+            .field("hw_accel", &self.info.hw)
             .field("paused", &self.is_paused())
             .finish_non_exhaustive()
     }
