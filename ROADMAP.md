@@ -179,40 +179,44 @@
 
 ## M6 — стикеры-окна (1–2 недели)
 
-Все низкоуровневые примитивы (`rst-win32`: `window_pick.rs`, `window_pin.rs`,
-`virtual_desktops.rs`; `rst-core`: `window_follow.rs`; `rst-render`:
-`window_highlight.rs`) готовы и покрыты тестами, но ничего не подключено к
-координатору/UI — сама фича пользователю пока недоступна. Остаётся одна
-большая интеграционная задача, не россыпь новых примитивов.
+Базовый цикл работает: «Добавить окно» в панели у курсора → подсветка
+окна под курсором → клик закрепляет его (`WS_EX_TOPMOST` + маркер) как
+новый стикер-окно, `placement` зеркалит прямоугольник окна 1:1 на каждое
+изменение (`sync_window_stickers`, вызывается на `WindowEvent::Changed`),
+уничтожение таргета убирает стикер из активного списка, выход из
+приложения снимает все закрепления. `virtual_desktops::is_window_on_current_desktop`
+готов, но ещё не подключён к `sync_window_stickers` (детект стикера на
+другом рабочем столе — следующий срез).
 
-- [ ] Режим выбора окна с подсветкой под курсором (hit-test под курсором —
-      `window_pick::window_at` — готов; рамка подсветки —
-      `window_highlight::WindowHighlight` — готова; вход в режим по
-      хоткею/панели и подключение обеих частей друг к другу в
-      overlay_manager.rs — нет)
-- [ ] `pin` / `unpin` через `SetWindowPos` + оконное свойство-маркер
-      (`window_pin::WindowPins` — готов: `SetWindowPos` без активации,
-      `SetPropW`-маркер, `AlreadyPinned`/`PinWindowGone`/`PinAccessDenied`;
-      не подключён к `OverlayCommand`/тулбару)
-- [ ] Гарантированное открепление при выходе, включая аварийный и `WM_ENDSESSION`
-      (`WindowPins::unpin_all` есть, вызов из `run()` на выходе — нет)
-- [ ] Перемещение и ресайз в пределах правил окна (чистая геометрия —
-      `rst_core::window_follow::follow_window` — готова и протестирована;
-      вызов на каждое изменение прямоугольника закреплённого окна из
-      `WindowEvent::Changed` — нет)
-- [x] `EVENT_OBJECT_DESTROY` → корректное удаление (`WindowPins::handle_snapshot`
-      поверх существующего кэша `WindowTracker`, без второго WinEvent-хука —
-      логика готова, эмитит `PinEvent::TargetDestroyed`; координатор ещё не
-      скармливает снимки и не решает судьбу стикера по событию)
-- [x] Обработка UIPI: понятное сообщение про права администратора
-      (`Win32Error::PinAccessDenied` на `ERROR_ACCESS_DENIED` из
-      `SetWindowPos`/`SetPropW`/`RemovePropW`, без обхода)
+- [x] Режим выбора окна с подсветкой под курсором (`BTN_ADD_WINDOW` →
+      `edit.picking_window`, наведение — `window_pick::window_at` +
+      `window_highlight::WindowHighlight`, `Esc`/клик мимо окна отменяет)
+- [x] `pin` / `unpin` через `SetWindowPos` + оконное свойство-маркер
+      (закрепление — сам таргет получает `WS_EX_TOPMOST`, SPEC.md §5:
+      «стикер» — это окно, не отдельный HWND; семантика `window_pin.rs`
+      скорректирована под это в процессе интеграции, найден и исправлен
+      попутный баг — `unpin` не снимал `WS_EX_TOPMOST`)
+- [x] Гарантированное открепление при выходе (`window_pins.unpin_all()` в
+      конце `run()`; аварийный выход/`WM_ENDSESSION` не покрыты — код после
+      kill/crash не выполняется, известный предел, не путать с багом)
+- [ ] Перемещение и ресайз в пределах правил окна: сейчас зеркалирование
+      одностороннее (окно → `placement`) — таскание стикера в режиме
+      редактирования не двигает реальное окно назад (следующий срез;
+      `rst_core::window_follow::follow_window` написан для частичного
+      перекрытия окна стикером, для целого окна 1:1 не понадобился —
+      `sync_window_stickers` считает placement напрямую)
+- [x] `EVENT_OBJECT_DESTROY` → корректное удаление (`sync_window_stickers`
+      скармливает снимки `WindowPins::handle_snapshot`, `TargetDestroyed`
+      убирает стикер из `cfg.stickers` и из выделения)
+- [x] Обработка UIPI: понятное сообщение про права администратора в логах
+      (`Win32Error::PinAccessDenied`); UI-диалог с предложением перезапуска
+      от администратора (SPEC §5.3) — не реализован, известный пробел
 - [x] Виртуальные рабочие столы через `IVirtualDesktopManager` с fallback
       (`virtual_desktops::is_window_on_current_desktop` — публичный COM,
       Windows 10 1607+; `MoveWindowToDesktop` сознательно не реализован —
       публичный API не даёт перечислить GUID'ы столов, только
       недокументированные приватные интерфейсы, это и есть fallback, а не
-      обход, ROADMAP это и просил; не подключено к координатору)
+      обход, ROADMAP это и просил; ещё не вызывается из координатора)
 
 ---
 
