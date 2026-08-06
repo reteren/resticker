@@ -3657,6 +3657,63 @@ fn sticker_marker(id: Uuid) -> u64 {
     id.as_u128() as u64
 }
 
+/// Обратное [`window_rect_to_placement`]: `Placement` стикера-окна (DIP
+/// относительно своего монитора) → физический прямоугольник (x, y, w, h) в
+/// координатах виртуального десктопа, для [`WindowPins::move_resize`]
+/// (M6, SPEC.md §5.2 — драг/ресайз стикера-окна двигает/ресайзит настоящее
+/// окно). Округление к ближайшему целому — та же точность, что у
+/// физических координат мыши.
+fn placement_to_physical_rect(
+    placement: &Placement,
+    bounds: &MonitorBounds,
+) -> (i32, i32, i32, i32) {
+    let scale = bounds.scale;
+    let phys_w = (placement.w * scale).round();
+    let phys_h = (placement.h * scale).round();
+    let phys_x = bounds.bounds_px.x as f64 + (placement.cx - placement.w / 2.0) * scale;
+    let phys_y = bounds.bounds_px.y as f64 + (placement.cy - placement.h / 2.0) * scale;
+    (
+        phys_x.round() as i32,
+        phys_y.round() as i32,
+        phys_w as i32,
+        phys_h as i32,
+    )
+}
+
+/// Если стикер `id` — стикер-окно и сейчас закреплён, применить его
+/// АКТУАЛЬНЫЙ `placement` к реальному окну через [`WindowPins::move_resize`]
+/// (M6, SPEC.md §5.2): вызывается на каждый шаг живого драга/ресайза
+/// (`apply_gesture`) — та же частота, с которой обычное перетаскивание
+/// окна за титульную строку двигает его в Windows, лишних вызовов
+/// `SetWindowPos` тут не бывает больше, чем реальных движений мыши.
+/// Ошибка — не паника: `tracing::warn!`, тот же принцип, что у
+/// `sync_window_stickers`/`add_window_sticker` (недоступное окно —
+/// диагностика, не крах).
+fn sync_pinned_window_from_placement(
+    cfg: &Config,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_pins: &WindowPins,
+    pinned_stickers: &HashMap<usize, Uuid>,
+    id: Uuid,
+) {
+    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) else {
+        return;
+    };
+    if !matches!(sticker.source, StickerSource::Window { .. }) {
+        return;
+    }
+    let Some((&target, _)) = pinned_stickers.iter().find(|(_, sid)| **sid == id) else {
+        return;
+    };
+    let Some(bounds) = monitor_bounds.get(&sticker.placement.monitor_id) else {
+        return;
+    };
+    let (x, y, w, h) = placement_to_physical_rect(&sticker.placement, bounds);
+    if let Err(e) = window_pins.move_resize(target, x, y, w, h) {
+        tracing::warn!(sticker = %id, error = %e, "не удалось сдвинуть/изменить размер закреплённого окна");
+    }
+}
+
 /// [`WindowRect`] таргета (физические px виртуального десктопа) →
 /// [`Placement`] стикера-окна (DIP относительно `monitor_id`). Окно и
 /// стикер-окно — одно и то же 1:1 (SPEC.md §5.2), в отличие от файловых
@@ -3944,12 +4001,14 @@ fn rebuild_toolbar(edit: &mut EditState, cfg: &Config, screen_h: f64) {
         paused: sticker.playback.paused,
         volume_pct: (sticker.playback.volume.clamp(0.0, 1.0) * 100.0).round() as u32,
     });
-    edit.toolbar = Some(toolbar::build_toolbar(
-        &bounds,
-        Some(sticker.transform.opacity),
-        video,
-        screen_h,
-    ));
+    // Стикер-окно не поддерживает прозрачность (SPEC.md §5.2 — это
+    // настоящее окно, `WS_EX_TOPMOST`, у него нет альфа-канала, которым
+    // можно было бы управлять): переиспользуем существующий путь
+    // билдера — `opacity: None` уже опускает ползунок/поле целиком (тот
+    // же контракт, что у мультивыделения).
+    let is_window = matches!(sticker.source, StickerSource::Window { .. });
+    let opacity = (!is_window).then_some(sticker.transform.opacity);
+    edit.toolbar = Some(toolbar::build_toolbar(&bounds, opacity, video, screen_h));
 }
 
 /// Пересобрать панель у курсора (раздел 4): есть, пока режим активен, на
@@ -4829,7 +4888,16 @@ fn handle_input(
                     false
                 }
                 Zone::Rotate(id, _corner) => {
-                    if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                    // Стикер-окно не поддерживает поворот (SPEC.md §5.2 —
+                    // это настоящее окно, WS_EX_TOPMOST-заголовок нельзя
+                    // повернуть): угол-хендл визуально остаётся (M6, известный
+                    // косметический пробел), но клик по нему для такого
+                    // стикера — no-op, не начинает жест.
+                    if let Some(sticker) = cfg
+                        .stickers
+                        .iter()
+                        .find(|s| s.id == id && !matches!(s.source, StickerSource::Window { .. }))
+                    {
                         let start = GestureStart {
                             id,
                             placement: sticker.placement.clone(),
@@ -4919,6 +4987,9 @@ fn handle_input(
                         modifiers,
                         monitor,
                         monitor_id,
+                        monitor_bounds,
+                        window_pins,
+                        pinned_stickers,
                     );
                     if need_redraw {
                         // Драг/ресайз/поворот меняют placement/opacity живо —
@@ -5332,6 +5403,7 @@ fn handle_input(
 
 /// Применить активный жест к текущей мировой точке курсора (DIP). Возвращает
 /// `true`, если нужна перерисовка (жест активен и стикер найден).
+#[allow(clippy::too_many_arguments)]
 fn apply_gesture(
     cfg: &mut Config,
     sprites: &mut [(Uuid, Sprite)],
@@ -5340,6 +5412,9 @@ fn apply_gesture(
     modifiers: Modifiers,
     monitor: DipRect,
     monitor_id: &MonitorId,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_pins: &WindowPins,
+    pinned_stickers: &HashMap<usize, Uuid>,
 ) -> bool {
     if let Some(Gesture::Marquee { anchor, .. }) = &edit.gesture {
         let anchor = *anchor;
@@ -5392,6 +5467,13 @@ fn apply_gesture(
             placement.cy += snap_result.dy;
             let placement = snap::clamp_min_visible(&placement, rotation, monitor);
             apply_transform(cfg, sprites, id, placement, start.transform);
+            sync_pinned_window_from_placement(
+                cfg,
+                monitor_bounds,
+                window_pins,
+                pinned_stickers,
+                id,
+            );
             true
         }
         Gesture::Resize {
@@ -5410,6 +5492,13 @@ fn apply_gesture(
             let placement =
                 snap::clamp_min_visible(&result.placement, result.transform.rotation, monitor);
             apply_transform(cfg, sprites, id, placement, result.transform);
+            sync_pinned_window_from_placement(
+                cfg,
+                monitor_bounds,
+                window_pins,
+                pinned_stickers,
+                id,
+            );
             true
         }
         Gesture::Rotate { start, grab } => {
@@ -6589,6 +6678,48 @@ mod tests {
         assert_eq!(p.h, 200.0);
         assert_eq!(p.cx, 100.0 + 200.0);
         assert_eq!(p.cy, 50.0 + 100.0);
+    }
+
+    #[test]
+    fn placement_to_physical_rect_is_inverse_of_window_rect_to_placement() {
+        for (mon, rect) in [
+            (
+                monitor_bounds_at(0, 0, 1920, 1080, 1.0),
+                WindowRect {
+                    x: 100,
+                    y: 50,
+                    w: 400,
+                    h: 300,
+                },
+            ),
+            (
+                monitor_bounds_at(1920, 0, 1920, 1080, 1.0),
+                WindowRect {
+                    x: 2020,
+                    y: 50,
+                    w: 200,
+                    h: 100,
+                },
+            ),
+            (
+                monitor_bounds_at(0, 0, 3840, 2160, 2.0),
+                WindowRect {
+                    x: 201,
+                    y: 101,
+                    w: 801,
+                    h: 401,
+                },
+            ),
+        ] {
+            let placement = window_rect_to_placement(&rect, MonitorId("m".to_string()), &mon);
+            let (x, y, w, h) = placement_to_physical_rect(&placement, &mon);
+            // Округление до целого физического px — допустимая погрешность
+            // 1 px в любую сторону (та же точность, что у координат мыши).
+            assert!((x - rect.x).abs() <= 1, "{rect:?}: x {x} vs {}", rect.x);
+            assert!((y - rect.y).abs() <= 1, "{rect:?}: y {y} vs {}", rect.y);
+            assert!((w - rect.w).abs() <= 1, "{rect:?}: w {w} vs {}", rect.w);
+            assert!((h - rect.h).abs() <= 1, "{rect:?}: h {h} vs {}", rect.h);
+        }
     }
 
     #[test]

@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, HANDLE, HWND, SetLastError};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetPropW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, RemovePropW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SetPropW, SetWindowPos,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetPropW, SetWindowPos,
 };
 use windows::core::{HRESULT, PCWSTR, w};
 
@@ -182,6 +182,37 @@ impl WindowPins {
             events.push(PinEvent::TargetDestroyed { target });
         }
         events
+    }
+
+    /// Переместить/изменить размер закреплённого окна (SPEC.md §5.2:
+    /// «перемещение — как у обычного стикера, свободное; изменение размера
+    /// — в рамках возможностей самого окна, как при перетаскивании его
+    /// собственной границы»). `rect` — физические px виртуального
+    /// десктопа, тот же перевод, что у `WindowInfo::rect`. Z-order не
+    /// трогается (`SWP_NOZORDER` — окно уже топовое из `pin`), фокус тоже
+    /// (`SWP_NOACTIVATE`) — драг стикера не должен красть фокус у другого
+    /// приложения.
+    ///
+    /// Не проверяет `is_pinned`/книжку — вызывающий (координатор) уже знает,
+    /// что таргет закреплён (иначе для него не было бы `Placement` живого
+    /// стикера-окна); `SetWindowPos` на мёртвом окне просто вернёт ошибку.
+    /// Windows сам ограничивает итоговый размер минимумом/максимумом окна
+    /// (SPEC: «в рамках возможностей окна») — clamp на нашей стороне не
+    /// нужен, `SetWindowPos` не проваливается на «слишком маленький» размер,
+    /// просто применяет ближайший допустимый.
+    pub fn move_resize(
+        &self,
+        target: usize,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> Result<(), Win32Error> {
+        let target_hwnd = hwnd_from_usize(target);
+        let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        // SAFETY: SetWindowPos безопасен для любого HWND, включая мёртвый —
+        // вернёт ошибку, не UB; x/y/w/h — обычные пиксельные координаты.
+        unsafe { SetWindowPos(target_hwnd, None, x, y, w, h, flags) }.map_err(map_pin_err)
     }
 }
 
@@ -411,6 +442,37 @@ mod tests {
         pins.unpin_all();
         assert!(!pins.is_pinned(key(target_a.0)));
         assert!(!pins.is_pinned(key(target_b.0)));
+    }
+
+    #[test]
+    fn move_resize_moves_and_resizes_pinned_window() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+        let target = TestWindow::create();
+        let mut pins = WindowPins::new();
+        pins.pin(MARKER, key(target.0)).expect("пин");
+
+        pins.move_resize(key(target.0), 10, 20, 300, 150)
+            .expect("move_resize закреплённого окна");
+
+        let mut rect = RECT::default();
+        // SAFETY: target — живое окно текущего потока.
+        unsafe { GetWindowRect(target.0, &mut rect) }.expect("GetWindowRect");
+        assert_eq!((rect.left, rect.top), (10, 20));
+        assert_eq!((rect.right - rect.left, rect.bottom - rect.top), (300, 150));
+        // Пин не тронут: z-order/маркер — SWP_NOZORDER, move_resize не
+        // трогает WindowPins::pinned вовсе.
+        assert!(pins.is_pinned(key(target.0)));
+    }
+
+    #[test]
+    fn move_resize_dead_target_errors() {
+        let target = TestWindow::create();
+        let dead = key(target.0);
+        drop(target);
+        let pins = WindowPins::new();
+        assert!(pins.move_resize(dead, 0, 0, 100, 100).is_err());
     }
 
     #[test]
