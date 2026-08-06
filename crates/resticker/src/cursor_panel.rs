@@ -21,6 +21,11 @@ pub const BTN_TOGGLE_ALL: WidgetId = 102;
 pub const BTN_SETTINGS: WidgetId = 103;
 /// «Выйти из режима редактирования».
 pub const BTN_EXIT: WidgetId = 104;
+/// «Добавить окно» — режим выбора окна для стикера-окна (SPEC.md §5.1,
+/// ROADMAP.md M6). Переиспользует [`Icon::Layers`] («слои видимости» —
+/// та же тема «окна»): отдельная выделенная иконка «добавить окно» —
+/// известное упрощение, не блокирует функциональность.
+pub const BTN_ADD_WINDOW: WidgetId = 105;
 
 /// Смещение панели от курсора вправо-вниз, DIP (не закрывать сам курсор).
 pub const CURSOR_OFFSET_DIP: f64 = 12.0;
@@ -28,11 +33,13 @@ pub const CURSOR_OFFSET_DIP: f64 = 12.0;
 const PANEL_PAD: f64 = 6.0;
 /// Зазор между кнопками, DIP.
 const BUTTON_GAP: f64 = 4.0;
+/// Число кнопок панели.
+const BUTTON_COUNT: f64 = 5.0;
 
-/// Размер панели (ширина, высота), DIP: четыре кнопки `theme::BUTTON_SIZE`
+/// Размер панели (ширина, высота), DIP: пять кнопок `theme::BUTTON_SIZE`
 /// с зазорами и отступами.
 pub const CURSOR_PANEL_SIZE: (f64, f64) = (
-    2.0 * PANEL_PAD + 4.0 * theme::BUTTON_SIZE + 3.0 * BUTTON_GAP,
+    2.0 * PANEL_PAD + BUTTON_COUNT * theme::BUTTON_SIZE + (BUTTON_COUNT - 1.0) * BUTTON_GAP,
     2.0 * PANEL_PAD + theme::BUTTON_SIZE,
 );
 
@@ -70,6 +77,7 @@ pub fn build_cursor_panel(cursor: (f64, f64), screen: &DipRect, all_visible: boo
     };
     let buttons = [
         (BTN_LOAD_FILE, Icon::FileOpen),
+        (BTN_ADD_WINDOW, Icon::Layers),
         (BTN_TOGGLE_ALL, toggle_icon),
         (BTN_SETTINGS, Icon::Settings),
         (BTN_EXIT, Icon::Exit),
@@ -155,7 +163,13 @@ mod tests {
     fn buttons_layout_and_ids() {
         let panel = build_cursor_panel((960.0, 540.0), &screen(), true);
         let f = panel.frame();
-        let ids = [BTN_LOAD_FILE, BTN_TOGGLE_ALL, BTN_SETTINGS, BTN_EXIT];
+        let ids = [
+            BTN_LOAD_FILE,
+            BTN_ADD_WINDOW,
+            BTN_TOGGLE_ALL,
+            BTN_SETTINGS,
+            BTN_EXIT,
+        ];
         let mut prev_cx = f64::NEG_INFINITY;
         for id in ids {
             let b = panel
@@ -179,13 +193,25 @@ mod tests {
         let panel = build_cursor_panel((960.0, 540.0), &screen(), true);
         assert_eq!(
             icons(&panel),
-            vec![Icon::FileOpen, Icon::HideAll, Icon::Settings, Icon::Exit]
+            vec![
+                Icon::FileOpen,
+                Icon::Layers,
+                Icon::HideAll,
+                Icon::Settings,
+                Icon::Exit
+            ]
         );
         // Часть скрыта → предлагает «показать все».
         let panel = build_cursor_panel((960.0, 540.0), &screen(), false);
         assert_eq!(
             icons(&panel),
-            vec![Icon::FileOpen, Icon::ShowAll, Icon::Settings, Icon::Exit]
+            vec![
+                Icon::FileOpen,
+                Icon::Layers,
+                Icon::ShowAll,
+                Icon::Settings,
+                Icon::Exit
+            ]
         );
     }
 

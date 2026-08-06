@@ -36,7 +36,7 @@ use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{
     Config, Hotkeys, MediaType, MonitorId, OverlapRule, Placement, Rect, Settings, Sticker,
-    StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode,
+    StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode, WindowLocator,
 };
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
@@ -48,9 +48,10 @@ use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::animation as media_animation;
 use rst_media::paste;
 use rst_render::{
-    Box2D, Button, Checkbox, Device, Icon, Key, NumericField, Panel, PointerEvent, Primitive,
-    RenderError, SelectionBox, Slider, Sprite, Texture, TextureAtlas, VideoTextures, WidgetId,
-    WindowTarget, edit_overlay, marquee_visuals, rasterize, solid_sprite, theme,
+    Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon, Key,
+    NumericField, Panel, PointerEvent, Primitive, RenderError, SelectionBox, Slider, Sprite,
+    Texture, TextureAtlas, VideoTextures, WidgetId, WindowHighlight, WindowTarget, edit_overlay,
+    marquee_visuals, rasterize, solid_sprite, theme,
 };
 use rst_video::VideoSource;
 use rst_win32::clipboard::{self, ClipboardImage};
@@ -62,6 +63,8 @@ use rst_win32::input::{
 use rst_win32::monitors;
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
 use rst_win32::window_enum::{WindowInfo, WindowRect};
+use rst_win32::window_pick;
+use rst_win32::window_pin::{self as window_pin, WindowPins};
 use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker};
 use uuid::Uuid;
 
@@ -643,6 +646,15 @@ struct EditState {
     /// (дизайн §5.2); фактическое открытие происходит в цикле `run()`,
     /// где снимок под рукой, сразу после обработки текущего сообщения.
     pending_open_picker: Option<Uuid>,
+    /// Режим выбора окна для стикера-окна активен (SPEC.md §5.1, ROADMAP.md
+    /// M6): установлен кликом по `BTN_ADD_WINDOW`, снят кликом по окну
+    /// (закрепляет его) или `Esc`. Пока активен, движение мыши подсвечивает
+    /// окно под курсором вместо обычного хит-теста сцены (см. `handle_input`).
+    picking_window: bool,
+    /// Окно под курсором в режиме выбора — числовой hwnd из `window_snapshot`
+    /// для подсветки (`WindowHighlight`) и последующего клика-закрепления.
+    /// `None` — курсор не над окном кэша трекера.
+    pick_hover: Option<usize>,
     /// Атлас только что добавленной анимации (M5a, docs/M5A_ANIMATION_DESIGN.md
     /// §5) — `add_sticker` собирает атлас (нужен `Renderer`, которого нет в
     /// `run()`) и кладёт его сюда вместо прямой записи в `animations`
@@ -1077,6 +1089,17 @@ fn run(
     // на стикер, конфиг ничего не хранит про этот тумблер).
     let mut audio_muted = false;
 
+    // Закрепления стикеров-окон (M6, SPEC.md §5) — маркер `WS_EX_TOPMOST` +
+    // window property, живёт на весь процесс рядом с `audio_mixer` (тот же
+    // паттерн: ресурс процесса, не переживает конфиг). `unpin_all()`
+    // вызывается на выходе из `run()`, ниже, по гарантии открепления
+    // (ROADMAP.md M6).
+    let mut window_pins = WindowPins::new();
+    // `target hwnd → sticker id` для уже закреплённых стикеров-окон —
+    // `WindowPins` не раскрывает свою книжку наружу, координатору нужна
+    // обратная карта для `sync_window_stickers` (см. там же).
+    let mut pinned_stickers: HashMap<usize, Uuid> = HashMap::new();
+
     let mut sprites: Vec<(Uuid, Sprite)> = Vec::new();
     let mut animations: HashMap<Uuid, StickerAnimation> = HashMap::new();
     let mut videos: HashMap<Uuid, VideoPlayback> = HashMap::new();
@@ -1293,6 +1316,8 @@ fn run(
         confirm: None,
         window_picker: None,
         pending_open_picker: None,
+        picking_window: false,
+        pick_hover: None,
         pending_animation: None,
         pending_video: None,
         marquee: None,
@@ -1326,6 +1351,8 @@ fn run(
         &black_tex,
         &mut ui_cache,
         &occluder_cache,
+        &window_snapshot,
+        &monitor_bounds,
     ) {
         if recover_device(
             &mut device,
@@ -1349,6 +1376,8 @@ fn run(
                 &black_tex,
                 &mut ui_cache,
                 &occluder_cache,
+                &window_snapshot,
+                &monitor_bounds,
             );
         } else {
             device_needs_recovery = true;
@@ -2093,6 +2122,8 @@ fn run(
                     &mut animations,
                     &mut videos,
                     audio_mixer.as_ref(),
+                    &mut window_pins,
+                    &mut pinned_stickers,
                 );
             }
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
@@ -2106,6 +2137,20 @@ fn run(
                 // стикер неверно относительно нового расположения окон.
                 tracing::debug!(count = windows.len(), "снимок окон обновлён");
                 window_snapshot = windows;
+                // M6 (SPEC.md §5): закрепление/открепление и зеркалирование
+                // геометрии стикеров-окон — до пересчёта окклюдеров, чтобы
+                // маска считалась уже по актуальному cfg.stickers (сама
+                // синхронизация ничего не рендерит и на маску не влияет, но
+                // порядок дешёвый и не создаёт сюрпризов).
+                sync_window_stickers(
+                    &mut cfg,
+                    &mut edit,
+                    &window_snapshot,
+                    &monitor_bounds,
+                    &mut window_pins,
+                    &mut pinned_stickers,
+                    &config_path,
+                );
                 occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
                 // Открытая панель выбора окон показывает СТАРЫЙ снимок —
                 // пересобрать её тем же новым снимком (M4_WINDOW_PICKER_DESIGN.md
@@ -2310,6 +2355,8 @@ fn run(
                 &black_tex,
                 &mut ui_cache,
                 &occluder_cache,
+                &window_snapshot,
+                &monitor_bounds,
             )
         {
             if recover_device(
@@ -2335,12 +2382,21 @@ fn run(
                     &black_tex,
                     &mut ui_cache,
                     &occluder_cache,
+                    &window_snapshot,
+                    &monitor_bounds,
                 );
             } else {
                 device_needs_recovery = true;
             }
         }
     }
+    // Гарантированное открепление стикеров-окон при выходе (ROADMAP.md M6,
+    // SPEC.md §5): без этого WS_EX_TOPMOST на чужих окнах пережил бы процесс
+    // resticker — цель ушла бы «навсегда поверх всего» до перезапуска той
+    // программы. Аварийный выход (kill/crash) этим не покрыт по определению
+    // (код после него не выполняется) — тот случай ROADMAP относит к
+    // «известный предел», не к этой гарантии.
+    window_pins.unpin_all();
     // monitors_map (Device+WindowTarget-обёртки внутри Renderer конструируются
     // временно и не переживают итерацию) и device освобождаются здесь;
     // MonitorState.target дропается раньше MonitorState.overlay в порядке
@@ -2845,6 +2901,19 @@ fn handle_key(
     if edit.confirm.is_some() {
         return if vk == VK_ESCAPE {
             edit.confirm = None;
+            true
+        } else {
+            false
+        };
+    }
+    // Режим выбора окна (M6, SPEC.md §5.1) блокирует клавиатуру целиком,
+    // кроме `Esc` — тем же паттерном, что панель выбора окон ниже: пока
+    // курсор «в режиме прицела», хоткеи вроде `Delete`/`Ctrl+D` по текущему
+    // выделению были бы путающими.
+    if edit.picking_window {
+        return if vk == VK_ESCAPE {
+            edit.picking_window = false;
+            edit.pick_hover = None;
             true
         } else {
             false
@@ -3459,6 +3528,156 @@ fn window_rect_to_core(r: &WindowRect) -> Option<Rect> {
         w: r.w as u32,
         h: r.h as u32,
     })
+}
+
+/// Синхронизация стикеров-окон со свежим снимком трекера (M6, SPEC.md §5):
+/// вызывается на каждый `OverlayMessage::Windows(Changed)`, тем же местом,
+/// что и пересчёт окклюдеров.
+///
+/// (1) Уничтоженные закреплённые окна убираются из активного списка
+/// (`WindowPins::handle_snapshot` → `PinEvent::TargetDestroyed`; SPEC:
+/// «стикер автоматически удаляется из активного списка», но не из пресета —
+/// пресеты сюда не заходят, у них своя копия).
+/// (2) Ещё не закреплённые стикеры-окна (только что добавлены или не
+/// нашлись при прошлой попытке — например, программа тогда не была
+/// запущена) пытаются резолвиться по `WindowLocator` и закрепляются при
+/// первом совпадении (`occluders::locator_matches`, тот же предикат, что у
+/// правил видимости M4).
+/// (3) Уже закреплённые зеркалят текущий прямоугольник таргета в
+/// `placement` (SPEC 5.2: «перемещение — как у обычного стикера,
+/// изменение размера — в рамках возможностей окна» — т.е. окно ведёт,
+/// `placement` следует за ним 1:1, а не наоборот).
+///
+/// `pinned_stickers` — обратная карта `target hwnd → sticker id`,
+/// поддерживается координатором рядом с `window_pins` (сам `WindowPins` не
+/// раскрывает свою книжку наружу — только предикаты и события).
+///
+/// Известное упрощение первого среза: монитор стикера-окна не
+/// переустанавливается, если окно физически переехало на другой монитор
+/// (в отличие от обычных стикеров, `monitor_rebind`) — эффект только на
+/// координаты хит-теста в режиме редактирования, ничего не рендерится для
+/// стикера-окна (SPEC §5.2: «визуальной рамки нет»), видимого расхождения
+/// нет.
+fn sync_window_stickers(
+    cfg: &mut Config,
+    edit: &mut EditState,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_pins: &mut WindowPins,
+    pinned_stickers: &mut HashMap<usize, Uuid>,
+    config_path: &Path,
+) -> bool {
+    let mut changed = false;
+
+    for event in window_pins.handle_snapshot(window_snapshot) {
+        let window_pin::PinEvent::TargetDestroyed { target } = event;
+        if let Some(sticker_id) = pinned_stickers.remove(&target) {
+            cfg.stickers.retain(|s| s.id != sticker_id);
+            edit.selection.deselect(sticker_id);
+            changed = true;
+        }
+    }
+
+    for i in 0..cfg.stickers.len() {
+        let (locator, monitor_id, sticker_id) = {
+            let s = &cfg.stickers[i];
+            let StickerSource::Window { window } = &s.source else {
+                continue;
+            };
+            (window.clone(), s.placement.monitor_id.clone(), s.id)
+        };
+
+        let target =
+            if let Some((&t, _)) = pinned_stickers.iter().find(|(_, id)| **id == sticker_id) {
+                Some(t)
+            } else {
+                window_snapshot
+                    .iter()
+                    .find(|w| !w.iconic && window_locator_matches(&locator, w))
+                    .map(|w| w.hwnd)
+            };
+        let Some(target) = target else { continue };
+
+        if let std::collections::hash_map::Entry::Vacant(entry) = pinned_stickers.entry(target) {
+            match window_pins.pin(sticker_marker(sticker_id), target) {
+                Ok(()) => {
+                    entry.insert(sticker_id);
+                }
+                Err(e) => {
+                    tracing::warn!(sticker = %sticker_id, error = %e, "не удалось закрепить стикер-окно");
+                    continue;
+                }
+            }
+        }
+
+        let Some(win) = window_snapshot.iter().find(|w| w.hwnd == target) else {
+            continue;
+        };
+        if win.iconic {
+            // Свёрнутое окно — rect от DWM мусорный (как у обычных окон,
+            // window_pick.rs): не обновляем placement на его основе,
+            // ждём следующего снимка, где оно развёрнуто или пропало.
+            continue;
+        }
+        let Some(bounds) = monitor_bounds.get(&monitor_id) else {
+            continue;
+        };
+        let new_placement = window_rect_to_placement(&win.rect, monitor_id.clone(), bounds);
+        if cfg.stickers[i].placement != new_placement {
+            cfg.stickers[i].placement = new_placement;
+            changed = true;
+        }
+    }
+
+    if changed {
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после синхронизации стикеров-окон");
+        }
+    }
+    changed
+}
+
+/// [`WindowLocator`] стикера-окна совпадает с живым окном? Обёртка над
+/// [`occluders::locator_matches`] с переводом [`WindowInfo`] в
+/// [`OccluderCandidate`] — тот же перевод, что у `occluder_rects_for`.
+fn window_locator_matches(locator: &WindowLocator, w: &WindowInfo) -> bool {
+    let candidate = OccluderCandidate {
+        exe_path: window_exe_path(w),
+        title: w.title.clone(),
+        class: w.class.clone(),
+    };
+    occluders::locator_matches(locator, &candidate)
+}
+
+/// Маркер `WindowPins::pin` для стикера: младшие 64 бита его `Uuid`.
+/// Используется только для сравнения «свой/чужой» на переиспользованном
+/// hwnd (`window_pin.rs`) — усечение не проблема, это не идентификатор для
+/// поиска, только отпечаток.
+fn sticker_marker(id: Uuid) -> u64 {
+    id.as_u128() as u64
+}
+
+/// [`WindowRect`] таргета (физические px виртуального десктопа) →
+/// [`Placement`] стикера-окна (DIP относительно `monitor_id`). Окно и
+/// стикер-окно — одно и то же 1:1 (SPEC.md §5.2), в отличие от файловых
+/// стикеров произвольного размера.
+fn window_rect_to_placement(
+    rect: &WindowRect,
+    monitor_id: MonitorId,
+    bounds: &MonitorBounds,
+) -> Placement {
+    let scale = bounds.scale;
+    let dip_x = (rect.x as f64 - bounds.bounds_px.x as f64) / scale;
+    let dip_y = (rect.y as f64 - bounds.bounds_px.y as f64) / scale;
+    let dip_w = rect.w as f64 / scale;
+    let dip_h = rect.h as f64 / scale;
+    Placement {
+        monitor_id,
+        cx: dip_x + dip_w / 2.0,
+        cy: dip_y + dip_h / 2.0,
+        w: dip_w,
+        h: dip_h,
+    }
 }
 
 /// Радиус скругления маски перекрытия, физические px — должен совпадать с
@@ -4304,6 +4523,15 @@ fn handle_cursor_panel_up(
         rebuild_cursor_panel(edit, cfg, &screen);
         return true;
     }
+    if clicked(edit, cursor_panel::BTN_ADD_WINDOW) {
+        // M6 (SPEC.md §5.1): переводит курсор в режим выбора окна —
+        // подсветка/клик обрабатываются эксклюзивно в `handle_input`
+        // (пока `edit.picking_window`), сама панель остаётся на экране
+        // (Esc — общий отмена-путь для незавершённых режимов, `handle_key`).
+        edit.picking_window = true;
+        edit.pick_hover = None;
+        return true;
+    }
     if clicked(edit, cursor_panel::BTN_TOGGLE_ALL) {
         let before = cfg.clone();
         if converge_all_stickers_visibility(cfg) {
@@ -4433,6 +4661,8 @@ fn handle_input(
     animations: &mut HashMap<Uuid, StickerAnimation>,
     videos: &mut HashMap<Uuid, VideoPlayback>,
     audio_mixer: Option<&AudioMixer>,
+    window_pins: &mut WindowPins,
+    pinned_stickers: &mut HashMap<usize, Uuid>,
 ) -> bool {
     let monitor = DipRect::new(
         0.0,
@@ -4456,6 +4686,28 @@ fn handle_input(
                         pos: (dip_x, dip_y),
                     });
                 }
+                return true;
+            }
+            // Режим выбора окна (M6, SPEC.md §5.1): клик закрепляет окно под
+            // курсором (`pick_hover`, обновляется на `MouseMove` ниже) или,
+            // если курсор не над окном кэша трекера, просто отменяет режим —
+            // ни один другой хит-тест сцены/панелей в этом режиме не
+            // выполняется (эксклюзивно, как у `confirm` выше).
+            if edit.picking_window {
+                if let Some(hwnd) = edit.pick_hover {
+                    add_window_sticker(
+                        cfg,
+                        config_path,
+                        window_snapshot,
+                        monitor_bounds,
+                        monitor_id,
+                        window_pins,
+                        pinned_stickers,
+                        hwnd,
+                    );
+                }
+                edit.picking_window = false;
+                edit.pick_hover = None;
                 return true;
             }
             // Панель выбора окон открыта из тулбара — она выше него по
@@ -4610,6 +4862,25 @@ fn handle_input(
                         pos: (dip_x, dip_y),
                     });
                 }
+                return true;
+            }
+            // Режим выбора окна (M6): подсветка окна под курсором вместо
+            // обычного роутинга по панелям/сцене — `pos` локальный
+            // физический (клиентская область окна монитора), `window_at`
+            // ждёт глобальный физический (виртуальный десктоп), поэтому
+            // прибавляем начало монитора (`monitor_bounds`, тот же перевод,
+            // что у обычного хит-теста стикеров через DIP, только без
+            // деления на масштаб — `WindowInfo::rect` тоже в физике).
+            if edit.picking_window {
+                let origin = monitor_bounds
+                    .get(monitor_id)
+                    .map(|b| (b.bounds_px.x, b.bounds_px.y))
+                    .unwrap_or((0, 0));
+                let point = window_pick::ScreenPoint {
+                    x: origin.0 + pos.x,
+                    y: origin.1 + pos.y,
+                };
+                edit.pick_hover = window_pick::window_at(window_snapshot, point);
                 return true;
             }
             match edit.pointer_owner {
@@ -5193,6 +5464,8 @@ fn redraw(
     scale: f32,
     monitor_id: &MonitorId,
     occluders: Option<&[OccluderSet]>,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
 ) -> bool {
     let mut frame: Vec<Sprite> = Vec::with_capacity(sprites.len() + 1 + 12);
     // (индекс в `frame`, индекс группы в `occluders`) для каждого видимого
@@ -5333,6 +5606,33 @@ fn redraw(
         }
     }
 
+    // Подсветка окна под курсором в режиме выбора (M6, SPEC.md §5.1) — живёт
+    // только на мониторе курсора (тот же паттерн, что марка/панель у
+    // курсора выше). `WindowInfo::rect` — физические px виртуального
+    // десктопа, `WindowHighlight` ждёт физику МОНИТОРА (вычитаем начало
+    // монитора — обратное тому, что делает `MouseMove` в `handle_input`,
+    // переводя локальные координаты курсора в глобальные для `window_at`).
+    if edit.picking_window && edit.cursor_monitor == *monitor_id {
+        if let Some(win) = edit
+            .pick_hover
+            .and_then(|hwnd| window_snapshot.iter().find(|w| w.hwnd == hwnd))
+        {
+            if let Some(bounds) = monitor_bounds.get(monitor_id) {
+                let highlight = WindowHighlight::new(
+                    win.rect.x as f64 - bounds.bounds_px.x as f64,
+                    win.rect.y as f64 - bounds.bounds_px.y as f64,
+                    win.rect.w as f64,
+                    win.rect.h as f64,
+                    bounds.scale,
+                );
+                let prims = highlight.primitives(HighlightKind::Hover, HIGHLIGHT_THICKNESS_DIP);
+                primitives_to_sprites(
+                    &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+                );
+            }
+        }
+    }
+
     // Тулбар и панель у курсора — над рамками выделения, под модалом
     // (раздел 11). Тулбар следует за монитором выделенного стикера; панель
     // у курсора и марка — за `edit.cursor_monitor` (M3, см. выше).
@@ -5469,6 +5769,8 @@ fn redraw_all(
     black_tex: &Texture,
     ui_cache: &mut UiTextureCache,
     occluder_cache: &HashMap<MonitorId, Vec<OccluderSet>>,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
 ) -> bool {
     for (monitor_id, ms) in monitors_map.iter_mut() {
         // Устаревшая цель на уже уничтоженном устройстве, которую не
@@ -5497,6 +5799,8 @@ fn redraw_all(
             ms.scale,
             monitor_id,
             occluder_cache.get(monitor_id).map(Vec::as_slice),
+            window_snapshot,
+            monitor_bounds,
         );
         if device_lost {
             return true;
@@ -5619,6 +5923,63 @@ fn recover_device(
     *ui_cache = UiTextureCache::new();
     *device = new_device;
     true
+}
+
+/// Закрепить окно `hwnd` (из `window_snapshot`) как новый стикер-окно (M6,
+/// SPEC.md §5.1: клик в режиме выбора). Локатор строится из полного пути к
+/// exe (`process_name`) — тот же формат, что у `source.kind == "window"` в
+/// CONFIG.md; `title_pattern` не задаётся (процесса обычно достаточно,
+/// пользовательская настройка локатора — вне скоупа первого среза).
+///
+/// Ничего не возвращает: неудача (окно исчезло между наведением и кликом,
+/// `PinAccessDenied`/`AlreadyPinned`) — просто `tracing::warn!` и no-op, тем
+/// же принципом «недостающие элементы — не паника», что у `apply_preset`.
+/// UI-диалог про права администратора (SPEC §5.3) — известный пробел
+/// первого среза, не реализован здесь.
+#[allow(clippy::too_many_arguments)]
+fn add_window_sticker(
+    cfg: &mut Config,
+    config_path: &Path,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    monitor_id: &MonitorId,
+    window_pins: &mut WindowPins,
+    pinned_stickers: &mut HashMap<usize, Uuid>,
+    hwnd: usize,
+) {
+    let Some(win) = window_snapshot.iter().find(|w| w.hwnd == hwnd) else {
+        tracing::warn!("окно под курсором исчезло до клика — стикер-окно не добавлен");
+        return;
+    };
+    let Some(bounds) = monitor_bounds.get(monitor_id) else {
+        return;
+    };
+    let placement = window_rect_to_placement(&win.rect, monitor_id.clone(), bounds);
+    let locator = WindowLocator {
+        process_name: window_exe_path(win),
+        title_pattern: None,
+        ..Default::default()
+    };
+    let sticker = Sticker::new_window(
+        locator,
+        placement.monitor_id,
+        placement.cx,
+        placement.cy,
+        placement.w,
+        placement.h,
+    );
+    match window_pins.pin(sticker_marker(sticker.id), hwnd) {
+        Ok(()) => {
+            pinned_stickers.insert(hwnd, sticker.id);
+            cfg.stickers.push(sticker);
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после добавления стикера-окна");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(hwnd, error = %e, "не удалось закрепить стикер-окно");
+        }
+    }
 }
 
 /// Добавить стикер из файла на диске. `pasted` — источник
@@ -6159,6 +6520,87 @@ mod tests {
             }),
             Some(bounds(-10, 20, 100, 200))
         );
+    }
+
+    // --- M6: стикеры-окна (SPEC.md §5) ---
+
+    fn monitor_bounds_at(x: i32, y: i32, w: u32, h: u32, scale: f64) -> MonitorBounds {
+        MonitorBounds {
+            id: MonitorId("test-monitor".to_string()),
+            bounds_px: bounds(x, y, w, h),
+            scale,
+        }
+    }
+
+    #[test]
+    fn window_rect_to_placement_scale_one_no_origin() {
+        let mon = monitor_bounds_at(0, 0, 1920, 1080, 1.0);
+        let p = window_rect_to_placement(
+            &WindowRect {
+                x: 100,
+                y: 50,
+                w: 400,
+                h: 300,
+            },
+            MonitorId("m".to_string()),
+            &mon,
+        );
+        assert_eq!(p.cx, 300.0, "cx = x + w/2");
+        assert_eq!(p.cy, 200.0, "cy = y + h/2");
+        assert_eq!(p.w, 400.0);
+        assert_eq!(p.h, 300.0);
+        assert_eq!(p.monitor_id, MonitorId("m".to_string()));
+    }
+
+    #[test]
+    fn window_rect_to_placement_subtracts_monitor_origin() {
+        // Второй монитор правее основного: начало (1920, 0) в физике.
+        let mon = monitor_bounds_at(1920, 0, 1920, 1080, 1.0);
+        let p = window_rect_to_placement(
+            &WindowRect {
+                x: 1920 + 100,
+                y: 50,
+                w: 200,
+                h: 100,
+            },
+            MonitorId("m".to_string()),
+            &mon,
+        );
+        // Локальные DIP-координаты монитора — без сдвига на его начало.
+        assert_eq!(p.cx, 100.0 + 100.0);
+        assert_eq!(p.cy, 100.0);
+    }
+
+    #[test]
+    fn window_rect_to_placement_divides_by_scale() {
+        // 200% DPI: физические пиксели вдвое больше DIP.
+        let mon = monitor_bounds_at(0, 0, 3840, 2160, 2.0);
+        let p = window_rect_to_placement(
+            &WindowRect {
+                x: 200,
+                y: 100,
+                w: 800,
+                h: 400,
+            },
+            MonitorId("m".to_string()),
+            &mon,
+        );
+        assert_eq!(p.w, 400.0, "физические 800 / scale 2.0 = 400 DIP");
+        assert_eq!(p.h, 200.0);
+        assert_eq!(p.cx, 100.0 + 200.0);
+        assert_eq!(p.cy, 50.0 + 100.0);
+    }
+
+    #[test]
+    fn sticker_marker_is_deterministic_and_differs_between_stickers() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        assert_eq!(
+            sticker_marker(a),
+            sticker_marker(a),
+            "тот же id — тот же маркер"
+        );
+        assert_ne!(sticker_marker(a), sticker_marker(b));
     }
 
     // --- M4: отсечение полностью перекрытых стикеров ---

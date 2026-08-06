@@ -197,6 +197,36 @@ impl Sticker {
             ..Self::default()
         }
     }
+
+    /// Новый стикер-окно (SPEC.md §5, ROADMAP.md M6): `placement` — текущий
+    /// прямоугольник целевого окна на момент закрепления (DIP, координатор
+    /// переводит из физических пикселей трекера), не производный/дефолтный
+    /// размер, как у файловых стикеров — окно уже существует со своими
+    /// размерами. Ничего не рендерится (SPEC §5.2: «визуальной рамки нет») —
+    /// `placement` только для хит-теста/выделения в режиме редактирования и
+    /// как мирроring текущей геометрии окна (`rst_core::window_follow`).
+    pub fn new_window(
+        locator: WindowLocator,
+        monitor_id: MonitorId,
+        cx: f64,
+        cy: f64,
+        w: f64,
+        h: f64,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            source: StickerSource::Window { window: locator },
+            placement: Placement {
+                monitor_id,
+                cx,
+                cy,
+                w,
+                h,
+            },
+            ..Self::default()
+        }
+    }
 }
 /// Источник стикера (SPEC.md, раздел 2.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
