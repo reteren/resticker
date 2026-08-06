@@ -28,6 +28,7 @@ mod texture;
 mod ui_textures;
 mod video;
 mod widgets;
+mod window_highlight;
 mod window_target;
 
 pub use atlas::{AtlasFrame, TextureAtlas};
@@ -52,4 +53,5 @@ pub use widgets::{
     Button, ButtonContent, Checkbox, EventResult, Icon, Key, NumericField, Panel, PointerEvent,
     Primitive, Slider, Widget, WidgetId, box_contains, theme,
 };
+pub use window_highlight::{HIGHLIGHT_THICKNESS_DIP, HighlightKind, WindowHighlight};
 pub use window_target::WindowTarget;
