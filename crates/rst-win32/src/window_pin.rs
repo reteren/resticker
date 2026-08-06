@@ -1,7 +1,10 @@
-//! Закрепление стикера за окном (ROADMAP.md M6, первый срез): `pin`/`unpin`
-//! через `SetWindowPos` (без активации/фокуса) плюс оконный маркер
-//! `SetPropW`, снятие маркера при `unpin` и отслеживание уничтожения
-//! закреплённого окна.
+//! Закрепление окна поверх остальных (ROADMAP.md M6, «стикеры-окна
+//! (Always On Top)», SPEC.md §5.2): `pin`/`unpin` — это НЕ отдельное окно
+//! (у стикера-окна нет своего HWND, `SPEC.md §5` — резюме: «Закреплённое
+//! окно получает `WS_EX_TOPMOST` и остаётся поверх остальных окон»), а
+//! `SetWindowPos(target, HWND_TOPMOST, ...)` на самом целевом окне, плюс
+//! оконный маркер `SetPropW`, снятый при `unpin`, и отслеживание
+//! уничтожения закреплённого окна.
 //!
 //! Уничтожение таргета ловится БЕЗ собственного WinEvent-хука: общий
 //! диспетчер — [`crate::window_tracker::WindowTracker`] (там же живёт
@@ -13,7 +16,9 @@
 //! Маркер — window property с уникальным именем `resticker`: переживает
 //! процессы (виден другим экземплярам), умирает вместе с окном и позволяет
 //! отличать уже закреплённые окна (в т.ч. оставшиеся от аварийного выхода
-//! прошлого запуска). Значение маркера — HWND стикера: по нему `pin`
+//! прошлого запуска). Значение маркера — непрозрачный `u64` от вызывающего
+//! кода (координатор передаёт хэш `Uuid` стикера — модуль намеренно не
+//! знает про `Uuid`/модель стикера, только числовой маркер): по нему `pin`
 //! отличает «чужой» маркер от своего и детектит переиспользование hwnd.
 //!
 //! UIPI (закрепление поверх окон с повышенными правами) сознательно не
@@ -25,8 +30,8 @@ use std::collections::{HashMap, HashSet};
 
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, HANDLE, HWND, SetLastError};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetPropW, HWND_TOP, IsWindow, RemovePropW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SetPropW, SetWindowPos,
+    GetPropW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, RemovePropW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SetPropW, SetWindowPos,
 };
 use windows::core::{HRESULT, PCWSTR, w};
 
@@ -34,19 +39,8 @@ use crate::error::Win32Error;
 use crate::window_enum::WindowInfo;
 
 /// Имя маркера-проперти (SetPropW), отличающего закреплённые окна.
-/// Уникально для resticker; значение — HWND стикера.
+/// Уникально для resticker; значение — маркер вызывающего кода.
 const PIN_PROP_NAME: PCWSTR = w!("resticker");
-
-/// Сторона закрепления: поверх или под таргетом в z-order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PinAnchor {
-    /// Стикер поверх таргета: `SetWindowPos` с `HWND_TOP` — стикер становится
-    /// верхним окном десктопа (поверх всего, включая таргет).
-    Above,
-    /// Стикер под таргетом: `SetWindowPos` с insertAfter = таргет — таргет
-    /// остаётся выше стикера и кликабельным, стикер перекрывает всё остальное.
-    Below,
-}
 
 /// Безопасное событие закрепления. Никаких Win32-типов.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,10 +55,11 @@ pub enum PinEvent {
 /// трекера): чистые `usize`-ключи, нити и Win32-ресурсы не нужны.
 #[derive(Default)]
 pub struct WindowPins {
-    /// `target hwnd → sticker hwnd`. Единственный источник правды: маркер на
-    /// чужом окне может быть снят извне (другой экземпляр), но книжка
-    /// отражает наши операции.
-    pinned: HashMap<usize, usize>,
+    /// `target hwnd → маркер вызывающего кода` (координатор кладёт сюда
+    /// хэш `Uuid` стикера). Единственный источник правды: маркер на чужом
+    /// окне может быть снят извне (другой экземпляр), но книжка отражает
+    /// наши операции.
+    pinned: HashMap<usize, u64>,
 }
 
 impl WindowPins {
@@ -72,26 +67,21 @@ impl WindowPins {
         Self::default()
     }
 
-    /// Закрепить стикер за таргетом: выставить z-order через `SetWindowPos`
-    /// (флаги `SWP_NOACTIVATE`/`SWP_NOMOVE`/`SWP_NOSIZE` — без активации,
-    /// фокуса и движения) и пометить таргет маркером `SetPropW`.
+    /// Закрепить окно `target` поверх остальных: `SetWindowPos` с
+    /// `HWND_TOPMOST` (флаги `SWP_NOACTIVATE`/`SWP_NOMOVE`/`SWP_NOSIZE` —
+    /// без активации, фокуса и движения/ресайза — SPEC.md §5.2, «стикер»
+    /// это само окно, не отдельный HWND) и маркер `SetPropW` со значением
+    /// `marker` (координатор передаёт свой опознавательный номер —
+    /// см. модульный доккомент).
     ///
-    /// Ошибки: [`Win32Error::PinWindowGone`] — одно из окон уже закрыто;
+    /// Ошибки: [`Win32Error::PinWindowGone`] — таргет уже закрыт;
     /// [`Win32Error::AlreadyPinned`] — таргет уже закреплён (маркер стоит,
     /// в т.ч. от аварийного выхода прошлого запуска); [`Win32Error::PinAccessDenied`]
     /// — UIPI: таргет с повышенными правами, обходить не пытаемся.
-    pub fn pin(
-        &mut self,
-        sticker: usize,
-        target: usize,
-        anchor: PinAnchor,
-    ) -> Result<(), Win32Error> {
-        let sticker_hwnd = hwnd_from_usize(sticker);
+    pub fn pin(&mut self, marker: u64, target: usize) -> Result<(), Win32Error> {
         let target_hwnd = hwnd_from_usize(target);
         // SAFETY: IsWindow безопасен для любых значений, включая мёртвые.
-        if !unsafe { IsWindow(Some(sticker_hwnd)) }.as_bool()
-            || !unsafe { IsWindow(Some(target_hwnd)) }.as_bool()
-        {
+        if !unsafe { IsWindow(Some(target_hwnd)) }.as_bool() {
             return Err(Win32Error::PinWindowGone);
         }
         // SAFETY: target проверен IsWindow выше; GetPropW безопасен и для
@@ -100,35 +90,37 @@ impl WindowPins {
             return Err(Win32Error::AlreadyPinned);
         }
 
-        let insert_after = match anchor {
-            PinAnchor::Below => Some(target_hwnd),
-            PinAnchor::Above => Some(HWND_TOP),
-        };
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-        // SAFETY: оба окна проверены IsWindow; флаги гарантируют отсутствие
+        // SAFETY: target проверен IsWindow; флаги гарантируют отсутствие
         // активации/фокуса и движения/ресайза; SetWindowPos — потокобезопасная
         // операция над чужим окном.
-        unsafe { SetWindowPos(sticker_hwnd, insert_after, 0, 0, 0, 0, flags) }
+        unsafe { SetWindowPos(target_hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags) }
             .map_err(map_pin_err)?;
 
         // SAFETY: target — живое окно; window properties видны из любого
         // процесса, SetPropW безопасен с любого потока.
         unsafe {
-            SetPropW(target_hwnd, PIN_PROP_NAME, Some(HANDLE(sticker_hwnd.0)))
+            SetPropW(target_hwnd, PIN_PROP_NAME, Some(marker_to_handle(marker)))
                 .map_err(map_pin_err)?;
         }
 
-        self.pinned.insert(target, sticker);
+        self.pinned.insert(target, marker);
         Ok(())
     }
 
-    /// Снять закрепление с таргета: снять маркер `RemovePropW` и очистить
-    /// книжку. Идемпотентно: незакреплённое/уже уничтоженное окно — `Ok`
-    /// без действий (маркер умер вместе с окном, либо был снят извне).
-    /// Единственная ошибка — [`Win32Error::PinAccessDenied`].
+    /// Снять закрепление с таргета: снять `WS_EX_TOPMOST` (`SetWindowPos`
+    /// с `HWND_NOTOPMOST` — парная операция к [`Self::pin`]), снять маркер
+    /// `RemovePropW` и очистить книжку. Идемпотентно: незакреплённое/уже
+    /// уничтоженное окно — `Ok` без действий (маркер умер вместе с окном,
+    /// либо был снят извне). Единственная ошибка — [`Win32Error::PinAccessDenied`].
     pub fn unpin(&mut self, target: usize) -> Result<(), Win32Error> {
         self.pinned.remove(&target);
         let target_hwnd = hwnd_from_usize(target);
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        // SAFETY: SetWindowPos безопасен и для уже уничтоженного окна
+        // (просто возвращает ошибку, которую мы здесь игнорируем — unpin
+        // мёртвого таргета не ошибка, снимать WS_EX_TOPMOST не с чего).
+        let _ = unsafe { SetWindowPos(target_hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags) };
         // SAFETY: SetLastError — потоковый регистр ошибки; RemovePropW
         // безопасен и для несуществующего окна (вернёт NULL + ошибку хэндла).
         unsafe {
@@ -176,11 +168,11 @@ impl WindowPins {
     pub fn handle_snapshot(&mut self, windows: &[WindowInfo]) -> Vec<PinEvent> {
         let present: HashSet<usize> = windows.iter().map(|w| w.hwnd).collect();
         let mut destroyed = Vec::new();
-        for (&target, &sticker) in &self.pinned {
+        for (&target, &marker) in &self.pinned {
             if present.contains(&target) {
                 continue;
             }
-            if !window_still_pinned(target, sticker) {
+            if !window_still_pinned(target, marker) {
                 destroyed.push(target);
             }
         }
@@ -193,16 +185,16 @@ impl WindowPins {
     }
 }
 
-/// Окно живо И несёт наш маркер (значение — HWND стикера). Мёртвое окно —
-/// `false`; живое окно без маркера — hwnd переиспользован чужим окном,
+/// Окно живо И несёт наш маркер. Мёртвое окно — `false`; живое окно с
+/// другим (или отсутствующим) маркером — hwnd переиспользован чужим окном,
 /// наш таргет мёртв — тоже `false`.
-fn window_still_pinned(target: usize, sticker: usize) -> bool {
+fn window_still_pinned(target: usize, marker: u64) -> bool {
     let hwnd = hwnd_from_usize(target);
     // SAFETY: IsWindow безопасен для любых значений; GetPropW — для чужих
     // и несуществующих окон (вернёт NULL).
     unsafe {
         IsWindow(Some(hwnd)).as_bool()
-            && GetPropW(hwnd, PIN_PROP_NAME).0 == hwnd_from_usize(sticker).0
+            && GetPropW(hwnd, PIN_PROP_NAME).0 == marker_to_handle(marker).0
     }
 }
 
@@ -218,6 +210,16 @@ fn map_pin_err(e: windows::core::Error) -> Win32Error {
 
 fn hwnd_from_usize(hwnd: usize) -> HWND {
     HWND(hwnd as *mut core::ffi::c_void)
+}
+
+/// Маркер вызывающего кода → значение window property. `HANDLE` внутри —
+/// просто числовое значение (как `HWND`), не настоящий хэндл: `SetPropW`/
+/// `GetPropW` не разыменовывают его, годится любой `usize`. На 32-битной
+/// сборке (не таргет resticker, но на всякий случай) усечение маркера до
+/// младших 32 бит — не проблема: маркер используется только для сравнения
+/// «свой/чужой», не как уникальный на всё пространство `u64` идентификатор.
+fn marker_to_handle(marker: u64) -> HANDLE {
+    HANDLE(marker as usize as *mut core::ffi::c_void)
 }
 
 #[cfg(test)]
@@ -310,30 +312,46 @@ mod tests {
         }
     }
 
+    /// Произвольный опознавательный маркер для теста (координатор передаёт
+    /// хэш `Uuid` стикера — здесь просто константа, значение не важно).
+    const MARKER: u64 = 0xC0FF_EE12_3456_7890;
+    const MARKER_B: u64 = 0xDEAD_BEEF_0000_0001;
+
+    /// Флаг `WS_EX_TOPMOST` окна.
+    fn is_topmost(hwnd: HWND) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GetWindowLongPtrW};
+        // SAFETY: чтение стиля живого окна.
+        (unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32
+            & windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST.0)
+            != 0
+    }
+
     #[test]
-    fn pin_sets_marker_and_bookkeeping() {
-        let sticker = TestWindow::create();
+    fn pin_sets_marker_and_topmost() {
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
         assert!(!pins.is_pinned(key(target.0)));
+        assert!(!is_topmost(target.0), "до pin не topmost");
 
-        pins.pin(key(sticker.0), key(target.0), PinAnchor::Below)
-            .expect("пин скрытых окон должен работать");
+        pins.pin(MARKER, key(target.0))
+            .expect("пин скрытого окна должен работать");
         assert!(pins.is_pinned(key(target.0)));
+        assert!(is_topmost(target.0), "pin выставляет WS_EX_TOPMOST");
         // SAFETY: маркер только что поставлен этим же тестом.
         let marker = unsafe { GetPropW(target.0, PIN_PROP_NAME) };
-        assert_eq!(marker.0, sticker.0.0, "маркер хранит HWND стикера");
+        assert_eq!(
+            marker.0,
+            marker_to_handle(MARKER).0,
+            "маркер сохранён как есть"
+        );
     }
 
     #[test]
     fn double_pin_same_target_is_rejected() {
-        let sticker_a = TestWindow::create();
-        let sticker_b = TestWindow::create();
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
-        pins.pin(key(sticker_a.0), key(target.0), PinAnchor::Above)
-            .expect("первичный пин");
-        let err = pins.pin(key(sticker_b.0), key(target.0), PinAnchor::Below);
+        pins.pin(MARKER, key(target.0)).expect("первичный пин");
+        let err = pins.pin(MARKER_B, key(target.0));
         match err {
             Err(Win32Error::AlreadyPinned) => {}
             Err(e) => panic!("ожидался AlreadyPinned, получено: {e}"),
@@ -343,12 +361,11 @@ mod tests {
 
     #[test]
     fn pin_dead_target_is_rejected() {
-        let sticker = TestWindow::create();
         let target = TestWindow::create();
         let dead = key(target.0);
         drop(target);
         let mut pins = WindowPins::new();
-        match pins.pin(key(sticker.0), dead, PinAnchor::Below) {
+        match pins.pin(MARKER, dead) {
             Err(Win32Error::PinWindowGone) => {}
             Err(e) => panic!("ожидался PinWindowGone, получено: {e}"),
             Ok(_) => panic!("пин мёртвого окна должен отвергаться"),
@@ -356,31 +373,28 @@ mod tests {
     }
 
     #[test]
-    fn unpin_removes_marker_and_allows_repin() {
-        let sticker = TestWindow::create();
+    fn unpin_removes_marker_and_topmost_and_allows_repin() {
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
-        pins.pin(key(sticker.0), key(target.0), PinAnchor::Below)
-            .expect("пин");
+        pins.pin(MARKER, key(target.0)).expect("пин");
         pins.unpin(key(target.0)).expect("unpin");
         assert!(!pins.is_pinned(key(target.0)));
+        assert!(!is_topmost(target.0), "unpin снимает WS_EX_TOPMOST");
 
         // Идемпотентность: повторный unpin не ошибка.
         pins.unpin(key(target.0)).expect("повторный unpin");
 
         // Маркер снят — можно пинить заново.
-        pins.pin(key(sticker.0), key(target.0), PinAnchor::Above)
+        pins.pin(MARKER_B, key(target.0))
             .expect("повторный пин после unpin");
         assert!(pins.is_pinned(key(target.0)));
     }
 
     #[test]
     fn unpin_dead_target_is_ok() {
-        let sticker = TestWindow::create();
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
-        pins.pin(key(sticker.0), key(target.0), PinAnchor::Below)
-            .expect("пин");
+        pins.pin(MARKER, key(target.0)).expect("пин");
         let dead = key(target.0);
         drop(target);
         // Окно уничтожено — маркер умер с ним, снимать нечего, это не ошибка.
@@ -389,15 +403,11 @@ mod tests {
 
     #[test]
     fn unpin_all_clears_all_pins() {
-        let sticker_a = TestWindow::create();
-        let sticker_b = TestWindow::create();
         let target_a = TestWindow::create();
         let target_b = TestWindow::create();
         let mut pins = WindowPins::new();
-        pins.pin(key(sticker_a.0), key(target_a.0), PinAnchor::Below)
-            .expect("пин A");
-        pins.pin(key(sticker_b.0), key(target_b.0), PinAnchor::Above)
-            .expect("пин B");
+        pins.pin(MARKER, key(target_a.0)).expect("пин A");
+        pins.pin(MARKER_B, key(target_b.0)).expect("пин B");
         pins.unpin_all();
         assert!(!pins.is_pinned(key(target_a.0)));
         assert!(!pins.is_pinned(key(target_b.0)));
@@ -405,11 +415,9 @@ mod tests {
 
     #[test]
     fn snapshot_with_target_present_keeps_pin() {
-        let sticker = TestWindow::create();
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
-        pins.pin(key(sticker.0), key(target.0), PinAnchor::Below)
-            .expect("пин");
+        pins.pin(MARKER, key(target.0)).expect("пин");
         assert!(pins.handle_snapshot(&[info(key(target.0))]).is_empty());
         assert!(pins.is_pinned(key(target.0)));
     }
@@ -418,11 +426,9 @@ mod tests {
     fn snapshot_alive_but_hidden_target_keeps_pin() {
         // Окно живо и помечено, но снимок его не видит (скрыто/свёрнуто) —
         // это не уничтожение, закрепление сохраняется.
-        let sticker = TestWindow::create();
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
-        pins.pin(key(sticker.0), key(target.0), PinAnchor::Below)
-            .expect("пин");
+        pins.pin(MARKER, key(target.0)).expect("пин");
         let events = pins.handle_snapshot(&[]);
         assert!(
             events.is_empty(),
@@ -433,11 +439,9 @@ mod tests {
 
     #[test]
     fn snapshot_after_destroy_emits_event_and_clears() {
-        let sticker = TestWindow::create();
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
-        pins.pin(key(sticker.0), key(target.0), PinAnchor::Below)
-            .expect("пин");
+        pins.pin(MARKER, key(target.0)).expect("пин");
         let dead = key(target.0);
         drop(target);
 
@@ -467,15 +471,13 @@ mod tests {
         // hwnd переиспользован другим окном: живой hwnd без нашего маркера —
         // таргет мёртв, закрепление снимается. Имитация: маркер снят, окно
         // живо и числится в книжке.
-        let sticker = TestWindow::create();
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
-        pins.pin(key(sticker.0), key(target.0), PinAnchor::Below)
-            .expect("пин");
+        pins.pin(MARKER, key(target.0)).expect("пин");
         pins.unpin(key(target.0)).expect("снятие маркера");
         // Вернуть таргет в книжку вручную — сценарий «маркер исчез извне,
         // окно живо».
-        pins.pinned.insert(key(target.0), key(sticker.0));
+        pins.pinned.insert(key(target.0), MARKER);
 
         let events = pins.handle_snapshot(&[]);
         assert_eq!(
@@ -629,17 +631,15 @@ mod tests {
         let (tracker, rx) = WindowTracker::start().expect("создание трекера");
         tracker.set_mask_needed(true);
         let win = RealWindow::create();
-        let sticker = TestWindow::create();
         let mut pins = WindowPins::new();
         let target = win.hwnd.0 as usize;
 
-        // Дождаться таргета в кэше трекера и закрепить за ним стикер.
+        // Дождаться таргета в кэше трекера и закрепить его.
         let seen = feed_until(&rx, |windows| {
             windows.iter().any(|w| w.hwnd == target).then_some(())
         });
         assert!(seen.is_some(), "тестовое окно должно попасть в кэш трекера");
-        pins.pin(key(sticker.0), target, PinAnchor::Below)
-            .expect("пин к реальному окну");
+        pins.pin(MARKER, target).expect("пин реального окна");
         assert!(pins.is_pinned(target));
 
         // Уничтожить таргет: EVENT_OBJECT_DESTROY → снимок трекера без окна →
