@@ -10,13 +10,15 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
 
 use rst_core::model::{OverlapRule, VisibilityMode, VisibilityRule};
 use rst_core::occluders::{OccluderCandidate, rule_matches};
 use rst_render::{
     Box2D, Button, ButtonContent, Checkbox, Panel, Primitive, Widget, WidgetId, text_size, theme,
 };
-use rst_win32::window_enum::WindowInfo;
+use rst_win32::window_enum::{WindowIcon, WindowInfo};
 
 /// Одна группа процессов (дизайн §3): ключ — короткое имя `exe_path`,
 /// не pid (переживает рестарты; «все будущие окна этого процесса», SPEC 4.2).
@@ -266,8 +268,8 @@ pub const PICKER_ROW_H: f64 = theme::BUTTON_SIZE;
 pub const PICKER_PAD: f64 = 6.0;
 /// Отступ строк окон от левого края строк процесса, DIP.
 pub const PICKER_WINDOW_INDENT: f64 = 24.0;
-/// Сторона слота-плейсхолдера иконки, DIP (дизайн §6: реальные иконки —
-/// отдельный срез, здесь только зарезервированное место).
+/// Сторона слота иконки, DIP (дизайн §6: реальный растр окна
+/// растягивается в этот квадрат; без иконки — плейсхолдер того же размера).
 pub const PICKER_ICON_SIZE: f64 = 20.0;
 /// Зазор между колонками, DIP.
 pub const PICKER_GAP: f64 = 8.0;
@@ -369,6 +371,7 @@ pub fn build_picker_panel(
                 text_rect(process_label_left, cy, &text),
                 icon_rect(icon_cx, cy),
                 text,
+                process_icon(group),
             ));
             built += 1;
         }
@@ -382,11 +385,16 @@ pub fn build_picker_panel(
                 cb.set_disabled(true);
                 panel.add_widget(cb);
                 let title = truncate_to_width(&window.title, window_label_max_w);
+                let window_icon = window
+                    .icon
+                    .clone()
+                    .map(|icon| (icon_key(&window.exe_path), icon));
                 panel.add_widget(RowLabel::new(
                     id + LABEL_FLAG,
                     text_rect(window_label_left, cy, &title),
                     icon_rect(icon_cx, cy),
                     title,
+                    window_icon,
                 ));
                 built += 1;
             }
@@ -439,7 +447,8 @@ fn text_rect(left: f64, cy: f64, text: &str) -> Box2D {
     }
 }
 
-/// Слот-плейсхолдер иконки (дизайн §6): пустой квадрат в колонке иконок.
+/// Слот иконки строки: квадрат в колонке иконок (реальный растр
+/// [`Primitive::Rgba`] или плейсхолдер-`Fill` — решает `RowLabel::draw`).
 fn icon_rect(cx: f64, cy: f64) -> Box2D {
     Box2D {
         cx,
@@ -458,25 +467,38 @@ fn all_windows_checked(visibility: &VisibilityRule, snapshot: &[WindowInfo]) -> 
         .all(|w| !window_can_express_rule(w) || window_is_checked(visibility, w))
 }
 
-/// Надпись строки списка + слот-плейсхолдер иконки (дизайн §6): один виджет
-/// на строку, эмитит квадрат колонки иконок и текст (заголовок окна / имя
-/// процесса). В toolbar.rs/cursor_panel.rs текстовых виджетов нет (подписи
-/// живут внутри кнопок) — поэтому мини-виджет приватный здесь. Хит-теста
-/// нет: строка не потребляет клики, интерактивны только чекбоксы.
+/// Надпись строки списка + слот иконки (дизайн §6; иконки — срез M4,
+/// `WindowInfo.icon`): один виджет на строку, эмитит квадрат колонки
+/// иконок (реальный растр [`Primitive::Rgba`] при `icon: Some`, иначе
+/// плейсхолдер-`Fill`) и текст (заголовок окна / имя процесса).
+/// В toolbar.rs/cursor_panel.rs текстовых виджетов нет (подписи живут
+/// внутри кнопок) — поэтому мини-виджет приватный здесь. Хит-теста нет:
+/// строка не потребляет клики, интерактивны только чекбоксы.
 struct RowLabel {
     id: WidgetId,
     text_rect: Box2D,
     icon_rect: Box2D,
     text: String,
+    /// Иконка строки: key кэша текстур (`Primitive::Rgba`, окна одного
+    /// exe делят key) + сам растр. `None` — иконка не извлеклась
+    /// (панель рисует плейсхолдер, дизайн §6).
+    icon: Option<(u64, WindowIcon)>,
 }
 
 impl RowLabel {
-    fn new(id: WidgetId, text_rect: Box2D, icon_rect: Box2D, text: String) -> Self {
+    fn new(
+        id: WidgetId,
+        text_rect: Box2D,
+        icon_rect: Box2D,
+        text: String,
+        icon: Option<(u64, WindowIcon)>,
+    ) -> Self {
         Self {
             id,
             text_rect,
             icon_rect,
             text,
+            icon,
         }
     }
 }
@@ -499,11 +521,21 @@ impl Widget for RowLabel {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
-        out.push(Primitive::Fill {
-            rect: self.icon_rect,
-            color: theme::BUTTON_BG,
-            opacity: 1.0,
-        });
+        match &self.icon {
+            Some((key, icon)) => out.push(Primitive::Rgba {
+                rect: self.icon_rect,
+                key: *key,
+                width: icon.width,
+                height: icon.height,
+                rgba: icon.rgba.clone(),
+                opacity: 1.0,
+            }),
+            None => out.push(Primitive::Fill {
+                rect: self.icon_rect,
+                color: theme::BUTTON_BG,
+                opacity: 1.0,
+            }),
+        }
         if !self.text.is_empty() {
             out.push(Primitive::Text {
                 rect: self.text_rect,
@@ -521,6 +553,25 @@ impl Widget for RowLabel {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+}
+
+/// Стабильный key иконки для кэша текстур (`Primitive::Rgba`): хэш полного
+/// пути exe — окна одного процесса делят одну GPU-текстуру (дедупликация
+/// на уровне кэша, как и на уровне извлечения иконок в rst-win32).
+/// `DefaultHasher` детерминирован в рамках процесса — кэш текстур живёт
+/// в нём же, рассинхрон ключей невозможен.
+fn icon_key(exe_path: &Path) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    exe_path.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Иконка строки процесса: общая для всех окон группы (один exe) — берём
+/// первое окно. `None` — у группы нет иконки (не извлеклась).
+fn process_icon(group: &ProcessGroup) -> Option<(u64, WindowIcon)> {
+    let window = group.windows.first()?;
+    let icon = window.icon.clone()?;
+    Some((icon_key(&window.exe_path), icon))
 }
 
 #[cfg(test)]
@@ -544,6 +595,25 @@ mod tests {
             iconic: false,
             icon: None,
         }
+    }
+
+    /// Окно с иконкой `size×size` (пустой растр — важен только факт наличия
+    /// и его размер/ключ).
+    fn window_with_icon(
+        hwnd: usize,
+        exe: &str,
+        title: &str,
+        pid: u32,
+        z: u32,
+        size: u32,
+    ) -> WindowInfo {
+        let mut w = window(hwnd, exe, title, pid, z);
+        w.icon = Some(WindowIcon {
+            width: size,
+            height: size,
+            rgba: vec![0u8; (size * size * 4) as usize],
+        });
+        w
     }
 
     fn rule(process: Option<&str>, title: Option<&str>) -> OverlapRule {
@@ -1016,6 +1086,20 @@ mod tests {
             .count()
     }
 
+    /// Все `Primitive::Rgba` панели в порядке отрисовки.
+    fn rgba_icons(panel: &Panel) -> Vec<(u64, u32, u32)> {
+        let mut out = Vec::new();
+        panel.draw(&mut out);
+        out.into_iter()
+            .filter_map(|p| match p {
+                Primitive::Rgba {
+                    key, width, height, ..
+                } => Some((key, width, height)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn empty_snapshot_builds_header_only() {
         let p = build_picker_panel(&allowlist(vec![]), &[], 0, picker_frame());
@@ -1330,5 +1414,75 @@ mod tests {
                 .any(|t| t.ends_with("...") && t.len() < long_title.len()),
             "длинный заголовок должен быть обрезан с многоточием: {texts:?}"
         );
+    }
+
+    // --- иконки строк (M4 §6) ---
+
+    #[test]
+    fn row_with_icon_emits_rgba_primitive_not_fill() {
+        let snapshot = [window_with_icon(
+            1,
+            r"C:\Apps\chrome.exe",
+            "Chrome",
+            100,
+            1,
+            16,
+        )];
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        // Строки: chrome-процесс + chrome-окно — обе с иконками: два Rgba,
+        // плейсхолдеров (Fill) в колонке иконок нет вовсе.
+        let icons = rgba_icons(&p.panel);
+        assert_eq!(icons.len(), 2, "процесс и окно несут иконки: {icons:?}");
+        assert!(icons.iter().all(|&(_, w, h)| w == 16 && h == 16));
+        assert_eq!(icon_slot_count(&p.panel), 0, "плейсхолдеров не осталось");
+    }
+
+    #[test]
+    fn rows_of_same_process_share_icon_key() {
+        let snapshot = [
+            window_with_icon(1, r"C:\Apps\chrome.exe", "Chrome A", 100, 1, 16),
+            window_with_icon(2, r"C:\Apps\chrome.exe", "Chrome B", 200, 2, 16),
+        ];
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let icons = rgba_icons(&p.panel);
+        // Процесс + два окна: три Rgba с одним ключом — одна GPU-текстура
+        // на весь процесс (дедупликация кэша текстур).
+        assert_eq!(icons.len(), 3);
+        let keys: Vec<u64> = icons.iter().map(|&(k, _, _)| k).collect();
+        assert!(
+            keys.iter().all(|&k| k == keys[0]),
+            "все строки одного exe делят key: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_processes_get_distinct_icon_keys() {
+        let snapshot = [
+            window_with_icon(1, r"C:\Apps\chrome.exe", "Chrome", 100, 1, 16),
+            window_with_icon(2, r"C:\Apps\firefox.exe", "Firefox", 200, 2, 16),
+        ];
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let icons = rgba_icons(&p.panel);
+        let keys: Vec<u64> = icons.iter().map(|&(k, _, _)| k).collect();
+        assert_eq!(keys[0], keys[1], "chrome: процесс и окно");
+        assert_eq!(keys[2], keys[3], "firefox: процесс и окно");
+        assert_ne!(keys[0], keys[2], "разные exe — разные key");
+    }
+
+    #[test]
+    fn window_without_icon_keeps_fill_placeholder() {
+        let snapshot = [window(1, r"C:\Apps\app.exe", "No icon", 1, 1)];
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        assert_eq!(icon_slot_count(&p.panel), 2, "процесс и окно: плейсхолдеры");
+        assert!(rgba_icons(&p.panel).is_empty());
+    }
+
+    #[test]
+    fn icon_key_is_stable_for_same_path() {
+        let a = icon_key(Path::new(r"C:\Apps\chrome.exe"));
+        let b = icon_key(Path::new(r"C:\Apps\chrome.exe"));
+        assert_eq!(a, b, "тот же путь — тот же key (кэш текстур стабилен)");
+        let c = icon_key(Path::new(r"C:\Apps\firefox.exe"));
+        assert_ne!(a, c, "разные пути — разные key");
     }
 }

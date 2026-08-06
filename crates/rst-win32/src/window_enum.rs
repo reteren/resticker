@@ -7,7 +7,9 @@
 //! отдельный модуль (`WindowTracker`, M4_PREP_NOTES §3), здесь только
 //! одноразовое перечисление.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -22,6 +24,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, PWSTR};
+
+use crate::window_icon;
 
 /// Таймаут кросс-поточного чтения заголовка (мс), [`window_text`]. Верх
 /// диапазона 200–500 мс: `SMTO_ABORTIFHUNG` и так возвращает сразу на
@@ -85,8 +89,43 @@ pub struct WindowInfo {
     /// Окно свёрнуто: не оклюдер (прямоугольник мусорный), но показывается
     /// в панели выбора (M4_PREP_NOTES §2.2).
     pub iconic: bool,
-    /// Место под иконку окна (панель выбора M4): пока всегда `None`.
+    /// Место под иконку окна (панель выбора M4): заполняется [`window_icon`]
+    /// при перечислении; `None` — у окна нет exe-пути (protected process),
+    /// извлечение не удалось или иконки нет (панель рисует плейсхолдер).
     pub icon: Option<WindowIcon>,
+}
+
+/// Кэш иконок по пути exe (M4, docs/M4_WINDOW_PICKER_DESIGN.md §6): окна
+/// одного процесса делят одну иконку, а `SHGetFileInfoW` на первом
+/// обращении к файлу стоит единицы миллисекунд — и то, и другое решается
+/// «вытащить один раз на уникальный exe и хранить». Кэшируется и неудача
+/// (`None`): exe мог быть удалён/стать недоступным — повторный пробой на
+/// каждое перечисление не нужен. Процесс-wide статик: трекер окон (и его
+/// полные перечисления) живёт на своём потоке, а иконки не зависят ни от
+/// времени, ни от окна — вытеснение не требуется (число уникальных exe за
+/// сессию — десятки, растр 16×16 ≈ 1 КБ).
+static ICON_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<WindowIcon>>>> = OnceLock::new();
+
+/// Иконка процесса по пути exe: кэш, иначе извлечение + запись в кэш
+/// (успех и неудача одинаково). Пустой путь (protected process, сбой
+/// `OpenProcess`) — `None` без обращения к кэшу.
+fn window_icon(exe_path: &Path) -> Option<WindowIcon> {
+    if exe_path.as_os_str().is_empty() {
+        return None;
+    }
+    let cache = ICON_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = match cache.lock() {
+        Ok(guard) => guard,
+        // Отравленный мьютекс (паника во время извлечения) — продолжаем
+        // работать со старым содержимым, иконки не критичны.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(icon) = cache.get(exe_path) {
+        return icon.clone();
+    }
+    let icon = window_icon::extract_icon(exe_path);
+    cache.insert(exe_path.to_path_buf(), icon.clone());
+    icon
 }
 
 /// Снимок признаков окна для чистого фильтра (собирается Win32-вызовами
@@ -172,6 +211,7 @@ fn collect_window(hwnd: HWND, z_order: u32) -> Option<WindowInfo> {
         return None;
     }
     let (pid, exe_path) = process_info(hwnd);
+    let icon = window_icon(&exe_path);
     Some(WindowInfo {
         hwnd: hwnd.0 as usize,
         rect: extended_frame_bounds(hwnd),
@@ -181,7 +221,7 @@ fn collect_window(hwnd: HWND, z_order: u32) -> Option<WindowInfo> {
         class: window_class(hwnd),
         z_order,
         iconic: flags.iconic,
-        icon: None,
+        icon,
     })
 }
 
@@ -561,5 +601,37 @@ mod tests {
             }
             prev = Some(w.z_order);
         }
+    }
+
+    /// Иконки окон (M4 §6) на реальном десктопе: хотя бы у одного окна
+    /// иконка извлечена (у окна с exe-путём шелл обязан её отдать), растр
+    /// квадратный и полный (`rgba.len() == w*h*4`). Окна без exe-пути
+    /// (protected process) остаются `None` — это не ошибка.
+    #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 window_enum -- --ignored"]
+    fn enumerate_populates_icons_for_real_windows() {
+        let windows = enumerate();
+        let mut with_icon = 0;
+        for w in &windows {
+            if let Some(icon) = &w.icon {
+                with_icon += 1;
+                assert_eq!(
+                    icon.rgba.len(),
+                    icon.width as usize * icon.height as usize * 4,
+                    "растр иконки полный: {w:?}"
+                );
+                assert!(icon.width > 0 && icon.height > 0, "размер иконки: {w:?}");
+            }
+            if w.exe_path.as_os_str().is_empty() {
+                assert!(
+                    w.icon.is_none(),
+                    "окно без exe-пути не может иметь иконку: {w:?}"
+                );
+            }
+        }
+        assert!(
+            with_icon > 0,
+            "хотя бы одно окно с иконкой на реальном десктопе"
+        );
     }
 }

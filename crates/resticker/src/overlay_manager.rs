@@ -750,6 +750,12 @@ struct UiTextureCache {
     // растягиваются как обычные спрайты) масштабонезависимы — не трогаем.
     texts: HashMap<(String, [u8; 3], u32), Texture>,
     icons: HashMap<(Icon, u32), Texture>,
+    // Иконки окон (M4 §6): ключ — (стабильный key примитива, размер растра).
+    // `rgba` примитива нужен только на первом аплоаде; размеры иконок окна
+    // фиксированы на сессию (16×16 на 96 DPI), масштабонезависимы, как
+    // `fills` — пересоздаются только при потере устройства (кэш целиком
+    // пересоздаётся в `recover_device`).
+    rgba_icons: HashMap<(u64, u32, u32), Texture>,
 }
 
 impl UiTextureCache {
@@ -758,6 +764,7 @@ impl UiTextureCache {
             fills: HashMap::new(),
             texts: HashMap::new(),
             icons: HashMap::new(),
+            rgba_icons: HashMap::new(),
         }
     }
 
@@ -822,6 +829,34 @@ impl UiTextureCache {
             }
         }
     }
+    /// Текстура произвольного RGBA-растра (иконка окна в панели выбора,
+    /// M4 §6): кэш по (key, width, height) — окна одного процесса делят
+    /// один key и одну текстуру; `rgba` используется только на первом
+    /// аплоаде. Ошибка фабрики не кэшируется (следующий кадр пробует
+    /// снова), как у `icon_texture`.
+    fn rgba_texture(
+        &mut self,
+        renderer: &Renderer,
+        key: u64,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Option<Texture> {
+        let ckey = (key, width, height);
+        if let Some(t) = self.rgba_icons.get(&ckey) {
+            return Some(t.clone());
+        }
+        match renderer.create_texture_from_rgba(rgba, width, height) {
+            Ok(t) => {
+                self.rgba_icons.insert(ckey, t.clone());
+                Some(t)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, key, "не удалось создать текстуру иконки окна");
+                None
+            }
+        }
+    }
 }
 
 /// Перевести примитивы панели (`Panel::draw`) в спрайты кадра, используя кэш
@@ -869,6 +904,18 @@ fn primitives_to_sprites(
                     .round()
                     .max(1.0) as u32;
                 if let Some(tex) = cache.icon_texture(renderer, *icon, size_px) {
+                    out.push(solid_sprite(&tex, monitor_id, rect, *opacity));
+                }
+            }
+            Primitive::Rgba {
+                rect,
+                key,
+                width,
+                height,
+                rgba,
+                opacity,
+            } => {
+                if let Some(tex) = cache.rgba_texture(renderer, *key, *width, *height, rgba) {
                     out.push(solid_sprite(&tex, monitor_id, rect, *opacity));
                 }
             }
