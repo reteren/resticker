@@ -8,8 +8,8 @@ use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    ExtractIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    ExtractIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -25,6 +25,20 @@ use crate::error::Win32Error;
 
 const WM_TRAYICON: u32 = WM_APP + 1;
 const CLASS_NAME: PCWSTR = w!("resticker_tray");
+
+/// `uID` иконки трея — единый для `NIM_ADD` (создание), `NIM_DELETE`
+/// (снятие) и `NIM_MODIFY` (баллон [`TrayIcon::show_balloon`]): `NIF_INFO`
+/// обновляет только поля уведомления УЖЕ существующей иконки, hwnd/uID
+/// обязаны совпадать с созданными в `notify_icon_data`.
+const TRAY_UID: u32 = 1;
+
+/// Максимум заголовка баллона, UTF-16 code units (Windows, `szInfoTitle`
+/// вмещает 64 с учётом завершающего NUL — значимых 63).
+pub const BALLOON_TITLE_MAX_UNITS: usize = 63;
+
+/// Максимум тела баллона, UTF-16 code units (Windows, `szInfo` вмещает 256
+/// с учётом завершающего NUL — значимых 255).
+pub const BALLOON_BODY_MAX_UNITS: usize = 255;
 
 /// Один пункт контекстного меню трея; `id` возвращается в `TrayEvent::MenuItem`.
 /// `id == 0` рисуется как разделитель (см. [`separator`]).
@@ -96,6 +110,42 @@ impl TrayIcon {
             },
             rx,
         ))
+    }
+
+    /// Показать баллонное уведомление от иконки трея (Windows
+    /// balloon-notification, `NOTIFYICONDATAW` с `NIF_INFO` →
+    /// `Shell_NotifyIconW(NIM_MODIFY, …)`) — на той же `hwnd`/`uID`, что
+    /// создала `NIM_ADD`, поэтому работает только при живом трее
+    /// (`Drop` после этой ошибки снимает иконку).
+    ///
+    /// `title`/`body` — UTF-8, внутри усекаются до лимитов Windows
+    /// (63/255 UTF-16 code units) корректно по границе символа (суррогатные
+    /// пары не разрываются, [`truncate_utf16_nul`]). `dwInfoFlags` —
+    /// `NIIF_WARNING` (предупреждение). Вызов можно делать с любого потока —
+    /// `Shell_NotifyIconW` не требует потока окна.
+    pub fn show_balloon(&self, title: &str, body: &str) -> Result<(), Win32Error> {
+        let title_w = truncate_utf16_nul(title, BALLOON_TITLE_MAX_UNITS);
+        let body_w = truncate_utf16_nul(body, BALLOON_BODY_MAX_UNITS);
+        let mut data = NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_UID,
+            // Только NIF_INFO: NIM_MODIFY обновляет поля уведомления, всё
+            // остальное (иконка, тултип) остаётся от NIM_ADD.
+            uFlags: NIF_INFO,
+            dwInfoFlags: NIIF_WARNING,
+            ..Default::default()
+        };
+        data.szInfoTitle[..title_w.len()].copy_from_slice(&title_w);
+        data.szInfo[..body_w.len()].copy_from_slice(&body_w);
+        // SAFETY: data полностью инициализирована выше; hwnd/uID — живого
+        // трея (пока TrayIcon жив), NIM_MODIFY на чужой/снятый hwnd просто
+        // вернёт FALSE, никакого UB.
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+            Ok(())
+        } else {
+            Err(Win32Error::TrayNotifyIconFailed)
+        }
     }
 }
 
@@ -264,7 +314,7 @@ fn notify_icon_data(hwnd: HWND, tooltip: &str) -> NOTIFYICONDATAW {
     let mut data = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
-        uID: 1,
+        uID: TRAY_UID,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: WM_TRAYICON,
         hIcon: app_icon().unwrap_or(fallback),
@@ -274,6 +324,27 @@ fn notify_icon_data(hwnd: HWND, tooltip: &str) -> NOTIFYICONDATAW {
     let len = wide.len().min(data.szTip.len() - 1);
     data.szTip[..len].copy_from_slice(&wide[..len]);
     data
+}
+
+/// Усечь строку до `max_units` UTF-16 code units и завершить NUL — для
+/// `szInfoTitle`/`szInfo` баллона (`NIF_INFO`). Лимиты Windows заданы в
+/// code units, а не в символах: суррогатная пара эмодзи — 2 units. Усечение
+/// идёт по границе символа: если последний взятый unit — верхний (старший)
+/// суррогат разорванной пары, он отбрасывается (влезает весь символ или
+/// ни одного). Результат — ровно `min(len, max_units)` (минус разорванная
+/// пара) единиц + NUL: помещается в `[u16; max_units + 1]`.
+fn truncate_utf16_nul(text: &str, max_units: usize) -> Vec<u16> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut out: Vec<u16> = units.iter().copied().take(max_units).collect();
+    // Высокий суррогат (0xD800..=0xDBFF) последним — пара разорвана на
+    // границе усечения: выкидываем старшую половину, низкий суррогат не
+    // влез (или текст целиком валиден, и тогда высокий суррогат последним
+    // не бывает — непарных суррогатов в валидном UTF-16 нет).
+    if out.last().is_some_and(|&u| (0xD800..=0xDBFF).contains(&u)) {
+        out.pop();
+    }
+    out.push(0);
+    out
 }
 
 fn add_notify_icon(hwnd: HWND, tooltip: &str) -> Result<(), Win32Error> {
@@ -290,7 +361,7 @@ fn remove_notify_icon(hwnd: HWND) -> Result<(), Win32Error> {
     let data = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
-        uID: 1,
+        uID: TRAY_UID,
         ..Default::default()
     };
     // SAFETY: data полностью инициализирована выше.
@@ -409,6 +480,86 @@ mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
+    // --- чистая функция усечения (без Win32) ---
+
+    fn as_utf16(s: &str) -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v
+    }
+
+    #[test]
+    fn truncate_keeps_short_string_nul_terminated() {
+        assert_eq!(truncate_utf16_nul("abc", 63), as_utf16("abc"));
+        assert_eq!(truncate_utf16_nul("", 255), vec![0]);
+    }
+
+    #[test]
+    fn truncate_exact_limit_keeps_everything() {
+        let s = "x".repeat(63);
+        let out = truncate_utf16_nul(&s, BALLOON_TITLE_MAX_UNITS);
+        assert_eq!(out.len(), 63 + 1);
+        assert_eq!(&out[..63], &as_utf16(&s)[..63]);
+    }
+
+    #[test]
+    fn truncate_cuts_at_unit_limit() {
+        // Кириллица — 1 code unit на символ: 70 символов режутся до 63.
+        let s = "я".repeat(70);
+        let out = truncate_utf16_nul(&s, BALLOON_TITLE_MAX_UNITS);
+        assert_eq!(out.len(), 63 + 1);
+        assert!(out[..63].iter().all(|&u| u == 'я' as u16));
+        assert_eq!(out[63], 0);
+    }
+
+    #[test]
+    fn truncate_body_limit_is_255() {
+        let s = "abc".repeat(100); // 300 единиц
+        let out = truncate_utf16_nul(&s, BALLOON_BODY_MAX_UNITS);
+        assert_eq!(out.len(), 255 + 1);
+    }
+
+    #[test]
+    fn truncate_does_not_split_surrogate_pair() {
+        // «😀» — суррогатная пара из 2 units. Лимит 3: «😀» (2) + старший
+        // суррогат второй пары — разорванная пара отбрасывается целиком.
+        let s = "😀😀";
+        let out = truncate_utf16_nul(s, 3);
+        assert_eq!(out, as_utf16("😀"));
+        // Лимит ровно 2 — вся первая пара влезает.
+        assert_eq!(truncate_utf16_nul(s, 2), as_utf16("😀"));
+        // Лимит 4 — обе пары.
+        assert_eq!(truncate_utf16_nul(s, 4), as_utf16("😀😀"));
+    }
+
+    #[test]
+    fn truncate_zero_limit_yields_only_nul() {
+        assert_eq!(truncate_utf16_nul("что-нибудь", 0), vec![0]);
+    }
+
+    #[test]
+    fn truncate_mixed_cjk_and_emoji_keeps_char_boundary() {
+        // CJK — 1 unit, эмодзи — 2. «漢漢漢😀» = 3 + 2 = 5 units.
+        // Лимит 5: всё влезает, не режем.
+        assert_eq!(truncate_utf16_nul("漢漢漢😀", 5), as_utf16("漢漢漢😀"));
+        // Лимит 4: взяты 3 CJK + старший суррогат пары — пара разорвана,
+        // суррогат отбрасывается, остаются только «漢漢漢».
+        assert_eq!(truncate_utf16_nul("漢漢漢😀", 4), as_utf16("漢漢漢"));
+    }
+
+    #[test]
+    fn truncate_surrogate_then_ascii_boundary() {
+        // «A😀» — A (1 unit) + пара (2): лимит 2 берёт [A, старший суррогат],
+        // пара разорвана на границе → старшая половина отбрасывается.
+        assert_eq!(truncate_utf16_nul("A😀", 2), as_utf16("A"));
+        // Лимит 3 — пара влезает целиком (A + обе половины), не режем.
+        assert_eq!(truncate_utf16_nul("A😀", 3), as_utf16("A😀"));
+        // «A😀B» при лимите 3: те же 3 units — «A😀», B не влез, пару не режем.
+        assert_eq!(truncate_utf16_nul("A😀B", 3), as_utf16("A😀"));
+    }
+
+    // --- интеграция: реальный трей ---
+
     #[test]
     fn create_then_drop_destroys_window() {
         let (tray, _rx) = TrayIcon::new("test", vec![]).expect("создание трея");
@@ -424,5 +575,20 @@ mod tests {
         // SAFETY: после Drop окно уничтожено; IsWindow над мёртвым хэндлом —
         // простое чтение, хэндл мы больше никуда не передаём.
         assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+    }
+
+    #[test]
+    fn show_balloon_succeeds_on_real_tray() {
+        let (tray, _rx) = TrayIcon::new("test", vec![]).expect("создание трея");
+        // NIM_MODIFY с NIF_INFO на живой иконке трея (hwnd/uID из NIM_ADD) —
+        // Shell_NotifyIconW обязан вернуть TRUE; реальный показ баллона
+        // зависит от shell, но ошибка API — нет. Длинный текст проверяет
+        // усечение в реальном буфере (не вылез бы за [u16; 64]/[u16; 256]).
+        tray.show_balloon(
+            &"Очень длинный заголовок".repeat(10),
+            &"Очень длинное тело уведомления с текстом".repeat(50),
+        )
+        .expect("Shell_NotifyIconW(NIM_MODIFY) не вернул ошибку");
+        drop(tray);
     }
 }
