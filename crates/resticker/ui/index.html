@@ -47,10 +47,27 @@
           <!-- ==== Пресеты ==== -->
           <div class="panel" data-panel="presets">
             <div class="column">
-              <p class="emptyHint">
-                Пресеты (сохранение и загрузка расстановки стикеров) ещё в разработке — см.
-                ROADMAP.md, веха M7.
-              </p>
+              <div class="inputGroup">
+                <p class="inputLabel">Список пресетов</p>
+                <button class="button compact" id="import-preset" title="Импортировать пресет из файла .json">
+                  Импорт из файла…
+                </button>
+              </div>
+              <div class="inputGroup presetSaveRow">
+                <input
+                  type="text"
+                  class="textInput"
+                  id="preset-name"
+                  placeholder="Имя нового пресета"
+                />
+                <button class="button compact" id="save-preset" disabled>Сохранить как пресет</button>
+              </div>
+              <div class="stickerList" id="preset-list">
+                <p class="emptyHint">Загрузка…</p>
+              </div>
+              <div class="inputGroup">
+                <span class="status" id="preset-status"></span>
+              </div>
             </div>
           </div>
 

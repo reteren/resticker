@@ -3,7 +3,8 @@
 // пустого каркаса, просто с реальным содержимым вкладок.
 
 const { invoke } = window.__TAURI__.core;
-const { open } = window.__TAURI__.dialog;
+const { open, save } = window.__TAURI__.dialog;
+const { listen } = window.__TAURI__.event;
 const { getCurrentWindow } = window.__TAURI__.window;
 
 /** @type {any} последний загруженный/применённый Config с бэкенда. */
@@ -13,9 +14,13 @@ let draftSettings = null;
 let draftHotkeys = null;
 /** Какое из трёх полей хоткея сейчас "слушает" следующую комбинацию клавиш. */
 let recordingField = null;
+/** id пресета, который сейчас переименовывается через поле `preset-name`
+ *  (`null` — режим «сохранить как пресет»). */
+let renameTargetId = null;
 
 const statusEl = document.getElementById('status');
 const stickerStatusEl = document.getElementById('sticker-status');
+const presetStatusEl = document.getElementById('preset-status');
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -54,6 +59,7 @@ async function loadConfig() {
   renderGeneral();
   renderControl();
   renderStickers();
+  renderPresets();
 }
 
 // ==== Вкладка «Общие» ====
@@ -316,6 +322,166 @@ document.getElementById('delete-all-stickers').addEventListener('click', async (
   await invoke('delete_all_stickers');
   await loadConfig();
   setStatus('Все стикеры удалены');
+});
+
+// ==== Вкладка «Пресеты» (M7) ====
+
+// Модель Preset — { id, name, stickers } (crates/rst-core/src/model.rs):
+// даты в ней нет, поэтому строка списка показывает число стикеров; если
+// бэкенд добавит `created_at`, показываем его (как мета-строку вкладки
+// «Стикеры»).
+function presetMeta(preset) {
+  if (preset.created_at) {
+    return new Date(preset.created_at).toLocaleDateString('ru-RU');
+  }
+  const n = (preset.stickers ?? []).length;
+  const plural =
+    n % 10 === 1 && n % 100 !== 11
+      ? 'стикер'
+      : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)
+        ? 'стикера'
+        : 'стикеров';
+  return `${n} ${plural}`;
+}
+
+function renderPresets() {
+  const list = document.getElementById('preset-list');
+  list.innerHTML = '';
+  const presets = config.presets ?? [];
+  if (presets.length === 0) {
+    list.innerHTML = '<p class="emptyHint">Пресетов пока нет. Сохраните текущую расстановку выше.</p>';
+    return;
+  }
+  for (const preset of presets) {
+    const row = document.createElement('div');
+    row.className = 'stickerRow';
+    row.innerHTML = `
+      <div class="stickerInfo">
+        <span class="stickerName">${escapeHtml(preset.name)}</span>
+        <span class="stickerMeta">${escapeHtml(presetMeta(preset))}</span>
+      </div>
+      <div class="stickerActions">
+        <button class="button compact" data-action="apply" data-id="${preset.id}" title="Заменить текущую расстановку">Применить</button>
+        <button class="button compact" data-action="rename" data-id="${preset.id}" title="Переименовать">Переименовать</button>
+        <button class="button compact" data-action="export" data-id="${preset.id}" title="Экспорт в файл .json">Экспорт</button>
+        <button class="button compact danger" data-action="delete" data-id="${preset.id}" title="Удалить">✕</button>
+      </div>
+    `;
+    list.appendChild(row);
+  }
+}
+
+// Вернуться из режима переименования в «сохранить как пресет».
+function resetRenameMode() {
+  renameTargetId = null;
+  document.getElementById('save-preset').textContent = 'Сохранить как пресет';
+  presetStatusEl.textContent = '';
+}
+
+document.getElementById('preset-list').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-action]');
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const action = btn.dataset.action;
+  const preset = (config.presets ?? []).find((p) => p.id === id);
+  try {
+    switch (action) {
+      case 'apply':
+        // Список недоступных элементов приходит отдельным событием
+        // 'preset-missing-elements' (обработчик ниже) — диалог недостающих
+        // элементов, SPEC §11.
+        await invoke('apply_preset', { id });
+        setStatus(`Пресет «${preset?.name ?? id}» применён`);
+        break;
+      case 'rename': {
+        renameTargetId = id;
+        document.getElementById('preset-name').value = preset?.name ?? '';
+        document.getElementById('save-preset').textContent = 'Переименовать';
+        document.getElementById('save-preset').disabled = false;
+        presetStatusEl.textContent = `Переименование пресета «${preset?.name ?? ''}» — нажмите «Переименовать»`;
+        return; // список не перезагружаем, строка не удаляется
+      }
+      case 'export': {
+        // SPEC §11 / CONFIG.md: внутри файла абсолютные пути к файлам
+        // пользователя и имена программ — предупреждение обязательно.
+        if (!confirm('Пресет содержит абсолютные пути к файлам на вашем диске и имена программ. Экспортировать?')) {
+          return;
+        }
+        const path = await save({
+          defaultPath: `${String(preset?.name ?? 'preset').replace(/[\\/:*?"<>|]/g, '_')}.json`,
+          filters: [{ name: 'Пресет resticker', extensions: ['json'] }],
+        });
+        if (!path) return; // отмена в диалоге сохранения
+        await invoke('export_preset', { id, path });
+        setStatus(`Пресет экспортирован: ${path}`);
+        break;
+      }
+      case 'delete':
+        if (!confirm(`Удалить пресет «${preset?.name ?? ''}»?`)) return;
+        await invoke('delete_preset', { id });
+        setStatus('Пресет удалён');
+        break;
+      default:
+        return;
+    }
+    await loadConfig();
+  } catch (err) {
+    presetStatusEl.textContent = `Ошибка: ${err}`;
+  }
+});
+
+const presetNameInput = document.getElementById('preset-name');
+const savePresetBtn = document.getElementById('save-preset');
+
+presetNameInput.addEventListener('input', () => {
+  savePresetBtn.disabled = !presetNameInput.value.trim();
+});
+presetNameInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !savePresetBtn.disabled) savePresetBtn.click();
+});
+
+savePresetBtn.addEventListener('click', async () => {
+  const name = presetNameInput.value.trim();
+  if (!name) return;
+  try {
+    if (renameTargetId) {
+      await invoke('rename_preset', { id: renameTargetId, name });
+      setStatus('Пресет переименован');
+    } else {
+      await invoke('save_preset', { name });
+      setStatus(`Пресет «${name}» сохранён`);
+    }
+    presetNameInput.value = '';
+    resetRenameMode();
+    savePresetBtn.disabled = true;
+    await loadConfig();
+  } catch (err) {
+    presetStatusEl.textContent = `Ошибка: ${err}`;
+  }
+});
+
+document.getElementById('import-preset').addEventListener('click', async () => {
+  try {
+    const path = await open({
+      multiple: false,
+      filters: [{ name: 'Пресет resticker', extensions: ['json'] }],
+    });
+    if (!path) return; // отмена в диалоге открытия
+    await invoke('import_preset', { path });
+    setStatus(`Пресет импортирован: ${path}`);
+    await loadConfig();
+  } catch (err) {
+    presetStatusEl.textContent = `Ошибка: ${err}`;
+  }
+});
+
+// Диалог недостающих элементов (SPEC §11): бэкенд применяет пресет без
+// недоступных стикеров и шлёт их список событием 'preset-missing-elements'.
+listen('preset-missing-elements', (event) => {
+  const missing = event.payload?.missing ?? [];
+  if (missing.length === 0) return;
+  const lines = missing.map((m) => `• ${m.path ?? m[1]}`).join('\n');
+  alert(`Пресет применён не полностью — недоступны:\n\n${lines}\n\nЗагружены остальные стикеры.`);
 });
 
 // ==== Подвал: Применить / ОК / Отмена ====
