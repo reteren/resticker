@@ -8,15 +8,16 @@ use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    ExtractIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, IDI_APPLICATION,
-    LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP,
-    WM_RBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPED,
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, HICON,
+    IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
+    WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -231,15 +232,42 @@ fn create_window() -> Result<HWND, Win32Error> {
     Ok(hwnd)
 }
 
+/// Иконка приложения (не стоковая `IDI_APPLICATION`): извлекается прямо из
+/// своего же exe — `tauri_build`/`winres` уже вшивает `icons/icon.ico` в
+/// ресурсы бинарника (build.rs, `tauri_build::try_build`), `ExtractIconW`
+/// по собственному пути (`current_exe`) достаёт её без необходимости знать
+/// точный числовой ID/имя ресурса, под которым её положил инструмент
+/// сборки — тот же принцип независимости от деталей упаковки. `None` —
+/// `current_exe()` не удался или в бинарнике нет иконки (например, тестовый
+/// прогон без реальной сборки `tauri_build`).
+fn app_icon() -> Option<HICON> {
+    let exe = std::env::current_exe().ok()?;
+    let text = exe.as_os_str().to_str()?;
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    wide.push(0);
+    // SAFETY: wide — валидный нуль-терминированный путь на время вызова;
+    // индекс 0 — первая (обычно единственная) иконка ресурсов exe.
+    let icon = unsafe { ExtractIconW(None, PCWSTR(wide.as_ptr()), 0) };
+    if icon.is_invalid() || icon.0.is_null() {
+        None
+    } else {
+        Some(icon)
+    }
+}
+
 fn notify_icon_data(hwnd: HWND, tooltip: &str) -> NOTIFYICONDATAW {
+    // Стоковая IDI_APPLICATION — запасной вариант, если извлечь свою
+    // иконку не удалось (например, `current_exe()` недоступен); всегда
+    // доступна как системная иконка.
+    // SAFETY: IDI_APPLICATION — системная стоковая иконка, всегда доступна.
+    let fallback = unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default();
     let mut data = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: WM_TRAYICON,
-        // SAFETY: IDI_APPLICATION — системная стоковая иконка, всегда доступна.
-        hIcon: unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default(),
+        hIcon: app_icon().unwrap_or(fallback),
         ..Default::default()
     };
     let wide: Vec<u16> = tooltip.encode_utf16().collect();
