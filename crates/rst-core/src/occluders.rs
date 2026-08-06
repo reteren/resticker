@@ -7,7 +7,7 @@
 
 use uuid::Uuid;
 
-use crate::model::{OverlapRule, Rect, VisibilityMode};
+use crate::model::{OverlapRule, Rect, VisibilityMode, WindowLocator};
 
 /// Класс окна панели задач (SPEC.md §4.3, `never_overlap_taskbar`).
 pub const TASKBAR_WINDOW_CLASS: &str = "Shell_TrayWnd";
@@ -76,6 +76,28 @@ pub fn rule_matches(rule: &OverlapRule, window: &OccluderCandidate) -> bool {
         _ => false,
     };
     let by_title = match &rule.title_pattern {
+        Some(pattern) => wildcard_match(pattern, &window.title),
+        None => false,
+    };
+    by_path || by_title
+}
+
+/// Совпадает ли [`WindowLocator`] стикера-окна (ROADMAP.md M6, SPEC.md §5)
+/// с живым окном: тот же предикат, что [`rule_matches`] для правил
+/// видимости (M4) — `process_name` ИЛИ `title_pattern`, тем же
+/// wildcard/регистронезависимым сравнением. Пустой локатор (оба `None`) не
+/// матчит ничего: искать окно без единого критерия бессмысленно.
+///
+/// Используется координатором при старте (переустановка `hwnd`, «в конфиг
+/// не пишется» — CONFIG.md, `source.kind == window`) и при добавлении
+/// нового стикера-окна (построение локатора из выбранного окна для
+/// последующего восстановления).
+pub fn locator_matches(locator: &WindowLocator, window: &OccluderCandidate) -> bool {
+    let by_path = match (&locator.process_name, &window.exe_path) {
+        (Some(name), Some(exe_path)) => path_eq_ignore_case(name, exe_path),
+        _ => false,
+    };
+    let by_title = match &locator.title_pattern {
         Some(pattern) => wildcard_match(pattern, &window.title),
         None => false,
     };
@@ -165,6 +187,53 @@ mod tests {
             process_name: process.map(String::from),
             title_pattern: title.map(String::from),
         }
+    }
+
+    fn locator(process: Option<&str>, title: Option<&str>) -> WindowLocator {
+        WindowLocator {
+            process_name: process.map(String::from),
+            title_pattern: title.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    // --- locator_matches (M6, стикеры-окна) ---
+
+    #[test]
+    fn locator_matches_by_short_process_name() {
+        let w = candidate(Some(r"C:\Program Files\obs-studio\obs64.exe"), "t", "c");
+        assert!(locator_matches(&locator(Some("obs64.exe"), None), &w));
+        assert!(!locator_matches(&locator(Some("other.exe"), None), &w));
+    }
+
+    #[test]
+    fn locator_matches_by_title_wildcard() {
+        let w = candidate(None, "OBS 30.1 - Профиль: Стрим", "c");
+        assert!(locator_matches(&locator(None, Some("OBS *")), &w));
+        assert!(!locator_matches(&locator(None, Some("Chrome *")), &w));
+    }
+
+    #[test]
+    fn locator_empty_matches_nothing() {
+        let w = candidate(Some(r"C:\a\b.exe"), "любой заголовок", "c");
+        assert!(!locator_matches(&locator(None, None), &w));
+    }
+
+    #[test]
+    fn locator_process_rule_no_exe_path_does_not_match() {
+        let w = candidate(None, "t", "c");
+        assert!(!locator_matches(&locator(Some("chrome.exe"), None), &w));
+    }
+
+    #[test]
+    fn locator_matches_by_either_criterion() {
+        // Правило по пути ИЛИ заголовку — как rule_matches: достаточно
+        // совпадения хотя бы одного критерия.
+        let w = candidate(Some(r"C:\a\notepad.exe"), "Wrong Title", "c");
+        assert!(locator_matches(
+            &locator(Some("notepad.exe"), Some("*Never*")),
+            &w
+        ));
     }
 
     // --- wildcard_match ---
