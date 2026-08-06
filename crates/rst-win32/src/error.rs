@@ -28,6 +28,14 @@ pub enum Win32Error {
     ClipboardDataCorrupt(&'static str),
     #[error("путь из системного диалога выбора файла повреждён (не валидный UTF-16)")]
     FileDialogPathInvalid,
+    #[error("окно закрепления не существует (закрыто до операции)")]
+    PinWindowGone,
+    #[error("окно уже закреплено (на нём уже стоит маркер resticker)")]
+    AlreadyPinned,
+    #[error(
+        "закрепление отклонено системой: у процесса нет доступа к целевому окну (UIPI). Перезапустите resticker от имени администратора, чтобы закреплять стикеры за окнами с повышенными правами"
+    )]
+    PinAccessDenied,
     #[error("реестр: {0}")]
     Registry(#[from] std::io::Error),
     #[error("Win32: {0}")]
