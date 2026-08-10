@@ -49,28 +49,24 @@ use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::animation as media_animation;
 use rst_media::paste;
 use rst_render::{
-    Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon, Key,
-    NumericField, Panel, PointerEvent, Primitive, RenderError, SelectionBox, Slider, Sprite,
-    Texture, TextureAtlas, VideoTextures, WidgetId, WindowHighlight, WindowTarget, edit_overlay,
-    marquee_visuals, rasterize, solid_sprite, theme,
+    Box2D, Button, Checkbox, Device, Icon, Key, NumericField, Panel, PointerEvent, Primitive,
+    RenderError, SelectionBox, Slider, Sprite, Texture, TextureAtlas, VideoTextures, WidgetId,
+    WindowTarget, edit_overlay, marquee_visuals, rasterize, solid_sprite, theme,
 };
 use rst_video::VideoSource;
 use rst_win32::Win32Error;
 use rst_win32::clipboard::{self, ClipboardImage};
 use rst_win32::file_dialog;
 use rst_win32::hotkey::HotkeyCombo;
-use rst_win32::input::{
-    Corner as Win32Corner, CursorShape, CursorZone, Handle as Win32Handle, InputEvent, Modifiers,
-};
+use rst_win32::input::{CursorShape, CursorZone, Handle as Win32Handle, InputEvent, Modifiers};
 use rst_win32::monitors;
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
 use rst_win32::window_enum::{WindowInfo, WindowRect};
-use rst_win32::window_pick;
 use rst_win32::window_pin::{self as window_pin, WindowPins};
 use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker};
 use uuid::Uuid;
 
-use crate::{confirm_dialog, cursor_panel, toolbar, window_picker};
+use crate::{confirm_dialog, cursor_panel, preset_picker, toolbar, window_pick_list, window_picker};
 
 /// Мост к `Device`/`WindowTarget` (M3 step 2 разделил `rst_render::Renderer`
 /// на процесс-wide устройство и цель на монитор, M3_PREP_NOTES.md §4.2).
@@ -397,6 +393,25 @@ fn teardown_monitor_state(
 /// если в конфиге он не задан или не парсится.
 const DEFAULT_EDIT_HOTKEY: &str = "Ctrl+Alt+S";
 
+/// Текст тоста первого запуска (ROADMAP.md M8) — `None`, если он уже был
+/// показан (`Settings::onboarding_shown`). Чистая функция: логика решения
+/// «показывать или нет» и текста сообщения тестируется без канала/GPU —
+/// сама отправка и запись флага остаются в `run()`.
+fn onboarding_notification(cfg: &Config) -> Option<(String, String)> {
+    if cfg.settings.onboarding_shown {
+        return None;
+    }
+    let hotkey_text = cfg
+        .hotkeys
+        .edit_mode
+        .as_deref()
+        .unwrap_or(DEFAULT_EDIT_HOTKEY);
+    Some(crate::i18n::onboarding_notification(
+        &cfg.settings.language,
+        hotkey_text,
+    ))
+}
+
 /// Виртуальный код `VK_ESCAPE` (docs.microsoft.com/Virtual-Key-Codes) — выход
 /// из режима редактирования. Константа, а не зависимость от `windows`: этот
 /// крейт не работает с Win32-типами напрямую (CONTRIBUTING.md).
@@ -415,11 +430,74 @@ const VK_Z: u32 = 0x5A;
 /// Глубина истории undo/redo — снимков `Config` (см. заметку о снимках выше).
 const UNDO_CAPACITY: usize = 100;
 
-/// Кольцо поворота — зона за угловой ручкой (SPEC 3.3): начинается сразу за
-/// квадратом ручки (проверяется раньше в `resolve_zone`, так что здесь нет
-/// отдельной внутренней границы) и тянется до `ROTATE_RING_MAX_DIP` от её
-/// центра.
-const ROTATE_RING_MAX_DIP: f64 = 24.0;
+/// Минимальный отступ от угла рамки выделения (DIP), с которого начинается
+/// зона поворота (фидбэк пользователя 2026-08-09, третий раунд): раньше
+/// зона поворота была кольцом вокруг угла (`ROTATE_RING_MAX_DIP=24`,
+/// срабатывало и ВНУТРИ рамки) — теперь поворот работает только СНАРУЖИ
+/// рамки, начиная с этого отступа от ближайшего угла, и тянется на
+/// бесконечную дистанцию (как в Photoshop — весь внешний периметр после
+/// выделения объекта отдан повороту, ресайз — только на самих ручках).
+const ROTATE_MIN_CORNER_GAP_DIP: f64 = 35.0;
+
+/// Задержка перед показом тултипа кнопки — с момента, когда курсор навёлся
+/// (фидбэк пользователя 2026-08-10: «через 0.2 секунды после того как
+/// навёлся»).
+const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(200);
+/// Длительность анимации плавного появления тултипа (0 → полная непрозрачность).
+const TOOLTIP_FADE_DURATION: Duration = Duration::from_millis(300);
+/// Шаг перепланирования кадра анимации появления тултипа — не «на каждый
+/// возможный тик», а с разумным интервалом (тот же принцип «ноль
+/// пробуждений в покое» ADR-006, что у анимации стикеров: пробуждаемся,
+/// только пока тултип реально ещё проявляется).
+const TOOLTIP_FADE_STEP: Duration = Duration::from_millis(16);
+/// Зазор между кнопкой и тултипом, DIP.
+const TOOLTIP_GAP_DIP: f64 = 8.0;
+/// Внутренний отступ текста в тултипе, DIP.
+const TOOLTIP_PAD_DIP: f64 = 5.0;
+
+/// Наведённая кнопка тулбара/панели у курсора: с какого момента наведена
+/// (для задержки показа и анимации появления), что показать и где —
+/// вычисляется заново при каждой смене наведённого виджета
+/// (`update_tooltip_hover`), не персистентно между наведениями.
+struct TooltipState {
+    text: &'static str,
+    hover_started: Instant,
+    /// Границы кнопки-источника (DIP, координаты монитора `monitor_id`) —
+    /// тултип позиционируется относительно них.
+    anchor: Box2D,
+    monitor_id: MonitorId,
+}
+
+impl TooltipState {
+    /// Прозрачность тултипа сейчас: 0 до истечения `TOOLTIP_SHOW_DELAY`,
+    /// затем линейно 0→1 за `TOOLTIP_FADE_DURATION`.
+    fn opacity(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.hover_started);
+        let Some(fade_elapsed) = elapsed.checked_sub(TOOLTIP_SHOW_DELAY) else {
+            return 0.0;
+        };
+        if fade_elapsed >= TOOLTIP_FADE_DURATION {
+            1.0
+        } else {
+            fade_elapsed.as_secs_f64() / TOOLTIP_FADE_DURATION.as_secs_f64()
+        }
+    }
+
+    /// Следующий момент, когда тултип нужно перерисовать — `None`, если
+    /// анимация появления уже завершена (`opacity` дальше не меняется без
+    /// смены наведённого виджета, которая приходит обычным `MouseMove`, не
+    /// через таймер).
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let elapsed = now.saturating_duration_since(self.hover_started);
+        if elapsed < TOOLTIP_SHOW_DELAY {
+            Some(self.hover_started + TOOLTIP_SHOW_DELAY)
+        } else if elapsed < TOOLTIP_SHOW_DELAY + TOOLTIP_FADE_DURATION {
+            Some(now + TOOLTIP_FADE_STEP)
+        } else {
+            None
+        }
+    }
+}
 
 pub enum OverlayCommand {
     AddSticker(PathBuf),
@@ -486,6 +564,12 @@ pub enum CoordinatorRequest {
     /// уходили только в лог (`HotkeyConflict`, `PinAccessDenied`) — SPEC.md
     /// требует показать их пользователю, не только записать в файл лога.
     ShowNotification { title: String, body: String },
+    /// Список пресетов изменился (сохранение/переименование/удаление/
+    /// импорт — не `ApplyPreset`, он не трогает сам список). Main.rs
+    /// пересобирает пункты меню трея (M7, «быстрое переключение из трея» —
+    /// ROADMAP.md) из `(id, name)`, не полного `Preset` (имя — единственное,
+    /// что нужно для пункта меню).
+    PresetsChanged(Vec<(Uuid, String)>),
 }
 
 /// Сообщение объединённого канала координатора: команда от Tauri, событие от
@@ -642,13 +726,18 @@ const MARQUEE_THRESHOLD_DIP: f64 = 4.0;
 const CHECKERBOARD_CELL_DIP: f64 = 16.0;
 
 /// Зона под курсором в режиме редактирования (docs/M2_INTEGRATION_PLAN.md,
-/// раздел 7): у выделенного стикера — кольцо поворота, ручки ресайза, тело;
-/// иначе — любой видимый стикер под курсором или фон.
+/// раздел 7): у выделенного стикера — зона поворота (весь внешний периметр,
+/// фидбэк пользователя 2026-08-09), ручки ресайза, тело; иначе — любой
+/// видимый стикер под курсором или фон.
+#[derive(Debug)]
 enum Zone {
     Background,
     StickerBody(Uuid),
     ResizeHandle(Uuid, HandleKind),
-    Rotate(Uuid, CoreCorner),
+    /// Угол в градусах (экранная конвенция) для курсора — направление от
+    /// центра стикера к БЛИЖАЙШЕМУ углу его рамки в мировом пространстве, с
+    /// учётом текущего поворота стикера (см. `nearest_corner_world_angle_deg`).
+    Rotate(Uuid, i32),
 }
 
 /// Состояние режима редактирования (docs/M2_INTEGRATION_PLAN.md, раздел 2).
@@ -679,27 +768,46 @@ struct EditState {
     /// хоткеи вроде `Delete`/`Ctrl+D`, сработавшие по текущему выделению
     /// параллельно с открытой панелью, были бы путающими.
     window_picker: Option<WindowPickerState>,
+    /// Открытая панель быстрого переключения пресетов (M7, SPEC.md §3.8;
+    /// `preset_picker.rs`) — в отличие от `window_picker`, модальна: пока
+    /// открыта, блокирует и мышь (клик мимо закрывает без изменений), и
+    /// клавиатуру, кроме `Esc` (см. `handle_key`) — она не редактирует
+    /// конкретный стикер, а предлагает одноразовый выбор действия, ближе
+    /// по семантике к `confirm`, чем к `window_picker`.
+    preset_picker: Option<PresetPickerState>,
     /// Установлен кликом по `TB_LAYERS` (`handle_toolbar_up`) — открытие
     /// нуждается в `window_snapshot`, которого нет в `handle_toolbar_up`
     /// (дизайн §5.2); фактическое открытие происходит в цикле `run()`,
     /// где снимок под рукой, сразу после обработки текущего сообщения.
     pending_open_picker: Option<Uuid>,
-    /// Режим выбора окна для стикера-окна активен (SPEC.md §5.1, ROADMAP.md
-    /// M6): установлен кликом по `BTN_ADD_WINDOW`, снят кликом по окну
-    /// (закрепляет его) или `Esc`. Пока активен, движение мыши подсвечивает
-    /// окно под курсором вместо обычного хит-теста сцены (см. `handle_input`).
-    picking_window: bool,
-    /// Окно под курсором в режиме выбора — числовой hwnd из `window_snapshot`
-    /// для подсветки (`WindowHighlight`) и последующего клика-закрепления.
-    /// `None` — курсор не над окном кэша трекера.
-    pick_hover: Option<usize>,
-    /// Атлас только что добавленной анимации (M5a, docs/M5A_ANIMATION_DESIGN.md
-    /// §5) — `add_sticker` собирает атлас (нужен `Renderer`, которого нет в
-    /// `run()`) и кладёт его сюда вместо прямой записи в `animations`
+    /// Установлен кликом по `BTN_ADD_WINDOW` (`handle_cursor_panel_up`) — тот
+    /// же повод, что у `pending_open_picker`: открытие списка нуждается в
+    /// `window_snapshot`, которого нет в `handle_cursor_panel_up`; несёт
+    /// монитор, на котором открывать панель (кнопка нажата на нём же).
+    pending_open_pick_list: Option<MonitorId>,
+    /// Открытый список окон для закрепления как стикер (M6, SPEC.md §5.1;
+    /// `window_pick_list.rs`) — установлен кликом по `BTN_ADD_WINDOW`, снят
+    /// кликом по строке (закрепляет выбранное окно), кликом мимо панели или
+    /// `Esc`. Модальна для мыши и клавиатуры, тем же паттерном, что
+    /// `preset_picker` (список действий, а не редактор конкретного
+    /// стикера): клик мимо панели закрывает её без изменений (докком
+    /// `preset_picker.rs`).
+    ///
+    /// Заменил прежний режим «наведение+клик по реальному окну на экране»
+    /// (`picking_window`/`pick_hover`, `WindowHighlight`): пользователь не
+    /// видел, какое именно окно выбирает, и жаловался, что кнопка «выбирает
+    /// какое-то текущее окно само» (фидбэк 2026-08-10) — явный список
+    /// названий/иконок снимает вопрос «что именно я сейчас выбираю».
+    window_pick_list: Option<WindowPickListState>,
+    /// Анимация только что добавленного стикера (M5a,
+    /// docs/M5A_ANIMATION_DESIGN.md §5; потоковый вариант — ROADMAP.md M5a
+    /// «потоковый режим») — `add_sticker` собирает атлас/открывает
+    /// потоковый декодер (нужен `Renderer`/`Device`, которого нет в
+    /// `run()`) и кладёт результат сюда вместо прямой записи в `animations`
     /// (локальная переменная `run()`, недоступная на глубине вызова); цикл
     /// `run()` забирает его в `animations` сразу после обработки текущего
     /// сообщения, тем же паттерном, что `pending_open_picker`.
-    pending_animation: Option<(Uuid, TextureAtlas)>,
+    pending_animation: Option<(Uuid, PendingAnimation)>,
     /// Видео только что добавленного стикера (M5b, docs/M5B_VIDEO_DESIGN.md
     /// §6) — тот же паттерн, что `pending_animation`: `add_sticker` открывает
     /// `VideoSource`/`AudioSource` (нужен `Device`/`AudioMixer`, которых нет
@@ -720,6 +828,10 @@ struct EditState {
     toolbar: Option<Panel>,
     /// Панель у курсора — есть, пока `active` (раздел 4).
     cursor_panel: Option<Panel>,
+    /// Тултип наведённой кнопки тулбара/панели у курсора (фидбэк
+    /// пользователя 2026-08-10) — `None`, если курсор не над кнопкой с
+    /// текстом подсказки.
+    tooltip: Option<TooltipState>,
     /// Кто держит текущий указательный жест начиная с `MouseDown` (раздел 5).
     /// Модал сюда не входит — он перехватывается раньше отдельной веткой.
     pointer_owner: PointerOwner,
@@ -787,6 +899,31 @@ struct WindowPickerState {
     /// как у `toolbar`/`cursor_panel`/`confirm` (M3, docs/M3_STEP4_REVIEW.md,
     /// пункт 2.1).
     monitor_id: MonitorId,
+}
+
+/// Открытая панель быстрого переключения пресетов (M7, SPEC.md §3.8) —
+/// в отличие от `WindowPickerState`, не привязана к стикеру и не
+/// пересобирается на лету: список пресетов не может измениться, пока эта
+/// модальная панель открыта (единственный способ её закрыть — клик по
+/// строке или `Esc`, оба сразу же убирают `Some`).
+struct PresetPickerState {
+    panel: Panel,
+    /// Монитор, на котором рисуется панель (тот же, что у панели у
+    /// курсора, — открыта её кнопкой), как у `ConfirmState`/`WindowPickerState`.
+    monitor_id: MonitorId,
+}
+
+/// Открытый список окон для закрепления (M6, `window_pick_list.rs`) — тот
+/// же паттерн, что `PresetPickerState`: панель + монитор, на котором она
+/// открыта. `scroll` — виртуализация списка (та же идея, что у
+/// `WindowPickerState`, но список здесь читает `window_snapshot` напрямую
+/// вместо `visibility`-состояния конкретного стикера, и панель
+/// пересобирается заново на каждом новом снимке трекера, а не хранится
+/// «замороженной» — список открытых окон живой, пока панель открыта).
+struct WindowPickListState {
+    panel: Panel,
+    monitor_id: MonitorId,
+    scroll: usize,
 }
 
 /// Кэш 1×1 текстур заливки и текстур растрированного текста для перевода
@@ -975,22 +1112,84 @@ fn primitives_to_sprites(
     }
 }
 
-/// Анимация одного стикера (M5a, docs/M5A_ANIMATION_DESIGN.md §5): атлас
-/// кадров на GPU + часы, решающие, какой кадр сейчас показывать. Чисто
+/// Анимация одного стикера (M5a, docs/M5A_ANIMATION_DESIGN.md §5). Чисто
 /// runtime-состояние `run()` — не поле `EditState`/`Config`, тем же
 /// паттерном, что `occluder_cache`/`window_snapshot`: переживает вход/выход
 /// из режима редактирования, не персистится.
-struct StickerAnimation {
-    atlas: TextureAtlas,
-    clock: AnimationClock,
+enum StickerAnimation {
+    /// Обычный случай: атлас всех кадров на GPU + часы, решающие, какой
+    /// кадр сейчас показывать — смена кадра это смена UV, декодирование не
+    /// требуется на тике.
+    Atlas {
+        atlas: TextureAtlas,
+        clock: AnimationClock,
+        /// Задержки кадров в порядке атласа, посчитаны ОДИН раз при
+        /// создании (ROADMAP.md M8, «профилирование, устранение горячих
+        /// точек»): `next_deadline` дёргается на КАЖДОЕ сообщение
+        /// координатора, а не только на `AnimationTick` (см.
+        /// `next_tick_deadline` в `run()`) — пересборка `Vec<Duration>` из
+        /// `atlas.frames` на каждый вызов означала аллокацию на каждое
+        /// движение мыши для каждого анимированного стикера одновременно
+        /// (найдено при ревью собственного кода этой же вехи).
+        delays: Vec<Duration>,
+    },
+    /// Потоковый режим (ROADMAP.md M5a, «потоковый режим для очень длинных
+    /// анимаций»): `decode_animation` отказал по порогу атласа
+    /// (`TooManyFrames`/`TooLargeForAtlas`, rst_media::animation) — вместо
+    /// атласа один переиспользуемый кадр-текстура, перезаливаемый декодером
+    /// на каждый тик; `StreamingAnimation::next_frame` зацикливает сама, не
+    /// требуя отслеживать конец анимации здесь.
+    ///
+    /// Часы устроены проще, чем `AnimationClock` атласного пути: без
+    /// модульной арифметики «долгой паузы» (`AnimationClock::advance`) —
+    /// там цена кадра это смена индекса, здесь это реальное декодирование,
+    /// поэтому после долгой паузы (сон/блокировка) потоковая анимация
+    /// просто продолжает с текущего кадра на ближайшем тике, а не пытается
+    /// досчитать пропущенные кадры по времени.
+    Streaming {
+        source: media_animation::StreamingAnimation,
+        texture: Texture,
+        deadline: Instant,
+    },
 }
 
 impl StickerAnimation {
-    /// Задержки кадров в порядке атласа — вход `AnimationClock::advance`/
-    /// `next_deadline`.
-    fn frame_delays(&self) -> Vec<Duration> {
-        self.atlas.frames.iter().map(|f| f.delay).collect()
+    /// Завести атласную анимацию: считает `delays` из `atlas.frames` один
+    /// раз здесь — единственное место, где это вообще должно происходить
+    /// (см. доккомент поля `Atlas::delays`).
+    fn from_atlas(atlas: TextureAtlas, clock: AnimationClock) -> Self {
+        let delays = atlas.frames.iter().map(|f| f.delay).collect();
+        Self::Atlas {
+            atlas,
+            clock,
+            delays,
+        }
     }
+
+    /// Ближайший момент, когда эта анимация должна тикнуть снова — вход
+    /// общего расчёта `next_tick_deadline` в `run()` (единая точка для
+    /// атласного и потокового путей).
+    fn next_deadline(&self) -> Instant {
+        match self {
+            Self::Atlas { clock, delays, .. } => clock.next_deadline(delays),
+            Self::Streaming { deadline, .. } => *deadline,
+        }
+    }
+}
+
+/// Результат декодирования анимации нового стикера, ещё не заведённый в
+/// `animations` (см. `EditState::pending_animation`) — `add_sticker` не
+/// видит локальную переменную цикла `run()`, поэтому кладёт готовый атлас
+/// или уже открытый потоковый декодер сюда, а `run()` заводит из него
+/// `StickerAnimation` (с часами/дедлайном) сразу после обработки текущего
+/// сообщения.
+enum PendingAnimation {
+    Atlas(TextureAtlas),
+    Streaming {
+        source: media_animation::StreamingAnimation,
+        texture: Texture,
+        first_delay: Duration,
+    },
 }
 
 /// Видео одного стикера (M5b, docs/M5B_VIDEO_DESIGN.md §6): декодер-поток
@@ -1009,6 +1208,60 @@ struct VideoPlayback {
     audio: Option<AudioSource>,
 }
 
+/// Схлопнуть подряд идущие `MouseMove` одного монитора в очереди `rx`,
+/// оставляя только последнее — защита от бага «стикер едет сам по себе
+/// после того, как отпустил мышь» (найдено в этой сессии, живое
+/// видео-подтверждение пользователя): канал `tx`/`rx` безлимитный, а
+/// координатор синхронно перерисовывает все мониторы на КАЖДОЕ сообщение
+/// (GPU-работа). Если поток окна успевает прислать реальные `WM_MOUSEMOVE`
+/// быстрее, чем координатор их разбирает, канал копит очередь настоящих, но
+/// устаревших позиций — и координатор потом честно доигрывает всю историю
+/// уже ПОСЛЕ того, как пользователь физически остановился (`MouseUp` в той
+/// же очереди, позже всех накопленных `MouseMove`). Внешне неотличимо от
+/// самопроизвольного движения, хотя каждое сообщение по отдельности
+/// абсолютно легитимно — разбираются они с опозданием, а не появляются
+/// беспричинно. Стандартный приём против этого класса багов — тот же, что у
+/// сырого Win32 `PeekMessage`/`PM_REMOVE` для `WM_MOUSEMOVE`: прыгать сразу
+/// к последней доступной позиции, не проигрывая промежуточные.
+///
+/// `first` — уже полученное из `rx` сообщение. Если это `MouseMove`, дальше
+/// неблокирующе (`try_recv`) вычитываются все НЕМЕДЛЕННО доступные
+/// сообщения; те, что тоже `MouseMove` того же монитора, заменяют текущее
+/// (более новая позиция вытесняет более старую); первое сообщение другого
+/// типа (или другого монитора) прерывает дренаж и возвращается как
+/// `leftover` — не теряется, а обрабатывается следующей итерацией цикла
+/// координатора. Если `first` — не `MouseMove`, дренаж не выполняется
+/// вовсе (только эта форма событий копится достаточно быстро, чтобы
+/// формировать бэклог; остальные — редкие/дискретные).
+fn coalesce_mouse_move(
+    rx: &Receiver<OverlayMessage>,
+    first: OverlayMessage,
+) -> (OverlayMessage, Option<OverlayMessage>) {
+    let OverlayMessage::Event(mid, OverlayEvent::Input(InputEvent::MouseMove { .. })) = &first
+    else {
+        return (first, None);
+    };
+    let mid = mid.clone();
+    let mut latest = first;
+    loop {
+        match rx.try_recv() {
+            Ok(next) => {
+                let same_monitor_move = matches!(
+                    &next,
+                    OverlayMessage::Event(next_mid, OverlayEvent::Input(InputEvent::MouseMove { .. }))
+                        if *next_mid == mid
+                );
+                if same_monitor_move {
+                    latest = next;
+                } else {
+                    return (latest, Some(next));
+                }
+            }
+            Err(_) => return (latest, None),
+        }
+    }
+}
+
 fn run(
     config_path: PathBuf,
     mut cfg: Config,
@@ -1016,6 +1269,19 @@ fn run(
     rx: Receiver<OverlayMessage>,
     coordinator_tx: Sender<CoordinatorRequest>,
 ) {
+    // Первый запуск (ROADMAP.md M8, «первый запуск: короткий онбординг,
+    // показать хоткей») — один короткий тост с хоткеем входа в режим
+    // редактирования, дальше `Settings::onboarding_shown` навсегда гасит
+    // повтор. До основного цикла, но после того, как `cfg`/`coordinator_tx`
+    // уже в скоупе — не зависит ни от монитора, ни от GPU-устройства ниже.
+    if let Some((title, body)) = onboarding_notification(&cfg) {
+        let _ = coordinator_tx.send(CoordinatorRequest::ShowNotification { title, body });
+        cfg.settings.onboarding_shown = true;
+        if let Err(e) = config::save(&cfg, &config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после показа онбординга");
+        }
+    }
+
     let hotkey = cfg
         .hotkeys
         .edit_mode
@@ -1353,15 +1619,17 @@ fn run(
         pending_snapshot: None,
         confirm: None,
         window_picker: None,
+        preset_picker: None,
         pending_open_picker: None,
-        picking_window: false,
-        pick_hover: None,
+        pending_open_pick_list: None,
+        window_pick_list: None,
         pending_animation: None,
         pending_video: None,
         marquee: None,
         marquee_started: false,
         toolbar: None,
         cursor_panel: None,
+        tooltip: None,
         pointer_owner: PointerOwner::None,
         ui_pending_snapshot: None,
         cursor_pos: (0.0, 0.0),
@@ -1389,8 +1657,6 @@ fn run(
         &black_tex,
         &mut ui_cache,
         &occluder_cache,
-        &window_snapshot,
-        &monitor_bounds,
     ) {
         if recover_device(
             &mut device,
@@ -1414,15 +1680,52 @@ fn run(
                 &black_tex,
                 &mut ui_cache,
                 &occluder_cache,
-                &window_snapshot,
-                &monitor_bounds,
             );
         } else {
             device_needs_recovery = true;
         }
     }
 
-    for msg in rx {
+    // Канал `tx`/`rx` — безлимитный `mpsc::channel` (ADR не документировал
+    // это как сознательное решение — просто так исторически сложилось).
+    // Каждое сообщение здесь может вызвать полный синхронный `redraw_all`
+    // по всем мониторам (GPU-работа, DirectComposition Commit). Если поток
+    // окна успевает прислать реальные `WM_MOUSEMOVE` быстрее, чем
+    // координатор успевает их разобрать и перерисовать (что тем более
+    // вероятно на живом железе с несколькими мониторами, чем в
+    // синтетических тестах на одном), канал накапливает очередь НАСТОЯЩИХ,
+    // но уже устаревших позиций мыши — координатор потом честно доигрывает
+    // её всю, кадр за кадром, ПОСЛЕ того, как пользователь физически
+    // остановился и отпустил кнопку (её `MouseUp` тоже в этой же очереди,
+    // позже всех накопленных `MouseMove`). Внешне это неотличимо от
+    // «стикер продолжает ехать сам по себе» — хотя каждое отдельное
+    // сообщение в очереди совершенно легитимно, проблема в том, что
+    // разбираются они с опозданием в реальном времени, а не в том, что
+    // они не должны были прийти. Ни один из предыдущих фиксов (проверка
+    // физической кнопки, дедуп по координатам на уровне Win32-сообщения)
+    // эту причину не ловит — там всё корректно уже В МОМЕНТ приёма
+    // сообщения, отставание образуется на СТОРОНЕ ПОТРЕБИТЕЛЯ.
+    //
+    // Стандартный приём против этого класса багов (используется практически
+    // в любом интерактивном drag поверх очереди сообщений, в т.ч. сам Win32
+    // `PeekMessage`/`PM_REMOVE` в этом же цикле для сырых `WM_MOUSEMOVE`) —
+    // схлопывать подряд идущие события движения мыши ОДНОГО монитора,
+    // оставляя только последнее перед тем, как обрабатывать/рисовать: тогда
+    // координатор всегда «прыгает» к актуальной позиции, а не проигрывает
+    // историю. `pending` — место для одного «нескоалесцированного»
+    // сообщения, вычитанного во время дренажа очереди, но не подошедшего
+    // под условие коалесинга (переносится на следующую итерацию цикла).
+    let mut pending: Option<OverlayMessage> = None;
+    loop {
+        let msg = match pending.take() {
+            Some(m) => m,
+            None => match rx.recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            },
+        };
+        let (msg, leftover) = coalesce_mouse_move(&rx, msg);
+        pending = leftover;
         let mut need_redraw = false;
         match msg {
             OverlayMessage::Command(OverlayCommand::AddSticker(path)) => {
@@ -1565,10 +1868,13 @@ fn run(
                 let media_type = if is_video {
                     MediaType::Video
                 } else {
-                    media_animation::decode_animation(&new_path)
-                        .ok()
-                        .filter(|a| a.frames.len() >= 2)
-                        .map_or(MediaType::Image, |_| MediaType::Animation)
+                    // sniff_media_type, а не ручной decode_animation().ok():
+                    // трактует TooManyFrames/TooLargeForAtlas как Animation
+                    // тоже (потоковый режим, ROADMAP.md M5a) — иначе
+                    // переуказание на очень длинную анимацию тихо давало бы
+                    // Image (тот же баг, что был у add_sticker до потокового
+                    // режима).
+                    media_animation::sniff_media_type(&new_path)
                 };
                 if ops::relink_file(&mut cfg, id, new_path, media_type).is_ok() {
                     sprites.retain(|(sid, _)| *sid != id);
@@ -1674,6 +1980,7 @@ fn run(
                 if let Err(e) = config::save(&cfg, &config_path) {
                     tracing::warn!(error = %e, "не удалось сохранить config.json после сохранения пресета");
                 }
+                notify_presets_changed(&cfg, &edit.coordinator_tx);
             }
             OverlayMessage::Command(OverlayCommand::ApplyPreset(id)) => {
                 match presets::apply_preset(&mut cfg, id) {
@@ -1716,6 +2023,7 @@ fn run(
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить config.json после переименования пресета");
                         }
+                        notify_presets_changed(&cfg, &edit.coordinator_tx);
                     }
                     Err(e) => {
                         tracing::warn!(preset = %id, error = %e, "не удалось переименовать пресет")
@@ -1728,6 +2036,7 @@ fn run(
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить config.json после удаления пресета");
                         }
+                        notify_presets_changed(&cfg, &edit.coordinator_tx);
                     }
                     Err(e) => tracing::warn!(preset = %id, error = %e, "не удалось удалить пресет"),
                 }
@@ -1744,6 +2053,7 @@ fn run(
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить config.json после импорта пресета");
                         }
+                        notify_presets_changed(&cfg, &edit.coordinator_tx);
                     }
                     Err(e) => {
                         tracing::warn!(path = %path.display(), error = %e, "не удалось импортировать пресет");
@@ -1771,19 +2081,12 @@ fn run(
                     &config_path,
                     &monitor_geometry,
                 );
-                // Клик-прозрачность снимается со ВСЕХ окон одновременно, не
-                // только с того, что владеет хоткеем — иначе мышь на других
-                // мониторах проваливалась бы сквозь режим редактирования
-                // (M3_PREP_NOTES.md, раздел 3.5). `toggle_edit_mode` уже
-                // применил её к окну-инициатору через `set_click_through`
-                // (там же — забирает фокус); остальные — через
-                // `set_interactive`, без повторного `SetForegroundWindow`,
-                // иначе несколько окон боролись бы за фокус друг с другом.
-                for (other_id, other_ms) in monitors_map.iter() {
-                    if *other_id != monitor_id {
-                        other_ms.overlay.set_interactive(edit.active);
-                    }
-                }
+                // Клик-прозрачность/захват мыши синхронизируются со ВСЕХ
+                // остальных мониторов — иначе мышь на них проваливалась бы
+                // сквозь режим редактирования (M3_PREP_NOTES.md, раздел 3.5)
+                // или залипала бы после выхода (см. доккомент
+                // `sync_other_monitors_edit_mode`).
+                sync_other_monitors_edit_mode(&monitors_map, &monitor_id, edit.active);
                 need_redraw = true;
             }
             OverlayMessage::Event(_, OverlayEvent::ToggleAllStickers) => {
@@ -1830,26 +2133,27 @@ fn run(
                 let old_scale = ms.scale;
                 ms.width = size.0;
                 ms.height = size.1;
-                ms.scale = dpi as f32 / 96.0;
+                // Масштаб и (если курсор сейчас на этом мониторе) его новая
+                // DIP-позиция — чистая арифметика, см. `dpi_change_scale_and_cursor`
+                // (вынесена ради юнит-тестов на 100/150/200%, ROADMAP.md M3).
+                // Если курсор на другом мониторе, его DIP уже в системе
+                // координат ТОГО, другого, монитора — трогать не надо, поэтому
+                // курсор пересчитывается тем же значением `old_scale`,
+                // которое эта смена DPI и не меняла бы (ratio = 1.0), а сам
+                // пересчёт применяется только под условием ниже.
+                let (new_scale, new_cursor_pos) =
+                    dpi_change_scale_and_cursor(old_scale, dpi, edit.cursor_pos);
+                ms.scale = new_scale;
                 ms.target.set_dpi_scale(ms.scale);
                 if let Err(e) = ms.target.resize(&device, ms.width, ms.height) {
                     tracing::error!(error = %e, "не удалось пересоздать цепочку рендера после смены DPI");
                 }
-                // `cursor_pos` — DIP от старого масштаба ЭТОГО монитора;
-                // физическая позиция курсора смена DPI не меняет, поэтому
-                // пересчёт — просто домножение на отношение масштабов, а не
-                // ожидание следующего MouseMove (который без этого не
-                // пересобрал бы панель вовсе — hover-ветка обновляет только
-                // состояние существующей панели, docs/M3_STEP2_3_REVIEW.md,
-                // пункт 2.2). Если курсор сейчас на другом мониторе, его
-                // DIP уже в системе координат того, другого, монитора —
-                // трогать не надо.
+                // Пересчёт курсора применяется без ожидания следующего
+                // MouseMove (который без этого не пересобрал бы панель
+                // вовсе — hover-ветка обновляет только состояние
+                // существующей панели, docs/M3_STEP2_3_REVIEW.md, пункт 2.2).
                 if edit.cursor_monitor == monitor_id {
-                    let ratio = old_scale / ms.scale;
-                    edit.cursor_pos = (
-                        edit.cursor_pos.0 * ratio as f64,
-                        edit.cursor_pos.1 * ratio as f64,
-                    );
+                    edit.cursor_pos = new_cursor_pos;
                 }
                 monitor_geometry.insert(monitor_id.clone(), (ms.width, ms.height, ms.scale));
                 if let Some(bounds) = monitor_bounds.get_mut(&monitor_id) {
@@ -1867,18 +2171,20 @@ fn run(
                 rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
                 need_redraw = true;
             }
-            OverlayMessage::Event(_, OverlayEvent::HotkeyConflict(combo)) => {
+            OverlayMessage::Event(_, OverlayEvent::HotkeyConflict(name, combo)) => {
                 // Окно продолжает работать без входа в режим редактирования;
                 // тост трея (`ShowNotification`) — тот же канал, что M6 уже
                 // использует для `PinAccessDenied` (общая инфраструктура,
-                // не задача-заглушка «на потом»).
-                tracing::warn!(combo = %combo, "хоткей режима редактирования уже занят другим приложением");
-                let _ = edit.coordinator_tx.send(CoordinatorRequest::ShowNotification {
-                    title: "Хоткей уже занят".to_string(),
-                    body: format!(
-                        "Комбинация {combo} уже используется другим приложением — вход в режим редактирования недоступен."
-                    ),
-                });
+                // не задача-заглушка «на потом»). `name` — какой именно из
+                // трёх хоткеев конфликтует (раньше лог/тост всегда говорил
+                // «режим редактирования», даже когда на самом деле не
+                // регистрировался toggle_all/mute_all).
+                tracing::warn!(?name, combo = %combo, "хоткей уже занят другим приложением");
+                let (title, body) =
+                    crate::i18n::hotkey_conflict_notification(&cfg.settings.language, name, &combo);
+                let _ = edit
+                    .coordinator_tx
+                    .send(CoordinatorRequest::ShowNotification { title, body });
             }
             OverlayMessage::Event(_, OverlayEvent::MonitorsChanged(new_infos)) => {
                 // Диффинг — всегда против ЖИВОГО состояния (`monitors_map`),
@@ -2216,6 +2522,7 @@ fn run(
                     device: &device,
                     target: &mut ms.target,
                 };
+                let was_active = edit.active;
                 need_redraw = handle_key(
                     vk,
                     modifiers,
@@ -2236,6 +2543,13 @@ fn run(
                     &mut videos,
                     audio_mixer.as_ref(),
                 );
+                // `Esc` внутри `handle_key` может дёрнуть `toggle_edit_mode`
+                // напрямую (без доступа к `monitors_map`, см. доккомент
+                // `sync_other_monitors_edit_mode`) — синхронизируем остальные
+                // мониторы здесь, где `ms`/`renderer` уже не заняты картой.
+                if edit.active != was_active {
+                    sync_other_monitors_edit_mode(&monitors_map, &monitor_id, edit.active);
+                }
             }
             OverlayMessage::Event(_, OverlayEvent::Key { .. }) => {}
             OverlayMessage::Event(monitor_id, OverlayEvent::Input(event)) if edit.active => {
@@ -2246,6 +2560,7 @@ fn run(
                     device: &device,
                     target: &mut ms.target,
                 };
+                let was_active = edit.active;
                 need_redraw = handle_input(
                     event,
                     ms.scale,
@@ -2268,6 +2583,13 @@ fn run(
                     &mut window_pins,
                     &mut pinned_stickers,
                 );
+                // Кнопка «выйти» тулбара у курсора (BTN_EXIT) дёргает
+                // `toggle_edit_mode` внутри `handle_input` напрямую (см.
+                // доккомент `sync_other_monitors_edit_mode`) — синхронизируем
+                // остальные мониторы здесь же.
+                if edit.active != was_active {
+                    sync_other_monitors_edit_mode(&monitors_map, &monitor_id, edit.active);
+                }
             }
             OverlayMessage::Event(_, OverlayEvent::Input(_)) => {
                 // Вне режима редактирования окно клик-прозрачно — эти
@@ -2300,6 +2622,10 @@ fn run(
                 // §5): список окон должен обновляться в реальном времени
                 // (SPEC 4.2), не только при переключении чекбоксов.
                 rebuild_window_picker(&mut edit, &cfg, &window_snapshot, &monitor_geometry);
+                // Список закрепления (M6) — та же логика: пока открыт,
+                // должен отражать реально открытые окна, а не застывший
+                // снимок на момент нажатия BTN_ADD_WINDOW.
+                rebuild_window_pick_list(&mut edit, &window_snapshot, &monitor_geometry);
                 need_redraw = true;
             }
             OverlayMessage::AnimationTick => {
@@ -2311,6 +2637,16 @@ fn run(
                 // одинаково для статичных и анимированных стикеров (UV по
                 // умолчанию — вся текстура).
                 let now = Instant::now();
+                // Тултип ещё анимируется (задержка показа или плавное
+                // появление, фидбэк пользователя 2026-08-10) — редрав нужен,
+                // даже если ни одна анимация стикера/видео сейчас не тикает.
+                if edit
+                    .tooltip
+                    .as_ref()
+                    .is_some_and(|t| t.next_deadline(now).is_some())
+                {
+                    need_redraw = true;
+                }
                 for (id, anim) in animations.iter_mut() {
                     let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) else {
                         continue;
@@ -2319,14 +2655,47 @@ fn run(
                     {
                         continue;
                     }
-                    let delays = anim.frame_delays();
-                    if anim.clock.advance(now, &delays) {
-                        let frame = anim.atlas.frames[anim.clock.frame_index];
-                        if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| sid == id) {
-                            sprite.uv_offset = frame.uv_offset;
-                            sprite.uv_scale = frame.uv_scale;
+                    match anim {
+                        StickerAnimation::Atlas {
+                            atlas,
+                            clock,
+                            delays,
+                        } => {
+                            if clock.advance(now, delays) {
+                                let frame = atlas.frames[clock.frame_index];
+                                if let Some((_, sprite)) =
+                                    sprites.iter_mut().find(|(sid, _)| sid == id)
+                                {
+                                    sprite.uv_offset = frame.uv_offset;
+                                    sprite.uv_scale = frame.uv_scale;
+                                }
+                                need_redraw = true;
+                            }
                         }
-                        need_redraw = true;
+                        StickerAnimation::Streaming {
+                            source,
+                            texture,
+                            deadline,
+                        } => {
+                            if now >= *deadline {
+                                match source.next_frame() {
+                                    Ok(frame) => {
+                                        if let Err(e) = device
+                                            .update_streaming_animation_frame(texture, &frame.rgba)
+                                        {
+                                            tracing::warn!(error = %e, sticker = %id, "потоковая анимация: не удалось обновить кадр");
+                                        } else {
+                                            need_redraw = true;
+                                        }
+                                        *deadline = now + frame.delay;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, sticker = %id, "потоковая анимация: ошибка декодирования кадра — тик остановлен на час");
+                                        *deadline = now + Duration::from_secs(3600);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // Видео (M5b, docs/M5B_VIDEO_DESIGN.md §6): декодер сам держит
@@ -2336,9 +2705,26 @@ fn run(
                 // (остальные устарели к моменту показа), а звук отдаём
                 // микшеру целиком, по порядку, ни одной порции не пропуская.
                 for (id, playback) in videos.iter_mut() {
+                    // Не выкачиваем кадры скрытого/полностью перекрытого
+                    // видео из очереди декодера — тот же гейт, что у
+                    // Atlas/Streaming-анимаций выше, чтобы кадр реально
+                    // «стопался» на скрытии, а не менялся невидимо под
+                    // шахматкой (фидбэк пользователя 2026-08-09). Очередь
+                    // декодера ограничена (2-3 кадра), декодер сам применит
+                    // бэкпрешер по PTS. Звук эта пауза не трогает — его
+                    // включение/выключение отдельная логика (mute_invisible).
+                    let should_tick = cfg
+                        .stickers
+                        .iter()
+                        .find(|s| s.id == *id)
+                        .is_some_and(|sticker| {
+                            sticker_should_tick(sticker, edit.active, &occluder_cache, &monitor_bounds)
+                        });
                     let mut latest = None;
-                    while let Some(frame) = playback.source.try_recv_frame() {
-                        latest = Some(frame);
+                    if should_tick {
+                        while let Some(frame) = playback.source.try_recv_frame() {
+                            latest = Some(frame);
+                        }
                     }
                     if let Some(frame) = latest {
                         if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| sid == id) {
@@ -2361,18 +2747,26 @@ fn run(
                 }
             }
         }
-        // Атлас только что добавленной анимации (M5a §5, EditState::
+        // Анимация только что добавленного стикера (M5a §5, EditState::
         // pending_animation) — заводим часы здесь, где под рукой
         // `animations`; `add_sticker` не может сделать это сам, он не видит
         // локальную переменную цикла `run()`.
-        if let Some((id, atlas)) = edit.pending_animation.take() {
-            animations.insert(
-                id,
-                StickerAnimation {
-                    atlas,
-                    clock: AnimationClock::new(Instant::now()),
+        if let Some((id, pending)) = edit.pending_animation.take() {
+            let anim = match pending {
+                PendingAnimation::Atlas(atlas) => {
+                    StickerAnimation::from_atlas(atlas, AnimationClock::new(Instant::now()))
+                }
+                PendingAnimation::Streaming {
+                    source,
+                    texture,
+                    first_delay,
+                } => StickerAnimation::Streaming {
+                    source,
+                    texture,
+                    deadline: Instant::now() + first_delay,
                 },
-            );
+            };
+            animations.insert(id, anim);
         }
         // `VideoPlayback` только что добавленного видеостикера (M5b, то же
         // паттерн — см. доккомент `EditState::pending_video`).
@@ -2442,7 +2836,7 @@ fn run(
                 .filter_map(|(id, anim)| {
                     let sticker = cfg.stickers.iter().find(|s| s.id == *id)?;
                     sticker_should_tick(sticker, edit.active, &occluder_cache, &monitor_bounds)
-                        .then(|| anim.clock.next_deadline(&anim.frame_delays()))
+                        .then(|| anim.next_deadline())
                 })
                 .min()
         };
@@ -2453,7 +2847,16 @@ fn run(
         } else {
             None
         };
-        let next_tick_deadline = [next_anim_deadline, next_video_deadline]
+        // Тултип (фидбэк пользователя 2026-08-10): пока идёт задержка показа
+        // или анимация появления, планировщику нужен дедлайн — тот же общий
+        // канал `AnimationTick`, что у анимаций/видео (ADR-006: ноль
+        // пробуждений в покое, дедлайн есть только пока реально что-то ещё
+        // должно измениться).
+        let next_tooltip_deadline = edit
+            .tooltip
+            .as_ref()
+            .and_then(|t| t.next_deadline(Instant::now()));
+        let next_tick_deadline = [next_anim_deadline, next_video_deadline, next_tooltip_deadline]
             .into_iter()
             .flatten()
             .min();
@@ -2474,13 +2877,20 @@ fn run(
             );
             need_redraw = true;
         }
+        // Открытие списка окон для закрепления — тем же поводом отложено,
+        // что открытие панели выбора окон выше (`BTN_ADD_WINDOW` в
+        // `handle_cursor_panel_up` не имеет `window_snapshot`).
+        if let Some(monitor_id) = edit.pending_open_pick_list.take() {
+            open_window_pick_list(&mut edit, &window_snapshot, &monitor_geometry, monitor_id);
+            need_redraw = true;
+        }
         // Гейт хуков трекера — раз за итерацию, дёшево (см. комментарий у
         // объявления `last_mask_needed`); переключается только при реальном
         // изменении, не на каждой итерации подряд. Пока открыта панель
         // выбора окон, снимок обязан оставаться живым независимо от
         // `mask_needed(cfg)` (дизайн §5.1) — иначе если ВСЕ стикеры сейчас
         // `Always`, трекер спит, и список окон в панели не наполнится вовсе.
-        let new_mask_needed = mask_needed(&cfg) || edit.window_picker.is_some();
+        let new_mask_needed = tracker_mask_needed(&cfg, &edit);
         if new_mask_needed != last_mask_needed {
             last_mask_needed = new_mask_needed;
             if let Some(tracker) = &window_tracker {
@@ -2498,8 +2908,6 @@ fn run(
                 &black_tex,
                 &mut ui_cache,
                 &occluder_cache,
-                &window_snapshot,
-                &monitor_bounds,
             )
         {
             if recover_device(
@@ -2525,8 +2933,6 @@ fn run(
                     &black_tex,
                     &mut ui_cache,
                     &occluder_cache,
-                    &window_snapshot,
-                    &monitor_bounds,
                 );
             } else {
                 device_needs_recovery = true;
@@ -2596,11 +3002,56 @@ fn toggle_edit_mode(
     overlay.set_click_through(!edit.active);
     if !edit.active {
         edit.selection.clear();
+        // Хоткей выхода мог сработать, пока пользователь ещё держит кнопку
+        // мыши (тянет ползунок/жест) — обычный цикл Down→Up, который снял бы
+        // Win32-захват сам, тогда не наступает вовремя, и уже
+        // клик-прозрачное окно продолжает монопольно получать всю мышь
+        // системы до следующего физического отпускания кнопки (найдено при
+        // разборе бага «HUD/мышь живут своей жизнью» — совместная сессия с
+        // ботами-воркерами через Orca, 2026-08-08). Безопасно и когда
+        // захвата нет вовсе.
+        overlay.force_release_capture();
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json при выходе из режима редактирования");
         }
     }
     rebuild_ui_panels(edit, cfg, monitor_geometry);
+}
+
+/// Синхронизировать клик-прозрачность и Win32-захват мыши на ВСЕХ мониторах,
+/// кроме `initiator_id`, после того как `toggle_edit_mode` сменил
+/// `edit.active` — общая точка для каждого места, откуда можно выйти/войти в
+/// режим редактирования (хоткей, `Esc`, кнопка «выйти» тулбара у курсора).
+///
+/// До этой функции синхронизацию делал только обработчик хоткея (единственное
+/// место, где `toggle_edit_mode` мог быть вызван вместе с доступом к
+/// `monitors_map` в одной точке) — `Esc` (`handle_key`) и кнопка «выйти»
+/// (`handle_cursor_panel_up` → `BTN_EXIT`) вызывали `toggle_edit_mode`
+/// напрямую и НЕ синхронизировали остальные мониторы: если пользователь
+/// выходил из режима редактирования не хоткеем (а это как минимум так же
+/// частый путь, если не чаще), не-главные мониторы оставались в интерактивном
+/// (не клик-прозрачном) режиме навсегда — ровно баг «не могу нажать ЛКМ/ПКМ
+/// на втором мониторе», о котором пользователь сообщил повторно 2026-08-09
+/// уже ПОСЛЕ фикса, который синхронизировал только путь через хоткей.
+/// Вызывающий код обязан сравнить `edit.active` до/после своего вызова
+/// `toggle_edit_mode` (прямого или через `handle_key`/`handle_input`) и
+/// позвать это здесь при реальном изменении — единой точки внутри самого
+/// `toggle_edit_mode` не сделать: некоторые вызывающие держат `&mut
+/// monitors_map`-производный `Renderer` (это боррош конфликтует с `&
+/// monitors_map`, нужным для обхода остальных мониторов) на момент вызова.
+fn sync_other_monitors_edit_mode(
+    monitors_map: &HashMap<MonitorId, MonitorState>,
+    initiator_id: &MonitorId,
+    edit_active: bool,
+) {
+    for (other_id, other_ms) in monitors_map.iter() {
+        if other_id != initiator_id {
+            other_ms.overlay.set_interactive(edit_active);
+            if !edit_active {
+                other_ms.overlay.force_release_capture();
+            }
+        }
+    }
 }
 
 /// Положить готовый снимок `Config` в историю undo и очистить историю redo —
@@ -2731,15 +3182,36 @@ fn load_sticker_sprite(device: &Device, sticker: &Sticker) -> Option<(Sprite, St
                         .with_uv(f0.uv_offset, f0.uv_scale);
                         return Some((
                             sprite,
-                            StickerAnimation {
+                            StickerAnimation::from_atlas(
                                 atlas,
-                                clock: AnimationClock::new(Instant::now()),
-                            },
+                                AnimationClock::new(Instant::now()),
+                            ),
                         ));
                     }
                     Err(e) => {
                         tracing::warn!(path = %path.display(), error = %e, "не удалось собрать атлас анимации — загружаю как статичное изображение");
                     }
+                }
+            }
+            Err(
+                media_animation::MediaError::TooManyFrames { .. }
+                | media_animation::MediaError::TooLargeForAtlas { .. },
+            ) => {
+                if let Some((texture, source, first_delay)) = open_streaming_animation(device, path)
+                {
+                    let sprite = Sprite::new(
+                        texture.clone(),
+                        sticker.placement.clone(),
+                        sticker.transform,
+                    );
+                    return Some((
+                        sprite,
+                        StickerAnimation::Streaming {
+                            source,
+                            texture,
+                            deadline: Instant::now() + first_delay,
+                        },
+                    ));
                 }
             }
             _ => {
@@ -2748,6 +3220,46 @@ fn load_sticker_sprite(device: &Device, sticker: &Sticker) -> Option<(Sprite, St
         }
     }
     None
+}
+
+/// Открыть анимацию в потоковом режиме (ROADMAP.md M5a, «потоковый режим
+/// для очень длинных анимаций» — `decode_animation` вернул `TooManyFrames`/
+/// `TooLargeForAtlas`): декодирует только первый кадр и заводит для него
+/// переиспользуемую GPU-текстуру; остальные кадры декодируются по одному на
+/// каждый `AnimationTick` (см. `StickerAnimation::Streaming`). `None` — сам
+/// потоковый декодер тоже не смог открыться/декодировать первый кадр
+/// (битый файл) — вызывающий код в этом случае оставляет стикер без
+/// спрайта, тем же принципом, что и остальные ошибки декода в этом файле.
+fn open_streaming_animation(
+    device: &Device,
+    path: &Path,
+) -> Option<(Texture, media_animation::StreamingAnimation, Duration)> {
+    let mut source = match media_animation::StreamingAnimation::open(path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "потоковая анимация: не удалось открыть");
+            return None;
+        }
+    };
+    let first = match source.next_frame() {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "потоковая анимация: не удалось декодировать первый кадр");
+            return None;
+        }
+    };
+    let texture = match device.create_streaming_animation_frame(
+        &first.rgba,
+        source.width(),
+        source.height(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "потоковая анимация: не удалось создать текстуру кадра");
+            return None;
+        }
+    };
+    Some((texture, source, first.delay))
 }
 
 /// Пустые (чёрные) видеотекстуры нужного размера — до первого декодированного
@@ -3049,14 +3561,23 @@ fn handle_key(
             false
         };
     }
-    // Режим выбора окна (M6, SPEC.md §5.1) блокирует клавиатуру целиком,
-    // кроме `Esc` — тем же паттерном, что панель выбора окон ниже: пока
-    // курсор «в режиме прицела», хоткеи вроде `Delete`/`Ctrl+D` по текущему
-    // выделению были бы путающими.
-    if edit.picking_window {
+    // Панель быстрого переключения пресетов (M7) модальна для клавиатуры,
+    // как и модал подтверждения выше, — тем же паттерном (единственный
+    // выход — Esc, ничего не применяя).
+    if edit.preset_picker.is_some() {
         return if vk == VK_ESCAPE {
-            edit.picking_window = false;
-            edit.pick_hover = None;
+            edit.preset_picker = None;
+            true
+        } else {
+            false
+        };
+    }
+    // Список окон для закрепления (M6, SPEC.md §5.1) блокирует клавиатуру
+    // целиком, кроме `Esc` — тот же паттерн, что `preset_picker` выше
+    // (список действий, а не редактор конкретного стикера).
+    if edit.window_pick_list.is_some() {
+        return if vk == VK_ESCAPE {
+            edit.window_pick_list = None;
             true
         } else {
             false
@@ -3392,10 +3913,54 @@ fn point_in_box2d(r: &Box2D, x: f64, y: f64) -> bool {
     (x - r.cx).abs() <= r.w / 2.0 && (y - r.cy).abs() <= r.h / 2.0
 }
 
+/// Направление от центра стикера к углу `corner` в ЛОКАЛЬНЫХ (неповёрнутых)
+/// осях, экранная конвенция (по часовой = плюс, см. `transform_ops::rotate`
+/// и доккомент `create_rotate_cursor` в rst-win32): чистая геометрия угла
+/// осеориентированного прямоугольника, не подобранная константа — NW/NE/
+/// SE/SW лежат на пересечении диагоналей ровно в этих направлениях
+/// независимо от размера прямоугольника.
+fn corner_local_angle_deg(corner: CoreCorner) -> f64 {
+    match corner {
+        CoreCorner::NorthWest => -135.0,
+        CoreCorner::NorthEast => -45.0,
+        CoreCorner::SouthEast => 45.0,
+        CoreCorner::SouthWest => 135.0,
+    }
+}
+
+/// Угол курсора поворота (градусы, целые — кэшируется по этому значению в
+/// `rst-win32`): направление к БЛИЖАЙШЕМУ (по расстоянию до ручки) углу
+/// рамки, повёрнутое вместе со стикером (фидбэк пользователя 2026-08-09,
+/// третий раунд — «бери положение угла картинки в пространстве», а не
+/// фиксированную константу на 4 угла: если стикер уже повёрнут, его углы
+/// физически не там, где были бы у неповёрнутого прямоугольника). Изгиб
+/// дуги курсора при этом смотрит туда же, куда «выпирает» реальный угол.
+fn nearest_corner_cursor_angle_deg(sbox: &SelectionBox, rotation: f64, dip_x: f64, dip_y: f64) -> i32 {
+    let nearest = CoreCorner::ALL
+        .into_iter()
+        .min_by(|a, b| {
+            let da = {
+                let (hx, hy) = sbox.handle_center(a.handle());
+                (dip_x - hx).hypot(dip_y - hy)
+            };
+            let db = {
+                let (hx, hy) = sbox.handle_center(b.handle());
+                (dip_x - hx).hypot(dip_y - hy)
+            };
+            da.total_cmp(&db)
+        })
+        .expect("CoreCorner::ALL непусто");
+    (corner_local_angle_deg(nearest) + rotation.to_degrees()).round() as i32
+}
+
 /// Разрешить зону под курсором (docs/M2_INTEGRATION_PLAN.md, раздел 7):
-/// порядок проверки — обратный порядку отрисовки. Ручки/кольцо поворота
-/// доступны только для одиночного выделения (мультивыделение — следующий
-/// срез).
+/// порядок проверки — обратный порядку отрисовки. Ручки — на самих себе;
+/// поворот — СНАРУЖИ рамки на расстоянии от ближайшего угла не меньше
+/// `ROTATE_MIN_CORNER_GAP_DIP`, без верхнего предела (весь внешний
+/// периметр, как в Photoshop — фидбэк пользователя 2026-08-09, третий
+/// раунд: старое кольцо вокруг угла срабатывало и ВНУТРИ рамки, и было
+/// ограничено дистанцией). Ручки/поворот доступны только для одиночного
+/// выделения (мультивыделение — следующий срез).
 fn resolve_zone(
     cfg: &Config,
     selection: &SelectionSet,
@@ -3410,27 +3975,43 @@ fn resolve_zone(
             .find(|s| s.id == *id && s.placement.monitor_id == *monitor_id)
         {
             let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
-            // Ручки ресайза — высший приоритет: их квадрат (сторона
-            // HANDLE_SIZE_DIP) целиком накрывает свой угол, поэтому кольцо
-            // поворота ниже начинается ровно за его границей без мёртвой
-            // зоны и без квадратного «угла» на внутренней границе
-            // (docs/M2_SLICE_REVIEW.md, пункт 3 — раньше внутренняя граница
-            // считалась от тела стикера, а не от центра ручки).
+            // Ручки ресайза — высший приоритет, безусловно (и внутри, и
+            // снаружи рамки — квадрат ручки обычно на самой границе).
             for (kind, rect) in sbox.handle_rects(rst_render::HANDLE_SIZE_DIP) {
                 if point_in_box2d(&rect, dip_x, dip_y) {
                     return Zone::ResizeHandle(*id, kind);
                 }
             }
-            for corner in CoreCorner::ALL {
-                let (hx, hy) = sbox.handle_center(corner.handle());
-                let dist = (dip_x - hx).hypot(dip_y - hy);
-                if dist <= ROTATE_RING_MAX_DIP {
-                    return Zone::Rotate(*id, corner);
-                }
-            }
-            if hittest::contains(&sticker.placement, &sticker.transform, dip_x, dip_y) {
+            let inside = hittest::contains(&sticker.placement, &sticker.transform, dip_x, dip_y);
+            if inside {
                 return Zone::StickerBody(*id);
             }
+            // Клик снаружи рамки выделенного стикера может лежать на ДРУГОМ
+            // стикере — переключение выделения важнее зоны поворота: она
+            // безгранична наружу (см. ниже), поэтому без этой проверки ни
+            // один другой стикер на экране вообще не кликабелен, пока
+            // текущий выделен (баг из репорта пользователя: «выбрал стикер —
+            // не могу выбрать другой», 2026-08-10).
+            if let Some(other_id) = hit_sticker_at(cfg, monitor_id, dip_x, dip_y) {
+                if other_id != *id {
+                    return Zone::StickerBody(other_id);
+                }
+            }
+            let nearest_corner_dist = CoreCorner::ALL
+                .into_iter()
+                .map(|corner| {
+                    let (hx, hy) = sbox.handle_center(corner.handle());
+                    (dip_x - hx).hypot(dip_y - hy)
+                })
+                .fold(f64::INFINITY, f64::min);
+            if nearest_corner_dist >= ROTATE_MIN_CORNER_GAP_DIP {
+                let angle =
+                    nearest_corner_cursor_angle_deg(&sbox, sticker.transform.rotation, dip_x, dip_y);
+                return Zone::Rotate(*id, angle);
+            }
+            // Снаружи, но ближе ROTATE_MIN_CORNER_GAP_DIP к углу и не на
+            // самой ручке — узкий буфер вокруг ручки, ни ресайз, ни поворот
+            // (та же логика, что «дырка» между зонами в Photoshop).
             return Zone::Background;
         }
     }
@@ -3453,15 +4034,6 @@ fn to_win32_handle(kind: HandleKind) -> Win32Handle {
     }
 }
 
-fn to_win32_corner(corner: CoreCorner) -> Win32Corner {
-    match corner {
-        CoreCorner::NorthWest => Win32Corner::NorthWest,
-        CoreCorner::NorthEast => Win32Corner::NorthEast,
-        CoreCorner::SouthEast => Win32Corner::SouthEast,
-        CoreCorner::SouthWest => Win32Corner::SouthWest,
-    }
-}
-
 fn cursor_shape_for_zone(zone: &Zone) -> CursorShape {
     match zone {
         Zone::Background => CursorZone::Background.cursor_shape(),
@@ -3469,8 +4041,99 @@ fn cursor_shape_for_zone(zone: &Zone) -> CursorShape {
         Zone::ResizeHandle(_, kind) => {
             CursorZone::ResizeHandle(to_win32_handle(*kind)).cursor_shape()
         }
-        Zone::Rotate(_, corner) => CursorZone::RotateZone(to_win32_corner(*corner)).cursor_shape(),
+        Zone::Rotate(_, angle_deg) => CursorZone::RotateZone(*angle_deg).cursor_shape(),
     }
+}
+
+/// Текст тултипа кнопки тулбара выделения (фидбэк пользователя 2026-08-10) —
+/// `None` для виджетов без подсказки (слайдер прозрачности, числовое поле —
+/// не кнопки). `is_window` — тот же признак, что у `build_toolbar`/
+/// `rebuild_toolbar`: `TB_EYE` у стикера-окна — не «показать/скрыть»
+/// (открепление стикера-окна, `handle_toolbar_up`).
+fn toolbar_tooltip_text(id: WidgetId, is_window: bool) -> Option<&'static str> {
+    match id {
+        toolbar::TB_LAYERS => Some("Слои видимости"),
+        toolbar::TB_EYE if is_window => Some("Открепить окно"),
+        toolbar::TB_EYE => Some("Показать/скрыть"),
+        toolbar::TB_ORDER_UP => Some("Переместить выше"),
+        toolbar::TB_ORDER_DOWN => Some("Переместить ниже"),
+        toolbar::TB_DUPLICATE => Some("Дублировать"),
+        toolbar::TB_RESET_SCALE => Some("Сбросить масштаб"),
+        toolbar::TB_DELETE => Some("Удалить"),
+        toolbar::TB_PLAY_PAUSE => Some("Играть/пауза"),
+        _ => None,
+    }
+}
+
+/// Текст тултипа кнопки панели у курсора (фидбэк пользователя 2026-08-10).
+fn cursor_panel_tooltip_text(id: WidgetId) -> Option<&'static str> {
+    match id {
+        cursor_panel::BTN_LOAD_FILE => Some("Загрузить файл"),
+        cursor_panel::BTN_ADD_WINDOW => Some("Закрепить окно"),
+        cursor_panel::BTN_PRESETS => Some("Пресеты"),
+        cursor_panel::BTN_TOGGLE_ALL => Some("Показать/скрыть все стикеры"),
+        cursor_panel::BTN_SETTINGS => Some("Настройки"),
+        cursor_panel::BTN_EXIT => Some("Выйти из режима редактирования"),
+        _ => None,
+    }
+}
+
+/// Примитивы тултипа: фон (та же двухслойная заливка, что у `Panel::draw` —
+/// PANEL_BORDER снаружи, PANEL_BG внутри, инсет 2 DIP) + текст, под кнопкой
+/// (либо над ней, если снизу не хватает места — тот же приём, что
+/// `toolbar_top`). `opacity` — множитель анимации появления (фидбэк
+/// пользователя 2026-08-10); `[]`, если `opacity <= 0` (задержка ещё не
+/// истекла) — не тратим текстуры на невидимое.
+fn tooltip_primitives(tooltip: &TooltipState, screen_h: f64, opacity: f64) -> Vec<Primitive> {
+    if opacity <= 0.0 {
+        return Vec::new();
+    }
+    let (text_w, text_h) = rst_render::text_size(tooltip.text);
+    let box_w = text_w + 2.0 * TOOLTIP_PAD_DIP;
+    let box_h = text_h + 2.0 * TOOLTIP_PAD_DIP;
+    let below_top = tooltip.anchor.cy + tooltip.anchor.h / 2.0 + TOOLTIP_GAP_DIP;
+    let top = if below_top + box_h <= screen_h {
+        below_top
+    } else {
+        tooltip.anchor.cy - tooltip.anchor.h / 2.0 - TOOLTIP_GAP_DIP - box_h
+    };
+    let cx = tooltip.anchor.cx;
+    let cy = top + box_h / 2.0;
+    let frame = Box2D {
+        cx,
+        cy,
+        w: box_w,
+        h: box_h,
+        rotation: 0.0,
+    };
+    vec![
+        Primitive::Fill {
+            rect: frame,
+            color: theme::PANEL_BORDER,
+            opacity: theme::PANEL_BG_OPACITY * opacity,
+        },
+        Primitive::Fill {
+            rect: Box2D {
+                w: (frame.w - 2.0).max(0.0),
+                h: (frame.h - 2.0).max(0.0),
+                ..frame
+            },
+            color: theme::PANEL_BG,
+            opacity: theme::PANEL_BG_OPACITY * opacity,
+        },
+        Primitive::Text {
+            rect: Box2D {
+                cx,
+                cy,
+                w: text_w,
+                h: text_h,
+                rotation: 0.0,
+            },
+            text: tooltip.text.to_string(),
+            color: theme::TEXT,
+            opacity,
+        },
+    ]
 }
 
 /// Записать `placement`/`transform` и в модель (`cfg.stickers`), и в спрайт
@@ -3558,6 +4221,23 @@ fn mask_needed(cfg: &Config) -> bool {
     cfg.stickers
         .iter()
         .any(|s| s.visibility.mode != VisibilityMode::Always)
+}
+
+/// Гейт хуков трекера окон (ADR-005, M4_PREP_NOTES §6.4): помимо
+/// `mask_needed(cfg)` (окклюдеры) трекер обязан жить, пока открыт любой UI,
+/// которому нужен живой `window_snapshot`, даже если ни у одного стикера нет
+/// правила видимости, зависящего от окклюдеров, — иначе на чистом конфиге
+/// (только что установленный resticker, все стикеры `Always` или их вообще
+/// нет) трекер спит, и такой UI получает пустой/протухший снимок.
+///
+/// `window_picker` (M4, панель «какие окна видимы» у стикера) — известный
+/// прежний случай. `window_pick_list` (M6, список окон для закрепления у
+/// кнопки `BTN_ADD_WINDOW`) — тот же паттерн: без него список не
+/// наполнялся бы НИКОГДА на чистом конфиге — трекер не просыпался,
+/// снимок оставался пустым (найдено по репорту пользователя «кнопка
+/// прикрепления окна вообще не работает», 2026-08-10).
+fn tracker_mask_needed(cfg: &Config, edit: &EditState) -> bool {
+    mask_needed(cfg) || edit.window_picker.is_some() || edit.window_pick_list.is_some()
 }
 
 /// Пересчитать группы окклюдеров по каждому монитору (M4_OCCLUDERS_DESIGN.md
@@ -4072,6 +4752,33 @@ fn apply_opacity(cfg: &mut Config, sprites: &mut [(Uuid, Sprite)], id: Uuid, per
     apply_transform(cfg, sprites, id, placement, transform);
 }
 
+/// Пересчёт масштаба и позиции курсора при `OverlayEvent::DpiChanged`
+/// (M3_PREP_NOTES.md §3.6) — чистая арифметика, вынесенная из ветки
+/// `DpiChanged` в `run()`, где остаются только GPU-пересоздание цели
+/// (`ms.target.resize`) и мутации `HashMap`, которым нужен реальный живой
+/// монитор/устройство. Эта часть — нет, поэтому проверяется юнит-тестами на
+/// синтетических переходах 100/150/200% (ROADMAP.md M3 «тест на смешанном
+/// DPI 100/150/200» — `WM_DPICHANGED` несёт готовое значение DPI независимо
+/// от того, откуда оно взялось физически: смена монитора или смена его
+/// настройки, — поэтому симулировать значения так же достоверно, как
+/// `rst_win32::overlay::handle_dpi_changed` уже делает для самого сообщения).
+///
+/// `cursor_pos` — DIP-курсор монитора, чья DPI сменилась (вызывающий код
+/// зовёт эту функцию, только когда `edit.cursor_monitor == monitor_id`).
+/// Курсор физически не двигался — только логический (DIP) масштаб этого
+/// монитора, поэтому DIP-позиция пересчитывается пропорционально отношению
+/// старого/нового масштаба (то же отношение, что сохраняет физический
+/// (px) курсор неизменным: `dip * scale` — инвариант перехода).
+fn dpi_change_scale_and_cursor(
+    old_scale: f32,
+    dpi: u32,
+    cursor_pos: (f64, f64),
+) -> (f32, (f64, f64)) {
+    let new_scale = dpi as f32 / 96.0;
+    let ratio = (old_scale / new_scale) as f64;
+    (new_scale, (cursor_pos.0 * ratio, cursor_pos.1 * ratio))
+}
+
 /// Границы монитора в DIP — общий вход для позиционирования UI-панелей
 /// (тулбар/панель у курсора).
 fn screen_dip_rect(overlay_size: (u32, u32), scale: f32) -> DipRect {
@@ -4151,7 +4858,9 @@ fn rebuild_toolbar(edit: &mut EditState, cfg: &Config, screen_h: f64) {
     // же контракт, что у мультивыделения).
     let is_window = matches!(sticker.source, StickerSource::Window { .. });
     let opacity = (!is_window).then_some(sticker.transform.opacity);
-    edit.toolbar = Some(toolbar::build_toolbar(&bounds, opacity, video, screen_h));
+    edit.toolbar = Some(toolbar::build_toolbar(
+        &bounds, opacity, video, screen_h, is_window,
+    ));
 }
 
 /// Пересобрать панель у курсора (раздел 4): есть, пока режим активен, на
@@ -4307,6 +5016,78 @@ fn rebuild_window_picker(
     state.panel = result.panel;
 }
 
+/// Открыть список окон для закрепления (M6, кнопка `BTN_ADD_WINDOW`,
+/// `window_pick_list.rs`, фидбэк пользователя 2026-08-10) — центрирован на
+/// экране монитора, где была нажата кнопка, тем же паттерном, что
+/// `open_preset_picker`. Вызывается из цикла `run()` (`pending_open_pick_list`,
+/// докком у объявления поля) — `handle_cursor_panel_up` не имеет
+/// `window_snapshot`, которым список наполняется.
+fn open_window_pick_list(
+    edit: &mut EditState,
+    window_snapshot: &[WindowInfo],
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    monitor_id: MonitorId,
+) {
+    if !monitor_geometry.contains_key(&monitor_id) {
+        return;
+    }
+    edit.window_pick_list = Some(WindowPickListState {
+        // Плейсхолдер — `rebuild_window_pick_list` ниже строит настоящую
+        // панель немедленно, до первой отрисовки.
+        panel: Panel::new(
+            window_pick_list::PANEL_ID,
+            Box2D {
+                cx: 0.0,
+                cy: 0.0,
+                w: 1.0,
+                h: 1.0,
+                rotation: 0.0,
+            },
+        ),
+        monitor_id,
+        scroll: 0,
+    });
+    rebuild_window_pick_list(edit, window_snapshot, monitor_geometry);
+}
+
+/// Пересобрать список окон для закрепления (новый снимок трекера —
+/// `OverlayMessage::Windows(Changed)` — список открытых окон живой, пока
+/// панель открыта, в отличие от `window_picker`, который правит один
+/// зафиксированный стикер). Центрирован на экране своего монитора, как
+/// `rebuild_window_picker`/модал подтверждения.
+fn rebuild_window_pick_list(
+    edit: &mut EditState,
+    window_snapshot: &[WindowInfo],
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) {
+    let Some(state) = &mut edit.window_pick_list else {
+        return;
+    };
+    let Some(&(w, h, scale)) = monitor_geometry.get(&state.monitor_id) else {
+        edit.window_pick_list = None;
+        return;
+    };
+    let screen = screen_dip_rect((w, h), scale);
+    let sorted = window_pick_list::sorted_snapshot(window_snapshot);
+    let frame = Box2D {
+        cx: screen.w / 2.0,
+        cy: screen.h / 2.0,
+        w: window_pick_list::WIDTH,
+        h: window_pick_list::height(sorted.len()),
+        rotation: 0.0,
+    };
+    let mut result = window_pick_list::build(&sorted, state.scroll, frame);
+    // Снимок окон мог сжаться (окно закрылось, пока список был открыт) —
+    // тот же кламп-и-перестрой, что `rebuild_window_picker`.
+    if result.total_rows > 0 && state.scroll >= result.total_rows {
+        state.scroll = result.total_rows - 1;
+        result = window_pick_list::build(&sorted, state.scroll, frame);
+    } else if result.total_rows == 0 {
+        state.scroll = 0;
+    }
+    state.panel = result.panel;
+}
+
 /// Опросить действия панели выбора окон после `Up` (M4_WINDOW_PICKER_DESIGN.md
 /// §1, §4): «Выбрать все» и чекбоксы процессов — каждое переключение своим
 /// шагом истории, как у тулбара. Чекбоксы окон всегда disabled (дизайн §7.6)
@@ -4425,6 +5206,161 @@ fn handle_window_picker_up(
     true
 }
 
+/// Открыть панель быстрого переключения пресетов (M7, клик по
+/// `cursor_panel::BTN_PRESETS` в `handle_cursor_panel_up` — только когда
+/// `cfg.presets` непусто, вызывающий код это уже проверил). Центрирована на
+/// экране своего монитора, как модал подтверждения/панель выбора окон —
+/// точное позиционирование у кнопки не важнее простоты (та же логика, что
+/// `open_window_picker`). В отличие от неё — не пересобирается впоследствии:
+/// пока модальная панель открыта, ничто больше не может изменить
+/// `cfg.presets` (`preset_picker.rs`, докком модуля).
+fn open_preset_picker(
+    edit: &mut EditState,
+    cfg: &Config,
+    monitor_id: &MonitorId,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) {
+    let Some(&(w, h, scale)) = monitor_geometry.get(monitor_id) else {
+        return;
+    };
+    let screen = screen_dip_rect((w, h), scale);
+    let frame = Box2D {
+        cx: screen.w / 2.0,
+        cy: screen.h / 2.0,
+        w: preset_picker::WIDTH,
+        h: preset_picker::height(cfg.presets.len()),
+        rotation: 0.0,
+    };
+    edit.preset_picker = Some(PresetPickerState {
+        panel: preset_picker::build(&cfg.presets, frame),
+        monitor_id: monitor_id.clone(),
+    });
+}
+
+/// Опросить клик по строке панели пресетов после `Up` (M7) — вызывается из
+/// `handle_input` напрямую (не через `handle_cursor_panel_up`: нужны
+/// `occluder_cache`/`window_snapshot`/`monitor_bounds`, которых у него нет,
+/// но есть у `handle_input`), тем же паттерном, что
+/// `OverlayCommand::ApplyPreset` в `run()` — тот же `presets::apply_preset`,
+/// тот же пересчёт occluder-кэша и та же пересылка недостающих элементов.
+/// Панель закрывается независимо от результата клика — единственная
+/// строка, которую можно нажать, это применение конкретного пресета.
+#[allow(clippy::too_many_arguments)]
+fn handle_preset_picker_up(
+    edit: &mut EditState,
+    renderer: &Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    occluder_cache: &mut HashMap<MonitorId, Vec<OccluderSet>>,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    pos: (f64, f64),
+) -> bool {
+    let Some(picker) = &mut edit.preset_picker else {
+        return true;
+    };
+    picker.panel.pointer_event(PointerEvent::Up { pos });
+    let clicked_id = cfg.presets.iter().enumerate().find_map(|(i, preset)| {
+        edit.preset_picker
+            .as_mut()
+            .and_then(|s| {
+                s.panel
+                    .widget_mut::<Button>(preset_picker::ROW_BASE + i as WidgetId)
+            })
+            .is_some_and(Button::take_click)
+            .then_some(preset.id)
+    });
+    edit.preset_picker = None;
+    let Some(id) = clicked_id else {
+        return true;
+    };
+    match presets::apply_preset(cfg, id) {
+        Ok(outcome) => {
+            edit.selection.clear();
+            resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после применения пресета из панели у курсора");
+            }
+            *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
+            if !outcome.missing.is_empty() {
+                let _ = edit
+                    .coordinator_tx
+                    .send(CoordinatorRequest::PresetMissingElements(outcome.missing));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(preset = %id, error = %e, "не удалось применить пресет из панели у курсора")
+        }
+    }
+    true
+}
+
+/// Опросить клик по строке списка окон после `Up` (M6, `window_pick_list.rs`,
+/// фидбэк пользователя 2026-08-10) — тем же паттерном, что
+/// `handle_preset_picker_up`: строка декодируется обратно в `WindowInfo`
+/// через тот же отсортированный снимок, что строил панель
+/// (`window_pick_list::sorted_snapshot` — детерминированный порядок,
+/// индекс строки не меняется между билдом и кликом в пределах одного
+/// снимка). Панель закрывается независимо от результата клика (окно могло
+/// исчезнуть между открытием списка и кликом — `add_window_sticker` тогда
+/// просто no-op, тем же принципом, что у `apply_preset`).
+#[allow(clippy::too_many_arguments)]
+fn handle_window_pick_list_up(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_pins: &mut WindowPins,
+    pinned_stickers: &mut HashMap<usize, Uuid>,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    pos: (f64, f64),
+) -> bool {
+    let Some(state) = &mut edit.window_pick_list else {
+        return true;
+    };
+    state.panel.pointer_event(PointerEvent::Up { pos });
+    let sorted = window_pick_list::sorted_snapshot(window_snapshot);
+    let clicked_hwnd = sorted.iter().enumerate().find_map(|(i, window)| {
+        edit.window_pick_list
+            .as_mut()
+            .and_then(|s| {
+                s.panel
+                    .widget_mut::<Button>(window_pick_list::ROW_BASE + i as WidgetId)
+            })
+            .is_some_and(Button::take_click)
+            .then_some(window.hwnd)
+    });
+    edit.window_pick_list = None;
+    let Some(hwnd) = clicked_hwnd else {
+        return true;
+    };
+    let new_id = add_window_sticker(
+        cfg,
+        config_path,
+        window_snapshot,
+        monitor_bounds,
+        window_pins,
+        pinned_stickers,
+        &edit.coordinator_tx,
+        hwnd,
+    );
+    // Сразу выделить новый стикер-окно (без этого закрепление никак не
+    // видно — ни рамки выделения, ни тулбара, будто ничего не произошло) —
+    // тот же паттерн, что `TB_DUPLICATE`.
+    if let Some(new_id) = new_id {
+        edit.selection.click(Some(new_id));
+        rebuild_ui_panels(edit, cfg, monitor_geometry);
+    }
+    true
+}
+
 /// Решить целевую видимость и применить её всем стикерам батчем (общая
 /// логика хоткея `toggle_all_stickers` и кнопки `BTN_TOGGLE_ALL`,
 /// docs/M2_WIRING_PLAN.md, раздел 6 «Панель у курсора»): сходится к
@@ -4498,6 +5434,8 @@ fn handle_toolbar_up(
     animations: &mut HashMap<Uuid, StickerAnimation>,
     videos: &mut HashMap<Uuid, VideoPlayback>,
     audio_mixer: Option<&AudioMixer>,
+    window_pins: &mut WindowPins,
+    pinned_stickers: &mut HashMap<usize, Uuid>,
     pos: (f64, f64),
     overlay_size: (u32, u32),
     scale: f32,
@@ -4563,6 +5501,19 @@ fn handle_toolbar_up(
         return true;
     }
     if clicked(edit, toolbar::TB_EYE) {
+        // Стикер-окно: та же кнопка — «открепить», не «показать/скрыть»
+        // (фидбэк пользователя 2026-08-10, см. доккомент `build_toolbar`).
+        let is_window_sticker = cfg
+            .stickers
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| matches!(s.source, StickerSource::Window { .. }));
+        if is_window_sticker {
+            unpin_window_sticker(cfg, config_path, window_pins, pinned_stickers, id);
+            edit.selection.deselect(id);
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
+            return true;
+        }
         commit_undo_snapshot(edit, cfg.clone());
         let _ = ops::toggle_visibility(cfg, id);
         if let Err(e) = config::save(cfg, config_path) {
@@ -4597,6 +5548,30 @@ fn handle_toolbar_up(
             tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
         }
         rebuild_ui_panels(edit, cfg, monitor_geometry);
+        return true;
+    }
+    if clicked(edit, toolbar::TB_RESET_SCALE) {
+        // То же действие, что `OverlayCommand::ResetStickerTransform` из
+        // окна настроек (фидбэк пользователя 2026-08-09): натуральный
+        // размер + сброс поворота/отражений, позиция и прозрачность не
+        // трогаются. Молча ничего не делает, если натуральный размер
+        // недоступен (стикер-окно без спрайта) — тот же контракт, что у
+        // команды настроек.
+        if let Some((natural_w, natural_h)) = sticker_natural_size(sprites, id) {
+            commit_undo_snapshot(edit, cfg.clone());
+            let _ = ops::reset_transform_and_size(cfg, id, natural_w, natural_h);
+            if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                let (placement, transform) = (sticker.placement.clone(), sticker.transform);
+                if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| *sid == id) {
+                    sprite.placement = placement;
+                    sprite.transform = transform;
+                }
+            }
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после сброса масштаба стикера");
+            }
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
+        }
         return true;
     }
     if clicked(edit, toolbar::TB_DELETE) {
@@ -4726,12 +5701,27 @@ fn handle_cursor_panel_up(
         return true;
     }
     if clicked(edit, cursor_panel::BTN_ADD_WINDOW) {
-        // M6 (SPEC.md §5.1): переводит курсор в режим выбора окна —
-        // подсветка/клик обрабатываются эксклюзивно в `handle_input`
-        // (пока `edit.picking_window`), сама панель остаётся на экране
-        // (Esc — общий отмена-путь для незавершённых режимов, `handle_key`).
-        edit.picking_window = true;
-        edit.pick_hover = None;
+        // M6 (SPEC.md §5.1, фидбэк пользователя 2026-08-10): открывает
+        // список открытых окон для закрепления (`window_pick_list.rs`) —
+        // отложено до цикла `run()` (`pending_open_pick_list`), у
+        // `handle_cursor_panel_up` нет `window_snapshot`, которым список
+        // наполняется (тот же повод, что у `pending_open_picker`/`TB_LAYERS`).
+        edit.pending_open_pick_list = Some(monitor_id.clone());
+        return true;
+    }
+    if clicked(edit, cursor_panel::BTN_PRESETS) {
+        // M7 (SPEC.md §3.8, ROADMAP.md «быстрое переключение… из панели
+        // редактирования»): пустой список — открывать нечего, сообщаем
+        // тостом (тот же канал, что HotkeyConflict/PinAccessDenied) вместо
+        // пустой панели без единой строки.
+        if cfg.presets.is_empty() {
+            let (title, body) = crate::i18n::no_presets_notification(&cfg.settings.language);
+            let _ = edit
+                .coordinator_tx
+                .send(CoordinatorRequest::ShowNotification { title, body });
+        } else {
+            open_preset_picker(edit, cfg, monitor_id, monitor_geometry);
+        }
         return true;
     }
     if clicked(edit, cursor_panel::BTN_TOGGLE_ALL) {
@@ -4890,27 +5880,41 @@ fn handle_input(
                 }
                 return true;
             }
-            // Режим выбора окна (M6, SPEC.md §5.1): клик закрепляет окно под
-            // курсором (`pick_hover`, обновляется на `MouseMove` ниже) или,
-            // если курсор не над окном кэша трекера, просто отменяет режим —
-            // ни один другой хит-тест сцены/панелей в этом режиме не
-            // выполняется (эксклюзивно, как у `confirm` выше).
-            if edit.picking_window {
-                if let Some(hwnd) = edit.pick_hover {
-                    add_window_sticker(
-                        cfg,
-                        config_path,
-                        window_snapshot,
-                        monitor_bounds,
-                        monitor_id,
-                        window_pins,
-                        pinned_stickers,
-                        &edit.coordinator_tx,
-                        hwnd,
-                    );
+            // Панель быстрого переключения пресетов (M7): в отличие от
+            // модала подтверждения, клик мимо неё не «ничего не делает», а
+            // закрывает её — обычная семантика попап-меню/дропдауна
+            // (`preset_picker.rs`, докком модуля). Клик по чужому монитору
+            // тоже закрывает: панель нарисована только на своём мониторе,
+            // «мимо» неё оттуда — тоже клик мимо.
+            if let Some(picker) = &mut edit.preset_picker {
+                let hit = picker.monitor_id == *monitor_id
+                    && picker
+                        .panel
+                        .pointer_event(PointerEvent::Down {
+                            pos: (dip_x, dip_y),
+                        })
+                        .consumed;
+                if !hit {
+                    edit.preset_picker = None;
                 }
-                edit.picking_window = false;
-                edit.pick_hover = None;
+                return true;
+            }
+            // Список окон для закрепления (M6, SPEC.md §5.1,
+            // `window_pick_list.rs`) — тот же паттерн, что панель пресетов
+            // выше: клик мимо панели (или по чужому монитору) закрывает её
+            // без изменений, реальное закрепление — `handle_window_pick_list_up`
+            // на `MouseUp`.
+            if let Some(state) = &mut edit.window_pick_list {
+                let hit = state.monitor_id == *monitor_id
+                    && state
+                        .panel
+                        .pointer_event(PointerEvent::Down {
+                            pos: (dip_x, dip_y),
+                        })
+                        .consumed;
+                if !hit {
+                    edit.window_pick_list = None;
+                }
                 return true;
             }
             // Панель выбора окон открыта из тулбара — она выше него по
@@ -5031,7 +6035,7 @@ fn handle_input(
                     }
                     false
                 }
-                Zone::Rotate(id, _corner) => {
+                Zone::Rotate(id, _angle_deg) => {
                     // Стикер-окно не поддерживает поворот (SPEC.md §5.2 —
                     // это настоящее окно, WS_EX_TOPMOST-заголовок нельзя
                     // повернуть): угол-хендл визуально остаётся (M6, известный
@@ -5065,6 +6069,20 @@ fn handle_input(
             let (dip_x, dip_y) = to_dip(pos, scale);
             edit.cursor_pos = (dip_x, dip_y);
             edit.cursor_monitor = monitor_id.clone();
+            if dragging {
+                // ВРЕМЕННАЯ диагностика бага «стикер дрейфует сам по себе» —
+                // снять после того, как причина найдена по логу реального
+                // запуска пользователя.
+                tracing::info!(
+                    px = pos.x,
+                    py = pos.y,
+                    dip_x,
+                    dip_y,
+                    ?edit.pointer_owner,
+                    has_gesture = edit.gesture.is_some(),
+                    "diag: coordinator MouseMove dragging=true"
+                );
+            }
             if let Some(confirm) = &mut edit.confirm {
                 // Модал блокирует всю сцену на любом мониторе (см. MouseDown),
                 // но hover-состояние его виджетов трогаем только своим
@@ -5076,23 +6094,24 @@ fn handle_input(
                 }
                 return true;
             }
-            // Режим выбора окна (M6): подсветка окна под курсором вместо
-            // обычного роутинга по панелям/сцене — `pos` локальный
-            // физический (клиентская область окна монитора), `window_at`
-            // ждёт глобальный физический (виртуальный десктоп), поэтому
-            // прибавляем начало монитора (`monitor_bounds`, тот же перевод,
-            // что у обычного хит-теста стикеров через DIP, только без
-            // деления на масштаб — `WindowInfo::rect` тоже в физике).
-            if edit.picking_window {
-                let origin = monitor_bounds
-                    .get(monitor_id)
-                    .map(|b| (b.bounds_px.x, b.bounds_px.y))
-                    .unwrap_or((0, 0));
-                let point = window_pick::ScreenPoint {
-                    x: origin.0 + pos.x,
-                    y: origin.1 + pos.y,
-                };
-                edit.pick_hover = window_pick::window_at(window_snapshot, point);
+            // Панель пресетов (M7): та же модальная блокировка сцены, что у
+            // `confirm` выше — hover её строк живёт своим движением мыши.
+            if let Some(picker) = &mut edit.preset_picker {
+                if picker.monitor_id == *monitor_id {
+                    picker.panel.pointer_event(PointerEvent::Move {
+                        pos: (dip_x, dip_y),
+                    });
+                }
+                return true;
+            }
+            // Список окон для закрепления (M6, `window_pick_list.rs`) — та
+            // же модальная блокировка сцены, что у панели пресетов выше.
+            if let Some(state) = &mut edit.window_pick_list {
+                if state.monitor_id == *monitor_id {
+                    state.panel.pointer_event(PointerEvent::Move {
+                        pos: (dip_x, dip_y),
+                    });
+                }
                 return true;
             }
             match edit.pointer_owner {
@@ -5172,6 +6191,52 @@ fn handle_input(
                             pos: (dip_x, dip_y),
                         })
                         .redraw;
+                }
+            }
+            // Тултип: панель у курсора приоритетнее тулбара (тот же
+            // top-down порядок, что у подсветки выше) — на практике панели
+            // не перекрываются, порядок имеет значение только в редком
+            // краевом случае. Кнопки без текста подсказки (слайдер/поле)
+            // тултип не получают. Пересобираем `TooltipState` заново при
+            // каждой смене наведённого виджета — сбрасывает задержку показа
+            // (фидбэк пользователя 2026-08-10: 0.2с задержка + 0.3с плавное
+            // появление).
+            let new_tooltip = edit
+                .cursor_panel
+                .as_ref()
+                .and_then(Panel::hovered_widget)
+                .and_then(|(id, bounds)| cursor_panel_tooltip_text(id).map(|text| (bounds, text)))
+                .or_else(|| {
+                    let toolbar_is_window = single_selected_id(&edit.selection)
+                        .and_then(|sid| cfg.stickers.iter().find(|s| s.id == sid))
+                        .is_some_and(|s| matches!(s.source, StickerSource::Window { .. }));
+                    toolbar_here
+                        .then(|| edit.toolbar.as_ref())
+                        .flatten()
+                        .and_then(Panel::hovered_widget)
+                        .and_then(|(id, bounds)| {
+                            toolbar_tooltip_text(id, toolbar_is_window).map(|text| (bounds, text))
+                        })
+                });
+            match new_tooltip {
+                Some((bounds, text)) => {
+                    let same = edit.tooltip.as_ref().is_some_and(|t| {
+                        t.text == text && t.anchor == bounds && t.monitor_id == *monitor_id
+                    });
+                    if !same {
+                        edit.tooltip = Some(TooltipState {
+                            text,
+                            hover_started: Instant::now(),
+                            anchor: bounds,
+                            monitor_id: monitor_id.clone(),
+                        });
+                        need_redraw = true;
+                    }
+                }
+                None => {
+                    if edit.tooltip.take().is_some() {
+                        need_redraw = true;
+                    }
                 }
             }
             let picker_here = edit
@@ -5288,6 +6353,36 @@ fn handle_input(
                 }
                 return true;
             }
+            if edit.preset_picker.is_some() {
+                return handle_preset_picker_up(
+                    edit,
+                    renderer,
+                    cfg,
+                    config_path,
+                    sprites,
+                    animations,
+                    videos,
+                    audio_mixer,
+                    window_snapshot,
+                    monitor_bounds,
+                    occluder_cache,
+                    monitor_geometry,
+                    (dip_x, dip_y),
+                );
+            }
+            if edit.window_pick_list.is_some() {
+                return handle_window_pick_list_up(
+                    edit,
+                    cfg,
+                    config_path,
+                    window_snapshot,
+                    monitor_bounds,
+                    window_pins,
+                    pinned_stickers,
+                    monitor_geometry,
+                    (dip_x, dip_y),
+                );
+            }
             match edit.pointer_owner {
                 PointerOwner::CursorPanel => {
                     edit.pointer_owner = PointerOwner::None;
@@ -5319,6 +6414,8 @@ fn handle_input(
                         animations,
                         videos,
                         audio_mixer,
+                        window_pins,
+                        pinned_stickers,
                         (dip_x, dip_y),
                         overlay_size,
                         scale,
@@ -5627,12 +6724,37 @@ fn apply_gesture(
         } => {
             let id = start.id;
             let delta = (dip_x - grab.0, dip_y - grab.1);
+            // Ctrl инвертирует блокировку пропорций в зависимости от типа
+            // ручки (фидбэк пользователя 2026-08-09): угловые ручки по
+            // умолчанию сохраняют пропорции, с Ctrl — деформируют; боковые
+            // (по центру грани) — наоборот, по умолчанию тянут одну ось,
+            // с Ctrl сохраняют пропорции. XOR ручки-угла с Ctrl даёт ровно
+            // эту инверсию для обоих типов разом.
             let dm = DragModifiers {
-                shift: modifiers.shift,
+                shift: handle.is_corner() != modifiers.ctrl,
                 alt: modifiers.alt,
             };
-            let result =
-                transform_ops::resize(&start.placement, &start.transform, *handle, delta, dm);
+            // Зеркалирование при протаскивании ручки через якорь не касается
+            // видео (тот же фидбэк) — для видео размер просто не уходит
+            // ниже минимума.
+            let allow_mirror = !cfg.stickers.iter().any(|s| {
+                s.id == id
+                    && matches!(
+                        &s.source,
+                        StickerSource::File {
+                            media_type: MediaType::Video,
+                            ..
+                        }
+                    )
+            });
+            let result = transform_ops::resize(
+                &start.placement,
+                &start.transform,
+                *handle,
+                delta,
+                dm,
+                allow_mirror,
+            );
             let placement =
                 snap::clamp_min_visible(&result.placement, result.transform.rotation, monitor);
             apply_transform(cfg, sprites, id, placement, result.transform);
@@ -5697,8 +6819,6 @@ fn redraw(
     scale: f32,
     monitor_id: &MonitorId,
     occluders: Option<&[OccluderSet]>,
-    window_snapshot: &[WindowInfo],
-    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
 ) -> bool {
     let mut frame: Vec<Sprite> = Vec::with_capacity(sprites.len() + 1 + 12);
     // (индекс в `frame`, индекс группы в `occluders`) для каждого видимого
@@ -5770,6 +6890,14 @@ fn redraw(
             }
             continue;
         }
+        // Последний показанный (замороженный) кадр стикера — под шахматкой,
+        // а не вместо неё: иначе несколько скрытых стикеров рядом неотличимы
+        // друг от друга (фидбэк пользователя 2026-08-09). Кадр реально
+        // «стопается» на скрытии — `sticker_should_tick`/видеопетля не
+        // продвигают анимацию/видео невидимого стикера, см. там же.
+        if let Some((_, sprite)) = sprites.iter().find(|(id, _)| *id == sticker.id) {
+            frame.push(sprite.clone());
+        }
         let bounds = hittest::aabb(&sticker.placement, sticker.transform.rotation);
         let cell_px = (CHECKERBOARD_CELL_DIP * f64::from(scale)).round().max(1.0) as u32;
         let w_px = (bounds.w * f64::from(scale)).round().max(1.0) as u32;
@@ -5784,10 +6912,15 @@ fn redraw(
                     h: bounds.h,
                     rotation: 0.0,
                 };
-                // Полная непрозрачность независимо от собственной opacity
-                // стикера — шахматка должна быть чётко видна, а не выцветать
-                // вместе со скрытым содержимым под ней.
-                frame.push(solid_sprite(&tex, monitor_id, &rect, 1.0));
+                // Полупрозрачно (HIDDEN_STICKER_CHECKERBOARD_OPACITY) поверх
+                // замороженного кадра, вне зависимости от собственной opacity
+                // стикера — так видно и что стикер скрыт, и какой именно.
+                frame.push(solid_sprite(
+                    &tex,
+                    monitor_id,
+                    &rect,
+                    rst_render::HIDDEN_STICKER_CHECKERBOARD_OPACITY,
+                ));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "не удалось создать текстуру шахматки для скрытого стикера");
@@ -5839,33 +6972,6 @@ fn redraw(
         }
     }
 
-    // Подсветка окна под курсором в режиме выбора (M6, SPEC.md §5.1) — живёт
-    // только на мониторе курсора (тот же паттерн, что марка/панель у
-    // курсора выше). `WindowInfo::rect` — физические px виртуального
-    // десктопа, `WindowHighlight` ждёт физику МОНИТОРА (вычитаем начало
-    // монитора — обратное тому, что делает `MouseMove` в `handle_input`,
-    // переводя локальные координаты курсора в глобальные для `window_at`).
-    if edit.picking_window && edit.cursor_monitor == *monitor_id {
-        if let Some(win) = edit
-            .pick_hover
-            .and_then(|hwnd| window_snapshot.iter().find(|w| w.hwnd == hwnd))
-        {
-            if let Some(bounds) = monitor_bounds.get(monitor_id) {
-                let highlight = WindowHighlight::new(
-                    win.rect.x as f64 - bounds.bounds_px.x as f64,
-                    win.rect.y as f64 - bounds.bounds_px.y as f64,
-                    win.rect.w as f64,
-                    win.rect.h as f64,
-                    bounds.scale,
-                );
-                let prims = highlight.primitives(HighlightKind::Hover, HIGHLIGHT_THICKNESS_DIP);
-                primitives_to_sprites(
-                    &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
-                );
-            }
-        }
-    }
-
     // Тулбар и панель у курсора — над рамками выделения, под модалом
     // (раздел 11). Тулбар следует за монитором выделенного стикера; панель
     // у курсора и марка — за `edit.cursor_monitor` (M3, см. выше).
@@ -5888,9 +6994,54 @@ fn redraw(
         }
     }
 
+    // Тултип (фидбэк пользователя 2026-08-10) — над тулбаром/панелью у
+    // курсора (та кнопка, к которой он относится, уже нарисована выше),
+    // под панелью выбора окон/пресетов/модалом. `monitor_id` тултипа —
+    // монитор кнопки-источника (`update_tooltip_hover`), не обязательно
+    // совпадает с `edit.cursor_monitor` (тулбар может жить на другом
+    // мониторе, чем текущая позиция курсора, M3).
+    if let Some(tooltip) = &edit.tooltip {
+        if tooltip.monitor_id == *monitor_id {
+            let opacity = tooltip.opacity(Instant::now());
+            let prims = tooltip_primitives(tooltip, height_px as f64 / scale as f64, opacity);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
+    }
+
     // Панель выбора окон — открыта из тулбара, поверх него, но под модалом
     // (M4_WINDOW_PICKER_DESIGN.md §1), только на своём «домашнем» мониторе.
     if let Some(state) = &edit.window_picker {
+        if state.monitor_id == *monitor_id {
+            let mut prims = Vec::new();
+            state.panel.draw(&mut prims);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
+    }
+
+    // Панель пресетов (M7) — модальна, как и модал подтверждения ниже,
+    // поэтому выше панели выбора окон (она не модальна), но под самим
+    // модалом (оба одновременно не бывают открыты на практике — модал
+    // открывается только при отсутствии жеста, панель пресетов сама
+    // блокирует жест, — порядок здесь на случай неучтённой гонки).
+    if let Some(state) = &edit.preset_picker {
+        if state.monitor_id == *monitor_id {
+            let mut prims = Vec::new();
+            state.panel.draw(&mut prims);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
+    }
+
+    // Список окон для закрепления (M6, window_pick_list.rs, фидбэк
+    // пользователя 2026-08-10) — тот же уровень z-order, что панель
+    // пресетов: модальный список действий, не редактор конкретного
+    // стикера (в отличие от `window_picker` выше).
+    if let Some(state) = &edit.window_pick_list {
         if state.monitor_id == *monitor_id {
             let mut prims = Vec::new();
             state.panel.draw(&mut prims);
@@ -6002,8 +7153,6 @@ fn redraw_all(
     black_tex: &Texture,
     ui_cache: &mut UiTextureCache,
     occluder_cache: &HashMap<MonitorId, Vec<OccluderSet>>,
-    window_snapshot: &[WindowInfo],
-    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
 ) -> bool {
     for (monitor_id, ms) in monitors_map.iter_mut() {
         // Устаревшая цель на уже уничтоженном устройстве, которую не
@@ -6032,8 +7181,6 @@ fn redraw_all(
             ms.scale,
             monitor_id,
             occluder_cache.get(monitor_id).map(Vec::as_slice),
-            window_snapshot,
-            monitor_bounds,
         );
         if device_lost {
             return true;
@@ -6158,36 +7305,76 @@ fn recover_device(
     true
 }
 
+/// Монитор, физически содержащий центр `rect` (глобальные физические px,
+/// как `WindowInfo::rect`) — какой монитор передать в
+/// `window_rect_to_placement` при закреплении окна (M6, фидбэк
+/// пользователя 2026-08-10): список окон (`window_pick_list.rs`) может
+/// быть открыт на ДРУГОМ мониторе, чем окно, которое выбирает
+/// пользователь, — в отличие от прежнего режима наведения (где курсор был
+/// физически над целью), нельзя просто взять монитор панели. `None` —
+/// окно не найдено ни в одном известном мониторе (редкий разрыв
+/// многомониторной геометрии — окно на мониторе, который только что
+/// отключили, снимок ещё не обновился).
+fn monitor_for_window_rect<'a>(
+    rect: &WindowRect,
+    monitor_bounds: &'a HashMap<MonitorId, MonitorBounds>,
+) -> Option<&'a MonitorId> {
+    let cx = rect.x + rect.w / 2;
+    let cy = rect.y + rect.h / 2;
+    monitor_bounds
+        .values()
+        .find(|b| {
+            cx >= b.bounds_px.x
+                && cx < b.bounds_px.x + b.bounds_px.w as i32
+                && cy >= b.bounds_px.y
+                && cy < b.bounds_px.y + b.bounds_px.h as i32
+        })
+        .map(|b| &b.id)
+}
+
 /// Закрепить окно `hwnd` (из `window_snapshot`) как новый стикер-окно (M6,
-/// SPEC.md §5.1: клик в режиме выбора). Локатор строится из полного пути к
-/// exe (`process_name`) — тот же формат, что у `source.kind == "window"` в
-/// CONFIG.md; `title_pattern` не задаётся (процесса обычно достаточно,
-/// пользовательская настройка локатора — вне скоупа первого среза).
+/// SPEC.md §5.1: клик в списке выбора, `window_pick_list.rs`). Локатор
+/// строится из полного пути к exe (`process_name`) — тот же формат, что у
+/// `source.kind == "window"` в CONFIG.md; `title_pattern` не задаётся
+/// (процесса обычно достаточно, пользовательская настройка локатора — вне
+/// скоупа первого среза). Монитор для `placement` определяется по
+/// физическому положению самого окна (`monitor_for_window_rect`), не по
+/// тому, где был открыт список.
 ///
-/// Ничего не возвращает: неудача (окно исчезло между наведением и кликом,
-/// `PinAccessDenied`/`AlreadyPinned`) — просто `tracing::warn!` и no-op, тем
-/// же принципом «недостающие элементы — не паника», что у `apply_preset`.
-/// UI-диалог про права администратора (SPEC §5.3) — известный пробел
-/// первого среза, не реализован здесь.
+/// Ничего не возвращает: неудача (окно исчезло между открытием списка и
+/// кликом, `PinAccessDenied`/`AlreadyPinned`) — просто `tracing::warn!` и
+/// no-op, тем же принципом «недостающие элементы — не паника», что у
+/// `apply_preset`. UI-диалог про права администратора (SPEC §5.3) —
+/// известный пробел первого среза, не реализован здесь.
+/// Сообщить main.rs, что `cfg.presets` изменился (для пересборки меню трея
+/// — M7 «быстрое переключение из трея», ROADMAP.md). Вызывается после
+/// успешных `SavePreset`/`RenamePreset`/`DeletePreset`/`ImportPreset` —
+/// `ApplyPreset` сам список не меняет, поэтому его не трогает.
+fn notify_presets_changed(cfg: &Config, coordinator_tx: &Sender<CoordinatorRequest>) {
+    let list = cfg.presets.iter().map(|p| (p.id, p.name.clone())).collect();
+    let _ = coordinator_tx.send(CoordinatorRequest::PresetsChanged(list));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_window_sticker(
     cfg: &mut Config,
     config_path: &Path,
     window_snapshot: &[WindowInfo],
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
-    monitor_id: &MonitorId,
     window_pins: &mut WindowPins,
     pinned_stickers: &mut HashMap<usize, Uuid>,
     coordinator_tx: &Sender<CoordinatorRequest>,
     hwnd: usize,
-) {
+) -> Option<Uuid> {
     let Some(win) = window_snapshot.iter().find(|w| w.hwnd == hwnd) else {
-        tracing::warn!("окно под курсором исчезло до клика — стикер-окно не добавлен");
-        return;
+        tracing::warn!("окно исчезло до клика по списку — стикер-окно не добавлен");
+        return None;
     };
-    let Some(bounds) = monitor_bounds.get(monitor_id) else {
-        return;
+    let Some(monitor_id) = monitor_for_window_rect(&win.rect, monitor_bounds) else {
+        tracing::warn!(hwnd, "окно вне известной геометрии мониторов — стикер-окно не добавлен");
+        return None;
     };
+    let bounds = &monitor_bounds[monitor_id];
     let placement = window_rect_to_placement(&win.rect, monitor_id.clone(), bounds);
     let locator = WindowLocator {
         process_name: window_exe_path(win),
@@ -6202,6 +7389,7 @@ fn add_window_sticker(
         placement.w,
         placement.h,
     );
+    let sticker_id = sticker.id;
     match window_pins.pin(sticker_marker(sticker.id), hwnd) {
         Ok(()) => {
             pinned_stickers.insert(hwnd, sticker.id);
@@ -6209,6 +7397,7 @@ fn add_window_sticker(
             if let Err(e) = config::save(cfg, config_path) {
                 tracing::warn!(error = %e, "не удалось сохранить config.json после добавления стикера-окна");
             }
+            Some(sticker_id)
         }
         Err(e) => {
             tracing::warn!(hwnd, error = %e, "не удалось закрепить стикер-окно");
@@ -6223,7 +7412,35 @@ fn add_window_sticker(
                     body: e.to_string(),
                 });
             }
+            None
         }
+    }
+}
+
+/// Открепить стикер-окно `sticker_id`: снять `WS_EX_TOPMOST`/маркер
+/// (`WindowPins::unpin`) и убрать сам стикер из конфига — окно
+/// возвращается в обычное состояние, как до закрепления (TB_EYE у
+/// стикера-окна, M6, фидбэк пользователя 2026-08-10: «deselect» вместо
+/// «показать/скрыть», см. доккомент `build_toolbar`). Без undo/redo — тот
+/// же принцип, что у создания пина (`add_window_sticker`) и у
+/// автоматического снятия при уничтожении таргета (`sync_window_stickers`):
+/// это выход из режима стикера, не правка контента.
+fn unpin_window_sticker(
+    cfg: &mut Config,
+    config_path: &Path,
+    window_pins: &mut WindowPins,
+    pinned_stickers: &mut HashMap<usize, Uuid>,
+    sticker_id: Uuid,
+) {
+    if let Some((&hwnd, _)) = pinned_stickers.iter().find(|&(_, &id)| id == sticker_id) {
+        if let Err(e) = window_pins.unpin(hwnd) {
+            tracing::warn!(sticker = %sticker_id, error = %e, "не удалось открепить стикер-окно");
+        }
+        pinned_stickers.remove(&hwnd);
+    }
+    cfg.stickers.retain(|s| s.id != sticker_id);
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, "не удалось сохранить config.json после открепления окна");
     }
 }
 
@@ -6279,42 +7496,65 @@ fn add_sticker(
     // §5): вставка из буфера (`pasted`) материализует растровые данные
     // (CF_DIBV5) как одиночный PNG в `StickerSource::Pasted`, который вообще
     // не несёт `MediaType` — там анимации в принципе быть не может.
+    // Вставка из буфера (`pasted`) никогда не несёт анимацию (см. коммент
+    // выше) — decode_animation вообще не вызывается, `None` без похода на
+    // диск повторно. Иначе — реальный результат decode_animation: `Ok` с
+    // >= 2 кадрами — атлас; `TooManyFrames`/`TooLargeForAtlas` — потоковый
+    // режим (ROADMAP.md M5a); остальное — статика.
     let animation = if pasted {
         None
     } else {
-        media_animation::decode_animation(&path)
-            .ok()
-            .filter(|a| a.frames.len() >= 2)
+        Some(media_animation::decode_animation(&path))
     };
 
-    let (texture, uv_offset, uv_scale, atlas) = if let Some(anim) = animation {
-        let frames: Vec<(Vec<u8>, Duration)> =
-            anim.frames.into_iter().map(|f| (f.rgba, f.delay)).collect();
-        match renderer.create_texture_atlas(&frames, anim.width, anim.height) {
-            Ok(atlas) => {
-                let f0 = atlas.frames[0];
-                (
-                    atlas.texture.clone(),
-                    f0.uv_offset,
-                    f0.uv_scale,
-                    Some(atlas),
-                )
-            }
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "не удалось собрать атлас анимации — загружаю как статичное изображение");
-                match load_static(renderer, &path) {
-                    Some(t) => (t, [0.0, 0.0], [1.0, 1.0], None),
-                    None => return false,
+    let (texture, uv_offset, uv_scale, pending) = match animation {
+        Some(Ok(anim)) if anim.frames.len() >= 2 => {
+            let frames: Vec<(Vec<u8>, Duration)> =
+                anim.frames.into_iter().map(|f| (f.rgba, f.delay)).collect();
+            match renderer.create_texture_atlas(&frames, anim.width, anim.height) {
+                Ok(atlas) => {
+                    let f0 = atlas.frames[0];
+                    (
+                        atlas.texture.clone(),
+                        f0.uv_offset,
+                        f0.uv_scale,
+                        Some(PendingAnimation::Atlas(atlas)),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "не удалось собрать атлас анимации — загружаю как статичное изображение");
+                    match load_static(renderer, &path) {
+                        Some(t) => (t, [0.0, 0.0], [1.0, 1.0], None),
+                        None => return false,
+                    }
                 }
             }
         }
-    } else {
-        match load_static(renderer, &path) {
+        Some(Err(
+            media_animation::MediaError::TooManyFrames { .. }
+            | media_animation::MediaError::TooLargeForAtlas { .. },
+        )) => match open_streaming_animation(renderer.device, &path) {
+            Some((texture, source, first_delay)) => (
+                texture.clone(),
+                [0.0, 0.0],
+                [1.0, 1.0],
+                Some(PendingAnimation::Streaming {
+                    source,
+                    texture,
+                    first_delay,
+                }),
+            ),
+            None => match load_static(renderer, &path) {
+                Some(t) => (t, [0.0, 0.0], [1.0, 1.0], None),
+                None => return false,
+            },
+        },
+        _ => match load_static(renderer, &path) {
             Some(t) => (t, [0.0, 0.0], [1.0, 1.0], None),
             None => return false,
-        }
+        },
     };
-    let media_type = if atlas.is_some() {
+    let media_type = if pending.is_some() {
         MediaType::Animation
     } else {
         MediaType::Image
@@ -6364,8 +7604,8 @@ fn add_sticker(
     // Часы анимации заводятся в `run()` (там живёт `animations`, локальная
     // переменная цикла, недоступная на этой глубине вызова) — см. доккомент
     // `EditState::pending_animation`.
-    if let Some(atlas) = atlas {
-        edit.pending_animation = Some((id, atlas));
+    if let Some(pending) = pending {
+        edit.pending_animation = Some((id, pending));
     }
     true
 }
@@ -6464,6 +7704,111 @@ mod tests {
         Rect { x, y, w, h }
     }
 
+    // --- coalesce_mouse_move: защита от бэклога безлимитного канала
+    // (см. доккомент функции) ---
+
+    fn move_msg(mid: &str, x: i32, y: i32) -> OverlayMessage {
+        OverlayMessage::Event(
+            MonitorId(mid.to_string()),
+            OverlayEvent::Input(InputEvent::MouseMove {
+                pos: rst_win32::input::Point { x, y },
+                modifiers: Modifiers::default(),
+                dragging: true,
+            }),
+        )
+    }
+
+    /// `OverlayMessage`/`OverlayCommand` не выводят `PartialEq` (утянуло бы
+    /// его через `Settings`/`Hotkeys` и весь `Config` — не нужно нигде,
+    /// кроме этих тестов) — сравниваем через паттерн-матчинг вместо
+    /// `assert_eq!` на всё сообщение целиком.
+    fn move_xy(msg: &OverlayMessage) -> Option<(i32, i32)> {
+        match msg {
+            OverlayMessage::Event(_, OverlayEvent::Input(InputEvent::MouseMove { pos, .. })) => {
+                Some((pos.x, pos.y))
+            }
+            _ => None,
+        }
+    }
+
+    fn move_monitor(msg: &OverlayMessage) -> Option<&str> {
+        match msg {
+            OverlayMessage::Event(mid, OverlayEvent::Input(InputEvent::MouseMove { .. })) => {
+                Some(mid.0.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn coalesce_mouse_move_collapses_same_monitor_backlog_to_latest() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(move_msg("main", 20, 20)).unwrap();
+        tx.send(move_msg("main", 30, 30)).unwrap();
+        tx.send(move_msg("main", 40, 40)).unwrap();
+        let first = rx.recv().unwrap();
+        let (coalesced, leftover) = coalesce_mouse_move(&rx, first);
+        assert_eq!(
+            move_xy(&coalesced),
+            Some((40, 40)),
+            "должна остаться только самая свежая позиция, а не первая из очереди"
+        );
+        assert!(leftover.is_none());
+    }
+
+    #[test]
+    fn coalesce_mouse_move_leaves_non_move_message_as_leftover() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(move_msg("main", 20, 20)).unwrap();
+        tx.send(move_msg("main", 30, 30)).unwrap();
+        tx.send(OverlayMessage::Tick).unwrap();
+        let first = rx.recv().unwrap();
+        let (coalesced, leftover) = coalesce_mouse_move(&rx, first);
+        assert_eq!(move_xy(&coalesced), Some((30, 30)));
+        assert!(
+            matches!(leftover, Some(OverlayMessage::Tick)),
+            "сообщение, прервавшее коалесинг, не должно теряться"
+        );
+    }
+
+    #[test]
+    fn coalesce_mouse_move_does_not_cross_monitors() {
+        // MouseMove другого монитора не должен быть съеден коалесингом
+        // текущего — иначе движение мыши на втором мониторе потерялось бы.
+        let (tx, rx) = mpsc::channel();
+        tx.send(move_msg("main", 20, 20)).unwrap();
+        tx.send(move_msg("second", 99, 99)).unwrap();
+        let first = rx.recv().unwrap();
+        let (coalesced, leftover) = coalesce_mouse_move(&rx, first);
+        assert_eq!(move_xy(&coalesced), Some((20, 20)));
+        let leftover = leftover.expect("сообщение второго монитора не должно теряться");
+        assert_eq!(move_monitor(&leftover), Some("second"));
+        assert_eq!(move_xy(&leftover), Some((99, 99)));
+    }
+
+    #[test]
+    fn coalesce_mouse_move_passes_through_non_move_first_message_untouched() {
+        let (tx, rx) = mpsc::channel();
+        // Даже если за Tick в очереди стоит MouseMove, коалесинг не должен
+        // запускаться вовсе — дренаж выполняется только когда ПЕРВОЕ
+        // сообщение само MouseMove (иначе Tick подавил бы реальный ход мыши).
+        tx.send(move_msg("main", 20, 20)).unwrap();
+        let (coalesced, leftover) = coalesce_mouse_move(&rx, OverlayMessage::Tick);
+        assert!(matches!(coalesced, OverlayMessage::Tick));
+        assert!(leftover.is_none());
+        // MouseMove остаётся нетронутым в канале для следующей итерации.
+        let still_queued = rx.recv().unwrap();
+        assert_eq!(move_xy(&still_queued), Some((20, 20)));
+    }
+
+    #[test]
+    fn coalesce_mouse_move_empty_queue_returns_first_unchanged() {
+        let (_tx, rx) = mpsc::channel();
+        let (coalesced, leftover) = coalesce_mouse_move(&rx, move_msg("main", 1, 1));
+        assert_eq!(move_xy(&coalesced), Some((1, 1)));
+        assert!(leftover.is_none());
+    }
+
     #[test]
     fn monitor_geometry_changed_false_when_nothing_moved() {
         let cached = (0, 0, 1920, 1080, 1.0);
@@ -6518,6 +7863,43 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn onboarding_notification_shown_on_fresh_config_with_default_hotkey() {
+        let cfg = Config::default();
+        let (title, body) = onboarding_notification(&cfg).expect("свежий конфиг ещё не показывал");
+        assert_eq!(title, "resticker запущен");
+        assert!(
+            body.contains("Ctrl+Alt+S"),
+            "тело должно содержать дефолтный хоткей: {body}"
+        );
+    }
+
+    #[test]
+    fn onboarding_notification_uses_configured_hotkey_when_customized() {
+        let mut cfg = Config::default();
+        cfg.hotkeys.edit_mode = Some("Ctrl+Shift+E".to_string());
+        let (_, body) = onboarding_notification(&cfg).expect("ещё не показывали");
+        assert!(
+            body.contains("Ctrl+Shift+E"),
+            "тело должно содержать настроенный хоткей, а не дефолт: {body}"
+        );
+    }
+
+    #[test]
+    fn onboarding_notification_falls_back_to_default_when_hotkey_unset() {
+        let mut cfg = Config::default();
+        cfg.hotkeys.edit_mode = None;
+        let (_, body) = onboarding_notification(&cfg).expect("ещё не показывали");
+        assert!(body.contains(DEFAULT_EDIT_HOTKEY));
+    }
+
+    #[test]
+    fn onboarding_notification_none_once_already_shown() {
+        let mut cfg = Config::default();
+        cfg.settings.onboarding_shown = true;
+        assert!(onboarding_notification(&cfg).is_none());
+    }
+
     // --- M4: refresh_occlusion / occluder_rects_for / конвертеры ---
 
     fn monitor_id(s: &str) -> MonitorId {
@@ -6538,6 +7920,785 @@ mod tests {
             visibility: rst_core::model::VisibilityRule { mode, rules },
             ..Sticker::default()
         }
+    }
+
+    // --- resolve_zone / курсор поворота: зона СНАРУЖИ рамки, отступ от угла,
+    // угол считается от реального направления угла в пространстве (фидбэк
+    // пользователя 2026-08-09, третий раунд) ---
+
+    /// Стикер 100×100 DIP с центром (200,200) без поворота — рамка выделения
+    /// x∈[150,250], y∈[150,250].
+    fn zone_test_sticker(rotation: f64) -> Sticker {
+        Sticker {
+            id: Uuid::new_v4(),
+            placement: Placement {
+                monitor_id: monitor_id("main"),
+                cx: 200.0,
+                cy: 200.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            transform: Transform {
+                rotation,
+                ..Transform::default()
+            },
+            ..Sticker::default()
+        }
+    }
+
+    fn zone_test_config(sticker: Sticker) -> (Config, SelectionSet, Uuid) {
+        let id = sticker.id;
+        let mut cfg = Config::default();
+        cfg.stickers.push(sticker);
+        let mut selection = SelectionSet::default();
+        selection.click(Some(id));
+        (cfg, selection, id)
+    }
+
+    // --- tracker_mask_needed: гейт хуков трекера окон должен оставаться
+    // включённым, пока открыт режим прицела «добавить окно» (M6,
+    // BTN_ADD_WINDOW), даже когда ни у одного стикера нет правила видимости,
+    // зависящего от окклюдеров (репорт пользователя «кнопка прикрепления
+    // окна вообще не работает», 2026-08-10) ---
+
+    /// Минимальный `EditState` для теста гейта: все опциональные режимы
+    /// выключены, `window_pick_list`/`window_picker` — единственное, что
+    /// варьируют тесты этой секции.
+    fn mask_gate_edit_state() -> EditState {
+        let (coordinator_tx, _rx) = mpsc::channel();
+        EditState {
+            active: true,
+            selection: SelectionSet::new(),
+            gesture: None,
+            snap: SnapConfig::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            pending_snapshot: None,
+            confirm: None,
+            window_picker: None,
+            preset_picker: None,
+            pending_open_picker: None,
+            pending_open_pick_list: None,
+            window_pick_list: None,
+            pending_animation: None,
+            pending_video: None,
+            marquee: None,
+            marquee_started: false,
+            toolbar: None,
+            cursor_panel: None,
+            tooltip: None,
+            pointer_owner: PointerOwner::None,
+            ui_pending_snapshot: None,
+            cursor_pos: (0.0, 0.0),
+            cursor_monitor: monitor_id("main"),
+            coordinator_tx,
+        }
+    }
+
+    #[test]
+    fn tracker_mask_needed_false_on_clean_config_and_idle_edit() {
+        // Ни одного стикера, никакой UI не открыт — трекеру спать.
+        let cfg = Config::default();
+        let edit = mask_gate_edit_state();
+        assert!(!tracker_mask_needed(&cfg, &edit));
+    }
+
+    #[test]
+    fn tracker_mask_needed_true_while_window_pick_list_open() {
+        // Это ровно баг из репорта: `mask_needed(cfg)` одна не видит, что
+        // список BTN_ADD_WINDOW нуждается в живом снимке — без
+        // `window_pick_list` в гейте трекер не просыпается, и список
+        // остаётся пустым независимо от реально открытых окон.
+        let cfg = Config::default();
+        let mut edit = mask_gate_edit_state();
+        edit.window_pick_list = Some(WindowPickListState {
+            panel: Panel::new(
+                window_pick_list::PANEL_ID,
+                Box2D {
+                    cx: 0.0,
+                    cy: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                    rotation: 0.0,
+                },
+            ),
+            monitor_id: monitor_id("main"),
+            scroll: 0,
+        });
+        assert!(tracker_mask_needed(&cfg, &edit));
+    }
+
+    #[test]
+    fn tracker_mask_needed_true_while_window_picker_panel_open() {
+        // Прежний случай (M4) — панель «какие окна видимы» у стикера должна
+        // и дальше держать трекер живым независимо от нового условия.
+        let cfg = Config::default();
+        let mut edit = mask_gate_edit_state();
+        edit.window_picker = Some(WindowPickerState {
+            sticker_id: Uuid::new_v4(),
+            panel: Panel::new(
+                window_picker::PICKER_PANEL_ID,
+                Box2D {
+                    cx: 0.0,
+                    cy: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                    rotation: 0.0,
+                },
+            ),
+            scroll: 0,
+            monitor_id: monitor_id("main"),
+        });
+        assert!(tracker_mask_needed(&cfg, &edit));
+    }
+
+    #[test]
+    fn tracker_mask_needed_true_when_sticker_has_non_always_visibility() {
+        // Существующий путь через `mask_needed(cfg)` не должен сломаться
+        // рефакторингом в `tracker_mask_needed`.
+        let mut cfg = Config::default();
+        let mut sticker = zone_test_sticker(0.0);
+        sticker.visibility.mode = VisibilityMode::Desktop;
+        cfg.stickers.push(sticker);
+        let edit = mask_gate_edit_state();
+        assert!(tracker_mask_needed(&cfg, &edit));
+    }
+
+    // --- add_window_sticker: pin-flow «навёл → кликнул → стикер в cfg»
+    // (M6, SPEC.md §5.1). Снимок и hover берутся 1:1 из веток `handle_input`
+    // (MouseMove 5934-5945, MouseDown 5722-5739) — здесь сквозной сценарий
+    // на реальном окне, без D3D-пластика, тем же приёмом, что drag_sim_*.
+
+    fn pin_flow_harness(
+    ) -> (Config, PathBuf, Vec<WindowInfo>, HashMap<MonitorId, MonitorBounds>, DragSimWindow) {
+        let wnd = DragSimWindow::create();
+        let hwnd = wnd.0.0 as usize;
+        let snapshot = vec![WindowInfo {
+            hwnd,
+            rect: WindowRect {
+                x: 10,
+                y: 20,
+                w: 300,
+                h: 200,
+            },
+            pid: std::process::id() + 1, // «чужое» окно — своё window_at отфильтрует
+            exe_path: std::env::current_exe().expect("путь к exe теста"),
+            z_order: 0,
+            ..Default::default()
+        }];
+        let mut monitor_bounds = HashMap::new();
+        monitor_bounds.insert(
+            monitor_id("main"),
+            MonitorBounds {
+                id: monitor_id("main"),
+                bounds_px: bounds(0, 0, 1920, 1080),
+                scale: 1.0,
+            },
+        );
+        let config_path = std::env::temp_dir().join(format!(
+            "resticker_pin_flow_{}_{}.json",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&config_path);
+        (Config::default(), config_path, snapshot, monitor_bounds, wnd)
+    }
+
+    #[test]
+    fn add_window_sticker_pins_window_and_saves_cfg() {
+        let (mut cfg, config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+
+        // Клик по строке списка (handle_input MouseUp,
+        // handle_window_pick_list_up): ровно вызов add_window_sticker с
+        // hwnd, декодированным из строки списка (window_pick_list.rs).
+        let (coordinator_tx, _rx) = mpsc::channel();
+        let mut window_pins = WindowPins::new();
+        let mut pinned_stickers: HashMap<usize, Uuid> = HashMap::new();
+        let new_id = add_window_sticker(
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            &mut pinned_stickers,
+            &coordinator_tx,
+            hwnd,
+        );
+
+        // Стикер-окно добавлен в cfg 1:1 с геометрией таргета (DIP, scale 1.0).
+        assert_eq!(cfg.stickers.len(), 1, "ровно один стикер за один клик");
+        let sticker = &cfg.stickers[0];
+        assert_eq!(
+            new_id,
+            Some(sticker.id),
+            "возвращённый id — для авто-выделения нового стикера (фидбэк 2026-08-10)"
+        );
+        let current_exe = std::env::current_exe().expect("путь к exe теста");
+        let StickerSource::Window { window } = &sticker.source else {
+            panic!("источник стикера должен быть Window");
+        };
+        assert_eq!(
+            window.process_name.as_deref(),
+            current_exe.to_str(),
+            "локатор строится из exe-пути окна"
+        );
+        assert_eq!(sticker.placement.monitor_id, monitor_id("main"));
+        assert_eq!(
+            (sticker.placement.cx, sticker.placement.cy, sticker.placement.w, sticker.placement.h),
+            (160.0, 120.0, 300.0, 200.0),
+            "placement = rect таргета, переведённый в DIP"
+        );
+
+        // Реальный пин: WS_EX_TOPMOST + маркер на настоящем окне.
+        assert!(window_pins.is_pinned(hwnd), "окно закреплено через WindowPins");
+        assert_eq!(
+            pinned_stickers.get(&hwnd),
+            Some(&sticker.id),
+            "обратная карта hwnd → sticker id"
+        );
+
+        // config::save из ветки успеха — файл на диске содержит стикер.
+        assert!(config_path.exists(), "конфиг сохранён после добавления");
+        let loaded = config::load(&config_path)
+            .expect("перечитать сохранённый конфиг")
+            .config;
+        assert_eq!(loaded.stickers.len(), 1);
+        assert_eq!(loaded.stickers[0].id, sticker.id);
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn add_window_sticker_missing_from_snapshot_is_noop() {
+        // Клик по строке, чьё окно в СВЕЖЕМ снимке уже нет (закрыто между
+        // открытием списка и кликом) — guard `find(|w| w.hwnd == hwnd)`
+        // обязан вернуться до каких-либо действий.
+        let (mut cfg, config_path, mut snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        snapshot.retain(|w| w.hwnd != hwnd);
+
+        let (coordinator_tx, _rx) = mpsc::channel();
+        let mut window_pins = WindowPins::new();
+        let mut pinned_stickers: HashMap<usize, Uuid> = HashMap::new();
+        let new_id = add_window_sticker(
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            &mut pinned_stickers,
+            &coordinator_tx,
+            hwnd,
+        );
+
+        assert_eq!(new_id, None, "no-op не возвращает id — нечего авто-выделять");
+        assert!(cfg.stickers.is_empty(), "стикер не добавлен");
+        assert!(pinned_stickers.is_empty(), "обратная карта не тронута");
+        assert!(
+            !window_pins.is_pinned(hwnd),
+            "окно живо, но клик по нему не пиновал (снимок его не видит)"
+        );
+        assert!(
+            !config_path.exists(),
+            "no-op путь не должен писать конфиг"
+        );
+    }
+
+    #[test]
+    fn add_window_sticker_destroyed_between_snapshot_and_click_is_noop() {
+        // Настоящая гонка «окно исчезло между построением снимка списка и
+        // кликом по нему»: снимок ещё содержит окно, IsWindow внутри `pin`
+        // уже видит мёртвый hwnd.
+        let (mut cfg, config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        drop(wnd); // окно умерло ДО клика
+
+        let (coordinator_tx, _rx) = mpsc::channel();
+        let mut window_pins = WindowPins::new();
+        let mut pinned_stickers: HashMap<usize, Uuid> = HashMap::new();
+        add_window_sticker(
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            &mut pinned_stickers,
+            &coordinator_tx,
+            hwnd,
+        );
+
+        assert!(cfg.stickers.is_empty(), "мёртвое окно не даёт стикер");
+        assert!(pinned_stickers.is_empty());
+        assert!(
+            !window_pins.is_pinned(hwnd),
+            "pin мёртвого таргета — PinWindowGone, книжка пуста"
+        );
+        assert!(!config_path.exists(), "no-op путь не должен писать конфиг");
+    }
+
+    #[test]
+    fn unpin_window_sticker_reverses_a_real_pin() {
+        // TB_EYE у стикера-окна (фидбэк пользователя 2026-08-10, «deselect»
+        // вместо «показать/скрыть») — тот же настоящий Win32-таргет, что
+        // используют `add_window_sticker_*` тесты выше, теперь откреплён
+        // обратно: снят WS_EX_TOPMOST/маркер, стикер убран из cfg.
+        let (mut cfg, config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        let (coordinator_tx, _rx) = mpsc::channel();
+        let mut window_pins = WindowPins::new();
+        let mut pinned_stickers: HashMap<usize, Uuid> = HashMap::new();
+        let sticker_id = add_window_sticker(
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            &mut pinned_stickers,
+            &coordinator_tx,
+            hwnd,
+        )
+        .expect("пин должен пройти на живом окне");
+        assert!(window_pins.is_pinned(hwnd), "предусловие: окно закреплено");
+
+        unpin_window_sticker(&mut cfg, &config_path, &mut window_pins, &mut pinned_stickers, sticker_id);
+
+        assert!(cfg.stickers.is_empty(), "стикер убран из конфига");
+        assert!(pinned_stickers.is_empty(), "обратная карта очищена");
+        assert!(!window_pins.is_pinned(hwnd), "WS_EX_TOPMOST/маркер сняты");
+        let loaded = config::load(&config_path)
+            .expect("перечитать сохранённый конфиг")
+            .config;
+        assert!(loaded.stickers.is_empty(), "открепление сохранено на диск");
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn unpin_window_sticker_unknown_id_is_noop_but_still_saves() {
+        // sticker_id не в `pinned_stickers` (уже откреплён/чужой) — не
+        // паникует, просто нечего снимать через WindowPins; retain на
+        // пустом cfg тоже no-op, но сохранение всё равно происходит (тот
+        // же путь кода, что у реального открепления).
+        let (mut cfg, config_path, _snapshot, _monitor_bounds, _wnd) = pin_flow_harness();
+        let mut window_pins = WindowPins::new();
+        let mut pinned_stickers: HashMap<usize, Uuid> = HashMap::new();
+        unpin_window_sticker(
+            &mut cfg,
+            &config_path,
+            &mut window_pins,
+            &mut pinned_stickers,
+            Uuid::new_v4(),
+        );
+        assert!(cfg.stickers.is_empty());
+        assert!(config_path.exists(), "сохранение всё равно происходит");
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn add_window_sticker_picks_monitor_by_window_position_not_a_caller_supplied_one() {
+        // Список (window_pick_list.rs) мог быть открыт на мониторе A
+        // (кнопка BTN_ADD_WINDOW нажата там), а выбранное окно физически
+        // на мониторе B — placement обязан резолвиться по РЕАЛЬНОМУ
+        // положению окна (`monitor_for_window_rect`), не по монитору
+        // списка: список — не наведение курсора, они больше не совпадают
+        // (фидбэк пользователя 2026-08-10).
+        let (mut cfg, config_path, _snapshot, _mb, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        // Монитор b правее монитора a (виртуальный десктоп 0..1920 | 1920..3840).
+        let snapshot = vec![WindowInfo {
+            hwnd,
+            rect: WindowRect {
+                x: 1920 + 50,
+                y: 30,
+                w: 300,
+                h: 200,
+            },
+            pid: std::process::id() + 1,
+            exe_path: std::env::current_exe().expect("путь к exe теста"),
+            z_order: 0,
+            ..Default::default()
+        }];
+        let mut monitor_bounds = HashMap::new();
+        monitor_bounds.insert(
+            monitor_id("a"),
+            MonitorBounds {
+                id: monitor_id("a"),
+                bounds_px: bounds(0, 0, 1920, 1080),
+                scale: 1.0,
+            },
+        );
+        monitor_bounds.insert(
+            monitor_id("b"),
+            MonitorBounds {
+                id: monitor_id("b"),
+                bounds_px: bounds(1920, 0, 1920, 1080),
+                scale: 1.0,
+            },
+        );
+
+        let (coordinator_tx, _rx) = mpsc::channel();
+        let mut window_pins = WindowPins::new();
+        let mut pinned_stickers: HashMap<usize, Uuid> = HashMap::new();
+        let new_id = add_window_sticker(
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            &mut pinned_stickers,
+            &coordinator_tx,
+            hwnd,
+        )
+        .expect("пин живого окна");
+        let sticker = cfg.stickers.iter().find(|s| s.id == new_id).unwrap();
+        assert_eq!(
+            sticker.placement.monitor_id,
+            monitor_id("b"),
+            "монитор определён по положению окна, не по вызывающему коду"
+        );
+        assert_eq!(
+            (sticker.placement.cx, sticker.placement.cy),
+            (50.0 + 150.0, 30.0 + 100.0),
+            "DIP локальны монитору b — вычтено его начало (1920, 0)"
+        );
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn add_window_sticker_window_outside_known_monitors_is_noop() {
+        let (mut cfg, config_path, _snapshot, _mb, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        let snapshot = vec![WindowInfo {
+            hwnd,
+            rect: WindowRect {
+                x: -50_000,
+                y: -50_000,
+                w: 100,
+                h: 100,
+            },
+            pid: std::process::id() + 1,
+            exe_path: std::env::current_exe().expect("путь к exe теста"),
+            z_order: 0,
+            ..Default::default()
+        }];
+        let mut monitor_bounds = HashMap::new();
+        monitor_bounds.insert(
+            monitor_id("main"),
+            MonitorBounds {
+                id: monitor_id("main"),
+                bounds_px: bounds(0, 0, 1920, 1080),
+                scale: 1.0,
+            },
+        );
+        let (coordinator_tx, _rx) = mpsc::channel();
+        let mut window_pins = WindowPins::new();
+        let mut pinned_stickers: HashMap<usize, Uuid> = HashMap::new();
+        let new_id = add_window_sticker(
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            &mut pinned_stickers,
+            &coordinator_tx,
+            hwnd,
+        );
+        assert_eq!(new_id, None, "нет монитора под окном — no-op");
+        assert!(cfg.stickers.is_empty());
+        assert!(
+            !window_pins.is_pinned(hwnd),
+            "монитор не найден — pin не должен был вызываться вовсе"
+        );
+    }
+
+    #[test]
+    fn corner_local_angle_deg_matches_axis_aligned_geometry() {
+        // Чистая геометрия направления к углу неповёрнутого прямоугольника
+        // в экранных осях (Y вниз) — не подобранная константа.
+        assert_eq!(corner_local_angle_deg(CoreCorner::NorthWest), -135.0);
+        assert_eq!(corner_local_angle_deg(CoreCorner::NorthEast), -45.0);
+        assert_eq!(corner_local_angle_deg(CoreCorner::SouthEast), 45.0);
+        assert_eq!(corner_local_angle_deg(CoreCorner::SouthWest), 135.0);
+    }
+
+    #[test]
+    fn resolve_zone_inside_box_is_sticker_body() {
+        let (cfg, selection, id) = zone_test_config(zone_test_sticker(0.0));
+        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), 200.0, 200.0);
+        assert!(matches!(zone, Zone::StickerBody(zid) if zid == id));
+    }
+
+    #[test]
+    fn resolve_zone_on_handle_is_resize_regardless_of_inside_outside() {
+        let (cfg, selection, id) = zone_test_config(zone_test_sticker(0.0));
+        // Точно на NW-ручке (150,150) — угол рамки.
+        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), 150.0, 150.0);
+        assert!(matches!(
+            zone,
+            Zone::ResizeHandle(zid, HandleKind::NorthWest) if zid == id
+        ));
+    }
+
+    #[test]
+    fn resolve_zone_outside_but_close_to_corner_is_dead_zone_not_rotate() {
+        // (140,140): снаружи рамки (x<150 и y<150), но всего ~14 DIP от угла
+        // (150,150) — меньше ROTATE_MIN_CORNER_GAP_DIP=35, значит НЕ поворот
+        // (фидбэк пользователя: раньше здесь СРАБАТЫВАЛО кольцо поворота
+        // даже так близко к рамке — теперь явный буфер).
+        let (cfg, selection, _id) = zone_test_config(zone_test_sticker(0.0));
+        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), 140.0, 140.0);
+        assert!(matches!(zone, Zone::Background), "должна быть мёртвая зона, не поворот");
+    }
+
+    #[test]
+    fn resolve_zone_outside_past_gap_near_corner_is_rotate_with_local_angle() {
+        // (120,120): снаружи, ~42 DIP от угла (150,150) — за отступом,
+        // ближайший угол NW, без поворота стикера угол курсора = -135°.
+        let (cfg, selection, id) = zone_test_config(zone_test_sticker(0.0));
+        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), 120.0, 120.0);
+        let Zone::Rotate(zid, angle) = zone else {
+            panic!("ожидался Zone::Rotate, получено другое");
+        };
+        assert_eq!(zid, id);
+        assert_eq!(angle, -135);
+    }
+
+    #[test]
+    fn resolve_zone_rotate_has_no_upper_distance_bound() {
+        // Старое кольцо было ограничено ROTATE_RING_MAX_DIP=24 сверху —
+        // очень далёкая точка снаружи ловилась бы в Background. Теперь
+        // поворот действует на бесконечную дистанцию (фидбэк пользователя).
+        let (cfg, selection, id) = zone_test_config(zone_test_sticker(0.0));
+        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), -5000.0, -5000.0);
+        assert!(matches!(zone, Zone::Rotate(zid, _) if zid == id));
+    }
+
+    #[test]
+    fn resolve_zone_captures_whole_perimeter_not_just_near_corners() {
+        // Точка снаружи прямо над серединой верхней грани (не рядом ни с
+        // одним углом конкретно) — тоже поворот, а не «мёртвая зона» (фидбэк
+        // пользователя: «он вообще захватывает всю зону редакции»).
+        let (cfg, selection, id) = zone_test_config(zone_test_sticker(0.0));
+        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), 200.0, 50.0);
+        assert!(matches!(zone, Zone::Rotate(zid, _) if zid == id));
+    }
+
+    #[test]
+    fn resolve_zone_rotate_angle_follows_sticker_rotation() {
+        // Стикер повёрнут на 90° (по часовой, экранная конвенция) — угол,
+        // который был NW у неповёрнутого прямоугольника, теперь физически
+        // там, где раньше был NE. Находим его РЕАЛЬНОЕ мировое положение
+        // через ту же SelectionBox, что использует resolve_zone, и берём
+        // точку далеко за ним по той же радиальной линии от центра.
+        let sticker = zone_test_sticker(std::f64::consts::FRAC_PI_2);
+        let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
+        let (hx, hy) = sbox.handle_center(CoreCorner::NorthWest.handle());
+        let (cx, cy) = (sticker.placement.cx, sticker.placement.cy);
+        // Точка вдвое дальше от центра по той же линии центр→угол —
+        // гарантированно снаружи рамки и дальше ROTATE_MIN_CORNER_GAP_DIP.
+        let (px, py) = (cx + (hx - cx) * 3.0, cy + (hy - cy) * 3.0);
+        let (cfg, selection, id) = zone_test_config(sticker);
+        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), px, py);
+        let Zone::Rotate(zid, angle) = zone else {
+            panic!("ожидался Zone::Rotate, получено другое");
+        };
+        assert_eq!(zid, id);
+        // Локальный угол NW (-135°) + поворот стикера (90°) = -45°.
+        assert_eq!(angle, -45);
+    }
+
+    #[test]
+    fn resolve_zone_click_on_other_sticker_selects_it_instead_of_rotating_selected() {
+        // Регрессия: зона поворота выделенного стикера безгранична наружу
+        // (см. `resolve_zone_rotate_has_no_upper_distance_bound` выше) — без
+        // явного приоритета клика по ДРУГОМУ стикеру она перехватывала бы
+        // клик по нему целиком, и переключить выделение на другой стикер
+        // было бы физически невозможно (репорт пользователя, 2026-08-10).
+        let a = zone_test_sticker(0.0); // центр (200,200), 100×100
+        let a_id = a.id;
+        let mut b = zone_test_sticker(0.0);
+        b.id = Uuid::new_v4();
+        b.placement.cx = 600.0;
+        b.placement.cy = 600.0;
+        let b_id = b.id;
+        let mut cfg = Config::default();
+        cfg.stickers.push(a);
+        cfg.stickers.push(b);
+        let mut selection = SelectionSet::default();
+        selection.click(Some(a_id));
+        // (600,600) — центр B, далеко за пределами зоны поворота A (которая
+        // формально безгранична, но клик должен уйти к B, не к повороту A).
+        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), 600.0, 600.0);
+        assert!(
+            matches!(zone, Zone::StickerBody(zid) if zid == b_id),
+            "клик по стикеру B должен выбрать B, получено: {zone:?}"
+        );
+    }
+
+    // --- Тултипы кнопок (фидбэк пользователя 2026-08-10): задержка 0.2с +
+    // плавное появление 0.3с ---
+
+    fn test_tooltip(hover_started: Instant) -> TooltipState {
+        TooltipState {
+            text: "Удалить",
+            hover_started,
+            anchor: Box2D {
+                cx: 100.0,
+                cy: 100.0,
+                w: 28.0,
+                h: 28.0,
+                rotation: 0.0,
+            },
+            monitor_id: monitor_id("main"),
+        }
+    }
+
+    #[test]
+    fn tooltip_opacity_zero_before_show_delay() {
+        let tooltip = test_tooltip(Instant::now());
+        assert_eq!(tooltip.opacity(Instant::now()), 0.0);
+        // 0.1с меньше задержки в 0.2с — всё ещё невидим.
+        let now = tooltip.hover_started + Duration::from_millis(100);
+        assert_eq!(tooltip.opacity(now), 0.0);
+    }
+
+    #[test]
+    fn tooltip_opacity_ramps_linearly_during_fade() {
+        let tooltip = test_tooltip(Instant::now());
+        // Ровно на границе задержки — начало анимации, opacity=0.
+        let start = tooltip.hover_started + TOOLTIP_SHOW_DELAY;
+        assert_eq!(tooltip.opacity(start), 0.0);
+        // На середине анимации появления — примерно половина.
+        let mid = start + TOOLTIP_FADE_DURATION / 2;
+        let mid_opacity = tooltip.opacity(mid);
+        assert!(
+            (mid_opacity - 0.5).abs() < 0.05,
+            "ожидалась ~0.5 на середине анимации, получено {mid_opacity}"
+        );
+    }
+
+    #[test]
+    fn tooltip_opacity_full_after_fade_completes() {
+        let tooltip = test_tooltip(Instant::now());
+        let after = tooltip.hover_started + TOOLTIP_SHOW_DELAY + TOOLTIP_FADE_DURATION;
+        assert_eq!(tooltip.opacity(after), 1.0);
+        // Далеко за завершением анимации — остаётся 1.0, не растёт бесконечно.
+        let far_after = after + Duration::from_secs(60);
+        assert_eq!(tooltip.opacity(far_after), 1.0);
+    }
+
+    #[test]
+    fn tooltip_next_deadline_targets_show_delay_end_before_fade() {
+        let tooltip = test_tooltip(Instant::now());
+        let deadline = tooltip
+            .next_deadline(Instant::now())
+            .expect("до истечения задержки дедлайн обязан быть");
+        assert_eq!(deadline, tooltip.hover_started + TOOLTIP_SHOW_DELAY);
+    }
+
+    #[test]
+    fn tooltip_next_deadline_none_after_fade_completes() {
+        let tooltip = test_tooltip(Instant::now());
+        let after = tooltip.hover_started + TOOLTIP_SHOW_DELAY + TOOLTIP_FADE_DURATION;
+        assert!(
+            tooltip.next_deadline(after).is_none(),
+            "после завершения анимации дедлайн больше не нужен — opacity стабилен"
+        );
+    }
+
+    #[test]
+    fn toolbar_tooltip_text_covers_all_buttons_and_skips_non_buttons() {
+        for id in [
+            toolbar::TB_LAYERS,
+            toolbar::TB_EYE,
+            toolbar::TB_ORDER_UP,
+            toolbar::TB_ORDER_DOWN,
+            toolbar::TB_DUPLICATE,
+            toolbar::TB_RESET_SCALE,
+            toolbar::TB_DELETE,
+            toolbar::TB_PLAY_PAUSE,
+        ] {
+            assert!(
+                toolbar_tooltip_text(id, false).is_some(),
+                "у кнопки {id} должен быть текст тултипа"
+            );
+        }
+        // Слайдер/поле/громкость — не кнопки, тултипа не имеют.
+        for id in [toolbar::TB_SLIDER, toolbar::TB_FIELD, toolbar::TB_VOLUME] {
+            assert_eq!(toolbar_tooltip_text(id, false), None);
+        }
+    }
+
+    #[test]
+    fn toolbar_tooltip_text_eye_button_is_unpin_for_window_stickers() {
+        // TB_EYE переиспользуется как «открепить» для стикеров-окон
+        // (фидбэк пользователя 2026-08-10) — тултип должен отражать это,
+        // а не «показать/скрыть» обычных стикеров.
+        assert_eq!(
+            toolbar_tooltip_text(toolbar::TB_EYE, true),
+            Some("Открепить окно")
+        );
+        assert_eq!(
+            toolbar_tooltip_text(toolbar::TB_EYE, false),
+            Some("Показать/скрыть")
+        );
+    }
+
+    #[test]
+    fn cursor_panel_tooltip_text_covers_all_buttons() {
+        for id in [
+            cursor_panel::BTN_LOAD_FILE,
+            cursor_panel::BTN_ADD_WINDOW,
+            cursor_panel::BTN_PRESETS,
+            cursor_panel::BTN_TOGGLE_ALL,
+            cursor_panel::BTN_SETTINGS,
+            cursor_panel::BTN_EXIT,
+        ] {
+            assert!(
+                cursor_panel_tooltip_text(id).is_some(),
+                "у кнопки {id} должен быть текст тултипа"
+            );
+        }
+    }
+
+    #[test]
+    fn tooltip_primitives_empty_when_invisible() {
+        let tooltip = test_tooltip(Instant::now());
+        assert!(tooltip_primitives(&tooltip, 1080.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn tooltip_primitives_positions_below_anchor_when_room() {
+        let tooltip = test_tooltip(Instant::now());
+        let prims = tooltip_primitives(&tooltip, 1080.0, 1.0);
+        assert_eq!(prims.len(), 3, "два Fill (рамка+фон) + один Text");
+        let Primitive::Fill { rect, opacity, .. } = prims[0] else {
+            panic!("первый примитив — фон-рамка");
+        };
+        assert_eq!(opacity, theme::PANEL_BG_OPACITY, "полная анимация — полная непрозрачность фона");
+        // Верх тултипа строго ниже низа кнопки (anchor.cy + h/2 = 114) плюс
+        // зазор TOOLTIP_GAP_DIP.
+        let anchor_bottom = tooltip.anchor.cy + tooltip.anchor.h / 2.0;
+        assert!(
+            rect.cy - rect.h / 2.0 >= anchor_bottom,
+            "тултип должен быть ниже кнопки, когда снизу есть место"
+        );
+    }
+
+    #[test]
+    fn tooltip_primitives_flips_above_anchor_when_no_room_below() {
+        // Кнопка у самого низа маленького экрана — снизу места нет, тултип
+        // должен уйти НАД кнопкой (тот же приём, что toolbar_top).
+        let mut tooltip = test_tooltip(Instant::now());
+        tooltip.anchor.cy = 195.0; // низ кнопки на y=209, экран высотой 210
+        let prims = tooltip_primitives(&tooltip, 210.0, 1.0);
+        let Primitive::Fill { rect, .. } = prims[0] else {
+            panic!("первый примитив — фон-рамка");
+        };
+        let anchor_top = tooltip.anchor.cy - tooltip.anchor.h / 2.0;
+        assert!(
+            rect.cy + rect.h / 2.0 <= anchor_top,
+            "тултип должен уйти над кнопкой, когда снизу не хватает места"
+        );
     }
 
     fn window(
@@ -6765,6 +8926,98 @@ mod tests {
             }),
             Some(bounds(-10, 20, 100, 200))
         );
+    }
+
+    // --- M3: смена DPI (M3_PREP_NOTES.md §3.6) — синтетические переходы
+    // 100/150/200%, без реального смешанного DPI-железа (см. докком
+    // `dpi_change_scale_and_cursor`) ---
+
+    #[test]
+    fn dpi_change_scale_matches_standard_percents() {
+        // 96/144/192 — стандартные Windows-точки 100/150/200% (dpi/96.0).
+        assert_eq!(dpi_change_scale_and_cursor(1.0, 96, (0.0, 0.0)).0, 1.0);
+        assert_eq!(dpi_change_scale_and_cursor(1.0, 144, (0.0, 0.0)).0, 1.5);
+        assert_eq!(dpi_change_scale_and_cursor(1.0, 192, (0.0, 0.0)).0, 2.0);
+    }
+
+    /// Отношение `old_scale/new_scale` считается в f32 (см. докком
+    /// `dpi_change_scale_and_cursor`) — для «некруглых» отношений вроде
+    /// 1.0/1.5 это не бит-в-бит точное число, поэтому сравнение физической
+    /// позиции ниже — с допуском, а не `assert_eq!` (стандартная практика
+    /// для float-арифметики, не признак бага в самой функции).
+    fn assert_close(a: f64, b: f64, msg: &str) {
+        assert!((a - b).abs() < 1e-4, "{msg}: {a} vs {b}");
+    }
+
+    #[test]
+    fn dpi_change_cursor_preserves_physical_position_100_to_150() {
+        // 300 DIP при 100% = 300 физических px; при 150% та же физическая
+        // точка — 200 DIP (300 / 1.5).
+        let (scale, cursor) = dpi_change_scale_and_cursor(1.0, 144, (300.0, 150.0));
+        assert_eq!(scale, 1.5);
+        assert_close(cursor.0, 200.0, "x");
+        assert_close(cursor.1, 100.0, "y");
+    }
+
+    #[test]
+    fn dpi_change_cursor_preserves_physical_position_150_to_200() {
+        // 150 DIP при 150% = 225 физических px; при 200% та же точка —
+        // 112.5 DIP (225 / 2.0).
+        let (scale, cursor) = dpi_change_scale_and_cursor(1.5, 192, (150.0, 300.0));
+        assert_eq!(scale, 2.0);
+        assert_close(cursor.0, 112.5, "x");
+        assert_close(cursor.1, 225.0, "y");
+    }
+
+    #[test]
+    fn dpi_change_cursor_preserves_physical_position_200_to_100() {
+        // Обратный переход (монитор передвинули со 200% экрана на 100%) —
+        // та же инвариантная физическая точка, ratio > 1 на этот раз.
+        let (scale, cursor) = dpi_change_scale_and_cursor(2.0, 96, (100.0, 50.0));
+        assert_eq!(scale, 1.0);
+        assert_close(cursor.0, 200.0, "x");
+        assert_close(cursor.1, 100.0, "y");
+    }
+
+    #[test]
+    fn dpi_change_same_dpi_is_a_no_op_for_cursor() {
+        // Дубль WM_DISPLAYCHANGE/WM_DPICHANGED на тот же DPI (случается —
+        // M3_HOTPLUG_DESIGN.md §2 про идемпотентность дублей) не должен
+        // сдвигать курсор ни на суб-пиксель.
+        let (scale, cursor) = dpi_change_scale_and_cursor(1.5, 144, (77.0, 33.0));
+        assert_eq!(scale, 1.5);
+        assert_close(cursor.0, 77.0, "x");
+        assert_close(cursor.1, 33.0, "y");
+    }
+
+    #[test]
+    fn dpi_change_chain_100_150_200_preserves_original_physical_position() {
+        // «Смешанный DPI» сквозь три перехода подряд (100% → 150% → 200%,
+        // как если бы окно переезжало по мониторам с разным DPI, или один
+        // монитор трижды сменил настройку) — физическая (px) позиция курсора
+        // должна остаться неизменной на каждом шаге, а не только на первом.
+        let start_dip = (960.0, 540.0);
+        let physical = start_dip.0 * 1.0;
+
+        let (scale_150, cursor_150) = dpi_change_scale_and_cursor(1.0, 144, start_dip);
+        assert_close(
+            cursor_150.0 * scale_150 as f64,
+            physical,
+            "физика после 150%",
+        );
+
+        let (scale_200, cursor_200) = dpi_change_scale_and_cursor(scale_150, 192, cursor_150);
+        assert_close(
+            cursor_200.0 * scale_200 as f64,
+            physical,
+            "физика после 200%",
+        );
+
+        let (scale_100, cursor_100) = dpi_change_scale_and_cursor(scale_200, 96, cursor_200);
+        assert_eq!(scale_100, 1.0);
+        // Полный круг 100→150→200→100 возвращает исходную DIP-позицию.
+        assert_close(cursor_100.0, start_dip.0, "x после полного круга");
+        assert_close(cursor_100.1, start_dip.1, "y после полного круга");
     }
 
     // --- M6: стикеры-окна (SPEC.md §5) ---
@@ -7032,5 +9285,383 @@ mod tests {
     fn inset_for_mask_radius_none_when_too_small() {
         assert_eq!(inset_for_mask_radius(&bounds(0, 0, 16, 100)), None);
         assert_eq!(inset_for_mask_radius(&bounds(0, 0, 100, 16)), None);
+    }
+
+    // --- M2: симуляция бага «стикер едет сам по себе» — дубликаты/coalesced
+    // WM_MOUSEMOVE с ТЕМИ ЖЕ координатами при живом Drag-жесте. Прогон через
+    // реальный `MouseCapture` (rst_win32::input, реальные коды сообщений
+    // Win32) и реальный `apply_gesture` — ровно тот вызов, что делает
+    // `handle_input` в ветке `PointerOwner::Scene if dragging`
+    // (handle_input → apply_gesture, строчка выше), с реальными
+    // `snap_placement`/`clamp_min_visible`. Вопрос: даёт ли дубликат
+    // координат ненулевую дельту (дрейф) из-за магнита/клампа? ---
+
+    use rst_win32::input::MouseCapture;
+    use windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
+    use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WNDCLASSEXW, WS_OVERLAPPED,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    };
+    use windows::core::w;
+
+    /// Скрытое окно тест-потока: `SetCapture` в `MouseCapture` требует живое
+    /// окно того же потока (инвариант `MouseCapture`, input.rs) — тот же
+    /// паттерн, что в тестах rst-win32.
+    struct DragSimWindow(HWND);
+
+    impl DragSimWindow {
+        fn create() -> Self {
+            // SAFETY: GetModuleHandleW(None) — хэндл текущего модуля.
+            let hinstance = unsafe { GetModuleHandleW(None) }.expect("хэндл модуля");
+            let wc = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(drag_sim_wndproc),
+                hInstance: hinstance.into(),
+                lpszClassName: w!("resticker_drag_sim_test"),
+                ..Default::default()
+            };
+            // SAFETY: wc заполнена корректно. Класс процесс-wide: повторная
+            // регистрация (параллельные тесты) — не ошибка.
+            if unsafe { RegisterClassExW(&wc) } == 0 {
+                // SAFETY: осмысленна сразу после провалившегося вызова.
+                let err = unsafe { GetLastError() };
+                assert_eq!(err, ERROR_CLASS_ALREADY_EXISTS);
+            }
+            // SAFETY: аргументы — валидные константы и зарегистрированный
+            // класс; окно скрытое, принадлежит текущему потоку.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    w!("resticker_drag_sim_test"),
+                    w!("test"),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    100,
+                    100,
+                    None,
+                    None,
+                    Some(hinstance.into()),
+                    None,
+                )
+            }
+            .expect("создание тестового окна");
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for DragSimWindow {
+        fn drop(&mut self) {
+            // SAFETY: окно создано этим же потоком выше.
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    unsafe extern "system" fn drag_sim_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        // SAFETY: делегирование системному обработчику.
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    /// Кодировка координат Win32: знаковые 16-битные поля x/y в lParam.
+    fn drag_sim_lparam(x: i16, y: i16) -> LPARAM {
+        LPARAM((((y as u16 as u32) << 16) | (x as u16 as u32)) as isize)
+    }
+
+    /// Стикер 300x200 с центром (500, 400) на мониторе «main» 1920x1080
+    /// (DIP = px при scale 1.0) + готовый `EditState` режима редактирования.
+    fn drag_sim_harness() -> (Config, EditState, DragSimWindow, MouseCapture) {
+        let mut cfg = Config::default();
+        cfg.stickers.push(Sticker {
+            id: Uuid::new_v4(),
+            placement: Placement {
+                monitor_id: monitor_id("main"),
+                cx: 500.0,
+                cy: 400.0,
+                w: 300.0,
+                h: 200.0,
+            },
+            ..Default::default()
+        });
+        let (coordinator_tx, _rx) = mpsc::channel();
+        let edit = EditState {
+            active: true,
+            selection: SelectionSet::new(),
+            gesture: None,
+            snap: SnapConfig::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            pending_snapshot: None,
+            confirm: None,
+            window_picker: None,
+            preset_picker: None,
+            pending_open_picker: None,
+            pending_open_pick_list: None,
+            window_pick_list: None,
+            pending_animation: None,
+            pending_video: None,
+            marquee: None,
+            marquee_started: false,
+            toolbar: None,
+            cursor_panel: None,
+            tooltip: None,
+            pointer_owner: PointerOwner::None,
+            ui_pending_snapshot: None,
+            cursor_pos: (0.0, 0.0),
+            cursor_monitor: monitor_id("main"),
+            coordinator_tx,
+        };
+        let wnd = DragSimWindow::create();
+        let cap = MouseCapture::new(wnd.0);
+        (cfg, edit, wnd, cap)
+    }
+
+    /// WM_LBUTTONDOWN через реальное ядро `MouseCapture` (тестируемая версия
+    /// с инъекцией состояния кнопки: `handle_message_checked(..., true)` —
+    /// в проде `handle_message` читает его через `GetAsyncKeyState`) + реальный
+    /// старт Gesture::Drag (эти строки `handle_input` выполняет в ветке
+    /// `Zone::StickerBody`): click + захват grab-офсета.
+    fn drag_sim_down(cap: &mut MouseCapture, cfg: &mut Config, edit: &mut EditState, x: i16, y: i16) {
+        let ev = cap
+            .handle_message_checked(WM_LBUTTONDOWN, WPARAM(0), drag_sim_lparam(x, y), true)
+            .expect("MouseDown");
+        let InputEvent::MouseDown { pos, .. } = ev else {
+            panic!("ожидался MouseDown, пришло: {ev:?}");
+        };
+        let (dip_x, dip_y) = to_dip(pos, 1.0);
+        let mid = monitor_id("main");
+        let zone = resolve_zone(cfg, &edit.selection, &mid, dip_x, dip_y);
+        let Zone::StickerBody(id) = zone else {
+            panic!("клик мимо стикера");
+        };
+        edit.selection.click(Some(id));
+        let sticker = cfg
+            .stickers
+            .iter()
+            .find(|s| s.id == id)
+            .expect("стикер в конфиге");
+        edit.gesture = Some(Gesture::Drag {
+            start: GestureStart {
+                id,
+                placement: sticker.placement.clone(),
+                transform: sticker.transform,
+            },
+            grab_dx: dip_x - sticker.placement.cx,
+            grab_dy: dip_y - sticker.placement.cy,
+        });
+        edit.pointer_owner = PointerOwner::Scene;
+    }
+
+    /// WM_MOUSEMOVE через реальное ядро `MouseCapture` + реальный
+    /// `apply_gesture` — точно тот же вызов, что в `handle_input` (ветка
+    /// dragging). `left_button_down` — физическое состояние ЛКМ, инъекция
+    /// вместо `GetAsyncKeyState` из `handle_message` (прод: кнопка зажата,
+    /// пока пользователь тянет).
+    fn drag_sim_move(
+        cap: &mut MouseCapture,
+        cfg: &mut Config,
+        edit: &mut EditState,
+        x: i16,
+        y: i16,
+        ctrl: bool,
+        left_button_down: bool,
+    ) {
+        let Some(ev) =
+            cap.handle_message_checked(WM_MOUSEMOVE, WPARAM(0), drag_sim_lparam(x, y), left_button_down)
+        else {
+            // Дедуп точных дубликатов (input.rs:226-244): повторный
+            // WM_MOUSEMOVE с бит-в-бит теми же координатами отсекается ещё
+            // на входе — до apply_gesture доезжает только несовпадающий.
+            return;
+        };
+        let InputEvent::MouseMove { pos, .. } = ev else {
+            panic!("ожидался MouseMove для WM_MOUSEMOVE=0x{WM_MOUSEMOVE:x}, пришло: {ev:?}");
+        };
+        let (dip_x, dip_y) = to_dip(pos, 1.0);
+        let mid = monitor_id("main");
+        let monitor = DipRect::new(0.0, 0.0, 1920.0, 1080.0);
+        let mods = Modifiers {
+            shift: false,
+            ctrl,
+            alt: false,
+        };
+        apply_gesture(
+            cfg,
+            &mut [],
+            edit,
+            (dip_x, dip_y),
+            mods,
+            monitor,
+            &mid,
+            &HashMap::new(),
+            &WindowPins::default(),
+            &HashMap::new(),
+        );
+    }
+
+    fn drag_sim_center(cfg: &Config) -> (f64, f64) {
+        (cfg.stickers[0].placement.cx, cfg.stickers[0].placement.cy)
+    }
+
+    #[test]
+    fn duplicate_coalesced_moves_do_not_drift_sticker() {
+        let (mut cfg, mut edit, _wnd, mut cap) = drag_sim_harness();
+        drag_sim_down(&mut cap, &mut cfg, &mut edit, 500, 400);
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 560, 420, false, true);
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 620, 430, false, true);
+        let last = drag_sim_center(&cfg);
+        // 3000 дубликатов WM_MOUSEMOVE с ТЕМИ ЖЕ координатами (coalescing,
+        // автоповторы, «призрачные» сообщения): 24 c × 60 fps × ~2 события.
+        // Кнопка физически зажата всю дорогу — как в реальном драге.
+        for i in 0..3000 {
+            drag_sim_move(&mut cap, &mut cfg, &mut edit, 620, 430, false, true);
+            assert_eq!(
+                drag_sim_center(&cfg),
+                last,
+                "дубликат WM_MOUSEMOVE (одинаковые координаты) сдвинул стикер на итерации {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_moves_with_snap_engaged_are_stable() {
+        let (mut cfg, mut edit, _wnd, mut cap) = drag_sim_harness();
+        drag_sim_down(&mut cap, &mut cfg, &mut edit, 500, 400);
+        // Стикер 300px шириной, центр 158 → левый край 8px от направляющей
+        // x=0 — ровно на пороге магнита (8 DIP): магнит должен притянуть к 150.
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 158, 400, false, true);
+        let snapped = drag_sim_center(&cfg);
+        // Контроль: с Ctrl магнит отключён (`snap_move` возвращает 0), центр
+        // остаётся 200 — значит выше магнит реально сработал. Точка взята
+        // далеко от направляющих И от предыдущей (иначе дедуп input.rs:226
+        // съел бы контрольный move как точный дубликат).
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 200, 400, true, true);
+        let unsnapped = drag_sim_center(&cfg);
+        assert_ne!(
+            snapped, unsnapped,
+            "магнит должен был притянуть на пороге: {snapped:?} vs {unsnapped:?}"
+        );
+        // Возврат к snap и 2000 дубликатов — позиция обязана быть бит-в-бит
+        // стабильной (иначе магнит «дёргал» бы стикер на каждом дубликате).
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 158, 400, false, true);
+        assert_eq!(drag_sim_center(&cfg), snapped);
+        for i in 0..2000 {
+            drag_sim_move(&mut cap, &mut cfg, &mut edit, 158, 400, false, true);
+            assert_eq!(
+                drag_sim_center(&cfg),
+                snapped,
+                "магнит залип/осциллирует на дубликате {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_moves_under_clamp_are_stable() {
+        let (mut cfg, mut edit, _wnd, mut cap) = drag_sim_harness();
+        drag_sim_down(&mut cap, &mut cfg, &mut edit, 500, 400);
+        // Захваченная мышь может уходить за границы монитора (Win32 шлёт
+        // координаты вне клиентской области). Стикер 300px, центр 2100 →
+        // правый край 2250 > 1920: `clamp_min_visible` зажимает (магнит
+        // выключен Ctrl — чистый кламп, без притягивания).
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 2100, 400, true, true);
+        let clamped = drag_sim_center(&cfg);
+        assert!(
+            clamped.0 < 2100.0,
+            "clamp_min_visible должен был зажать центр: {clamped:?}"
+        );
+        for i in 0..2000 {
+            drag_sim_move(&mut cap, &mut cfg, &mut edit, 2100, 400, true, true);
+            assert_eq!(
+                drag_sim_center(&cfg),
+                clamped,
+                "кламп дёргает стикер на дубликате {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn released_button_terminates_drag_via_getasynckeystate_guard() {
+        // Защита из input.rs::handle_message_checked: WM_MOUSEMOVE во время
+        // драга при физически отжатой ЛКМ обрабатывается как WM_LBUTTONUP
+        // (input.rs:201-205) — жест обязан завершиться, а не «ехать сам».
+        let (mut cfg, mut edit, _wnd, mut cap) = drag_sim_harness();
+        drag_sim_down(&mut cap, &mut cfg, &mut edit, 500, 400);
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 620, 430, false, true);
+        let ev = cap
+            .handle_message_checked(WM_MOUSEMOVE, WPARAM(0), drag_sim_lparam(620, 430), false)
+            .expect("движение при отжатой кнопке");
+        assert!(
+            matches!(ev, InputEvent::MouseUp { .. }),
+            "WM_MOUSEMOVE при отжатой кнопке должен превратиться в MouseUp: {ev:?}"
+        );
+        assert!(!cap.is_captured());
+        // 1000 последующих движений (кнопка всё ещё отжата) — захват снят,
+        // драг не возобновляется.
+        for _ in 0..1000 {
+            let ev = cap
+                .handle_message_checked(WM_MOUSEMOVE, WPARAM(0), drag_sim_lparam(620, 430), false)
+                .expect("move без захвата");
+            assert!(!matches!(ev, InputEvent::MouseDown { .. } | InputEvent::MouseUp { .. }));
+        }
+    }
+
+    #[test]
+    fn subpixel_noise_while_button_held_moves_sticker() {
+        // Документированный в input.rs:218-222 остаточный механизм: дедуп
+        // срабатывает только на БИТ-В-БИТ равные координаты; «микро-джиттер»
+        // сенсора между спровоцированными пересылками (±1px к той же позиции)
+        // при зажатой кнопке даёт ненулевую дельту — самоподдерживающаяся
+        // петля «стикер едет сам при неподвижном курсоре». Тест фиксирует
+        // этот факт, чтобы отличать его от чистых дубликатов.
+        let (mut cfg, mut edit, _wnd, mut cap) = drag_sim_harness();
+        drag_sim_down(&mut cap, &mut cfg, &mut edit, 500, 400);
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 620, 430, false, true);
+        let before = drag_sim_center(&cfg);
+        // Точный дубликат — дедуп, дельты нет.
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 620, 430, false, true);
+        assert_eq!(drag_sim_center(&cfg), before, "точный дубликат не двигает");
+        // Джиттер ±1px вокруг той же позиции — дельта есть.
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 621, 430, false, true);
+        let after = drag_sim_center(&cfg);
+        assert_ne!(before, after, "джиттер-пересылка должна дать дельту");
+    }
+
+    #[test]
+    fn duplicate_moves_after_mouse_up_do_not_restart_drag() {
+        let (mut cfg, mut edit, _wnd, mut cap) = drag_sim_harness();
+        drag_sim_down(&mut cap, &mut cfg, &mut edit, 500, 400);
+        drag_sim_move(&mut cap, &mut cfg, &mut edit, 620, 430, false, true);
+        // WM_LBUTTONUP — жест завершается (captured=false в автомате,
+        // ReleaseCapture), последующие дубликаты move идут с dragging=false.
+        let up = cap
+            .handle_message_checked(WM_LBUTTONUP, WPARAM(0), drag_sim_lparam(620, 430), false)
+            .expect("MouseUp");
+        assert!(matches!(up, InputEvent::MouseUp { .. }));
+        for _ in 0..500 {
+            let ev = cap
+                .handle_message_checked(
+                    WM_MOUSEMOVE,
+                    WPARAM(0),
+                    drag_sim_lparam(620, 430),
+                    false,
+                )
+                .expect("move после up");
+            let InputEvent::MouseMove { dragging, .. } = ev else {
+                panic!("ожидался MouseMove");
+            };
+            assert!(!dragging, "после MouseUp движение не должно быть драгом");
+        }
+        assert!(
+            edit.gesture.is_some(),
+            "жест в EditState снимается только обработчиком MouseUp в handle_input"
+        );
     }
 }

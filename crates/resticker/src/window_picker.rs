@@ -465,7 +465,7 @@ fn row_cy(list_top: f64, visible_index: usize) -> f64 {
 /// или имя процесса иначе просто рисовался бы за правым краем панели).
 /// Считает по символам (`char`), не байтам — заголовки часто кириллические,
 /// обрезка по байтам могла бы разрезать символ пополам.
-fn truncate_to_width(text: &str, max_w: f64) -> String {
+pub(crate) fn truncate_to_width(text: &str, max_w: f64) -> String {
     if text_size(text).0 <= max_w {
         return text.to_string();
     }

@@ -51,11 +51,12 @@ async function loadConfig() {
   try {
     config = await invoke('get_config');
   } catch (err) {
-    setStatus(`Ошибка загрузки config.json: ${err}`);
+    setStatus(t('error.configLoad', { err }));
     config = { settings: {}, hotkeys: {}, stickers: [] };
   }
   draftSettings = { ...config.settings };
   draftHotkeys = { ...config.hotkeys };
+  applyStaticTranslations(draftSettings.language ?? 'ru');
   renderGeneral();
   renderControl();
   renderStickers();
@@ -76,6 +77,7 @@ function renderGeneral() {
   const fps = draftSettings.battery_fps_limit ?? 30;
   document.getElementById('battery-fps-limit').value = fps;
   document.getElementById('battery-fps-limit-value').textContent = String(fps);
+  document.getElementById('language').value = draftSettings.language ?? 'ru';
 }
 
 const GENERAL_CHECKBOXES = [
@@ -98,6 +100,18 @@ const fpsValue = document.getElementById('battery-fps-limit-value');
 fpsSlider.addEventListener('input', () => {
   fpsValue.textContent = fpsSlider.value;
   draftSettings.battery_fps_limit = Number(fpsSlider.value);
+});
+
+// Смена языка применяется сразу, без перезапуска окна (перерисовываем и
+// статический, и динамический текст — вкладки «Стикеры»/«Пресеты» строят
+// разметку через t() на каждый рендер) — сохраняется в draftSettings и
+// уходит в конфиг обычным путём, вместе с остальными настройками, по
+// «Применить»/«ОК».
+document.getElementById('language').addEventListener('change', (e) => {
+  draftSettings.language = e.target.value;
+  applyStaticTranslations(draftSettings.language);
+  renderStickers();
+  renderPresets();
 });
 
 // ==== Вкладка «Управление» (хоткеи) ====
@@ -140,7 +154,7 @@ for (const [elId] of HOTKEY_FIELDS) {
     cancelRecording();
     recordingField = elId;
     input.classList.add('recording');
-    input.value = 'Нажмите комбинацию…';
+    input.value = t('control.recording');
   });
 }
 
@@ -186,11 +200,11 @@ const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'];
 function mediaTypeLabel(source) {
   // StickerSource — internally tagged (#[serde(tag = "kind")]), значения
   // snake_case: "file" | "window" | "pasted".
-  if (source?.kind === 'window') return 'Окно';
+  if (source?.kind === 'window') return t('media.window');
   const mt = source?.media_type;
-  if (mt === 'video') return 'Видео';
-  if (mt === 'animation') return 'Анимация';
-  return 'Изображение';
+  if (mt === 'video') return t('media.video');
+  if (mt === 'animation') return t('media.animation');
+  return t('media.image');
 }
 
 function stickerFilePath(sticker) {
@@ -204,7 +218,7 @@ function renderStickers() {
   list.innerHTML = '';
   const stickers = config.stickers ?? [];
   if (stickers.length === 0) {
-    list.innerHTML = '<p class="emptyHint">Стикеров пока нет.</p>';
+    list.innerHTML = `<p class="emptyHint">${t('stickers.empty')}</p>`;
     return;
   }
   for (const sticker of stickers) {
@@ -212,23 +226,23 @@ function renderStickers() {
     row.className = 'stickerRow' + (sticker.visible ? '' : ' disabled');
 
     const path = stickerFilePath(sticker);
-    const name = path ? path.split(/[\\/]/).pop() : '(окно)';
+    const name = path ? path.split(/[\\/]/).pop() : `(${t('media.window').toLowerCase()})`;
 
     row.innerHTML = `
-      <label class="checkboxWrapper" title="Включить/выключить" style="flex:none">
+      <label class="checkboxWrapper" title="${t('sticker.toggleTitle')}" style="flex:none">
         <input type="checkbox" data-action="toggle" data-id="${sticker.id}" ${sticker.visible ? 'checked' : ''} />
         <span class="checkmark"></span>
       </label>
       <div class="stickerInfo">
         <span class="stickerName">${escapeHtml(name)}</span>
-        <span class="stickerMeta">${mediaTypeLabel(sticker.source)} · монитор ${escapeHtml(sticker.placement?.monitor_id ?? '?')}</span>
+        <span class="stickerMeta">${mediaTypeLabel(sticker.source)} · ${t('sticker.monitorLabel', { id: escapeHtml(sticker.placement?.monitor_id ?? '?') })}</span>
       </div>
       <div class="stickerActions">
-        <button class="button compact" data-action="reset-pos" data-id="${sticker.id}" title="Сбросить позицию">⤾</button>
-        <button class="button compact" data-action="reset-transform" data-id="${sticker.id}" title="Сбросить размер и поворот">⟲</button>
-        <button class="button compact" data-action="reveal" data-id="${sticker.id}" title="Показать в проводнике" ${path ? '' : 'disabled'}>📁</button>
-        <button class="button compact" data-action="relink" data-id="${sticker.id}" title="Переуказать файл" ${path ? '' : 'disabled'}>↻</button>
-        <button class="button compact danger" data-action="delete" data-id="${sticker.id}" title="Удалить">✕</button>
+        <button class="button compact" data-action="reset-pos" data-id="${sticker.id}" title="${t('sticker.resetPosTitle')}">⤾</button>
+        <button class="button compact" data-action="reset-transform" data-id="${sticker.id}" title="${t('sticker.resetTransformTitle')}">⟲</button>
+        <button class="button compact" data-action="reveal" data-id="${sticker.id}" title="${t('sticker.revealTitle')}" ${path ? '' : 'disabled'}>📁</button>
+        <button class="button compact" data-action="relink" data-id="${sticker.id}" title="${t('sticker.relinkTitle')}" ${path ? '' : 'disabled'}>↻</button>
+        <button class="button compact danger" data-action="delete" data-id="${sticker.id}" title="${t('sticker.deleteTitle')}">✕</button>
       </div>
     `;
     list.appendChild(row);
@@ -267,7 +281,7 @@ document.getElementById('sticker-list').addEventListener('click', async (e) => {
         const path = await open({
           multiple: false,
           filters: [
-            { name: 'Изображения и видео', extensions: [...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS] },
+            { name: t('stickers.dialogFilter'), extensions: [...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS] },
           ],
         });
         if (path) await invoke('relink_sticker', { id, path });
@@ -278,7 +292,7 @@ document.getElementById('sticker-list').addEventListener('click', async (e) => {
     }
     await loadConfig();
   } catch (err) {
-    stickerStatusEl.textContent = `Ошибка: ${err}`;
+    stickerStatusEl.textContent = t('error.generic', { err });
   }
 });
 
@@ -289,7 +303,7 @@ document.getElementById('sticker-list').addEventListener('change', async (e) => 
     await invoke('set_sticker_enabled', { id: input.dataset.id, enabled: input.checked });
     await loadConfig();
   } catch (err) {
-    stickerStatusEl.textContent = `Ошибка: ${err}`;
+    stickerStatusEl.textContent = t('error.generic', { err });
   }
 });
 
@@ -298,30 +312,30 @@ document.getElementById('add-sticker').addEventListener('click', async () => {
     const path = await open({
       multiple: false,
       filters: [
-        { name: 'Изображения и видео', extensions: [...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS] },
+        { name: t('stickers.dialogFilter'), extensions: [...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS] },
       ],
     });
     if (path) {
       await invoke('add_sticker', { path });
-      stickerStatusEl.textContent = `Добавлено: ${path}`;
+      stickerStatusEl.textContent = t('stickers.added', { path });
       await loadConfig();
     }
   } catch (err) {
-    stickerStatusEl.textContent = `Ошибка: ${err}`;
+    stickerStatusEl.textContent = t('error.generic', { err });
   }
 });
 
 document.getElementById('reset-all-stickers').addEventListener('click', async () => {
   await invoke('reset_all_stickers');
   await loadConfig();
-  setStatus('Все стикеры сброшены');
+  setStatus(t('stickers.resetAllDone'));
 });
 
 document.getElementById('delete-all-stickers').addEventListener('click', async () => {
-  if (!confirm('Удалить все стикеры? Это действие нельзя отменить.')) return;
+  if (!confirm(t('stickers.deleteAllConfirm'))) return;
   await invoke('delete_all_stickers');
   await loadConfig();
-  setStatus('Все стикеры удалены');
+  setStatus(t('stickers.deleteAllDone'));
 });
 
 // ==== Вкладка «Пресеты» (M7) ====
@@ -332,16 +346,10 @@ document.getElementById('delete-all-stickers').addEventListener('click', async (
 // «Стикеры»).
 function presetMeta(preset) {
   if (preset.created_at) {
-    return new Date(preset.created_at).toLocaleDateString('ru-RU');
+    return new Date(preset.created_at).toLocaleDateString(currentLang === 'ru' ? 'ru-RU' : 'en-US');
   }
   const n = (preset.stickers ?? []).length;
-  const plural =
-    n % 10 === 1 && n % 100 !== 11
-      ? 'стикер'
-      : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)
-        ? 'стикера'
-        : 'стикеров';
-  return `${n} ${plural}`;
+  return t('preset.stickersCount', { n, word: pluralStickerWord(n) });
 }
 
 function renderPresets() {
@@ -349,7 +357,7 @@ function renderPresets() {
   list.innerHTML = '';
   const presets = config.presets ?? [];
   if (presets.length === 0) {
-    list.innerHTML = '<p class="emptyHint">Пресетов пока нет. Сохраните текущую расстановку выше.</p>';
+    list.innerHTML = `<p class="emptyHint">${t('presets.empty')}</p>`;
     return;
   }
   for (const preset of presets) {
@@ -361,10 +369,10 @@ function renderPresets() {
         <span class="stickerMeta">${escapeHtml(presetMeta(preset))}</span>
       </div>
       <div class="stickerActions">
-        <button class="button compact" data-action="apply" data-id="${preset.id}" title="Заменить текущую расстановку">Применить</button>
-        <button class="button compact" data-action="rename" data-id="${preset.id}" title="Переименовать">Переименовать</button>
-        <button class="button compact" data-action="export" data-id="${preset.id}" title="Экспорт в файл .json">Экспорт</button>
-        <button class="button compact danger" data-action="delete" data-id="${preset.id}" title="Удалить">✕</button>
+        <button class="button compact" data-action="apply" data-id="${preset.id}" title="${t('preset.applyTitle')}">${t('preset.applyAction')}</button>
+        <button class="button compact" data-action="rename" data-id="${preset.id}" title="${t('preset.renameTitle')}">${t('presets.rename')}</button>
+        <button class="button compact" data-action="export" data-id="${preset.id}" title="${t('preset.exportTitle')}">${t('preset.exportAction')}</button>
+        <button class="button compact danger" data-action="delete" data-id="${preset.id}" title="${t('preset.deleteTitle')}">✕</button>
       </div>
     `;
     list.appendChild(row);
@@ -374,7 +382,7 @@ function renderPresets() {
 // Вернуться из режима переименования в «сохранить как пресет».
 function resetRenameMode() {
   renameTargetId = null;
-  document.getElementById('save-preset').textContent = 'Сохранить как пресет';
+  document.getElementById('save-preset').textContent = t('presets.save');
   presetStatusEl.textContent = '';
 }
 
@@ -391,42 +399,42 @@ document.getElementById('preset-list').addEventListener('click', async (e) => {
         // 'preset-missing-elements' (обработчик ниже) — диалог недостающих
         // элементов, SPEC §11.
         await invoke('apply_preset', { id });
-        setStatus(`Пресет «${preset?.name ?? id}» применён`);
+        setStatus(t('preset.applied', { name: preset?.name ?? id }));
         break;
       case 'rename': {
         renameTargetId = id;
         document.getElementById('preset-name').value = preset?.name ?? '';
-        document.getElementById('save-preset').textContent = 'Переименовать';
+        document.getElementById('save-preset').textContent = t('presets.rename');
         document.getElementById('save-preset').disabled = false;
-        presetStatusEl.textContent = `Переименование пресета «${preset?.name ?? ''}» — нажмите «Переименовать»`;
+        presetStatusEl.textContent = t('preset.renamingStatus', { name: preset?.name ?? '' });
         return; // список не перезагружаем, строка не удаляется
       }
       case 'export': {
         // SPEC §11 / CONFIG.md: внутри файла абсолютные пути к файлам
         // пользователя и имена программ — предупреждение обязательно.
-        if (!confirm('Пресет содержит абсолютные пути к файлам на вашем диске и имена программ. Экспортировать?')) {
+        if (!confirm(t('preset.exportConfirm'))) {
           return;
         }
         const path = await save({
           defaultPath: `${String(preset?.name ?? 'preset').replace(/[\\/:*?"<>|]/g, '_')}.json`,
-          filters: [{ name: 'Пресет resticker', extensions: ['json'] }],
+          filters: [{ name: t('presets.dialogFilter'), extensions: ['json'] }],
         });
         if (!path) return; // отмена в диалоге сохранения
         await invoke('export_preset', { id, path });
-        setStatus(`Пресет экспортирован: ${path}`);
+        setStatus(t('preset.exported', { path }));
         break;
       }
       case 'delete':
-        if (!confirm(`Удалить пресет «${preset?.name ?? ''}»?`)) return;
+        if (!confirm(t('preset.deleteConfirm', { name: preset?.name ?? '' }))) return;
         await invoke('delete_preset', { id });
-        setStatus('Пресет удалён');
+        setStatus(t('preset.deleted'));
         break;
       default:
         return;
     }
     await loadConfig();
   } catch (err) {
-    presetStatusEl.textContent = `Ошибка: ${err}`;
+    presetStatusEl.textContent = t('error.generic', { err });
   }
 });
 
@@ -446,17 +454,17 @@ savePresetBtn.addEventListener('click', async () => {
   try {
     if (renameTargetId) {
       await invoke('rename_preset', { id: renameTargetId, name });
-      setStatus('Пресет переименован');
+      setStatus(t('preset.renamed'));
     } else {
       await invoke('save_preset', { name });
-      setStatus(`Пресет «${name}» сохранён`);
+      setStatus(t('preset.saved', { name }));
     }
     presetNameInput.value = '';
     resetRenameMode();
     savePresetBtn.disabled = true;
     await loadConfig();
   } catch (err) {
-    presetStatusEl.textContent = `Ошибка: ${err}`;
+    presetStatusEl.textContent = t('error.generic', { err });
   }
 });
 
@@ -464,14 +472,14 @@ document.getElementById('import-preset').addEventListener('click', async () => {
   try {
     const path = await open({
       multiple: false,
-      filters: [{ name: 'Пресет resticker', extensions: ['json'] }],
+      filters: [{ name: t('presets.dialogFilter'), extensions: ['json'] }],
     });
     if (!path) return; // отмена в диалоге открытия
     await invoke('import_preset', { path });
-    setStatus(`Пресет импортирован: ${path}`);
+    setStatus(t('preset.imported', { path }));
     await loadConfig();
   } catch (err) {
-    presetStatusEl.textContent = `Ошибка: ${err}`;
+    presetStatusEl.textContent = t('error.generic', { err });
   }
 });
 
@@ -481,7 +489,7 @@ listen('preset-missing-elements', (event) => {
   const missing = event.payload?.missing ?? [];
   if (missing.length === 0) return;
   const lines = missing.map((m) => `• ${m.path ?? m[1]}`).join('\n');
-  alert(`Пресет применён не полностью — недоступны:\n\n${lines}\n\nЗагружены остальные стикеры.`);
+  alert(t('preset.missingAlert', { lines }));
 });
 
 // ==== Подвал: Применить / ОК / Отмена ====
@@ -489,7 +497,7 @@ listen('preset-missing-elements', (event) => {
 async function applyChanges() {
   await invoke('update_settings', { settings: draftSettings });
   await invoke('update_hotkeys', { hotkeys: draftHotkeys });
-  setStatus('Применено');
+  setStatus(t('footer.applied'));
 }
 
 document.getElementById('apply').addEventListener('click', () => {

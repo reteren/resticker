@@ -453,6 +453,35 @@ impl Device {
         Ok(TextureAtlas { texture, frames })
     }
 
+    /// Создать текстуру для потоковой анимации (ROADMAP.md M5a, «потоковый
+    /// режим для очень длинных анимаций»): один RGBA8-кадр без атласной
+    /// сетки и без мипов (тот же аргумент, что у `create_texture_atlas` —
+    /// содержимое переливается целиком на каждый показанный кадр, мипы
+    /// добавляли бы работу GPU без выгоды). Используется вместо
+    /// `create_texture_atlas`, когда `rst_media::animation::decode_animation`
+    /// отказал по порогу атласа (`TooManyFrames`/`TooLargeForAtlas`) —
+    /// дальнейшие кадры декодируются по одному
+    /// (`rst_media::animation::StreamingAnimation`) и заливаются через
+    /// [`Self::update_streaming_animation_frame`].
+    pub fn create_streaming_animation_frame(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Texture, RenderError> {
+        Texture::from_rgba_atlas(&self.device, &self.context, rgba, width, height)
+    }
+
+    /// Обновить текстуру потоковой анимации новым декодированным кадром —
+    /// тот же размер, что при создании [`Self::create_streaming_animation_frame`].
+    pub fn update_streaming_animation_frame(
+        &self,
+        texture: &Texture,
+        rgba: &[u8],
+    ) -> Result<(), RenderError> {
+        texture.update_rgba(&self.context, rgba)
+    }
+
     /// Создать три R8-плоскости видеокадра непрозрачного видео (M5b,
     /// docs/M5B_VIDEO_DESIGN.md §3): Y — полное разрешение `width`×`height`,
     /// U/V — половина по каждой оси, округлённая вверх (4:2:0, нечётные
@@ -1169,6 +1198,129 @@ mod gpu_tests {
 
     #[test]
     #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn draw_flip_h_mirrors_pixels_not_just_clamps_to_one_edge() {
+        // Регрессия по репорту пользователя 2026-08-09: mainVS вычислял UV
+        // при флипе через `lerp(0.5, c-0.5, sign)+0.5`, что при sign=-1 даёт
+        // uv=2-c (вне [0,1]) вместо корректного uv=1-c. С CLAMP-семплером
+        // (AddressU/V) это стягивало ОБА края к одному и тому же u≈1 —
+        // картинка не отражалась, а «схлопывалась» в полоску правого края
+        // текстуры. Текстура 4×4: левая половина красная, правая зелёная —
+        // при верном флипе левая половина экрана должна стать зелёной,
+        // правая — красной (не «обе зелёные», как давал баг).
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render flip gpu test"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let target = WindowTarget::new(&device, hwnd, 64, 64).expect("цель создаётся");
+
+        let (tw, th) = (4u32, 4u32);
+        let mut rgba = vec![0u8; (tw * th * 4) as usize];
+        for y in 0..th {
+            for x in 0..tw {
+                let i = ((y * tw + x) * 4) as usize;
+                let color: [u8; 4] = if x < tw / 2 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 255, 0, 255]
+                };
+                rgba[i..i + 4].copy_from_slice(&color);
+            }
+        }
+        let texture = device
+            .create_texture_from_rgba(&rgba, tw, th)
+            .expect("текстура создаётся");
+        let placement = Placement {
+            monitor_id: MonitorId(String::new()),
+            cx: 32.0,
+            cy: 32.0,
+            w: 64.0,
+            h: 64.0,
+        };
+
+        let read_at = |device: &Device, target: &WindowTarget, x: u32, y: u32| {
+            let resource: ID3D11Resource = unsafe {
+                target
+                    .rtv()
+                    .expect("цель ненулевого размера имеет RTV")
+                    .GetResource()
+            }
+            .expect("RTV даёт исходный ресурс");
+            let pixels = read_bgra_texture(&device.device, &device.context, &resource, 64, 64);
+            let i = ((y * 64 + x) * 4) as usize;
+            (pixels[i + 2], pixels[i + 1], pixels[i], pixels[i + 3]) // (R,G,B,A)
+        };
+
+        // Без флипа: левая половина экрана красная, правая — зелёная.
+        // Кадр рисуется дважды — тот же приём, что в
+        // draw_masked_cuts_out_occluded_sprite (FLIP_SEQUENTIAL swapchain,
+        // закэшированный RTV может смотреть не на тот backbuffer после
+        // одного Present).
+        let normal = Sprite::new(texture.clone(), placement.clone(), Transform::default());
+        device
+            .draw(&target, std::slice::from_ref(&normal))
+            .expect("draw без флипа не падает");
+        device
+            .draw(&target, std::slice::from_ref(&normal))
+            .expect("draw без флипа не падает (второй кадр)");
+        assert_eq!(
+            read_at(&device, &target, 8, 32),
+            (255, 0, 0, 255),
+            "без флипа: левая половина красная"
+        );
+        assert_eq!(
+            read_at(&device, &target, 56, 32),
+            (0, 255, 0, 255),
+            "без флипа: правая половина зелёная"
+        );
+
+        // С flip_h: левая половина должна стать зелёной, правая — красной
+        // (настоящее зеркалирование, а не схлопывание в один цвет с обеих
+        // сторон).
+        let flipped = Sprite::new(
+            texture,
+            placement,
+            Transform {
+                flip_h: true,
+                ..Transform::default()
+            },
+        );
+        device
+            .draw(&target, std::slice::from_ref(&flipped))
+            .expect("draw с флипом не падает");
+        device
+            .draw(&target, std::slice::from_ref(&flipped))
+            .expect("draw с флипом не падает (второй кадр)");
+        assert_eq!(
+            read_at(&device, &target, 8, 32),
+            (0, 255, 0, 255),
+            "с flip_h: левая половина должна стать зелёной"
+        );
+        assert_eq!(
+            read_at(&device, &target, 56, 32),
+            (255, 0, 0, 255),
+            "с flip_h: правая половина должна стать красной"
+        );
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
     fn draw_masked_cuts_out_occluded_sprite() {
         // SAFETY: окно системного класса Static, как в tests/gpu_smoke.rs —
         // регистрация своего класса не нужна, все параметры валидны.
@@ -1401,6 +1553,273 @@ mod gpu_tests {
                 "кадр 1 должен быть синим в ({x},{y})"
             );
         }
+
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn atlas_frame_edge_does_not_bleed_into_neighbor_cell() {
+        // Регрессия по репорту пользователя (тонкие белые линии на
+        // масштабированной анимированной гифке): `frame_uvs` раньше отдавал
+        // UV-подпрямоугольник ВПРИТЫК к границе ячейки, без инсета —
+        // билинейная фильтрация у самого края подмешивала соседний кадр
+        // атласа. Атлас 2×1: кадр 0 — белый, кадр 1 — чёрный (максимальный
+        // контраст, худший случай); спрайт кадра 0 занимает весь экран
+        // 64×64 (магнификация x8 от ячейки 8×8 — та же ситуация, что
+        // увеличенный стикер) — самый правый столбец экрана сэмплирует
+        // почти вплотную к границе с кадром 1. Без инсета это давал бы
+        // видимую серую примесь; с инсетом — крайний сэмпл стоит ровно в
+        // центре крайнего текселя ячейки, чёрный кадр 1 не задет вообще.
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render atlas bleed gpu test"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let target = WindowTarget::new(&device, hwnd, 64, 64).expect("цель создаётся");
+
+        let solid = |rgb: [u8; 3]| [rgb[0], rgb[1], rgb[2], 255].repeat(8 * 8);
+        let white = solid([255, 255, 255]);
+        let black = solid([0, 0, 0]);
+        let delay = Duration::from_millis(100);
+        let atlas = device
+            .create_texture_atlas(&[(white, delay), (black, delay)], 8, 8)
+            .expect("атлас создаётся");
+        let placement = Placement {
+            monitor_id: MonitorId(String::new()),
+            cx: 32.0,
+            cy: 32.0,
+            w: 64.0,
+            h: 64.0,
+        };
+        let f0 = atlas.frames[0];
+        let sprite = Sprite::new(atlas.texture, placement, Transform::default())
+            .with_uv(f0.uv_offset, f0.uv_scale);
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw не падает (второй кадр, FLIP_SEQUENTIAL)");
+
+        let resource: ID3D11Resource = unsafe {
+            target
+                .rtv()
+                .expect("цель ненулевого размера имеет RTV")
+                .GetResource()
+        }
+        .expect("RTV даёт исходный ресурс");
+        let pixels = read_bgra_texture(&device.device, &device.context, &resource, 64, 64);
+        let at = |x: u32, y: u32| {
+            let i = ((y * 64 + x) * 4) as usize;
+            (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3])
+        };
+        // Самый правый столбец экрана — граница с кадром 1 (чёрным) в
+        // атласе; премалтипленный непрозрачный белый — (255,255,255,255)
+        // в любом порядке каналов (все три канала равны, порядок BGRA/RGBA
+        // не важен для чистого белого).
+        for x in [60u32, 61, 62, 63] {
+            assert_eq!(
+                at(x, 32),
+                (255, 255, 255, 255),
+                "правый край кадра 0 (x={x}) не должен темнеть от соседнего чёрного кадра"
+            );
+        }
+
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn streaming_animation_frame_updates_in_place_without_recreating_texture() {
+        // ROADMAP.md M5a «потоковый режим для очень длинных анимаций»:
+        // create_streaming_animation_frame создаёт ОДНУ текстуру, дальнейшие
+        // кадры заливаются через update_streaming_animation_frame поверх
+        // неё (тот же контракт, что update_r8 у видео) — здесь проверяем и
+        // сам факт переиспользования (SRV не меняется), и что содержимое
+        // реально обновляется на GPU (не только в юнит-тесте validate/
+        // premultiply).
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render streaming animation gpu test"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let target = WindowTarget::new(&device, hwnd, 64, 64).expect("цель создаётся");
+
+        let solid = |rgb: [u8; 3]| [rgb[0], rgb[1], rgb[2], 255].repeat(8 * 8);
+        let red = solid([255, 0, 0]);
+        let green = solid([0, 255, 0]);
+        let texture = device
+            .create_streaming_animation_frame(&red, 8, 8)
+            .expect("текстура потокового кадра создаётся");
+        assert_eq!(texture.width(), 8);
+        assert_eq!(texture.height(), 8);
+
+        let placement = Placement {
+            monitor_id: MonitorId(String::new()),
+            cx: 32.0,
+            cy: 32.0,
+            w: 64.0,
+            h: 64.0,
+        };
+        let sprite = Sprite::new(texture.clone(), placement, Transform::default());
+
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw красного кадра не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw красного кадра не падает (второй кадр)");
+        let resource: ID3D11Resource = unsafe {
+            target
+                .rtv()
+                .expect("цель ненулевого размера имеет RTV")
+                .GetResource()
+        }
+        .expect("RTV даёт исходный ресурс");
+        let pixels = read_bgra_texture(&device.device, &device.context, &resource, 64, 64);
+        assert_eq!(
+            (pixels[0], pixels[1], pixels[2], pixels[3]),
+            (0, 0, 255, 255),
+            "первый кадр должен быть красным (B,G,R,A)"
+        );
+
+        // Тот же Sprite/текстура — update_streaming_animation_frame заливает
+        // новое содержимое поверх, без пересоздания SRV/спрайта.
+        device
+            .update_streaming_animation_frame(&texture, &green)
+            .expect("обновление кадра потоковой анимации не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw зелёного кадра не падает");
+        device
+            .draw(&target, std::slice::from_ref(&sprite))
+            .expect("draw зелёного кадра не падает (второй кадр)");
+        let resource: ID3D11Resource = unsafe {
+            target
+                .rtv()
+                .expect("цель ненулевого размера имеет RTV")
+                .GetResource()
+        }
+        .expect("RTV даёт исходный ресурс");
+        let pixels = read_bgra_texture(&device.device, &device.context, &resource, 64, 64);
+        assert_eq!(
+            (pixels[0], pixels[1], pixels[2], pixels[3]),
+            (0, 255, 0, 255),
+            "после update_streaming_animation_frame та же текстура должна показывать зелёный"
+        );
+
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn window_target_resize_and_dpi_scale_round_trip_100_150_200() {
+        // ROADMAP.md M3 «Обработка WM_DPICHANGED, тест на смешанном DPI
+        // 100/150/200»: реального многодисплейного стенда с разным DPI на
+        // машине разработки нет (M3_SESSION_SLEEP_REVIEW.md), но сам переход
+        // — это ровно то, что `overlay_manager::dpi_change_scale_and_cursor`
+        // отдаёт этому слою: новый физический размер + новый масштаб.
+        // Реальный GPU-объект — цель этого теста: `resize`/`set_dpi_scale`
+        // не падают и отдают именно те размер/масштаб, что были запрошены,
+        // на всех трёх стандартных точках подряд (как переезд окна по
+        // мониторам с разным DPI или три последовательных смены настройки).
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render dpi gpu test"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        // 100% на условном мониторе 640×480.
+        let mut target = WindowTarget::new(&device, hwnd, 640, 480).expect("цель создаётся");
+        target.set_dpi_scale(1.0);
+        assert_eq!(target.size(), (640, 480));
+        assert_eq!(target.dpi_scale(), 1.0);
+        assert!(
+            target.rtv().is_some(),
+            "ненулевой размер — RTV обязан существовать сразу после создания"
+        );
+
+        // 150%: тот же логический монитор в DIP, но физически больше.
+        target
+            .resize(&device, 960, 720)
+            .expect("resize на 150% не падает");
+        target.set_dpi_scale(1.5);
+        assert_eq!(target.size(), (960, 720));
+        assert_eq!(target.dpi_scale(), 1.5);
+        assert!(
+            target.rtv().is_some(),
+            "RTV обязан пересоздаться после resize на 150%"
+        );
+
+        // 200%: ещё один переход подряд — «смешанный DPI» по ROADMAP-пункту.
+        target
+            .resize(&device, 1280, 960)
+            .expect("resize на 200% не падает");
+        target.set_dpi_scale(2.0);
+        assert_eq!(target.size(), (1280, 960));
+        assert_eq!(target.dpi_scale(), 2.0);
+        assert!(
+            target.rtv().is_some(),
+            "RTV обязан пересоздаться после resize на 200%"
+        );
+
+        // Обратно на 100% — цепочка resize не «застревает» на последнем
+        // увеличенном размере, полный круг работает так же, как один шаг.
+        target
+            .resize(&device, 640, 480)
+            .expect("resize обратно на 100% не падает");
+        target.set_dpi_scale(1.0);
+        assert_eq!(target.size(), (640, 480));
+        assert_eq!(target.dpi_scale(), 1.0);
+        assert!(target.rtv().is_some());
 
         unsafe { DestroyWindow(hwnd) }.unwrap();
     }

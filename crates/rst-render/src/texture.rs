@@ -159,6 +159,38 @@ impl Texture {
         })
     }
 
+    /// Обновить содержимое одно-миповой RGBA-текстуры новым кадром (ROADMAP.md
+    /// M5a, «потоковый режим для очень длинных анимаций»): тот же размер,
+    /// что при создании (`from_rgba_atlas`) — переиспользование текстуры на
+    /// каждый декодированный кадр вместо пересоздания, тот же паттерн, что
+    /// `update_r8` у видео. Straight alpha на входе, premultiply — как у
+    /// `from_rgba_inner`.
+    pub(crate) fn update_rgba(
+        &self,
+        context: &ID3D11DeviceContext,
+        data: &[u8],
+    ) -> Result<(), RenderError> {
+        validate_texture_data(self.width, self.height, data.len())?;
+        let mut data = data.to_vec();
+        premultiply_rgba(&mut data);
+        // SAFETY: `self._texture` — валидный ID3D11Resource устройства
+        // контекста; `data` живёт до конца вызова; UpdateSubresource
+        // копирует синхронно; RowPitch = width*4 (RGBA8).
+        unsafe {
+            let tex_res: ID3D11Resource =
+                self._texture.clone().cast().map_err(RenderError::Windows)?;
+            context.UpdateSubresource(
+                Some(&tex_res),
+                0,
+                None,
+                data.as_ptr().cast(),
+                self.width * 4,
+                0,
+            );
+        }
+        Ok(())
+    }
+
     /// Создать R8_UNORM текстурy-плоскость для видеокадра (M5b,
     /// docs/M5B_VIDEO_DESIGN.md §3): один 8-битный канал на тексель, один
     /// мип, без рендер-таргета. Y/U/V-плоскости видео обновляются на каждый

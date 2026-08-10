@@ -59,15 +59,19 @@ impl TransformedState {
 /// - `Shift` — пропорции стартового состояния: общий масштаб задаёт
 ///   доминирующая ось (наибольшее относительное изменение);
 /// - минимальный размер — [`MIN_SIZE_DIP`];
-/// - ручку можно протащить через якорь: отрицательный размер превращается
-///   в переключение `flip_h`/`flip_v` (зеркалирование, SPEC 3.3), размеры
-///   в `placement` остаются положительными.
+/// - `allow_mirror: true` — ручку можно протащить через якорь: отрицательный
+///   размер превращается в переключение `flip_h`/`flip_v` (зеркалирование,
+///   фидбэк пользователя 2026-08-09), размеры в `placement` остаются
+///   положительными; `allow_mirror: false` — видео (та же дата, «эта
+///   механика не касается видео»): размер просто не уходит ниже
+///   [`MIN_SIZE_DIP`], зеркалирования не происходит.
 pub fn resize(
     placement: &Placement,
     transform: &Transform,
     handle: HandleKind,
     delta: (f64, f64),
     modifiers: DragModifiers,
+    allow_mirror: bool,
 ) -> TransformedState {
     let mut out = TransformedState::new(placement, transform);
     let start_ok = [placement.w, placement.h, transform.rotation]
@@ -106,9 +110,16 @@ pub fn resize(
         new_h = placement.h * s;
     }
 
-    // Знаковые размеры: зеркалирование ещё не свёрнуто в flip-флаги.
-    new_w = clamp_min_abs(new_w, MIN_SIZE_DIP);
-    new_h = clamp_min_abs(new_h, MIN_SIZE_DIP);
+    if allow_mirror {
+        // Знаковые размеры: зеркалирование ещё не свёрнуто в flip-флаги.
+        new_w = clamp_min_abs(new_w, MIN_SIZE_DIP);
+        new_h = clamp_min_abs(new_h, MIN_SIZE_DIP);
+    } else {
+        // Видео не зеркалим — размер не уходит ниже минимума ни в какую
+        // сторону, знак не несёт зеркалирования.
+        new_w = new_w.max(MIN_SIZE_DIP);
+        new_h = new_h.max(MIN_SIZE_DIP);
+    }
 
     if !modifiers.alt {
         // Якорь (противоположная грань/угол) обязан остаться на месте в миру.
@@ -128,6 +139,8 @@ pub fn resize(
     }
 
     // Зеркалирование складывается в flip-флаги; размеры храним положительными.
+    // При `allow_mirror: false` знак сюда не доходит — new_w/new_h уже
+    // неотрицательны после `.max(MIN_SIZE_DIP)` выше.
     if new_w < 0.0 {
         new_w = -new_w;
         out.transform.flip_h = !out.transform.flip_h;
@@ -257,6 +270,7 @@ mod tests {
                 handle,
                 (10.0, 6.0),
                 mods(false, false),
+                true,
             );
             assert_placement(&out, cx, cy, w, h, &ctx);
             assert!(!out.transform.flip_h && !out.transform.flip_v, "{ctx}");
@@ -272,6 +286,7 @@ mod tests {
             HandleKind::East,
             (0.0, 10.0),
             mods(false, false),
+            true,
         );
         assert_placement(&out, 100.0, 55.0, 50.0, 20.0, "East rot=+90");
 
@@ -282,6 +297,7 @@ mod tests {
             HandleKind::West,
             (0.0, 10.0),
             mods(false, false),
+            true,
         );
         assert_placement(&out, 100.0, 55.0, 50.0, 20.0, "West rot=-90");
     }
@@ -295,6 +311,7 @@ mod tests {
             HandleKind::SouthEast,
             (30.0, 0.0),
             mods(true, false),
+            true,
         );
         assert_placement(&out, 15.0, 7.5, 130.0, 65.0, "SE, dx dominant");
 
@@ -305,6 +322,7 @@ mod tests {
             HandleKind::SouthEast,
             (0.0, 30.0),
             mods(true, false),
+            true,
         );
         assert_placement(&out, 30.0, 15.0, 160.0, 80.0, "SE, dy dominant");
 
@@ -315,6 +333,7 @@ mod tests {
             HandleKind::East,
             (30.0, 999.0),
             mods(true, false),
+            true,
         );
         assert_placement(&out, 15.0, 0.0, 130.0, 65.0, "E side");
 
@@ -325,6 +344,7 @@ mod tests {
             HandleKind::North,
             (999.0, 20.0),
             mods(true, false),
+            true,
         );
         assert_placement(&out, 0.0, 10.0, 60.0, 30.0, "N side");
     }
@@ -338,6 +358,7 @@ mod tests {
             HandleKind::East,
             (10.0, 0.0),
             mods(false, true),
+            true,
         );
         assert_placement(&out, 100.0, 50.0, 60.0, 20.0, "E alt");
 
@@ -348,6 +369,7 @@ mod tests {
             HandleKind::SouthEast,
             (10.0, 10.0),
             mods(false, true),
+            true,
         );
         assert_placement(&out, 100.0, 50.0, 60.0, 40.0, "SE alt");
 
@@ -358,6 +380,7 @@ mod tests {
             HandleKind::SouthEast,
             (30.0, 0.0),
             mods(true, true),
+            true,
         );
         assert_placement(&out, 0.0, 0.0, 160.0, 80.0, "SE alt+shift");
     }
@@ -371,6 +394,7 @@ mod tests {
             HandleKind::East,
             (-30.0, 0.0),
             mods(false, false),
+            true,
         );
         assert_placement(&out, 88.0, 50.0, 16.0, 20.0, "positive clamp");
     }
@@ -385,6 +409,7 @@ mod tests {
             HandleKind::East,
             (-70.0, 0.0),
             mods(false, false),
+            true,
         );
         assert_placement(&out, 65.0, 50.0, 30.0, 20.0, "flip");
         assert!(out.transform.flip_h);
@@ -399,6 +424,7 @@ mod tests {
             HandleKind::East,
             (10.0, 0.0),
             mods(false, false),
+            true,
         );
         assert!(!back.transform.flip_h);
 
@@ -410,6 +436,7 @@ mod tests {
             HandleKind::East,
             (70.0, 0.0),
             mods(false, false),
+            true,
         );
         assert_placement(&grown, 100.0, 50.0, 100.0, 20.0, "grow after flip");
         assert!(grown.transform.flip_h);
@@ -424,6 +451,7 @@ mod tests {
             HandleKind::East,
             (-70.0, 0.0),
             mods(false, true),
+            true,
         );
         assert_placement(&out, 100.0, 50.0, 100.0, 20.0, "alt flip");
         assert!(out.transform.flip_h);
@@ -438,9 +466,46 @@ mod tests {
             HandleKind::East,
             (-50.0, 0.0),
             mods(false, false),
+            true,
         );
         assert_placement(&out, 72.0, 50.0, 16.0, 20.0, "negative clamp");
         assert!(out.transform.flip_h);
+    }
+
+    #[test]
+    fn resize_no_mirror_clamps_instead_of_flipping() {
+        // Тот же жест, что resize_flip_through_anchor (протащено далеко за
+        // якорь), но allow_mirror=false (видео, фидбэк 2026-08-09): вместо
+        // flip_h размер просто останавливается на MIN_SIZE_DIP.
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(0.0),
+            HandleKind::East,
+            (-70.0, 0.0),
+            mods(false, false),
+            false,
+        );
+        assert_placement(&out, 88.0, 50.0, 16.0, 20.0, "no-mirror clamp");
+        assert!(!out.transform.flip_h);
+        assert!(!out.transform.flip_v);
+    }
+
+    #[test]
+    fn resize_no_mirror_never_flips_regardless_of_drag_distance() {
+        // Ещё дальше за якорь — размер остаётся на минимуме, флаги не
+        // переключаются вообще, сколько бы ни тянули.
+        let out = resize(
+            &placement(100.0, 50.0, 40.0, 20.0),
+            &transform(0.0),
+            HandleKind::SouthEast,
+            (-500.0, -500.0),
+            mods(false, false),
+            false,
+        );
+        assert_close_ctx(out.placement.w, MIN_SIZE_DIP, "w stays at minimum");
+        assert_close_ctx(out.placement.h, MIN_SIZE_DIP, "h stays at minimum");
+        assert!(!out.transform.flip_h);
+        assert!(!out.transform.flip_v);
     }
 
     #[test]
@@ -453,6 +518,7 @@ mod tests {
             HandleKind::SouthEast,
             (-150.0, 0.0),
             mods(true, false),
+            true,
         );
         assert_placement(&out, -75.0, -37.5, 50.0, 25.0, "shift flip");
         assert!(out.transform.flip_h && out.transform.flip_v);
@@ -468,7 +534,7 @@ mod tests {
             opacity: 0.5,
             ..transform(0.0)
         };
-        let out = resize(&p, &t, HandleKind::East, (10.0, 0.0), mods(false, false));
+        let out = resize(&p, &t, HandleKind::East, (10.0, 0.0), mods(false, false), true);
         assert_eq!(out.placement.monitor_id, p.monitor_id);
         assert_close_ctx(out.transform.opacity, 0.5, "opacity");
         assert_close_ctx(out.transform.rotation, 0.0, "rotation");
@@ -485,12 +551,13 @@ mod tests {
             HandleKind::East,
             (f64::NAN, 0.0),
             mods(false, false),
+            true,
         );
         assert_eq!(out.placement, p);
         assert_eq!(out.transform, t);
         // Отрицательный стартовый размер (битый конфиг) — состояние не меняется.
         let bad = placement(0.0, 0.0, -5.0, 20.0);
-        let out = resize(&bad, &t, HandleKind::East, (10.0, 0.0), mods(false, false));
+        let out = resize(&bad, &t, HandleKind::East, (10.0, 0.0), mods(false, false), true);
         assert_eq!(out.placement, bad);
     }
 
@@ -504,6 +571,7 @@ mod tests {
             HandleKind::East,
             (10.0, 0.0),
             mods(true, false),
+            true,
         );
         assert!(out.placement.w.is_finite());
         assert_close_ctx(out.placement.w, MIN_SIZE_DIP, "clamped from zero");
@@ -516,7 +584,7 @@ mod tests {
                 let ctx = format!("{handle:?} rot={rotation}");
                 let p = placement(120.0, 80.0, 60.0, 30.0);
                 let t = transform(rotation);
-                let out = resize(&p, &t, handle, (14.0, -9.0), mods(false, false));
+                let out = resize(&p, &t, handle, (14.0, -9.0), mods(false, false), true);
                 let (sx, sy) = handle.local_sign();
                 // Мировая позиция якоря (противоположной грани/угла) до и
                 // после ресайза обязана совпасть.
@@ -543,6 +611,7 @@ mod tests {
                 handle,
                 (25.0, 10.0),
                 mods(true, false),
+                true,
             );
             assert_close_ctx(
                 out.placement.w / out.placement.h,

@@ -12,6 +12,7 @@ pub mod hotkey;
 pub mod input;
 pub mod monitors;
 pub mod overlay;
+pub mod single_instance;
 pub mod tray;
 pub mod virtual_desktops;
 pub mod window_enum;

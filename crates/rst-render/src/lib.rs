@@ -41,8 +41,8 @@ pub use marquee::{
 };
 pub use selection::{
     Box2D, CHECKER_BLACK, CHECKER_MAGENTA, CHECKERBOARD_HLSL, EDIT_OVERLAY_OPACITY,
-    HANDLE_SIZE_DIP, HandleKind, OUTLINE_THICKNESS_DIP, SelectionBox, SelectionVisuals,
-    checkerboard_tile, edit_overlay, solid_sprite,
+    HANDLE_SIZE_DIP, HIDDEN_STICKER_CHECKERBOARD_OPACITY, HandleKind, OUTLINE_THICKNESS_DIP,
+    SelectionBox, SelectionVisuals, checkerboard_tile, edit_overlay, solid_sprite,
 };
 pub use sprite::Sprite;
 pub use text::{Glyph, LINE_HEIGHT, glyph_for, rasterize, text_size, width_up_to};

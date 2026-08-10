@@ -26,6 +26,11 @@ pub const BTN_EXIT: WidgetId = 104;
 /// та же тема «окна»): отдельная выделенная иконка «добавить окно» —
 /// известное упрощение, не блокирует функциональность.
 pub const BTN_ADD_WINDOW: WidgetId = 105;
+/// «Пресеты» — быстрое переключение (M7, SPEC.md §3.8 «Загрузить пресет»;
+/// ROADMAP.md — «быстрое переключение… из панели редактирования»). Пустой
+/// список пресетов не открывает панель (см. `handle_cursor_panel_up`) —
+/// кнопка всегда на месте, реагирует иначе только по клику.
+pub const BTN_PRESETS: WidgetId = 106;
 
 /// Смещение панели от курсора вправо-вниз, DIP (не закрывать сам курсор).
 pub const CURSOR_OFFSET_DIP: f64 = 12.0;
@@ -34,7 +39,7 @@ const PANEL_PAD: f64 = 6.0;
 /// Зазор между кнопками, DIP.
 const BUTTON_GAP: f64 = 4.0;
 /// Число кнопок панели.
-const BUTTON_COUNT: f64 = 5.0;
+const BUTTON_COUNT: f64 = 6.0;
 
 /// Размер панели (ширина, высота), DIP: пять кнопок `theme::BUTTON_SIZE`
 /// с зазорами и отступами.
@@ -78,6 +83,7 @@ pub fn build_cursor_panel(cursor: (f64, f64), screen: &DipRect, all_visible: boo
     let buttons = [
         (BTN_LOAD_FILE, Icon::FileOpen),
         (BTN_ADD_WINDOW, Icon::Layers),
+        (BTN_PRESETS, Icon::PresetLoad),
         (BTN_TOGGLE_ALL, toggle_icon),
         (BTN_SETTINGS, Icon::Settings),
         (BTN_EXIT, Icon::Exit),
@@ -166,6 +172,7 @@ mod tests {
         let ids = [
             BTN_LOAD_FILE,
             BTN_ADD_WINDOW,
+            BTN_PRESETS,
             BTN_TOGGLE_ALL,
             BTN_SETTINGS,
             BTN_EXIT,
@@ -196,6 +203,7 @@ mod tests {
             vec![
                 Icon::FileOpen,
                 Icon::Layers,
+                Icon::PresetLoad,
                 Icon::HideAll,
                 Icon::Settings,
                 Icon::Exit
@@ -208,6 +216,7 @@ mod tests {
             vec![
                 Icon::FileOpen,
                 Icon::Layers,
+                Icon::PresetLoad,
                 Icon::ShowAll,
                 Icon::Settings,
                 Icon::Exit

@@ -38,6 +38,7 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
         Icon::Exit => draw_exit(&mut canvas, s),
         Icon::Play => draw_play(&mut canvas, s),
         Icon::Pause => draw_pause(&mut canvas, s),
+        Icon::ResetScale => draw_reset_scale(&mut canvas, s),
     }
     canvas.into_rgba()
 }
@@ -61,6 +62,7 @@ fn color_of(icon: Icon) -> [u8; 3] {
         Icon::Exit => [0xf2, 0x9a, 0x6a],
         Icon::Play => [0x8a, 0xd0, 0x9c],
         Icon::Pause => [0xf0, 0xf0, 0xf0],
+        Icon::ResetScale => [0xe8, 0xc8, 0x6a],
     }
 }
 
@@ -337,6 +339,41 @@ fn draw_play(cv: &mut Canvas, s: f64) {
 fn draw_pause(cv: &mut Canvas, s: f64) {
     fill_rect(cv, 0.30 * s, 0.26 * s, 0.44 * s, 0.74 * s);
     fill_rect(cv, 0.56 * s, 0.26 * s, 0.70 * s, 0.74 * s);
+}
+
+/// «Сбросить масштаб» (тулбар выделения, фидбэк пользователя 2026-08-09):
+/// кольцо на 3/4 окружности (разрыв — под остриё стрелки) с треугольным
+/// остриём на конце — обычная пиктограмма «вернуть исходное состояние».
+fn draw_reset_scale(cv: &mut Canvas, s: f64) {
+    let (cx, cy) = (0.5 * s, 0.5 * s);
+    let r = 0.27 * s;
+    let t = 0.09 * s;
+    let h = t / 2.0;
+    // Разрыв кольца (в радианах, угол от +X по часовой — экранная ось Y
+    // направлена вниз): дуга идёт от gap_end до gap_start по часовой,
+    // остриё стрелки садится на конец дуги у gap_end.
+    let gap_start = 20.0_f64.to_radians();
+    let gap_end = 95.0_f64.to_radians();
+    cv.draw(move |x, y| {
+        let (dx, dy) = (x - cx, y - cy);
+        let dist = (dx * dx + dy * dy).sqrt();
+        if (dist - r).abs() > h {
+            return false;
+        }
+        let angle = dy.atan2(dx).rem_euclid(2.0 * std::f64::consts::PI);
+        !(gap_start..gap_end).contains(&angle)
+    });
+    let tip_angle = gap_end;
+    let (tx, ty) = (cx + r * tip_angle.cos(), cy + r * tip_angle.sin());
+    let tangent = tip_angle + std::f64::consts::FRAC_PI_2;
+    let spread = 0.11 * s;
+    let back1 = (tx + spread * tangent.cos(), ty + spread * tangent.sin());
+    let back2 = (tx - spread * tangent.cos(), ty - spread * tangent.sin());
+    let point = (
+        tx + 0.14 * s * tip_angle.cos(),
+        ty + 0.14 * s * tip_angle.sin(),
+    );
+    fill_triangle(cv, point, back1, back2);
 }
 
 #[cfg(test)]

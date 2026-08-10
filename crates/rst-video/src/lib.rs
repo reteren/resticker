@@ -339,20 +339,18 @@ impl VideoSource {
     /// docs/M5B_VIDEO_DESIGN.md §4) — декодер сам звук не умножает; здесь
     /// значение хранится и отдаётся по требованию.
     pub fn set_volume(&self, volume: f32) {
-        *self
-            .shared
-            .volume
-            .lock()
-            .expect("volume: мьютекс не отравлен") = volume.clamp(0.0, 1.0);
+        // Восстанавливаемся из отравленного мьютекса вместо паники: паника
+        // декодер-потока при удержании этого лока не должна каскадом ронять
+        // поток координатора на первом же движении ползунка громкости —
+        // худший исход порчи `f32` под мьютексом — чуть неверная громкость,
+        // не небезопасность памяти (тот же принцип, что `TrayIcon::set_menu`,
+        // rst-win32/tray.rs).
+        *self.shared.volume.lock().unwrap_or_else(|e| e.into_inner()) = volume.clamp(0.0, 1.0);
     }
 
     /// Текущая громкость (см. [`Self::set_volume`]).
     pub fn volume(&self) -> f32 {
-        *self
-            .shared
-            .volume
-            .lock()
-            .expect("volume: мьютекс не отравлен")
+        *self.shared.volume.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Последний готовый кадр (неблокирующе) — вызывается координатором

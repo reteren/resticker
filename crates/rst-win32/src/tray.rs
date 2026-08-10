@@ -3,6 +3,7 @@
 //! Весь unsafe живёт здесь, наружу — только каналы и безопасные типы.
 
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -13,11 +14,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, HICON,
-    IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-    WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPED,
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, HICON, HMENU,
+    IDI_APPLICATION, LoadIconW, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
+    WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -41,10 +42,36 @@ pub const BALLOON_TITLE_MAX_UNITS: usize = 63;
 pub const BALLOON_BODY_MAX_UNITS: usize = 255;
 
 /// Один пункт контекстного меню трея; `id` возвращается в `TrayEvent::MenuItem`.
-/// `id == 0` рисуется как разделитель (см. [`separator`]).
+/// Непустой `children` рисует пункт как вложенное подменю ([`MenuItem::submenu`],
+/// SPEC.md §12 — «пресеты (подменю)»), а не кликабельный пункт: `id`
+/// подменю в `TrayEvent` никогда не приходит. Иначе `id == 0` рисуется как
+/// разделитель (см. [`separator`]).
+#[derive(Clone)]
 pub struct MenuItem {
     pub id: u32,
     pub label: String,
+    pub children: Vec<MenuItem>,
+}
+
+impl MenuItem {
+    /// Обычный кликабельный пункт.
+    pub fn new(id: u32, label: impl Into<String>) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            children: Vec::new(),
+        }
+    }
+
+    /// Вложенное подменю: `label` — заголовок, `children` — его пункты.
+    /// Само не кликабельно (`id` — не участвует в `TrayEvent::MenuItem`).
+    pub fn submenu(label: impl Into<String>, children: Vec<MenuItem>) -> Self {
+        Self {
+            id: 0,
+            label: label.into(),
+            children,
+        }
+    }
 }
 
 /// Разделитель между пунктами меню.
@@ -52,6 +79,7 @@ pub fn separator() -> MenuItem {
     MenuItem {
         id: 0,
         label: String::new(),
+        children: Vec::new(),
     }
 }
 
@@ -67,6 +95,7 @@ pub enum TrayEvent {
 pub struct TrayIcon {
     hwnd: HWND,
     thread: Option<JoinHandle<()>>,
+    menu: Arc<Mutex<Vec<MenuItem>>>,
 }
 
 // HWND — просто числовой хэндл (isize), безопасно передавать между потоками;
@@ -81,7 +110,7 @@ struct SendHwnd(HWND);
 unsafe impl Send for SendHwnd {}
 
 struct WndState {
-    menu: Vec<MenuItem>,
+    menu: Arc<Mutex<Vec<MenuItem>>>,
     tx: Sender<TrayEvent>,
 }
 
@@ -95,8 +124,11 @@ impl TrayIcon {
         let (tx, rx) = mpsc::channel::<TrayEvent>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<SendHwnd, Win32Error>>();
         let tooltip = tooltip.to_string();
+        let menu = Arc::new(Mutex::new(menu));
+        let menu_for_thread = Arc::clone(&menu);
 
-        let thread = thread::spawn(move || run_message_loop(tooltip, menu, tx, ready_tx));
+        let thread =
+            thread::spawn(move || run_message_loop(tooltip, menu_for_thread, tx, ready_tx));
 
         let hwnd = ready_rx
             .recv()
@@ -107,9 +139,19 @@ impl TrayIcon {
             Self {
                 hwnd,
                 thread: Some(thread),
+                menu,
             },
             rx,
         ))
+    }
+
+    /// Заменить пункты контекстного меню целиком. Берёт эффект со
+    /// следующего открытия меню ([`show_context_menu`] читает
+    /// `WndState.menu` заново при каждом клике правой кнопкой) — сам список
+    /// живёт в `Arc<Mutex<..>>`, общем с потоком трея, поэтому обновление
+    /// безопасно с любого потока и не требует пересоздания иконки/окна.
+    pub fn set_menu(&self, items: Vec<MenuItem>) {
+        *self.menu.lock().unwrap_or_else(|e| e.into_inner()) = items;
     }
 
     /// Показать баллонное уведомление от иконки трея (Windows
@@ -170,7 +212,7 @@ impl Drop for TrayIcon {
 
 fn run_message_loop(
     tooltip: String,
-    menu: Vec<MenuItem>,
+    menu: Arc<Mutex<Vec<MenuItem>>>,
     tx: Sender<TrayEvent>,
     ready_tx: Sender<Result<SendHwnd, Win32Error>>,
 ) {
@@ -372,6 +414,38 @@ fn remove_notify_icon(hwnd: HWND) -> Result<(), Win32Error> {
     }
 }
 
+/// Собрать `HMENU` из списка пунктов, рекурсивно (вложенные `children` →
+/// `MF_POPUP`-подпункты, [`MenuItem::submenu`]). `DestroyMenu` на корневом
+/// `HMENU` уничтожает и все вложенные подменю — Win32 делает это сам
+/// (MSDN: `DestroyMenu` "also destroys any submenus"), поэтому вызывающий
+/// код освобождает только корень.
+fn build_hmenu(items: &[MenuItem]) -> Option<HMENU> {
+    // SAFETY: CreatePopupMenu без аргументов; ошибка (пустой HMENU) обрабатывается ниже.
+    let hmenu = unsafe { CreatePopupMenu() }.ok()?;
+    for item in items {
+        let wide: Vec<u16> = item
+            .label
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: hmenu только что создано; wide — валидная nul-terminated строка,
+        // живущая до конца вызова AppendMenuW.
+        unsafe {
+            if !item.children.is_empty() {
+                let Some(submenu) = build_hmenu(&item.children) else {
+                    continue;
+                };
+                let _ = AppendMenuW(hmenu, MF_POPUP, submenu.0 as usize, PCWSTR(wide.as_ptr()));
+            } else if item.id == 0 {
+                let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+            } else {
+                let _ = AppendMenuW(hmenu, MF_STRING, item.id as usize, PCWSTR(wide.as_ptr()));
+            }
+        }
+    }
+    Some(hmenu)
+}
+
 fn show_context_menu(hwnd: HWND) {
     // SAFETY: hwnd было создано этим же потоком (GWLP_USERDATA принадлежит ему).
     let state_ptr = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) } as *mut WndState;
@@ -386,26 +460,10 @@ fn show_context_menu(hwnd: HWND) {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
     }
 
-    // SAFETY: CreatePopupMenu без аргументов; ошибка (пустой HMENU) обрабатывается ниже.
-    let Ok(hmenu) = (unsafe { CreatePopupMenu() }) else {
+    let items = state.menu.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(hmenu) = build_hmenu(&items) else {
         return;
     };
-    for item in &state.menu {
-        let wide: Vec<u16> = item
-            .label
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: hmenu только что создано; wide — валидная nul-terminated строка,
-        // живущая до конца вызова AppendMenuW.
-        unsafe {
-            if item.id == 0 {
-                let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
-            } else {
-                let _ = AppendMenuW(hmenu, MF_STRING, item.id as usize, PCWSTR(wide.as_ptr()));
-            }
-        }
-    }
 
     let mut pt = Default::default();
     // SAFETY: pt — валидный указатель на стековую POINT.
@@ -575,6 +633,34 @@ mod tests {
         // SAFETY: после Drop окно уничтожено; IsWindow над мёртвым хэндлом —
         // простое чтение, хэндл мы больше никуда не передаём.
         assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+    }
+
+    #[test]
+    fn build_hmenu_with_submenu_succeeds_and_is_destroyable() {
+        let items = vec![
+            MenuItem::new(1, "Top"),
+            separator(),
+            MenuItem::submenu(
+                "Presets",
+                vec![MenuItem::new(10, "A"), MenuItem::new(11, "B")],
+            ),
+        ];
+        let hmenu = build_hmenu(&items).expect("меню с подменю строится");
+        // SAFETY: hmenu только что построено выше, ещё не показано/уничтожено.
+        unsafe {
+            let _ = DestroyMenu(hmenu);
+        }
+    }
+
+    #[test]
+    fn set_menu_replaces_items_seen_by_next_build() {
+        let (tray, _rx) = TrayIcon::new("test", vec![MenuItem::new(1, "one")]).expect("трей");
+        tray.set_menu(vec![MenuItem::new(2, "two"), MenuItem::new(3, "three")]);
+        let items = tray.menu.lock().unwrap().clone();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, 2);
+        assert_eq!(items[1].id, 3);
+        drop(tray);
     }
 
     #[test]

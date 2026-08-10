@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    COLORREF, ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::RemoteDesktop::{
@@ -34,14 +34,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA,
-    GetMessageW, GetSystemMetrics, GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect, MSG,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-    SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR,
-    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    GetMessageW, GetSystemMetrics, GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect,
+    LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_APP, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK,
     WTS_SESSION_UNLOCK,
 };
@@ -74,6 +75,20 @@ const MUTE_ALL_HOTKEY_ID: i32 = 3;
 /// `wParam` — форма, закодированная [`cursor_shape_to_wparam`].
 const WM_APP_EDIT_CURSOR: u32 = WM_APP + 1;
 
+/// Координатор → поток оверлея: снять Win32-захват мыши безусловно
+/// ([`crate::input::MouseCapture::force_release`]) — должно выполняться на
+/// потоке окна (`SetCapture`/`ReleaseCapture` — thread-affine Win32 API),
+/// поэтому не прямой вызов, а сообщение, как и `WM_APP_EDIT_CURSOR`.
+const WM_APP_RELEASE_CAPTURE: u32 = WM_APP + 2;
+
+/// Смещение кода угла поворота в кодировке `WPARAM` — коды `0..ROTATE_BASE`
+/// заняты фиксированными формами, `ROTATE_BASE + N` (`N` — 0..359) кодирует
+/// `CursorShape::Rotate` под произвольным углом (фидбэк пользователя
+/// 2026-08-09, третий раунд: угол курсора поворота больше не одна из 4
+/// констант, а считается динамически от направления угла рамки в
+/// пространстве).
+const ROTATE_WPARAM_BASE: usize = 1000;
+
 fn cursor_shape_to_wparam(shape: CursorShape) -> WPARAM {
     WPARAM(match shape {
         CursorShape::Arrow => 0,
@@ -82,7 +97,7 @@ fn cursor_shape_to_wparam(shape: CursorShape) -> WPARAM {
         CursorShape::SizeWE => 3,
         CursorShape::SizeNESW => 4,
         CursorShape::SizeNWSE => 5,
-        CursorShape::Rotate => 6,
+        CursorShape::Rotate(angle_deg) => ROTATE_WPARAM_BASE + angle_deg.rem_euclid(360) as usize,
     })
 }
 
@@ -94,9 +109,26 @@ fn cursor_shape_from_wparam(wparam: WPARAM) -> Option<CursorShape> {
         3 => CursorShape::SizeWE,
         4 => CursorShape::SizeNESW,
         5 => CursorShape::SizeNWSE,
-        6 => CursorShape::Rotate,
+        n @ ROTATE_WPARAM_BASE..=ROTATE_WPARAM_MAX => {
+            CursorShape::Rotate((n - ROTATE_WPARAM_BASE) as i32)
+        }
         _ => return None,
     })
+}
+
+const ROTATE_WPARAM_MAX: usize = ROTATE_WPARAM_BASE + 359;
+
+/// Какой из трёх глобальных хоткеев не удалось зарегистрировать
+/// (docs/M3_PREP_NOTES.md, раздел 3.3; M5d) — без этого различения тост/лог
+/// конфликта всегда указывал бы на «режим редактирования», даже когда на
+/// самом деле заняты `toggle_all_stickers`/`mute_all` (найдено при разборе
+/// бага «программа живёт своей жизнью»: пользователь видел «хоткей режима
+/// редактирования занят», хотя реально конфликтовал `mute_all`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyName {
+    EditMode,
+    ToggleAllStickers,
+    MuteAll,
 }
 
 /// Безопасное событие оверлей-окна для координатора (docs/M2_INTEGRATION_PLAN.md,
@@ -116,7 +148,7 @@ pub enum OverlayEvent {
     /// другим приложением. Строка — каноничный вид комбинации из конфига
     /// (ARCHITECTURE.md, раздел 5.1). Окно продолжает работать — недоступны
     /// только хоткеи, которые не удалось зарегистрировать.
-    HotkeyConflict(String),
+    HotkeyConflict(HotkeyName, String),
     /// Масштаб монитора сменился (`WM_DPICHANGED`): окно уже применило
     /// рекомендованный прямоугольник (`SetWindowPos`), `dpi` — новый DPI
     /// монитора (младшее слово `wParam`), `size` — новый размер окна в
@@ -353,6 +385,22 @@ impl OverlayWindow {
                 ex &= !bits;
             }
             SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex as isize);
+            // SetWindowLongPtrW само по себе не гарантирует, что менеджер
+            // окон немедленно перечитает кэшированные ex-стили (MS Learn:
+            // «Some window data is cached, so changes you make ... will not
+            // take effect until you call SetWindowPos»); SWP_FRAMECHANGED —
+            // штатный способ форсировать пересчёт без реального
+            // перемещения/ресайза/z-order/фокуса (найдено брейнштормом
+            // ботов-воркеров, 2026-08-09).
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
     }
 
@@ -393,6 +441,20 @@ impl OverlayWindow {
             );
         }
     }
+
+    /// Попросить поток оверлея безусловно снять Win32-захват мыши —
+    /// защитная мера на выходе из режима редактирования (см.
+    /// [`WM_APP_RELEASE_CAPTURE`]): если хоткей выхода сработал, пока
+    /// пользователь ещё держит кнопку мыши (тянет ползунок/жест), обычный
+    /// цикл Down→Up, который снял бы захват сам, не наступит вовремя, и
+    /// уже клик-прозрачное окно продолжает монопольно получать всю мышь
+    /// системы.
+    pub fn force_release_capture(&self) {
+        // SAFETY: hwnd — наше окно; PostMessage безопасен с любого потока.
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_RELEASE_CAPTURE, WPARAM(0), LPARAM(0));
+        }
+    }
 }
 
 impl Drop for OverlayWindow {
@@ -428,9 +490,11 @@ struct WndState {
 /// занята другим приложением, пользователя надо предупредить и предложить
 /// другую (M2b6). Прочие ошибки `RegisterHotKey` — редкие системные сбои,
 /// им достаточно warn-лога в `run_message_loop`.
-fn hotkey_conflict_event(err: &Win32Error) -> Option<OverlayEvent> {
+fn hotkey_conflict_event(err: &Win32Error, name: HotkeyName) -> Option<OverlayEvent> {
     match err {
-        Win32Error::HotkeyConflict(combo) => Some(OverlayEvent::HotkeyConflict(combo.clone())),
+        Win32Error::HotkeyConflict(combo) => {
+            Some(OverlayEvent::HotkeyConflict(name, combo.clone()))
+        }
         _ => None,
     }
 }
@@ -460,7 +524,7 @@ fn run_message_loop(
             Ok(h) => Some(h),
             Err(e) => {
                 tracing::warn!(error = %e, "не удалось зарегистрировать хоткей режима редактирования");
-                if let Some(event) = hotkey_conflict_event(&e) {
+                if let Some(event) = hotkey_conflict_event(&e, HotkeyName::EditMode) {
                     let _ = event_tx.send(event);
                 }
                 None
@@ -480,7 +544,7 @@ fn run_message_loop(
                     error = %e,
                     "не удалось зарегистрировать хоткей «показать/скрыть все стикеры»"
                 );
-                if let Some(event) = hotkey_conflict_event(&e) {
+                if let Some(event) = hotkey_conflict_event(&e, HotkeyName::ToggleAllStickers) {
                     let _ = event_tx.send(event);
                 }
                 None
@@ -498,7 +562,7 @@ fn run_message_loop(
                     error = %e,
                     "не удалось зарегистрировать хоткей «заглушить все стикеры»"
                 );
-                if let Some(event) = hotkey_conflict_event(&e) {
+                if let Some(event) = hotkey_conflict_event(&e, HotkeyName::MuteAll) {
                     let _ = event_tx.send(event);
                 }
                 None
@@ -634,6 +698,16 @@ fn create_window(bounds_px: Rect) -> Result<HWND, Win32Error> {
     // пойдёт напрямую через DirectComposition (проверено спайком S0). Оба
     // флага (NOACTIVATE, TRANSPARENT) снимаются на время режима
     // редактирования через `set_click_through` (M2).
+    //
+    // LAYERED — обязателен для реального клик-сквозь: по докам Win32
+    // (Layered Windows, Raymond Chen 2012-12-17) TRANSPARENT без LAYERED
+    // описан только как порядок отрисовки СРЕДИ ОКОН ОДНОГО ПОТОКА, а не
+    // маршрутизация кликов чужим процессам (Explorer, панель задач и т. д.);
+    // системный проброс кликов сквозь TOPMOST-окно на другие процессы
+    // гарантирован только для LAYERED|TRANSPARENT (найдено брейнштормом
+    // ботов-воркеров при разборе бага «мышь мертва системно с запуска»,
+    // 2026-08-09). DirectComposition официально совместим с LAYERED
+    // (DirectComposition Basic Concepts, «composition target window»).
     // SAFETY: все аргументы — валидные константы и только что
     // зарегистрированный класс; размеры окон реальных мониторов влезают в i32.
     let hwnd = unsafe {
@@ -642,7 +716,8 @@ fn create_window(bounds_px: Rect) -> Result<HWND, Win32Error> {
                 | WS_EX_TOOLWINDOW
                 | WS_EX_NOACTIVATE
                 | WS_EX_TRANSPARENT
-                | WS_EX_NOREDIRECTIONBITMAP,
+                | WS_EX_NOREDIRECTIONBITMAP
+                | WS_EX_LAYERED,
             CLASS_NAME,
             WINDOW_TITLE,
             WS_POPUP,
@@ -660,6 +735,16 @@ fn create_window(bounds_px: Rect) -> Result<HWND, Win32Error> {
 
     if hwnd.0.is_null() {
         return Err(Win32Error::OverlayWindowCreateFailed);
+    }
+
+    // LAYERED-окно без вызова SetLayeredWindowAttributes/UpdateLayeredWindow
+    // остаётся невидимым (доки Win32). alpha=255/LWA_ALPHA — полностью
+    // непрозрачно по системным меркам (реальный контент рисует
+    // DirectComposition отдельно, этот вызов только включает механизм
+    // клик-сквозь LAYERED-окна, визуально ничего не меняет).
+    // SAFETY: hwnd — только что созданное окно этим потоком.
+    unsafe {
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
     }
 
     // SAFETY: hwnd — действительное окно, созданное выше этим потоком.
@@ -767,10 +852,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
     match msg {
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE | WM_CAPTURECHANGED => {
-            if let Some(state) = unsafe { state_ptr.as_mut() } {
-                if let Some(event) = state.capture.handle_message(msg, wparam, lparam) {
-                    let _ = state.tx.send(OverlayEvent::Input(event));
-                    return LRESULT(0);
+            // Жёсткий гейт: вне режима редактирования окно клик-прозрачно
+            // (WS_EX_TRANSPARENT, `set_click_through`/`set_interactive`), и
+            // Win32-мышь должна идти сквозь него полностью — ни `SetCapture`,
+            // ни какая-либо реакция. Раньше `MouseCapture::handle_message`
+            // вызывался безусловно на любое сообщение, дошедшее до этого
+            // wndproc: если хоть один клик всё же попадал в клик-прозрачное
+            // окно (редкая, но реальная гонка DWM-хиттеста при смене стиля,
+            // либо WM_CAPTURECHANGED извне), окно молча ставило `SetCapture`
+            // и с этого момента монопольно поглощало ВСЮ мышь системы, пока
+            // не пришло бы совпадающее `WM_LBUTTONUP` — то есть потенциально
+            // никогда, если этот клик не был «нашим» началом драга (найдено
+            // при разборе бага «мышь не реагирует даже на панель задач»).
+            // Проверяем текущий стиль напрямую (а не кэш) — источник истины
+            // тот же, что у `set_exstyle_bits`.
+            // SAFETY: hwnd — валидное окно этого потока.
+            let click_through =
+                unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0 != 0;
+            if !click_through {
+                if let Some(state) = unsafe { state_ptr.as_mut() } {
+                    if let Some(event) = state.capture.handle_message(msg, wparam, lparam) {
+                        let _ = state.tx.send(OverlayEvent::Input(event));
+                        return LRESULT(0);
+                    }
+                }
+            } else if let Some(state) = unsafe { state_ptr.as_mut() } {
+                // Защитно: если что-то всё же успело поставить захват до
+                // того, как стиль стал клик-прозрачным (гонка), снимаем его
+                // здесь же — не полагаемся только на `force_release_capture`
+                // из `toggle_edit_mode`.
+                if state.capture.is_captured() {
+                    state.capture.force_release();
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -788,6 +900,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(shape) = cursor_shape_from_wparam(wparam) {
                     state.cursor.set_shape(shape);
                 }
+            }
+            LRESULT(0)
+        }
+        WM_APP_RELEASE_CAPTURE => {
+            if let Some(state) = unsafe { state_ptr.as_mut() } {
+                state.capture.force_release();
             }
             LRESULT(0)
         }
@@ -892,6 +1010,53 @@ mod tests {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    #[test]
+    fn cursor_shape_wparam_round_trips_fixed_shapes() {
+        for shape in [
+            CursorShape::Arrow,
+            CursorShape::Move,
+            CursorShape::SizeNS,
+            CursorShape::SizeWE,
+            CursorShape::SizeNESW,
+            CursorShape::SizeNWSE,
+        ] {
+            assert_eq!(
+                cursor_shape_from_wparam(cursor_shape_to_wparam(shape)),
+                Some(shape)
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_shape_wparam_round_trips_rotate_angles() {
+        // 0/359 — границы диапазона; -45/-135 — реальные значения,
+        // используемые ядром (нормализуются rem_euclid(360) при кодировании,
+        // см. доккомент ROTATE_WPARAM_BASE); 400 — больше 360, тоже обязан
+        // нормализоваться корректно.
+        for angle in [0, 45, 90, 180, 270, 359, -45, -135, 400] {
+            let shape = CursorShape::Rotate(angle);
+            let decoded = cursor_shape_from_wparam(cursor_shape_to_wparam(shape));
+            let CursorShape::Rotate(decoded_angle) = decoded.expect("Rotate декодируется") else {
+                panic!("ожидался CursorShape::Rotate");
+            };
+            assert_eq!(
+                decoded_angle,
+                angle.rem_euclid(360),
+                "угол {angle} должен нормализоваться в 0..360"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_shape_from_wparam_rejects_out_of_range() {
+        assert_eq!(cursor_shape_from_wparam(WPARAM(6)), None);
+        assert_eq!(cursor_shape_from_wparam(WPARAM(999)), None);
+        assert_eq!(
+            cursor_shape_from_wparam(WPARAM(ROTATE_WPARAM_MAX + 1)),
+            None
+        );
+    }
 
     fn test_hotkey() -> HotkeyCombo {
         // Экзотическая комбинация — не конфликтует с реальными приложениями
@@ -1081,18 +1246,30 @@ mod tests {
         // Конфликт → событие с той же каноничной комбинацией.
         let conflict = Win32Error::HotkeyConflict("Ctrl+Alt+Shift+F22".to_string());
         assert_eq!(
-            hotkey_conflict_event(&conflict),
+            hotkey_conflict_event(&conflict, HotkeyName::EditMode),
             Some(OverlayEvent::HotkeyConflict(
+                HotkeyName::EditMode,
+                "Ctrl+Alt+Shift+F22".to_string()
+            ))
+        );
+        // Имя хоткея прокидывается насквозь, а не всегда EditMode.
+        assert_eq!(
+            hotkey_conflict_event(&conflict, HotkeyName::MuteAll),
+            Some(OverlayEvent::HotkeyConflict(
+                HotkeyName::MuteAll,
                 "Ctrl+Alt+Shift+F22".to_string()
             ))
         );
         // Прочие ошибки регистрации события не порождают — им хватает warn-лога.
         assert_eq!(
-            hotkey_conflict_event(&Win32Error::OverlayWindowCreateFailed),
+            hotkey_conflict_event(&Win32Error::OverlayWindowCreateFailed, HotkeyName::EditMode),
             None
         );
         assert_eq!(
-            hotkey_conflict_event(&Win32Error::InvalidHotkey("Ctrl".to_string())),
+            hotkey_conflict_event(
+                &Win32Error::InvalidHotkey("Ctrl".to_string()),
+                HotkeyName::EditMode
+            ),
             None
         );
     }
@@ -1114,7 +1291,10 @@ mod tests {
         // Создание второго окна не провалилось — конфликт лишь событие, окно
         // продолжает работать.
         match second_events.recv_timeout(Duration::from_secs(5)) {
-            Ok(OverlayEvent::HotkeyConflict(s)) => assert_eq!(s, "Ctrl+Alt+Shift+F22"),
+            Ok(OverlayEvent::HotkeyConflict(name, s)) => {
+                assert_eq!(name, HotkeyName::EditMode);
+                assert_eq!(s, "Ctrl+Alt+Shift+F22");
+            }
             Ok(other) => panic!("ожидался HotkeyConflict, получено: {other:?}"),
             Err(e) => panic!("второе окно не прислало HotkeyConflict: {e}"),
         }
@@ -1161,7 +1341,10 @@ mod tests {
         // Тот же паттерн, что и для edit-хоткея: конфликт — событие, а не
         // ошибка создания окна.
         match second_events.recv_timeout(Duration::from_secs(5)) {
-            Ok(OverlayEvent::HotkeyConflict(s)) => assert_eq!(s, "Ctrl+Alt+Shift+F20"),
+            Ok(OverlayEvent::HotkeyConflict(name, s)) => {
+                assert_eq!(name, HotkeyName::ToggleAllStickers);
+                assert_eq!(s, "Ctrl+Alt+Shift+F20");
+            }
             Ok(other) => panic!("ожидался HotkeyConflict, получено: {other:?}"),
             Err(e) => panic!("второе окно не прислало HotkeyConflict: {e}"),
         }
@@ -1182,7 +1365,10 @@ mod tests {
                 .expect("второе окно");
 
         match second_events.recv_timeout(Duration::from_secs(5)) {
-            Ok(OverlayEvent::HotkeyConflict(s)) => assert_eq!(s, "Ctrl+Alt+Shift+F18"),
+            Ok(OverlayEvent::HotkeyConflict(name, s)) => {
+                assert_eq!(name, HotkeyName::MuteAll);
+                assert_eq!(s, "Ctrl+Alt+Shift+F18");
+            }
             Ok(other) => panic!("ожидался HotkeyConflict, получено: {other:?}"),
             Err(e) => panic!("второе окно не прислало HotkeyConflict: {e}"),
         }

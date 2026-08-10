@@ -41,9 +41,19 @@ static const float2 corners[6] = { float2(0,0), float2(1,0), float2(0,1),
 VSOut mainVS(uint vid : SV_VertexID) {
     float2 c = corners[vid];
     VSOut o;
-    // flip через lerp: sign=+1 -> uv = c, sign=-1 -> uv = 1-c
-    o.uv = float2(lerp(0.5, c.x - 0.5, misc.w) + 0.5,
-                  lerp(0.5, c.y - 0.5, misc2.x) + 0.5);
+    // flip: sign=+1 -> uv = c, sign=-1 -> uv = 1-c (отражение вокруг 0.5).
+    // ВАЖНО: НЕ через lerp(0.5, c-0.5, sign) — та формула при sign=-1 даёт
+    // uv = 2-c (внешифт range [0,1]), а не 1-c: у lerp(a,b,t)=a+t(b-a) при
+    // t=-1 результат ЭКСТРАПОЛИРУЕТ за a в противоположную от b сторону, а
+    // не отражает c симметрично вокруг 0.5 — баг был найден по репорту
+    // пользователя 2026-08-09 (переворот стикера рвал UV: обычная картинка
+    // схлопывалась в полоску крайних пикселей текстуры, кадры анимации
+    // «мерцали» и цепляли соседние ячейки атласа, потому что uv=2-c уходит
+    // за пределы подпрямоугольника uv_offset/uv_scale). Прямая формула
+    // sign*(c-0.5)+0.5 — корректное отражение при sign=-1 и тождество c при
+    // sign=+1, без lerp.
+    o.uv = float2(misc.w * (c.x - 0.5) + 0.5,
+                  misc2.x * (c.y - 0.5) + 0.5);
     float2 local = (c - 0.5) * tr.zw;                       // размер
     float2 rot = float2(local.x * misc.x - local.y * misc.y,
                         local.x * misc.y + local.y * misc.x); // поворот

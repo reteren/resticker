@@ -5,15 +5,26 @@
 //! (`overlay_manager`), добавление стикера из настроек, восстановление
 //! между запусками. Остальное — следующие вехи (ROADMAP.md).
 
+// Без этого бинарник линкуется под CONSOLE-подсистему (дефолт для `fn main()`
+// без GUI-фреймворка, который сам берёт это на себя) — каждый запуск
+// открывал бы пустое консольное окно поверх трея/оверлея (найдено на живой
+// машине пользователя: выглядело как «зависшая» программа). В debug-сборке
+// подсистема остаётся консольной — `cargo run` показывает panic/eprintln
+// напрямую, не только через файл лога.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod confirm_dialog;
 mod cursor_panel;
+mod i18n;
 mod logging;
 mod overlay_manager;
+mod preset_picker;
 mod toolbar;
+mod window_pick_list;
 mod window_picker;
 
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::Context;
 use rst_core::model::{Config, Hotkeys, Settings};
@@ -26,6 +37,47 @@ use rst_win32::tray::{self, MenuItem, TrayEvent, TrayIcon};
 const MENU_OPEN_SETTINGS: u32 = 1;
 const MENU_TOGGLE_VISIBLE: u32 = 2;
 const MENU_EXIT: u32 = 3;
+/// Первый id пункта меню трея под пресет (M7, «быстрое переключение из
+/// трея» — ROADMAP.md). `WM_COMMAND` несёт id только в младшем слове
+/// `wParam` (Win32-соглашение, `tray.rs::wndproc` берёт `wparam.0 & 0xffff`)
+/// — 16 бит, поэтому пункт кодирует не сам `Uuid` пресета, а его индекс в
+/// списке на момент последней пересборки меню; обратное соответствие —
+/// `preset_ids` ниже.
+const MENU_PRESET_BASE: u32 = 100;
+
+/// Собрать пункты меню трея из текущего списка пресетов (M7, «быстрое
+/// переключение из трея» — ROADMAP.md; SPEC.md §12: «пресеты (подменю)») —
+/// постоянные пункты + вложенное подменю «Пресеты» (пусто — не добавляется).
+/// Возвращает и сами пункты, и id-список пресетов в том же порядке, что и
+/// пункты подменю: `preset_ids[i]` — это пресет пункта с
+/// `id == MENU_PRESET_BASE + i` (см. `MENU_PRESET_BASE`).
+/// `lang` — `cfg.settings.language`, захваченный один раз при старте
+/// resticker (см. вызовы в `main()`): как и хоткеи, смена языка в окне
+/// настроек применяется к меню трея после перезапуска, не мгновенно
+/// (`crates/resticker/src/i18n.rs`, доккомент модуля).
+fn build_tray_menu(presets: &[(Uuid, String)], lang: &str) -> (Vec<MenuItem>, Vec<Uuid>) {
+    let mut items = vec![
+        MenuItem::new(MENU_OPEN_SETTINGS, i18n::tray_open_settings(lang)),
+        tray::separator(),
+        MenuItem::new(MENU_TOGGLE_VISIBLE, i18n::tray_toggle_visible(lang)),
+    ];
+    let ids: Vec<Uuid> = presets.iter().map(|(id, _)| *id).collect();
+    if !ids.is_empty() {
+        let children = presets
+            .iter()
+            .enumerate()
+            .map(|(i, (_, name))| MenuItem::new(MENU_PRESET_BASE + i as u32, name.clone()))
+            .collect();
+        items.push(tray::separator());
+        items.push(MenuItem::submenu(
+            i18n::tray_presets_submenu(lang),
+            children,
+        ));
+    }
+    items.push(tray::separator());
+    items.push(MenuItem::new(MENU_EXIT, i18n::tray_exit(lang)));
+    (items, ids)
+}
 
 /// Добавить стикер по пути, выбранному в диалоге настроек (M1).
 #[tauri::command]
@@ -42,7 +94,37 @@ fn add_sticker(path: String, overlay: tauri::State<OverlayHandle>) {
 fn get_config(config_path: tauri::State<PathBuf>) -> Result<Config, String> {
     rst_core::config::load(&config_path)
         .map(|loaded| loaded.config)
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            tracing::warn!(error = %e, "get_config: не удалось загрузить config.json");
+            friendly_config_error(&e)
+        })
+}
+
+/// Понятный пользователю текст ошибки конфига вместо кода/сырого текста
+/// (ROADMAP.md M8, «понятные тексты ошибок вместо кодов»): `CoreError`
+/// оборачивает `std::io::Error`/`serde_json::Error`, чей `Display` — это
+/// текст ОС/парсера ("The system cannot find the file specified. (os error
+/// 2)", "expected value at line 3 column 1") — годится для лога
+/// (`tracing::warn!`), но не для показа в окне настроек. Полный `e`
+/// логируется рядом в каждом вызывающем коде — эта функция только для
+/// текста, который видит пользователь.
+fn friendly_config_error(e: &rst_core::CoreError) -> String {
+    match e {
+        rst_core::CoreError::Io(io) => match io.kind() {
+            std::io::ErrorKind::NotFound => "Файл настроек не найден.".to_string(),
+            std::io::ErrorKind::PermissionDenied => {
+                "Нет доступа к файлу настроек — проверьте права на папку AppData.".to_string()
+            }
+            _ => "Не удалось прочитать файл настроек.".to_string(),
+        },
+        rst_core::CoreError::Json(_) | rst_core::CoreError::Migrate(_) => {
+            "Файл настроек повреждён.".to_string()
+        }
+        rst_core::CoreError::UnknownSchemaVersion(_) => {
+            "Файл настроек создан более новой версией resticker — обновите программу.".to_string()
+        }
+        rst_core::CoreError::NotAnObject => "Файл настроек повреждён.".to_string(),
+    }
 }
 
 /// Заменить `cfg.settings` целиком (вкладка «Общие») — координатор
@@ -61,7 +143,10 @@ fn update_hotkeys(hotkeys: Hotkeys, overlay: tauri::State<OverlayHandle>) {
 }
 
 fn parse_id(id: &str) -> Result<Uuid, String> {
-    Uuid::parse_str(id).map_err(|e| e.to_string())
+    Uuid::parse_str(id).map_err(|e| {
+        tracing::warn!(error = %e, id, "parse_id: некорректный идентификатор от UI");
+        "Внутренняя ошибка: некорректный идентификатор элемента.".to_string()
+    })
 }
 
 #[tauri::command]
@@ -184,7 +269,10 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
         .arg(format!("/select,{path}"))
         .spawn()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            tracing::warn!(error = %e, path, "reveal_in_explorer: не удалось запустить проводник");
+            "Не удалось открыть проводник.".to_string()
+        })
 }
 
 fn config_path() -> anyhow::Result<PathBuf> {
@@ -195,6 +283,26 @@ fn config_path() -> anyhow::Result<PathBuf> {
 fn main() -> anyhow::Result<()> {
     let log_path = logging::init()?;
     tracing::info!(path = %log_path.display(), "логирование инициализировано");
+
+    // Второй экземпляр (автозапуск + ручной запуск, повторный клик по
+    // ярлыку) поднял бы второй набор WS_EX_TOPMOST оверлей-окон на тех же
+    // мониторах — оба получают реальные события мыши/клавиатуры вперемешку
+    // (rst_win32::single_instance, доккомент модуля). Тихо выходим, не
+    // трогая конфиг/трей/оверлей уже работающего экземпляра.
+    let _single_instance: Option<rst_win32::single_instance::SingleInstance> =
+        match rst_win32::single_instance::acquire() {
+            rst_win32::single_instance::SingleInstanceResult::Acquired(guard) => Some(guard),
+            rst_win32::single_instance::SingleInstanceResult::AlreadyRunning => {
+                tracing::warn!("resticker уже запущен в этом сеансе — выходим");
+                return Ok(());
+            }
+            rst_win32::single_instance::SingleInstanceResult::Error => {
+                tracing::warn!(
+                    "не удалось проверить единственность экземпляра (CreateMutex не сработал) — продолжаем запуск как есть"
+                );
+                None
+            }
+        };
 
     let cfg_path = config_path()?;
     let loaded = rst_core::config::load(&cfg_path).context("загрузка config.json")?;
@@ -213,26 +321,16 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "не удалось синхронизировать автозапуск");
     }
 
-    let (tray_icon, tray_rx) = TrayIcon::new(
-        "resticker",
-        vec![
-            MenuItem {
-                id: MENU_OPEN_SETTINGS,
-                label: "Открыть настройки".into(),
-            },
-            tray::separator(),
-            MenuItem {
-                id: MENU_TOGGLE_VISIBLE,
-                label: "Показать/скрыть все стикеры".into(),
-            },
-            tray::separator(),
-            MenuItem {
-                id: MENU_EXIT,
-                label: "Выход".into(),
-            },
-        ],
-    )
-    .context("инициализация иконки трея")?;
+    let tray_lang = cfg.settings.language.clone();
+    let initial_presets: Vec<(Uuid, String)> =
+        cfg.presets.iter().map(|p| (p.id, p.name.clone())).collect();
+    let (initial_menu, initial_preset_ids) = build_tray_menu(&initial_presets, &tray_lang);
+    let (tray_icon, tray_rx) =
+        TrayIcon::new("resticker", initial_menu).context("инициализация иконки трея")?;
+    // Индекс пункта меню → id пресета (см. `MENU_PRESET_BASE`) — общий между
+    // потоком трея (читает при клике) и потоком координатора (пишет при
+    // `CoordinatorRequest::PresetsChanged`).
+    let preset_ids = Arc::new(Mutex::new(initial_preset_ids));
 
     let silent_start = cfg.settings.silent_start;
     // Для окна настроек (`get_config`) — читает диск напрямую, не через
@@ -278,6 +376,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let handle = app.handle().clone();
+            let preset_ids_for_tray = Arc::clone(&preset_ids);
             std::thread::spawn(move || {
                 for event in tray_rx {
                     match event {
@@ -293,6 +392,23 @@ fn main() -> anyhow::Result<()> {
                                 .send(OverlayCommand::ToggleAllStickers);
                         }
                         TrayEvent::MenuItem(MENU_EXIT) => handle.exit(0),
+                        // M7: клик по пункту пресета в меню трея — id несёт
+                        // только индекс в списке на момент последней
+                        // пересборки меню (`build_tray_menu`), сам `Uuid`
+                        // ищем в общем с координатор-потоком `preset_ids`.
+                        TrayEvent::MenuItem(id) if id >= MENU_PRESET_BASE => {
+                            let target = {
+                                let ids = preset_ids_for_tray
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                ids.get((id - MENU_PRESET_BASE) as usize).copied()
+                            };
+                            if let Some(preset_id) = target {
+                                handle
+                                    .state::<OverlayHandle>()
+                                    .send(OverlayCommand::ApplyPreset(preset_id));
+                            }
+                        }
                         TrayEvent::MenuItem(_) => {}
                     }
                 }
@@ -302,6 +418,8 @@ fn main() -> anyhow::Result<()> {
             // раздел 12): окна живут на главном потоке, оверлей-поток их
             // трогать не может. Обработка — та же, что у пункта трея.
             let coordinator_handle = app.handle().clone();
+            let preset_ids_for_coordinator = Arc::clone(&preset_ids);
+            let tray_lang_for_coordinator = tray_lang.clone();
             std::thread::spawn(move || {
                 for request in coordinator_rx {
                     match request {
@@ -330,6 +448,16 @@ fn main() -> anyhow::Result<()> {
                                 tracing::warn!(error = %e, "не удалось показать баллон-уведомление трея");
                             }
                         }
+                        // M7: список пресетов изменился — пересобираем меню
+                        // трея целиком (`TrayIcon::set_menu`) и обновляем
+                        // общий с потоком трея id→Uuid список.
+                        CoordinatorRequest::PresetsChanged(list) => {
+                            let (items, ids) = build_tray_menu(&list, &tray_lang_for_coordinator);
+                            *preset_ids_for_coordinator
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = ids;
+                            coordinator_handle.state::<TrayIcon>().set_menu(items);
+                        }
                     }
                 }
             });
@@ -348,4 +476,65 @@ fn main() -> anyhow::Result<()> {
         .context("запуск приложения Tauri")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ROADMAP.md M8 «понятные тексты ошибок вместо кодов»: текст, который
+    /// увидит пользователь в окне настроек, не должен содержать сырые
+    /// сообщения `std::io::Error`/`serde_json::Error` (пути к файлам,
+    /// "os error N", позиции JSON-парсера и т.п.).
+    #[test]
+    fn friendly_config_error_hides_raw_io_and_json_text() {
+        let not_found = rst_core::CoreError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(
+            friendly_config_error(&not_found),
+            "Файл настроек не найден."
+        );
+
+        let denied =
+            rst_core::CoreError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            friendly_config_error(&denied),
+            "Нет доступа к файлу настроек — проверьте права на папку AppData."
+        );
+
+        let other_io = rst_core::CoreError::Io(std::io::Error::other("что-то сломалось на диске"));
+        let msg = friendly_config_error(&other_io);
+        assert_eq!(msg, "Не удалось прочитать файл настроек.");
+        assert!(
+            !msg.contains("что-то сломалось"),
+            "сырой текст io::Error не должен просочиться в UI-сообщение"
+        );
+
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let msg = friendly_config_error(&rst_core::CoreError::Json(json_err));
+        assert_eq!(msg, "Файл настроек повреждён.");
+
+        let msg = friendly_config_error(&rst_core::CoreError::UnknownSchemaVersion(99));
+        assert_eq!(
+            msg,
+            "Файл настроек создан более новой версией resticker — обновите программу."
+        );
+
+        let msg = friendly_config_error(&rst_core::CoreError::NotAnObject);
+        assert_eq!(msg, "Файл настроек повреждён.");
+    }
+
+    #[test]
+    fn parse_id_rejects_garbage_with_friendly_text_not_raw_parse_error() {
+        let err = parse_id("not-a-uuid").unwrap_err();
+        assert_eq!(
+            err,
+            "Внутренняя ошибка: некорректный идентификатор элемента."
+        );
+    }
+
+    #[test]
+    fn parse_id_accepts_valid_uuid() {
+        let id = Uuid::new_v4();
+        assert_eq!(parse_id(&id.to_string()).unwrap(), id);
+    }
 }

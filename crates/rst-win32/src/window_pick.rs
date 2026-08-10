@@ -137,6 +137,24 @@ mod tests {
     }
 
     #[test]
+    fn stale_snapshot_dead_hwnd_still_returned_liveness_is_click_side_guard() {
+        // Гонка «первый кадр после пробуждения трекера» (overlay_manager.rs,
+        // run()/handle_input): BTN_ADD_WINDOW ставит `picking_window`, трекер
+        // просыпается асинхронно, и один-два кадра `window_at` хит-тестит
+        // СТАРЫЙ (до-wake) снимок. Окно из него могло уже умереть — но
+        // `window_at` обязан вернуть его как есть: IsWindow на каждый
+        // hit-test был бы кросс-процессным вызовом на рендер-цикле.
+        // Живость проверяет сторона клика (`add_window_sticker`:
+        // поиск по текущему снимку + `PinWindowGone` из `WindowPins::pin`).
+        let snapshot = vec![info(0xDEAD_BEEF, 0, 0, 200, 200, 0)];
+        assert_eq!(
+            window_at(&snapshot, ScreenPoint { x: 100, y: 100 }),
+            Some(0xDEAD_BEEF),
+            "мёртвый hwnd из устаревшего снимка возвращается — liveness за вызывающим"
+        );
+    }
+
+    #[test]
     fn cursor_position_is_on_some_screen() {
         // Интерактивная сессия предполагается (хоткеи уже тестируются так);
         // GetCursorPos падает только в экзотических контекстах без десктопа.

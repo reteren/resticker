@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [build-dependencies]
-tauri-build = { version = "2" }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 rst-core = { path = "../rst-core" }
@@ -18,12 +18,19 @@ rst-video = { path = "../rst-video" }
 rst-audio = { path = "../rst-audio" }
 anyhow = "1"
 chrono = { workspace = true }
-tauri = { version = "2" }
+tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true }
+
+[dev-dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+] }
 
 [lints]
 workspace = true

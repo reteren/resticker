@@ -31,6 +31,11 @@ pub struct Settings {
     /// `None` — дефолтное смещение (12, 12).
     pub cursor_panel_offset: Option<(f64, f64)>,
     pub language: String,
+    /// Онбординг первого запуска уже показан (ROADMAP.md M8, «первый
+    /// запуск: короткий онбординг, показать хоткей») — тост с хоткеем
+    /// входа в режим редактирования показывается ровно один раз, дальше
+    /// координатор проверяет этот флаг и молчит.
+    pub onboarding_shown: bool,
 }
 
 impl Default for Settings {
@@ -46,6 +51,7 @@ impl Default for Settings {
             mute_invisible_stickers: true,
             cursor_panel_offset: None,
             language: "ru".to_string(),
+            onboarding_shown: false,
         }
     }
 }

@@ -79,13 +79,16 @@ pub enum Icon {
     Play,
     /// «Пауза» — видео-стикер играет (M5b).
     Pause,
+    /// «Сбросить масштаб» — тулбар выделения, возвращает размер/поворот/
+    /// отражения к натуральным (фидбэк пользователя 2026-08-09).
+    ResetScale,
 }
 
 impl Icon {
     /// Все варианты в порядке объявления — для предварительной генерации
     /// кэша иконок (текс-карта `HashMap<Icon, Texture>`, M2_WIRING_PLAN §3)
     /// и тестов генератора `icon_rgba`.
-    pub const ALL: [Icon; 16] = [
+    pub const ALL: [Icon; 17] = [
         Icon::Layers,
         Icon::Eye,
         Icon::EyeOff,
@@ -102,6 +105,7 @@ impl Icon {
         Icon::Exit,
         Icon::Play,
         Icon::Pause,
+        Icon::ResetScale,
     ];
 }
 
@@ -1153,6 +1157,13 @@ impl Panel {
     /// Идентификатор сфокусированного виджета, если есть.
     pub fn focused_widget(&self) -> Option<WidgetId> {
         self.focus.map(|i| self.widgets[i].id())
+    }
+
+    /// Идентификатор и границы (DIP) наведённого виджета, если есть — для
+    /// тултипов (позиционируются относительно кнопки-источника).
+    pub fn hovered_widget(&self) -> Option<(WidgetId, Box2D)> {
+        self.hovered
+            .map(|i| (self.widgets[i].id(), self.widgets[i].bounds()))
     }
 
     /// Доступ к виджету по идентификатору (опрос состояния ядром).
