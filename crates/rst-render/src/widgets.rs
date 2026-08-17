@@ -196,6 +196,14 @@ pub mod theme {
     pub const FIELD_PAD: f64 = 4.0;
     /// Сторона чекбокса панели выбора окон, DIP.
     pub const CHECKBOX_SIZE: f64 = 16.0;
+    /// Ширина вертикальной полосы скролла, DIP (панели «Слои видимости»/
+    /// список закрепления окон — тонкая, не съедает заметную часть и так
+    /// узкого правого отступа панели).
+    pub const SCROLLBAR_WIDTH: f64 = 3.0;
+    /// Минимальная высота ручки скролла, DIP — при очень длинных списках
+    /// `thumb_fraction` может выродиться в единицы DIP, ручка должна
+    /// оставаться видимой и кликабельной на глаз.
+    pub const SCROLLBAR_MIN_THUMB_H: f64 = 16.0;
 }
 
 /// Событие указателя в DIP-координатах монитора (перевод из `WM_MOUSE*` —
@@ -601,6 +609,106 @@ impl Widget for Slider {
             PointerEvent::Move { pos } => self.dragging && self.set_from_x(pos.0),
             PointerEvent::Up { .. } => std::mem::replace(&mut self.dragging, false),
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Вертикальный индикатор прокрутки списка (панель «Слои видимости»/список
+/// закрепления окон, M4/M6) — живой репорт пользователя: длинный список
+/// окон обрезался без единого визуального намёка, что его можно листать
+/// (сам скролл к тому же не был подключён к колесу мыши, см. `InputEvent::
+/// MouseWheel`). Только отрисовка — колесо мыши двигает `scroll` на
+/// вызывающем слое, виджет лишь визуализирует текущее положение; не
+/// перетаскиваемый (ручка мыши не нужна списку такого размера, дорожка/
+/// ручка достаточно, чтобы было видно «тут можно листать»).
+pub struct ScrollBar {
+    id: WidgetId,
+    bounds: Box2D,
+    /// Доля видимой части списка от общего числа строк, `(0.0, 1.0]`.
+    thumb_fraction: f64,
+    /// Положение верха ручки как доля высоты дорожки, `[0.0, 1.0 -
+    /// thumb_fraction]`.
+    thumb_offset: f64,
+}
+
+impl ScrollBar {
+    /// `visible_rows`/`total_rows` — то же, что даёт билдер панели
+    /// (`PickerPanel::total_rows`/аналог); `scroll` — текущая позиция (в
+    /// строках, как у панели). `total_rows <= visible_rows` даёт ручку во
+    /// всю дорожку (скроллить нечего) — вызывающий слой обычно вообще не
+    /// добавляет виджет в этом случае, но `ScrollBar` не паникует.
+    pub fn new(
+        id: WidgetId,
+        bounds: Box2D,
+        visible_rows: usize,
+        total_rows: usize,
+        scroll: usize,
+    ) -> Self {
+        let total_rows = total_rows.max(1);
+        let thumb_fraction = (visible_rows as f64 / total_rows as f64).min(1.0);
+        let max_scroll = total_rows.saturating_sub(1).max(1);
+        let thumb_offset = if total_rows <= visible_rows {
+            0.0
+        } else {
+            (scroll.min(max_scroll) as f64 / max_scroll as f64) * (1.0 - thumb_fraction)
+        };
+        Self {
+            id,
+            bounds,
+            thumb_fraction,
+            thumb_offset,
+        }
+    }
+}
+
+impl Widget for ScrollBar {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.bounds
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.bounds = bounds;
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        // Дорожка — на всю высоту, полупрозрачная; ручка — акцентным
+        // цветом поверх (тот же принцип, что у `Slider::opacity`/`SLIDER_FILL`).
+        out.push(Primitive::Fill {
+            rect: self.bounds,
+            color: theme::SLIDER_TRACK,
+            opacity: 0.5,
+        });
+        let top = self.bounds.cy - self.bounds.h / 2.0;
+        let thumb_h = (self.bounds.h * self.thumb_fraction).max(theme::SCROLLBAR_MIN_THUMB_H);
+        let thumb_top = top + self.bounds.h * self.thumb_offset;
+        out.push(Primitive::Fill {
+            rect: Box2D {
+                cx: self.bounds.cx,
+                cy: thumb_top + thumb_h / 2.0,
+                w: self.bounds.w,
+                h: thumb_h,
+                rotation: 0.0,
+            },
+            color: theme::SLIDER_FILL,
+            opacity: 0.9,
+        });
+    }
+
+    /// Не интерактивна (доккомент структуры) — клики/hover сквозь неё к
+    /// содержимому под ней, панель не отдаёт ей события указателя.
+    fn hit_test(&self, _pos: Point) -> bool {
+        false
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1477,6 +1585,75 @@ mod tests {
         out.clear();
         s.draw(&mut out);
         assert_eq!(out.len(), 2, "при нуле заполненной части нет");
+    }
+
+    // --- ScrollBar ---
+
+    const ID_SCROLLBAR: WidgetId = 900;
+
+    fn scrollbar_bounds() -> Box2D {
+        Box2D {
+            cx: 100.0,
+            cy: 100.0,
+            w: theme::SCROLLBAR_WIDTH,
+            h: 200.0,
+            rotation: 0.0,
+        }
+    }
+
+    #[test]
+    fn scrollbar_fits_content_gives_full_track_thumb() {
+        let sb = ScrollBar::new(ID_SCROLLBAR, scrollbar_bounds(), 10, 10, 0);
+        assert_eq!(sb.thumb_fraction, 1.0);
+        assert_eq!(sb.thumb_offset, 0.0);
+    }
+
+    #[test]
+    fn scrollbar_at_top_thumb_at_top() {
+        let sb = ScrollBar::new(ID_SCROLLBAR, scrollbar_bounds(), 10, 30, 0);
+        assert_eq!(sb.thumb_offset, 0.0);
+        assert!((sb.thumb_fraction - 10.0 / 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scrollbar_scrolled_to_max_thumb_at_bottom() {
+        // total_rows=30, максимально валидный scroll — 29 (доккомент
+        // `WindowPickerState`/`rebuild_window_picker`: «валиден в 0..=total_rows-1»).
+        let sb = ScrollBar::new(ID_SCROLLBAR, scrollbar_bounds(), 10, 30, 29);
+        assert!(
+            (sb.thumb_offset - (1.0 - 10.0 / 30.0)).abs() < 1e-9,
+            "ручка у самого низа дорожки: {}",
+            sb.thumb_offset
+        );
+    }
+
+    #[test]
+    fn scrollbar_halfway_thumb_at_midpoint() {
+        // total_rows=21 -> max_scroll=20, scroll=10 -> ровно середина.
+        let sb = ScrollBar::new(ID_SCROLLBAR, scrollbar_bounds(), 10, 21, 10);
+        let expected = 0.5 * (1.0 - 10.0 / 21.0);
+        assert!((sb.thumb_offset - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scrollbar_scroll_beyond_total_rows_clamps_like_max() {
+        let over = ScrollBar::new(ID_SCROLLBAR, scrollbar_bounds(), 10, 30, 9999);
+        let at_max = ScrollBar::new(ID_SCROLLBAR, scrollbar_bounds(), 10, 30, 29);
+        assert_eq!(over.thumb_offset, at_max.thumb_offset);
+    }
+
+    #[test]
+    fn scrollbar_draws_track_and_thumb() {
+        let sb = ScrollBar::new(ID_SCROLLBAR, scrollbar_bounds(), 10, 30, 0);
+        let mut out = Vec::new();
+        sb.draw(&mut out);
+        assert_eq!(out.len(), 2, "дорожка + ручка");
+    }
+
+    #[test]
+    fn scrollbar_never_intercepts_pointer() {
+        let sb = ScrollBar::new(ID_SCROLLBAR, scrollbar_bounds(), 10, 30, 5);
+        assert!(!sb.hit_test((100.0, 100.0)), "не интерактивна");
     }
 
     /// Поле 1–100, центр (100, 50), ширина 48: левый край 76, текст с x = 80.

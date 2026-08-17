@@ -16,7 +16,8 @@ use std::path::Path;
 use rst_core::model::{OverlapRule, VisibilityMode, VisibilityRule};
 use rst_core::occluders::{OccluderCandidate, rule_matches};
 use rst_render::{
-    Box2D, Button, ButtonContent, Checkbox, Panel, Primitive, Widget, WidgetId, text_size, theme,
+    Box2D, Button, ButtonContent, Checkbox, Panel, Primitive, ScrollBar, Widget, WidgetId,
+    text_size, theme,
 };
 use rst_win32::window_enum::{WindowIcon, WindowInfo};
 
@@ -264,6 +265,10 @@ pub const PICKER_BTN_SELECT_ALL: WidgetId = 201;
 /// «Снять все», но с постоянной узнаваемой подписью (дизайн §2.3: пустой
 /// allow-list семантически тождествен `Desktop`).
 pub const PICKER_BTN_DESKTOP_ONLY: WidgetId = 202;
+/// Полоса скролла списка (живой репорт пользователя: длинный список окон
+/// обрезался без видимого намёка, что его можно листать колесом мыши —
+/// `overlay_manager::handle_input`, `InputEvent::MouseWheel`).
+const PICKER_SCROLLBAR_ID: WidgetId = 203;
 
 /// Подпись кнопки-пресета «Только рабочий стол» — постоянна, не зависит от
 /// состояния списка правил (в отличие от подписи переключателя «Выбрать
@@ -386,7 +391,10 @@ pub fn build_picker_panel(
     // местом в конвейере примитивов, где рисуется текст произвольной длины
     // без клиппинга: длинный заголовок окна/имя процесса иначе просто рисуют
     // за рамкой. Обрезаем по ширине с многоточием (`truncate_to_width`).
-    let right_edge = frame.cx + frame.w / 2.0 - PICKER_PAD;
+    // Полоса скролла (ниже) всегда откусывает свою колонку от правого края —
+    // ширина текста не скачет в зависимости от того, нужен ли сейчас скролл.
+    let right_edge =
+        frame.cx + frame.w / 2.0 - PICKER_PAD - theme::SCROLLBAR_WIDTH - PICKER_GAP;
     let process_label_max_w = right_edge - process_label_left;
     let window_label_max_w = right_edge - window_label_left;
 
@@ -445,6 +453,27 @@ pub fn build_picker_panel(
             }
             row += 1;
         }
+    }
+
+    // Полоса скролла — только когда реально есть что листать (живой репорт
+    // пользователя: список был длиннее видимой части панели, но ничего не
+    // намекало, что можно листать колесом мыши — `PICKER_SCROLLBAR_ID`,
+    // `overlay_manager::handle_input`, `InputEvent::MouseWheel`).
+    if row > PICKER_VISIBLE_ROWS {
+        let list_h = PICKER_VISIBLE_ROWS as f64 * PICKER_ROW_H;
+        panel.add_widget(ScrollBar::new(
+            PICKER_SCROLLBAR_ID,
+            Box2D {
+                cx: right_edge + PICKER_GAP + theme::SCROLLBAR_WIDTH / 2.0,
+                cy: list_top + list_h / 2.0,
+                w: theme::SCROLLBAR_WIDTH,
+                h: list_h,
+                rotation: 0.0,
+            },
+            PICKER_VISIBLE_ROWS,
+            row,
+            scroll,
+        ));
     }
 
     PickerPanel {
@@ -1486,6 +1515,49 @@ mod tests {
                 .widget::<Checkbox>(PICKER_ROW_WINDOW_BASE + 10)
                 .is_none(),
             "10-е окно за видимым окном не строится"
+        );
+    }
+
+    /// Регрессия на живой репорт пользователя: список длиннее видимой части
+    /// панели ничем не намекал, что его можно листать — полоса скролла
+    /// теперь обязана появиться, когда есть что скроллить, и отсутствовать,
+    /// когда весь список и так помещается.
+    #[test]
+    fn scrollbar_appears_only_when_list_overflows_visible_rows() {
+        let short: Vec<WindowInfo> = (0..3u32)
+            .map(|i| window(i as usize, r"C:\Apps\app.exe", &format!("t{i}"), 1, i))
+            .collect();
+        let short_panel = build_picker_panel(&allowlist(vec![]), &short, 0, picker_frame());
+        assert!(
+            short_panel.total_rows <= PICKER_VISIBLE_ROWS,
+            "фикстура должна умещаться без скролла"
+        );
+        assert!(
+            short_panel
+                .panel
+                .widget::<ScrollBar>(PICKER_SCROLLBAR_ID)
+                .is_none(),
+            "нечего листать — полосы скролла быть не должно"
+        );
+
+        let mut long = Vec::new();
+        for i in 0..12u32 {
+            long.push(window(
+                i as usize,
+                r"C:\Apps\app.exe",
+                &format!("t{i}"),
+                1,
+                i,
+            ));
+        }
+        let long_panel = build_picker_panel(&allowlist(vec![]), &long, 0, picker_frame());
+        assert!(long_panel.total_rows > PICKER_VISIBLE_ROWS);
+        assert!(
+            long_panel
+                .panel
+                .widget::<ScrollBar>(PICKER_SCROLLBAR_ID)
+                .is_some(),
+            "список длиннее видимой части — полоса скролла обязана появиться"
         );
     }
 

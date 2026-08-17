@@ -26,11 +26,12 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWi
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, GWLP_USERDATA, GetMessageW,
-    GetWindowLongPtrW, HWND_MESSAGE, IsWindow, KillTimer, MSG, OBJID_WINDOW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, TranslateMessage,
-    WINEVENT_OUTOFCONTEXT, WM_APP, WM_CLOSE, WM_DESTROY, WM_TIMER, WM_WTSSESSION_CHANGE,
-    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, GWLP_USERDATA,
+    GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, IsWindow, KillTimer, MSG, OBJID_WINDOW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW,
+    TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_APP, WM_CLOSE, WM_DESTROY, WM_TIMER,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_POPUP, WTS_SESSION_LOCK,
+    WTS_SESSION_UNLOCK,
 };
 use windows::core::{PCWSTR, w};
 
@@ -304,11 +305,13 @@ fn create_window() -> Result<HWND, Win32Error> {
     Ok(hwnd)
 }
 
-/// Установить оба диапазона хуков (M4_WINDOW_TRACKER_DESIGN.md §3): диапазон
+/// Установить все диапазоны хуков (M4_WINDOW_TRACKER_DESIGN.md §3, с
+/// правкой по `FOREGROUND` — см. коммент у самого диапазона ниже): диапазон
 /// `DESTROY..LOCATIONCHANGE` захватывает и `SHOW`/`HIDE` (соседние коды) —
 /// колбэк фильтрует по точному `event`, лишние коды в диапазоне просто
-/// падают в `_ => {}`; `MINIMIZESTART..MINIMIZEEND` — отдельный узкий
-/// диапазон (коды не соседствуют с первым). Без `WINEVENT_SKIPOWNPROCESS`
+/// падают в `_ => {}`; `MINIMIZESTART..MINIMIZEEND` и `FOREGROUND` —
+/// отдельные узкие диапазоны (коды не соседствуют ни с первым, ни друг с
+/// другом). Без `WINEVENT_SKIPOWNPROCESS`
 /// намеренно: собственные оверлеи и так никогда не попадают в кэш
 /// (`is_real_window` отбраковывает их по `WS_EX_NOACTIVATE`), поэтому их
 /// `LOCATIONCHANGE` просто не проходит проверку «hwnd в кэше» в колбэке —
@@ -324,6 +327,19 @@ fn install_hooks(state: &mut WndState) {
     for (min, max) in [
         (EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
+        // Узкий диапазон на одно событие (M4_WINDOW_TRACKER_DESIGN.md §3,
+        // пересмотрено — живой репорт пользователя: переключение фокуса
+        // между уже существующими неподвижными окнами не двигало и не
+        // показывало/прятало ни одно окно, поэтому не порождало ни одного
+        // события из диапазонов выше — маска молча не обновлялась при
+        // простом Alt+Tab. Раньше `EVENT_SYSTEM_FOREGROUND` был осознанно
+        // не в таблице («z-order маске не нужен», ADR-004 §4.7) — это было
+        // верно, пока маска строилась как объединение прямоугольников БЕЗ
+        // учёта z-order; теперь `occluder_rects_for` (overlay_manager.rs)
+        // вычитает окна, стоящие выше в z-order, так что смена переднего
+        // плана меняет фактическую видимую площадь окклюдера и обязана
+        // будить пересчёт.
+        (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
     ] {
         // SAFETY: win_event_proc — валидный `WINEVENTPROC`; hmodule/idprocess/
         // idthread = 0/None — весь процесс, любой поток (WINEVENT_OUTOFCONTEXT
@@ -531,7 +547,9 @@ enum PendingOp {
 /// впустую.
 fn classify_event(event: u32, in_cache: bool) -> Option<PendingOp> {
     match event {
-        EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE => Some(PendingOp::NeedsFull),
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_SYSTEM_FOREGROUND => {
+            Some(PendingOp::NeedsFull)
+        }
         EVENT_OBJECT_DESTROY => Some(PendingOp::Destroyed),
         EVENT_SYSTEM_MINIMIZESTART => Some(PendingOp::Minimized(true)),
         EVENT_SYSTEM_MINIMIZEEND => Some(PendingOp::Minimized(false)),
@@ -862,9 +880,25 @@ mod tests {
     #[test]
     fn classify_event_unknown_is_none() {
         assert_eq!(classify_event(0, true), None);
-        // EVENT_SYSTEM_FOREGROUND (3) — намеренно не в таблице хуков
-        // (z-order маске не нужен, M4_WINDOW_TRACKER_DESIGN.md §3).
-        assert_eq!(classify_event(3, true), None);
+    }
+
+    /// Регрессия на живой репорт пользователя: переключение фокуса без
+    /// движения/показа/скрытия окна раньше не будило пересчёт маски вовсе —
+    /// `EVENT_SYSTEM_FOREGROUND` не был в таблице хуков. Теперь окклюдер
+    /// вычитает окна выше по z-order (`occluder_rects_for`), так что смена
+    /// переднего плана меняет фактическую видимую площадь и обязана
+    /// триггерить полное перечисление, как `SHOW`/`HIDE`.
+    #[test]
+    fn classify_event_foreground_needs_full() {
+        assert_eq!(
+            classify_event(EVENT_SYSTEM_FOREGROUND, false),
+            Some(PendingOp::NeedsFull)
+        );
+        // in_cache не важен — тот же принцип, что у SHOW/HIDE.
+        assert_eq!(
+            classify_event(EVENT_SYSTEM_FOREGROUND, true),
+            Some(PendingOp::NeedsFull)
+        );
     }
 
     #[test]

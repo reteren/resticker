@@ -39,10 +39,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
     SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_APP, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR,
-    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA, WM_APP,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK,
     WTS_SESSION_UNLOCK,
 };
@@ -883,6 +884,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // из `toggle_edit_mode`.
                 if state.capture.is_captured() {
                     state.capture.force_release();
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_MOUSEWHEEL => {
+            // Тот же клик-прозрачный гейт, что у мышиных кнопок выше — вне
+            // режима редактирования колесо тоже должно уходить сквозь окно
+            // (`DefWindowProcW`), а не листать невидимую панель. Захвата
+            // мышью колесо не касается — не через `MouseCapture`, отдельное
+            // событие напрямую (живой репорт пользователя: длинный список
+            // окон в панели «Слои видимости» не листался).
+            let click_through =
+                unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0 != 0;
+            if !click_through {
+                if let Some(state) = unsafe { state_ptr.as_mut() } {
+                    // Старшее слово `wParam` — знаковый `i16` дельты колеса
+                    // (MSDN `WM_MOUSEWHEEL`); `WHEEL_DELTA` = 120 на один
+                    // «щелчок» физического колеса.
+                    let raw_delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                    let notches = raw_delta / WHEEL_DELTA as i32;
+                    if notches != 0 {
+                        let _ = state.tx.send(OverlayEvent::Input(InputEvent::MouseWheel {
+                            notches,
+                        }));
+                    }
+                    return LRESULT(0);
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

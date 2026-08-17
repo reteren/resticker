@@ -16,7 +16,7 @@
 //! (`handle_window_pick_list_up`) живёт в overlay_manager.rs, тем же
 //! местом, что у `handle_preset_picker_up`.
 
-use rst_render::{Box2D, Button, ButtonContent, Panel, WidgetId, theme};
+use rst_render::{Box2D, Button, ButtonContent, Panel, ScrollBar, WidgetId, theme};
 use rst_win32::window_enum::WindowInfo;
 
 use crate::window_picker::truncate_to_width;
@@ -28,6 +28,10 @@ pub const PANEL_ID: WidgetId = 500;
 /// z-order снимке (`sorted_snapshot`) — тот же индекс, что видит вызывающий
 /// код при декодировании клика обратно в `WindowInfo`.
 pub const ROW_BASE: WidgetId = 501;
+/// Полоса скролла (тот же живой репорт пользователя, что у
+/// `window_picker::PICKER_SCROLLBAR_ID`: длинный список окон не листался и
+/// ничем не намекал, что это возможно).
+const SCROLLBAR_ID: WidgetId = 599;
 
 /// Ширина панели, DIP.
 pub const WIDTH: f64 = 320.0;
@@ -84,7 +88,10 @@ pub struct PickListPanel {
 pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPanel {
     let mut panel = Panel::new(PANEL_ID, frame);
     let top = frame.cy - frame.h / 2.0 + PAD;
-    let row_w = frame.w - 2.0 * PAD;
+    // Полоса скролла (ниже) всегда откусывает свою колонку от правого края —
+    // ширина строк не скачет в зависимости от того, нужен ли сейчас скролл
+    // (тот же приём, что `window_picker::build_picker_panel`).
+    let row_w = frame.w - 2.0 * PAD - theme::SCROLLBAR_WIDTH - ROW_GAP;
     let max_text_w = row_w - 2.0 * theme::BUTTON_PAD;
 
     for (i, window) in sorted.iter().enumerate().skip(scroll).take(VISIBLE_ROWS) {
@@ -94,13 +101,36 @@ pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPane
         panel.add_widget(Button::new(
             ROW_BASE + i as WidgetId,
             Box2D {
-                cx: frame.cx,
+                cx: frame.cx - theme::SCROLLBAR_WIDTH / 2.0 - ROW_GAP / 2.0,
                 cy,
                 w: row_w,
                 h: theme::BUTTON_SIZE,
                 rotation: 0.0,
             },
             ButtonContent::Label(label),
+        ));
+    }
+
+    if sorted.len() > VISIBLE_ROWS {
+        // Полная высота видимой области списка (VISIBLE_ROWS строк) —
+        // независимо от того, сколько строк реально построилось на текущей
+        // позиции скролла: панель не меняет размер (`height()` капается на
+        // VISIBLE_ROWS), последняя страница просто может быть неполной
+        // (тот же принцип, что у `window_picker`).
+        let list_h =
+            VISIBLE_ROWS as f64 * theme::BUTTON_SIZE + (VISIBLE_ROWS - 1) as f64 * ROW_GAP;
+        panel.add_widget(ScrollBar::new(
+            SCROLLBAR_ID,
+            Box2D {
+                cx: frame.cx + frame.w / 2.0 - PAD - theme::SCROLLBAR_WIDTH / 2.0,
+                cy: top + list_h / 2.0,
+                w: theme::SCROLLBAR_WIDTH,
+                h: list_h,
+                rotation: 0.0,
+            },
+            VISIBLE_ROWS,
+            sorted.len(),
+            scroll,
         ));
     }
 
@@ -208,6 +238,31 @@ mod tests {
         assert_eq!(labels(&p.panel), vec!["Win 12", "Win 13", "Win 14"]);
         assert!(p.panel.widget::<Button>(ROW_BASE + 12).is_some());
         assert!(p.panel.widget::<Button>(ROW_BASE + 11).is_none());
+    }
+
+    /// Регрессия на живой репорт пользователя: длинный список окон для
+    /// закрепления обрезался без намёка на то, что его можно листать.
+    #[test]
+    fn scrollbar_appears_only_when_list_overflows_visible_rows() {
+        let short: Vec<WindowInfo> = (0..3)
+            .map(|i| window(&format!(r"C:\Apps\app{i}.exe"), &format!("Win {i}"), i))
+            .collect();
+        let sorted_short = sorted_snapshot(&short);
+        let p_short = build(&sorted_short, 0, frame(height(sorted_short.len())));
+        assert!(
+            p_short.panel.widget::<ScrollBar>(SCROLLBAR_ID).is_none(),
+            "нечего листать — полосы скролла быть не должно"
+        );
+
+        let long: Vec<WindowInfo> = (0..15)
+            .map(|i| window(&format!(r"C:\Apps\app{i}.exe"), &format!("Win {i}"), i))
+            .collect();
+        let sorted_long = sorted_snapshot(&long);
+        let p_long = build(&sorted_long, 0, frame(height(VISIBLE_ROWS)));
+        assert!(
+            p_long.panel.widget::<ScrollBar>(SCROLLBAR_ID).is_some(),
+            "список длиннее видимой части — полоса скролла обязана появиться"
+        );
     }
 
     #[test]

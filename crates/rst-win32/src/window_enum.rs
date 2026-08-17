@@ -208,6 +208,17 @@ extern "system" fn enum_windows_proc(hwnd: HWND, data: LPARAM) -> BOOL {
 fn collect_window(hwnd: HWND, z_order: u32) -> Option<WindowInfo> {
     let flags = window_flags(hwnd);
     if !is_real_window(&flags) {
+        // Диагностика на живой репорт пользователя («список окон в панели
+        // короче, чем реально открытых окон») — почему именно окно
+        // отфильтровано, без похода на диск/сеть: title/class дёшевы, уже
+        // читаются ниже для принятых окон, здесь читаем только при отказе.
+        tracing::debug!(
+            hwnd = hwnd.0 as usize,
+            title = %window_text(hwnd),
+            class = %window_class(hwnd),
+            ?flags,
+            "is_real_window отбраковал окно"
+        );
         return None;
     }
     let (pid, exe_path) = process_info(hwnd);

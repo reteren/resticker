@@ -4301,6 +4301,18 @@ fn refresh_occlusion(
 /// участвуют: их прямоугольник мусорный (`WindowInfo::iconic`,
 /// M4_PREP_NOTES.md §2.2) — они всё равно не показывают содержимого, под
 /// которым стикеру имело бы смысл прятаться.
+///
+/// Каждый окклюдер режется `occluders::subtract_rects` по окнам, которые
+/// физически ВЫШЕ него в z-order (`window_snapshot` уже в z-order сверху
+/// вниз — `window_tracker.rs`, `Vec<WindowInfo>` кэша) — не только другими
+/// окклюдерами, любым непрозрачным окном. Живой репорт пользователя: без
+/// этого маска резала стикер по прямоугольнику окна, даже когда его
+/// физически не видно (перекрыто чем-то ещё или пользователь давно
+/// переключился на другое окно) — стикер не появлялся обратно, пока
+/// окклюдер не закрывался/не двигался буквально. Теперь видимая площадь
+/// окклюдера — это его rect минус то, что реально сверху, поэтому смена
+/// переднего плана (`EVENT_SYSTEM_FOREGROUND`, см. `window_tracker.rs`)
+/// сразу меняет и маску.
 fn occluder_rects_for(
     mode: VisibilityMode,
     rules: &[OverlapRule],
@@ -4308,22 +4320,33 @@ fn occluder_rects_for(
     window_snapshot: &[WindowInfo],
     monitor_bounds_px: &Rect,
 ) -> Vec<Rect> {
-    window_snapshot
-        .iter()
-        .filter(|w| !w.iconic)
-        .filter(|w| {
-            let candidate = OccluderCandidate {
-                exe_path: window_exe_path(w),
-                title: w.title.clone(),
-                class: w.class.clone(),
-            };
-            occluders::is_occluder(&candidate, mode, rules, never_overlap_taskbar)
-        })
-        .filter_map(|w| {
-            let win_rect = window_rect_to_core(&w.rect)?;
-            occluders::clip_rect(&win_rect, monitor_bounds_px)
-        })
-        .collect()
+    let visible: Vec<&WindowInfo> = window_snapshot.iter().filter(|w| !w.iconic).collect();
+    let mut rects = Vec::new();
+    for (i, w) in visible.iter().enumerate() {
+        let candidate = OccluderCandidate {
+            exe_path: window_exe_path(w),
+            title: w.title.clone(),
+            class: w.class.clone(),
+        };
+        if !occluders::is_occluder(&candidate, mode, rules, never_overlap_taskbar) {
+            continue;
+        }
+        let Some(win_rect) = window_rect_to_core(&w.rect) else {
+            continue;
+        };
+        // `visible[..i]` — всё, что стоит выше `w` в z-order (индекс 0 —
+        // самое верхнее окно).
+        let higher: Vec<Rect> = visible[..i]
+            .iter()
+            .filter_map(|hw| window_rect_to_core(&hw.rect))
+            .collect();
+        for piece in occluders::subtract_rects(win_rect, &higher) {
+            if let Some(clipped) = occluders::clip_rect(&piece, monitor_bounds_px) {
+                rects.push(clipped);
+            }
+        }
+    }
+    rects
 }
 
 /// `WindowInfo::exe_path` — пустой `PathBuf`, когда `OpenProcess` не дал путь
@@ -6561,6 +6584,29 @@ fn handle_input(
                 if let Err(e) = config::save(cfg, config_path) {
                     tracing::warn!(error = %e, "не удалось сохранить config.json после жеста редактирования");
                 }
+                true
+            } else {
+                false
+            }
+        }
+        InputEvent::MouseWheel { notches } => {
+            // Живой репорт пользователя: длинный список окон в панели «Слои
+            // видимости»/списке закрепления окон обрезался без возможности
+            // долистать — `scroll` был, но ничего не двигало его. Три строки
+            // на «щелчок» колеса — типичный шаг ОС для списков. На нижний
+            // край (за пределы `total_rows`) кламп делает сам
+            // `rebuild_window_picker`/`rebuild_window_pick_list`, здесь
+            // нужен только пол в 0 — `saturating_add_signed` даёт его
+            // бесплатно.
+            const ROWS_PER_NOTCH: isize = 3;
+            let rows = (notches as isize).saturating_mul(-ROWS_PER_NOTCH);
+            if let Some(state) = &mut edit.window_picker {
+                state.scroll = state.scroll.saturating_add_signed(rows);
+                rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+                true
+            } else if let Some(state) = &mut edit.window_pick_list {
+                state.scroll = state.scroll.saturating_add_signed(rows);
+                rebuild_window_pick_list(edit, window_snapshot, monitor_geometry);
                 true
             } else {
                 false
@@ -8879,6 +8925,116 @@ mod tests {
             &bounds(0, 0, 1920, 1080),
         );
         assert!(rects.is_empty());
+    }
+
+    /// Регрессия на живой репорт пользователя: окклюдер, частично закрытый
+    /// ДРУГИМ окном, стоящим выше него в z-order (`windows[0]` — самое
+    /// верхнее, порядок кэша трекера), даёт вырезанный прямоугольник, а не
+    /// исходный целиком — иначе стикер оставался спрятанным даже там, где
+    /// окклюдер физически не виден. Allow-list с правилом `notepad.exe`:
+    /// `notepad` — «разрешённое» окно (сверху, `is_occluder` false, само по
+    /// себе рект в вывод не даёт), `chrome` не подходит под правило —
+    /// окклюдер (сравнение с `allowlist_matches_by_short_process_name`/
+    /// `allowlist_process_rule_no_exe_path_still_occludes` в occluders.rs).
+    #[test]
+    fn occluder_rects_for_subtracts_windows_above_in_z_order() {
+        let on_top = window(
+            Some("notepad.exe"),
+            "поверх",
+            "c",
+            WindowRect {
+                x: 0,
+                y: 0,
+                w: 50,
+                h: 100,
+            },
+            false,
+        );
+        let occluder = window(
+            Some("chrome.exe"),
+            "t",
+            "c",
+            WindowRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
+            false,
+        );
+        // z-order сверху вниз: `on_top` первым (топовое окно), `occluder` —
+        // ниже (window_tracker.rs: «Кэш: Vec<WindowInfo> (порядок = z-order)»).
+        let windows = vec![on_top, occluder];
+        let rule = OverlapRule {
+            process_name: Some("notepad.exe".to_string()),
+            title_pattern: None,
+        };
+        let rects = occluder_rects_for(
+            VisibilityMode::OverlapAllowlist,
+            &[rule],
+            false,
+            &windows,
+            &bounds(0, 0, 1920, 1080),
+        );
+        let total_area: i64 = rects.iter().map(|r| r.w as i64 * r.h as i64).sum();
+        assert_eq!(
+            total_area,
+            100 * 100 - 50 * 100,
+            "видимая площадь окклюдера — его rect минус то, что реально сверху"
+        );
+        for r in &rects {
+            assert!(r.x >= 50, "куски не должны заходить в область on_top: {r:?}");
+        }
+    }
+
+    /// Окно, разрешённое allow-list'ом (само не окклюдер), но стоящее выше
+    /// окклюдера в z-order и полностью его закрывающее, всё равно должно
+    /// вычитать его площадь — маска реагирует на «что реально видно», а не
+    /// только на другие окклюдеры (тот самый случай из репорта:
+    /// переключились на постороннее/разрешённое окно — оно теперь сверху и
+    /// закрывает исключённое окно, стикер обязан появиться под ним).
+    #[test]
+    fn occluder_rects_for_subtracts_non_matching_window_above_too() {
+        let allowed_on_top = window(
+            Some("notepad.exe"),
+            "разрешённое",
+            "c",
+            WindowRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
+            false,
+        );
+        let occluder = window(
+            Some("chrome.exe"),
+            "t",
+            "c",
+            WindowRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
+            false,
+        );
+        let windows = vec![allowed_on_top, occluder];
+        let rule = OverlapRule {
+            process_name: Some("notepad.exe".to_string()),
+            title_pattern: None,
+        };
+        let rects = occluder_rects_for(
+            VisibilityMode::OverlapAllowlist,
+            &[rule],
+            false,
+            &windows,
+            &bounds(0, 0, 1920, 1080),
+        );
+        assert!(
+            rects.is_empty(),
+            "полностью закрытый сверху окклюдер не должен давать видимую площадь, а закрывающее окно само не окклюдер"
+        );
     }
 
     #[test]

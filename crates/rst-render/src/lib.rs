@@ -51,7 +51,7 @@ pub use ui_textures::{TextureFactory, UiTextures};
 pub use video::VideoTextures;
 pub use widgets::{
     Button, ButtonContent, Checkbox, EventResult, Icon, Key, NumericField, Panel, PointerEvent,
-    Primitive, Slider, Widget, WidgetId, box_contains, theme,
+    Primitive, ScrollBar, Slider, Widget, WidgetId, box_contains, theme,
 };
 pub use window_highlight::{HIGHLIGHT_THICKNESS_DIP, HighlightKind, WindowHighlight};
 pub use window_target::WindowTarget;

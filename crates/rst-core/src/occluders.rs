@@ -170,6 +170,89 @@ pub fn clip_rect(r: &Rect, bounds: &Rect) -> Option<Rect> {
     })
 }
 
+/// `base` минус объединение `holes` — список непересекающихся прямоугольников,
+/// покрывающих ровно ту часть `base`, которую не закрывает ни один из `holes`
+/// (живой репорт пользователя: маска резала стикер по прямоугольнику окна,
+/// даже когда это окно физически не видно — перекрыто чем-то другим или
+/// просто не в фокусе; `occluder_rects_for` в `overlay_manager.rs` вызывает
+/// это для каждого окна-окклюдера с `holes` = окна, стоящие выше него в
+/// z-order, чтобы прятать стикер только там, где окклюдер реально виден).
+/// Каждая дыра режет накопленные куски на «бублик» из до 4 полос (верх/низ/
+/// лево/право вокруг пересечения) — классический алгоритм вычитания
+/// прямоугольников, без пересечений и без дыр между кусками.
+pub fn subtract_rects(base: Rect, holes: &[Rect]) -> Vec<Rect> {
+    let mut pieces = vec![base];
+    for hole in holes {
+        if pieces.is_empty() {
+            break;
+        }
+        pieces = pieces
+            .into_iter()
+            .flat_map(|p| subtract_one(p, hole))
+            .collect();
+    }
+    pieces
+}
+
+/// `r` минус `hole` — до 4 непересекающихся прямоугольников. Пустой
+/// `Vec` — `hole` полностью покрывает `r`.
+fn subtract_one(r: Rect, hole: &Rect) -> Vec<Rect> {
+    let (rx0, ry0) = (r.x, r.y);
+    let (rx1, ry1) = (r.x.saturating_add(r.w as i32), r.y.saturating_add(r.h as i32));
+    let (hx0, hy0) = (hole.x, hole.y);
+    let (hx1, hy1) = (
+        hole.x.saturating_add(hole.w as i32),
+        hole.y.saturating_add(hole.h as i32),
+    );
+
+    let ix0 = rx0.max(hx0);
+    let iy0 = ry0.max(hy0);
+    let ix1 = rx1.min(hx1);
+    let iy1 = ry1.min(hy1);
+    if ix1 <= ix0 || iy1 <= iy0 {
+        return vec![r]; // не пересекаются — r остаётся целиком
+    }
+
+    let mut out = Vec::with_capacity(4);
+    // Верхняя полоса: вся ширина r, от верха r до верха пересечения.
+    if iy0 > ry0 {
+        out.push(Rect {
+            x: rx0,
+            y: ry0,
+            w: r.w,
+            h: (iy0 - ry0) as u32,
+        });
+    }
+    // Нижняя полоса: вся ширина r, от низа пересечения до низа r.
+    if iy1 < ry1 {
+        out.push(Rect {
+            x: rx0,
+            y: iy1,
+            w: r.w,
+            h: (ry1 - iy1) as u32,
+        });
+    }
+    // Левая и правая полосы — только в вертикальной полосе пересечения
+    // [iy0, iy1), чтобы не задваивать углы с верхней/нижней полосой.
+    if ix0 > rx0 {
+        out.push(Rect {
+            x: rx0,
+            y: iy0,
+            w: (ix0 - rx0) as u32,
+            h: (iy1 - iy0) as u32,
+        });
+    }
+    if ix1 < rx1 {
+        out.push(Rect {
+            x: ix1,
+            y: iy0,
+            w: (rx1 - ix1) as u32,
+            h: (iy1 - iy0) as u32,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +520,93 @@ mod tests {
         let win = r(-100, 200, 400, 300);
         assert_eq!(clip_rect(&win, &left), Some(r(1820, 200, 100, 300)));
         assert_eq!(clip_rect(&win, &right), Some(r(0, 200, 300, 300)));
+    }
+
+    // --- subtract_rects (окклюдер виден только там, где его не закрывает
+    // окно выше по z-order — живой репорт пользователя) ---
+
+    fn area(rects: &[Rect]) -> i64 {
+        rects.iter().map(|r| r.w as i64 * r.h as i64).sum()
+    }
+
+    /// Ни один из полученных кусков не пересекается ни с одной дырой —
+    /// инвариант, который должен держаться независимо от геометрии.
+    fn no_piece_overlaps_any_hole(pieces: &[Rect], holes: &[Rect]) -> bool {
+        pieces.iter().all(|p| {
+            holes.iter().all(|h| {
+                let ix0 = p.x.max(h.x);
+                let iy0 = p.y.max(h.y);
+                let ix1 = (p.x + p.w as i32).min(h.x + h.w as i32);
+                let iy1 = (p.y + p.h as i32).min(h.y + h.h as i32);
+                ix1 <= ix0 || iy1 <= iy0
+            })
+        })
+    }
+
+    #[test]
+    fn subtract_rects_no_overlap_keeps_base_whole() {
+        let base = r(0, 0, 100, 100);
+        let hole = r(200, 200, 50, 50);
+        assert_eq!(subtract_rects(base, &[hole]), vec![base]);
+    }
+
+    #[test]
+    fn subtract_rects_hole_fully_covers_base_yields_empty() {
+        let base = r(10, 10, 50, 50);
+        let hole = r(0, 0, 1000, 1000);
+        assert_eq!(subtract_rects(base, &[hole]), Vec::<Rect>::new());
+    }
+
+    #[test]
+    fn subtract_rects_center_hole_leaves_four_strips_of_correct_total_area() {
+        // Окклюдер 100x100 в (0,0); окно выше по z-order — центральный
+        // квадрат 20x20 — видимая площадь окклюдера теряет ровно этот кусок.
+        let base = r(0, 0, 100, 100);
+        let hole = r(40, 40, 20, 20);
+        let pieces = subtract_rects(base, &[hole]);
+        assert_eq!(area(&pieces), 100 * 100 - 20 * 20);
+        assert!(no_piece_overlaps_any_hole(&pieces, &[hole]));
+    }
+
+    #[test]
+    fn subtract_rects_edge_hole_leaves_two_strips() {
+        // Дыра прижата к левому краю на всю высоту — левая/правая полосы
+        // вырождаются в одну (левой полосы нет вовсе, только правая), но
+        // верх/низ по-прежнему валидны (в данном случае дыра высотой во
+        // весь r — значит и верх/низ вырождаются тоже, остаётся одна
+        // полоса справа).
+        let base = r(0, 0, 100, 100);
+        let hole = r(0, 0, 30, 100);
+        assert_eq!(subtract_rects(base, &[hole]), vec![r(30, 0, 70, 100)]);
+    }
+
+    #[test]
+    fn subtract_rects_multiple_holes_accumulate() {
+        // Живой сценарий: окклюдер частично закрыт ДВУМЯ окнами, стоящими
+        // выше него в z-order (например, два маленьких окна поверх одного
+        // большого).
+        let base = r(0, 0, 100, 100);
+        let holes = [r(0, 0, 30, 30), r(70, 70, 30, 30)];
+        let pieces = subtract_rects(base, &holes);
+        assert_eq!(area(&pieces), 100 * 100 - 30 * 30 - 30 * 30);
+        assert!(no_piece_overlaps_any_hole(&pieces, &holes));
+    }
+
+    #[test]
+    fn subtract_rects_disjoint_pieces_never_overlap_each_other() {
+        let base = r(0, 0, 100, 100);
+        let holes = [r(20, 0, 10, 100), r(60, 0, 10, 100)];
+        let pieces = subtract_rects(base, &holes);
+        for i in 0..pieces.len() {
+            for j in (i + 1)..pieces.len() {
+                let a = pieces[i];
+                let b = pieces[j];
+                let ix0 = a.x.max(b.x);
+                let iy0 = a.y.max(b.y);
+                let ix1 = (a.x + a.w as i32).min(b.x + b.w as i32);
+                let iy1 = (a.y + a.h as i32).min(b.y + b.h as i32);
+                assert!(ix1 <= ix0 || iy1 <= iy0, "куски {a:?} и {b:?} пересекаются");
+            }
+        }
     }
 }

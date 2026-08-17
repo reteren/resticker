@@ -1,7 +1,11 @@
 //! Системный диалог выбора файла (M2, панель у курсора: кнопка «Загрузить
 //! файл» — `docs/M2_WIRING_PLAN.md`, раздел 12). Обёртка над `IFileOpenDialog`
 //! (COM, `Common Item Dialog`), с фильтром по расширениям изображений и,
-//! начиная с M5b, видео.
+//! начиная с M5b, видео. Открывается на комбинированном фильтре «все
+//! поддерживаемые файлы» (картинки и видео сразу в одном списке) — раньше
+//! дефолтом был отдельный фильтр «Images», из-за чего видео в диалоге
+//! выглядело недоступным, пока пользователь не находил переключатель
+//! фильтра вручную.
 //!
 //! Каждый вызов сам инициализирует и деинициализирует COM на вызывающем
 //! потоке (`CoInitializeEx`/`CoUninitialize`) — диалог модален и живёт ровно
@@ -41,6 +45,16 @@ const IMAGE_FILTER_SPEC: &str = "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp";
 /// разошлись.
 const VIDEO_FILTER_NAME: &str = "Videos";
 
+/// Имя комбинированного фильтра «изображения и видео» — открывается первым
+/// (индекс 1), чтобы видео не терялось за отдельным непереключённым
+/// фильтром «Images» (живой репорт пользователя: диалог открывался на
+/// «Images», mp4 в списке казались отфильтрованными/недоступными, хотя
+/// декодер их прекрасно открывает — единственная проблема была в порядке
+/// фильтров, не в поддержке формата). «Images»/«Videos» остаются отдельными
+/// пунктами в том же выпадающем списке — для тех, кто хочет сузить список
+/// вручную.
+const ALL_MEDIA_FILTER_NAME: &str = "All supported files";
+
 fn video_filter_spec() -> String {
     VIDEO_EXTENSIONS
         .iter()
@@ -49,12 +63,16 @@ fn video_filter_spec() -> String {
         .join(";")
 }
 
+fn all_media_filter_spec() -> String {
+    format!("{IMAGE_FILTER_SPEC};{}", video_filter_spec())
+}
+
 /// Показать системный диалог выбора файла-изображения или видео
 /// (`owner_hwnd` — окно-владелец; `HWND(0)`/`HWND::default()`, если владельца
 /// нет). `Ok(None)` — пользователь отменил выбор, это не ошибка. Диалог
-/// открывается на фильтре «Images» (индекс 1) — видео выбирается
-/// переключением фильтра в самом диалоге, тем же способом, что и раньше для
-/// любого не первого по списку расширения.
+/// открывается на комбинированном фильтре «All supported files» (индекс 1,
+/// картинки и видео вместе) — «Images»/«Videos» доступны рядом в том же
+/// выпадающем списке, если нужно сузить выбор.
 pub fn pick_media_file(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> {
     // SAFETY: инициализация COM на вызывающем потоке для длительности одного
     // модального диалога; деинициализация — в конце этой же функции, на том
@@ -92,7 +110,20 @@ fn show_dialog(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
+    let all_media_filter_name: Vec<u16> = ALL_MEDIA_FILTER_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let all_media_filter_spec_owned = all_media_filter_spec();
+    let all_media_filter_spec: Vec<u16> = all_media_filter_spec_owned
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let filters = [
+        COMDLG_FILTERSPEC {
+            pszName: PCWSTR(all_media_filter_name.as_ptr()),
+            pszSpec: PCWSTR(all_media_filter_spec.as_ptr()),
+        },
         COMDLG_FILTERSPEC {
             pszName: PCWSTR(image_filter_name.as_ptr()),
             pszSpec: PCWSTR(image_filter_spec.as_ptr()),
@@ -102,12 +133,14 @@ fn show_dialog(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> {
             pszSpec: PCWSTR(video_filter_spec.as_ptr()),
         },
     ];
-    // SAFETY: `filters` содержит указатели в `image_filter_name`/
-    // `image_filter_spec`/`video_filter_name`/`video_filter_spec`, все живут
-    // до конца этой функции — дольше, чем нужен вызов.
+    // SAFETY: `filters` содержит указатели в `all_media_filter_name`/
+    // `all_media_filter_spec`/`image_filter_name`/`image_filter_spec`/
+    // `video_filter_name`/`video_filter_spec`, все живут до конца этой
+    // функции — дольше, чем нужен вызов.
     unsafe { dialog.SetFileTypes(&filters) }?;
     // SAFETY: индексация фильтров у `IFileDialog` с единицы (не с нуля) —
-    // 1 открывает диалог на фильтре «Images» по умолчанию.
+    // 1 открывает диалог на комбинированном фильтре «All supported files»
+    // по умолчанию (см. доккомент `pick_media_file`).
     unsafe { dialog.SetFileTypeIndex(1) }?;
 
     let owner = if owner_hwnd.is_invalid() {
@@ -191,6 +224,28 @@ mod tests {
         }
     }
 
+    /// Регрессия на живой репорт пользователя: диалог открывался на
+    /// фильтре «Images» по умолчанию, mp4 в списке выглядели недоступными
+    /// — формат декодер поддерживал всегда, дело было только в порядке
+    /// фильтров. Комбинированный фильтр (индекс 1, дефолт) обязан покрывать
+    /// оба списка расширений одновременно.
+    #[test]
+    fn all_media_filter_spec_covers_both_images_and_video() {
+        let spec = all_media_filter_spec();
+        for ext in ["png", "jpg", "jpeg", "bmp", "gif", "webp"] {
+            assert!(
+                spec.contains(&format!("*.{ext}")),
+                "комбинированный фильтр не содержит расширение изображения {ext}"
+            );
+        }
+        for ext in VIDEO_EXTENSIONS {
+            assert!(
+                spec.contains(&format!("*.{ext}")),
+                "комбинированный фильтр не содержит видео-расширение {ext}"
+            );
+        }
+    }
+
     #[test]
     fn filter_strings_are_null_terminated_when_encoded() {
         // То же преобразование, что и в `show_dialog`, — конечный элемент
@@ -206,9 +261,9 @@ mod tests {
     #[test]
     #[ignore = "открывает реальный системный диалог; запуск вручную: cargo test -p rst-win32 file_dialog -- --ignored"]
     fn pick_media_file_manual_smoke() {
-        // Ручная проверка: диалог должен открыться с фильтром «Images» (и
-        // доступным переключением на «Videos») и вернуть выбранный путь либо
-        // `None` при отмене.
+        // Ручная проверка: диалог должен открыться с комбинированным
+        // фильтром «All supported files» (картинки и видео сразу видны, без
+        // переключения) и вернуть выбранный путь либо `None` при отмене.
         let result = pick_media_file(HWND::default());
         assert!(result.is_ok(), "{result:?}");
     }
