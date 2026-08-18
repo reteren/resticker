@@ -16,8 +16,16 @@
 //! (`handle_window_pick_list_up`) живёт в overlay_manager.rs, тем же
 //! местом, что у `handle_preset_picker_up`.
 
-use rst_render::{Box2D, Button, ButtonContent, Panel, ScrollBar, WidgetId, theme};
-use rst_win32::window_enum::WindowInfo;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use rst_core::model::OverlapRule;
+use rst_core::occluders::is_denylisted;
+use rst_render::{
+    Box2D, Button, ButtonContent, Label, Panel, Primitive, ScrollBar, Widget, WidgetId, text_size,
+    theme,
+};
+use rst_win32::window_enum::{WindowIcon, WindowInfo};
 
 use crate::window_picker::truncate_to_width;
 
@@ -32,6 +40,15 @@ pub const ROW_BASE: WidgetId = 501;
 /// `window_picker::PICKER_SCROLLBAR_ID`: длинный список окон не листался и
 /// ничем не намекал, что это возможно).
 const SCROLLBAR_ID: WidgetId = 599;
+/// Плейсхолдер «нет окон» (пустой снимок): отдельный id вне диапазона строк
+/// (визуальный полироль — раньше пустой список оставлял панель голым
+/// прямоугольником без единой подсказки).
+const EMPTY_LABEL_ID: WidgetId = 598;
+/// Флаг для id надписи строки — не декодируется координатором обратно в
+/// окно (тот же приём, что `window_picker::LABEL_FLAG`: строка = интерактивная
+/// `Button` под тем же индексом + неинтерактивная надпись поверх неё, оба
+/// виджета делят видимый прямоугольник строки).
+const LABEL_FLAG: WidgetId = 0x8000_0000;
 
 /// Ширина панели, DIP.
 pub const WIDTH: f64 = 320.0;
@@ -39,6 +56,13 @@ pub const WIDTH: f64 = 320.0;
 const PAD: f64 = 6.0;
 /// Зазор между строками, DIP.
 const ROW_GAP: f64 = 4.0;
+/// Сторона слота иконки строки, DIP — тот же размер, что
+/// `window_picker::PICKER_ICON_SIZE` (визуальная параллель с «Слои
+/// видимости», ближайшим аналогом этой панели в D3D11-рендере).
+const ICON_SIZE: f64 = 20.0;
+/// Зазор между иконкой и текстом строки, DIP — тот же, что
+/// `window_picker::PICKER_GAP`.
+const ICON_GAP: f64 = 8.0;
 /// Сколько строк списка влезает в панель без скролла (виртуализация, тот
 /// же приём, что `window_picker::PICKER_VISIBLE_ROWS`).
 pub const VISIBLE_ROWS: usize = 10;
@@ -59,6 +83,39 @@ pub fn sorted_snapshot(snapshot: &[WindowInfo]) -> Vec<WindowInfo> {
     out
 }
 
+/// Снимок, из которого убраны окна, не годящиеся для закрепления
+/// (редизайн пинов, SPEC.md «Закрепление окна»): денайлистовые
+/// (`cfg.settings.denylist`, предикат [`is_denylisted`] — те же
+/// процесс/заголовок-правила, что у хоткей-пина) и свёрнутые (rect от DWM
+/// мусорный, пинить нечего — тот же принцип, что у `window_picker`/
+/// окклюдеров). Порядок снимка сохраняется — сортировка по z-order
+/// ([`sorted_snapshot`]) накладывается ПОВЕРХ этого фильтра, и индексы
+/// строк должны считаться по одинаково отфильтрованному списку и в билдере,
+/// и при декодировании клика (координатор, `handle_window_pick_list_up`).
+///
+/// Процесс для денайлиста — полный путь к exe, как его понимают
+/// окклюдеры (`path_eq_ignore_case`: правило матчит и по полному пути, и по
+/// одному имени файла).
+pub fn eligible_snapshot(snapshot: &[WindowInfo], denylist: &[OverlapRule]) -> Vec<WindowInfo> {
+    snapshot
+        .iter()
+        .filter(|w| !w.iconic && !is_denylisted(window_exe_path(w).as_deref(), Some(&w.title), denylist))
+        .cloned()
+        .collect()
+}
+
+/// Полный путь к exe окна для денайлиста — тот же перевод, что
+/// `window_exe_path` в overlay_manager.rs (дублирован локально: тот
+/// приватный, а этот модуль — самодостаточный и тестируемый без
+/// координатора).
+fn window_exe_path(w: &WindowInfo) -> Option<String> {
+    if w.exe_path.as_os_str().is_empty() {
+        None
+    } else {
+        w.exe_path.to_str().map(str::to_owned)
+    }
+}
+
 /// Подпись строки: заголовок окна, иначе (пустой заголовок) — имя exe,
 /// иначе — заглушка. Окно из кэша трекера всегда должно быть чем-то
 /// подписано, иначе строку нечем отличить от соседней.
@@ -73,6 +130,15 @@ fn row_label(window: &WindowInfo, max_w: f64) -> String {
     truncate_to_width(&text, max_w)
 }
 
+/// Стабильный key иконки для кэша текстур (`Primitive::Rgba`) — тот же
+/// приём, что `window_picker::icon_key`: хэш полного пути exe, окна одного
+/// процесса делят одну GPU-текстуру.
+fn icon_key(window: &WindowInfo) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    window.exe_path.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Результат [`build`]: панель + общее число строк (для клампа скролла
 /// вызывающим кодом, тот же контракт, что `window_picker::PickerPanel`).
 pub struct PickListPanel {
@@ -80,11 +146,81 @@ pub struct PickListPanel {
     pub total_rows: usize,
 }
 
+/// Иконка + подпись строки (визуальный аналог `window_picker::RowLabel` —
+/// не переиспользуется напрямую, тот приватен и завязан на бизнес-логику
+/// панели правил соседства, здесь только отрисовка). Не интерактивна: клики
+/// и hover-подсветку строки обрабатывает лежащая под ней `Button` того же
+/// прямоугольника (тот же id, без [`LABEL_FLAG`]) — тот же приём разделения
+/// «фон/интерактив» и «контент» строки, что в `window_picker.rs`.
+struct RowContent {
+    id: WidgetId,
+    text_rect: Box2D,
+    icon_rect: Box2D,
+    text: String,
+    icon: Option<(u64, WindowIcon)>,
+}
+
+impl Widget for RowContent {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.text_rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.text_rect = bounds;
+    }
+
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        match &self.icon {
+            Some((key, icon)) => out.push(Primitive::Rgba {
+                rect: self.icon_rect,
+                key: *key,
+                width: icon.width,
+                height: icon.height,
+                rgba: icon.rgba.clone(),
+                opacity: 1.0,
+            }),
+            None => out.push(Primitive::Fill {
+                rect: self.icon_rect,
+                color: theme::BUTTON_BG,
+                opacity: 1.0,
+            }),
+        }
+        if !self.text.is_empty() {
+            out.push(Primitive::Text {
+                rect: self.text_rect,
+                text: self.text.clone(),
+                color: theme::TEXT,
+                opacity: 1.0,
+            });
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 /// Собрать видимый срез списка. `sorted` — [`sorted_snapshot`] (уже
 /// отсортированный, чтобы не сортировать на каждый вызов при скролле),
 /// `scroll` — сколько строк пропущено сверху, `frame` — рамка панели
 /// (типовой размер — [`WIDTH`]×[`height`]`(sorted.len())`, вызывающий код
 /// сам решает).
+///
+/// Пустой список (`sorted` пуст) не остаётся голым прямоугольником —
+/// рисуется приглушённая подсказка по центру панели (полироль: раньше
+/// пустая панель ничем не отличалась от зависшей/незагруженной).
 pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPanel {
     let mut panel = Panel::new(PANEL_ID, frame);
     let top = frame.cy - frame.h / 2.0 + PAD;
@@ -92,23 +228,58 @@ pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPane
     // ширина строк не скачет в зависимости от того, нужен ли сейчас скролл
     // (тот же приём, что `window_picker::build_picker_panel`).
     let row_w = frame.w - 2.0 * PAD - theme::SCROLLBAR_WIDTH - ROW_GAP;
-    let max_text_w = row_w - 2.0 * theme::BUTTON_PAD;
+    let row_left = frame.cx - row_w / 2.0 - theme::SCROLLBAR_WIDTH / 2.0 - ROW_GAP / 2.0;
+    let icon_cx = row_left + ICON_SIZE / 2.0;
+    let text_left = icon_cx + ICON_SIZE / 2.0 + ICON_GAP;
+    let row_right = row_left + row_w;
+    let max_text_w = (row_right - text_left).max(0.0);
+
+    if sorted.is_empty() {
+        let mut label = Label::new(EMPTY_LABEL_ID, row_left, frame.cy, "Нет доступных окон");
+        label.set_dim(true);
+        panel.add_widget(label);
+    }
 
     for (i, window) in sorted.iter().enumerate().skip(scroll).take(VISIBLE_ROWS) {
         let visible_index = i - scroll;
         let cy = top + visible_index as f64 * (theme::BUTTON_SIZE + ROW_GAP) + theme::BUTTON_SIZE / 2.0;
-        let label = row_label(window, max_text_w);
+        let id = ROW_BASE + i as WidgetId;
+        // Фон + hover/armed-подсветка + хит-тест строки — без своей надписи
+        // (иначе конвейер спрайтов растянул бы текстуру текста на всю
+        // ширину строки, см. регрессионный тест в rst-render `widgets.rs`);
+        // содержимое рисует `RowContent` поверх.
         panel.add_widget(Button::new(
-            ROW_BASE + i as WidgetId,
+            id,
             Box2D {
-                cx: frame.cx - theme::SCROLLBAR_WIDTH / 2.0 - ROW_GAP / 2.0,
+                cx: row_left + row_w / 2.0,
                 cy,
                 w: row_w,
                 h: theme::BUTTON_SIZE,
                 rotation: 0.0,
             },
-            ButtonContent::Label(label),
+            ButtonContent::Label(String::new()),
         ));
+        let label = row_label(window, max_text_w);
+        let (label_w, label_h) = text_size(&label);
+        panel.add_widget(RowContent {
+            id: id + LABEL_FLAG,
+            text_rect: Box2D {
+                cx: text_left + label_w / 2.0,
+                cy,
+                w: label_w,
+                h: label_h,
+                rotation: 0.0,
+            },
+            icon_rect: Box2D {
+                cx: icon_cx,
+                cy,
+                w: ICON_SIZE,
+                h: ICON_SIZE,
+                rotation: 0.0,
+            },
+            text: label,
+            icon: window.icon.clone().map(|icon| (icon_key(window), icon)),
+        });
     }
 
     if sorted.len() > VISIBLE_ROWS {
@@ -143,7 +314,6 @@ pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPane
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rst_render::{Primitive, Widget};
     use std::path::PathBuf;
 
     fn window(exe: &str, title: &str, z: u32) -> WindowInfo {
@@ -190,8 +360,25 @@ mod tests {
         let sorted = sorted_snapshot(&[]);
         let p = build(&sorted, 0, frame(height(0)));
         assert_eq!(p.total_rows, 0);
-        assert!(labels(&p.panel).is_empty());
         assert!(p.panel.widget::<Button>(ROW_BASE).is_none());
+    }
+
+    /// Полироль: пустой список окон рисует подсказку вместо голого
+    /// прямоугольника.
+    #[test]
+    fn empty_snapshot_shows_placeholder_message() {
+        let sorted = sorted_snapshot(&[]);
+        let p = build(&sorted, 0, frame(height(0)));
+        assert_eq!(labels(&p.panel), vec!["Нет доступных окон"]);
+    }
+
+    /// Непустой список не показывает подсказку «нет окон».
+    #[test]
+    fn nonempty_snapshot_has_no_placeholder_message() {
+        let snapshot = [window(r"C:\Apps\a.exe", "A", 0)];
+        let sorted = sorted_snapshot(&snapshot);
+        let p = build(&sorted, 0, frame(height(1)));
+        assert!(!labels(&p.panel).contains(&"Нет доступных окон".to_string()));
     }
 
     #[test]
@@ -286,6 +473,41 @@ mod tests {
         assert!(text.len() < snapshot[0].title.len());
     }
 
+    /// Полироль: строка без иконки окна рисует плейсхолдер-квадрат (тот же
+    /// приём, что `window_picker::RowLabel`), не оставляет колонку иконки
+    /// пустой/невидимой.
+    #[test]
+    fn row_without_icon_draws_placeholder_fill() {
+        let snapshot = [window(r"C:\Apps\app.exe", "App", 0)];
+        let sorted = sorted_snapshot(&snapshot);
+        let p = build(&sorted, 0, frame(height(1)));
+        let mut out = Vec::new();
+        p.panel.draw(&mut out);
+        let has_icon_placeholder = out.iter().any(|prim| {
+            matches!(prim, Primitive::Fill { rect, .. } if rect.w == ICON_SIZE && rect.h == ICON_SIZE)
+        });
+        assert!(has_icon_placeholder, "нет иконки — рисуется плейсхолдер-квадрат");
+    }
+
+    /// Строка с реальной иконкой окна рисует её растром, не плейсхолдером.
+    #[test]
+    fn row_with_icon_draws_rgba_primitive() {
+        let mut w = window(r"C:\Apps\app.exe", "App", 0);
+        w.icon = Some(WindowIcon {
+            width: 16,
+            height: 16,
+            rgba: vec![0u8; 16 * 16 * 4],
+        });
+        let sorted = sorted_snapshot(&[w]);
+        let p = build(&sorted, 0, frame(height(1)));
+        let mut out = Vec::new();
+        p.panel.draw(&mut out);
+        let has_rgba_icon = out
+            .iter()
+            .any(|prim| matches!(prim, Primitive::Rgba { width: 16, height: 16, .. }));
+        assert!(has_rgba_icon, "с иконкой — рисуется реальный растр, не плейсхолдер");
+    }
+
     #[test]
     fn height_grows_with_visible_count_but_caps_at_visible_rows() {
         assert!(height(3) > height(1));
@@ -294,6 +516,71 @@ mod tests {
             height(VISIBLE_ROWS),
             height(VISIBLE_ROWS + 50),
             "высота не растёт за пределы видимых строк — список скроллится"
+        );
+    }
+
+    #[test]
+    fn eligible_snapshot_removes_denylisted_windows() {
+        let allowed = window(r"C:\Apps\good.exe", "Good", 0);
+        let denied_by_name = window(r"C:\Apps\bad.exe", "Bad", 1);
+        let denied_by_title = window(r"C:\Apps\other.exe", "Secret * window", 2);
+        let snapshot = [allowed.clone(), denied_by_name.clone(), denied_by_title.clone()];
+        let denylist = vec![
+            OverlapRule {
+                process_name: Some("bad.exe".to_string()),
+                title_pattern: None,
+            },
+            OverlapRule {
+                process_name: None,
+                title_pattern: Some("Secret * window".to_string()),
+            },
+        ];
+        let eligible = eligible_snapshot(&snapshot, &denylist);
+        assert_eq!(
+            eligible,
+            vec![allowed.clone()],
+            "денайлистовые окна не в списке вовсе"
+        );
+        // Порядок исходного снимка сохранён (сортировка — отдельный шаг).
+        let eligible_full = eligible_snapshot(&snapshot, &[]);
+        assert_eq!(
+            eligible_full,
+            vec![allowed, denied_by_name, denied_by_title],
+            "пустой денайлист пропускает все окна"
+        );
+    }
+
+    #[test]
+    fn eligible_snapshot_matches_process_by_file_name_or_path() {
+        let by_full_path = window(r"C:\Apps\chrome.exe", "Tab", 0);
+        let denylist_full = vec![OverlapRule {
+            process_name: Some(r"C:\Apps\chrome.exe".to_string()),
+            title_pattern: None,
+        }];
+        assert!(
+            eligible_snapshot(std::slice::from_ref(&by_full_path), &denylist_full).is_empty()
+        );
+
+        let denylist_name = vec![OverlapRule {
+            process_name: Some("chrome.exe".to_string()),
+            title_pattern: None,
+        }];
+        assert!(
+            eligible_snapshot(&[by_full_path], &denylist_name).is_empty(),
+            "правило с одним именем файла матчит полный путь (path_eq_ignore_case)"
+        );
+    }
+
+    #[test]
+    fn eligible_snapshot_removes_iconic_windows() {
+        let mut minimized = window(r"C:\Apps\app.exe", "Min", 0);
+        minimized.iconic = true;
+        let normal = window(r"C:\Apps\app.exe", "Normal", 1);
+        let eligible = eligible_snapshot(&[minimized, normal.clone()], &[]);
+        assert_eq!(
+            eligible,
+            vec![normal],
+            "свёрнутые окна не предлагаются к закреплению"
         );
     }
 

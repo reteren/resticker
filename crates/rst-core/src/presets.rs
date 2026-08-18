@@ -83,10 +83,7 @@ pub fn delete_preset(cfg: &mut Config, id: Uuid) -> Result<(), PresetError> {
 ///   отсутствующие перечисляются в [`ApplyPresetOutcome::missing`]
 ///   (SPEC: диалог [Загрузить остальное] применяет пресет без них);
 /// - `Pasted` — всегда (файл вставки лежит в профиле приложения и
-///   пресетом не перемещается);
-/// - `Window` — всегда: доступность окна проверяет координатор
-///   (rst-core платформенно-независимый, окон нет), SPEC «программа не
-///   запущена» — слой интеграции.
+///   пресетом не перемещается).
 ///
 /// Сам пресет не модифицируется; несуществующий id — ошибка без мутации
 /// конфига.
@@ -104,9 +101,7 @@ pub fn apply_preset(cfg: &mut Config, id: Uuid) -> Result<ApplyPresetOutcome, Pr
             StickerSource::File { path, .. } if !path.exists() => {
                 missing.push((sticker.id, path.clone()));
             }
-            StickerSource::File { .. }
-            | StickerSource::Pasted { .. }
-            | StickerSource::Window { .. } => applied.push(sticker),
+            StickerSource::File { .. } | StickerSource::Pasted { .. } => applied.push(sticker),
         }
     }
     cfg.stickers = applied;
@@ -138,7 +133,13 @@ pub fn export_preset_to_file(cfg: &Config, id: Uuid, path: &Path) -> Result<(), 
 /// сохраняются как в файле. Возвращает добавленный пресет.
 pub fn import_preset_from_file(cfg: &mut Config, path: &Path) -> Result<Preset, PresetError> {
     let raw = fs::read_to_string(path).map_err(CoreError::Io)?;
-    let mut preset: Preset = serde_json::from_str(&raw).map_err(CoreError::Json)?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(CoreError::Json)?;
+    // Старый файл пресета мог нести закреплённые окна (`"kind": "window"`) —
+    // вариант удалён редизайном пинов, вычищаем ДО десериализации (см.
+    // `config::strip_legacy_window_stickers`), иначе пресет не импортировался
+    // бы целиком.
+    crate::config::strip_legacy_window_stickers(&mut value);
+    let mut preset: Preset = serde_json::from_value(value).map_err(CoreError::Json)?;
     preset.id = Uuid::new_v4();
     cfg.presets.push(preset.clone());
     Ok(preset)
@@ -192,17 +193,6 @@ mod tests {
             order,
             source: StickerSource::Pasted {
                 path: PathBuf::from("pasted/x.png"),
-            },
-            ..Default::default()
-        }
-    }
-
-    fn window_sticker(id: u128, order: i64) -> Sticker {
-        Sticker {
-            id: Uuid::from_u128(id),
-            order,
-            source: StickerSource::Window {
-                window: Default::default(),
             },
             ..Default::default()
         }
@@ -356,16 +346,6 @@ mod tests {
         let outcome = apply_preset(&mut cfg, Uuid::from_u128(1)).unwrap();
         assert!(outcome.missing.is_empty());
         assert_eq!(cfg.stickers, vec![pasted_sticker(10, 0)]);
-    }
-
-    #[test]
-    fn apply_preset_window_always_present() {
-        // Доступность окна — слой интеграции (координатор, M6); ядро
-        // платформенно-независимо и окна не проверяет.
-        let mut cfg = cfg_with(vec![preset(1, "W", vec![window_sticker(10, 0)])]);
-        let outcome = apply_preset(&mut cfg, Uuid::from_u128(1)).unwrap();
-        assert!(outcome.missing.is_empty());
-        assert_eq!(cfg.stickers, vec![window_sticker(10, 0)]);
     }
 
     #[test]

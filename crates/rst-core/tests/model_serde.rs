@@ -20,7 +20,7 @@ fn fixture_v1_loads() {
     assert_eq!(cfg.hotkeys.edit_mode.as_deref(), Some("Ctrl+Alt+S"));
     assert_eq!(cfg.monitors.len(), 1);
     assert_eq!(cfg.monitors[0].friendly_name, "LG ULTRAGEAR");
-    assert_eq!(cfg.stickers.len(), 3);
+    assert_eq!(cfg.stickers.len(), 2);
 
     let file = &cfg.stickers[0];
     assert_eq!(file.order, 3);
@@ -41,37 +41,47 @@ fn fixture_v1_loads() {
         Some("chrome.exe")
     );
 
-    let window = &cfg.stickers[1];
-    assert!(
-        matches!(&window.source, StickerSource::Window { window } if window.pin_mode == PinMode::ClientArea),
-        "второй стикер — окно с pin_mode=client_area"
-    );
-    assert_eq!(window.playback.audio_track, Some(1));
-    assert!(window.playback.override_mute_when_invisible);
-
-    let pasted = &cfg.stickers[2];
+    let pasted = &cfg.stickers[1];
     assert!(matches!(&pasted.source, StickerSource::Pasted { .. }));
     assert!(!pasted.enabled);
     assert_eq!(pasted.playback.loop_mode, LoopMode::Once);
     assert!(
         pasted.origin.is_some(),
-        "третий стикер — мигрированный (origin)"
+        "второй стикер — мигрированный (origin)"
     );
 }
 
 #[test]
-fn enum_tags_match_schema() {
-    let v = serde_json::to_value(StickerSource::Window {
-        window: WindowLocator {
-            process_name: Some("obs64.exe".to_string()),
-            title_pattern: None,
-            pin_mode: PinMode::ClientArea,
-        },
-    })
-    .unwrap();
-    assert_eq!(v["kind"], "window");
-    assert_eq!(v["window"]["pin_mode"], "client_area");
+fn legacy_window_stickers_are_dropped_without_breaking_load() {
+    // Редизайн пинов: `"kind": "window"` удалён из модели. Старый конфиг с
+    // такой записью не должен ронять загрузку ВСЕГО файла — запись молча
+    // отбрасывается (`config::strip_legacy_window_stickers`), остальное
+    // грузится как обычно.
+    let value = json!({
+        "schema_version": 1,
+        "stickers": [
+            { "source": { "kind": "window", "window": { "process_name": "obs64.exe" } } },
+            { "source": { "kind": "pasted", "path": "pasted/x.png" } }
+        ],
+        "presets": [
+            {
+                "name": "P",
+                "stickers": [
+                    { "source": { "kind": "window", "window": { "process_name": "obs64.exe" } } }
+                ]
+            }
+        ]
+    });
+    let mut value = value;
+    config::strip_legacy_window_stickers(&mut value);
+    let cfg: Config = serde_json::from_value(value).expect("конфиг без window-записей парсится");
+    assert_eq!(cfg.stickers.len(), 1);
+    assert!(matches!(cfg.stickers[0].source, StickerSource::Pasted { .. }));
+    assert!(cfg.presets[0].stickers.is_empty(), "window-стикер пресета тоже отброшен");
+}
 
+#[test]
+fn enum_tags_match_schema() {
     let v = serde_json::to_value(StickerSource::File {
         path: "a.png".into(),
         media_type: MediaType::Video,
@@ -79,6 +89,12 @@ fn enum_tags_match_schema() {
     .unwrap();
     assert_eq!(v["kind"], "file");
     assert_eq!(v["media_type"], "video");
+
+    let v = serde_json::to_value(StickerSource::Pasted {
+        path: "pasted/x.png".into(),
+    })
+    .unwrap();
+    assert_eq!(v["kind"], "pasted");
 
     assert_eq!(
         serde_json::to_value(VisibilityMode::OverlapAllowlist).unwrap(),
@@ -107,17 +123,13 @@ fn roundtrip_all_variants() {
             title_pattern: Some("*YouTube*".to_string()),
         }],
     };
-    let sticker_window = Sticker {
+    let sticker_pasted = Sticker {
         order: 1,
-        source: StickerSource::Window {
-            window: WindowLocator {
-                process_name: Some("obs64.exe".to_string()),
-                title_pattern: None,
-                pin_mode: PinMode::Window,
-            },
+        source: StickerSource::Pasted {
+            path: "pasted/x.png".into(),
         },
         visibility: VisibilityRule {
-            mode: VisibilityMode::NeverOverlap,
+            mode: VisibilityMode::Desktop,
             rules: vec![],
         },
         playback: PlaybackSettings {
@@ -127,19 +139,8 @@ fn roundtrip_all_variants() {
         },
         ..Default::default()
     };
-    let sticker_pasted = Sticker {
-        order: 0,
-        source: StickerSource::Pasted {
-            path: "pasted/x.png".into(),
-        },
-        visibility: VisibilityRule {
-            mode: VisibilityMode::Desktop,
-            rules: vec![],
-        },
-        ..Default::default()
-    };
     let config = Config {
-        stickers: vec![sticker_file, sticker_window, sticker_pasted],
+        stickers: vec![sticker_file, sticker_pasted],
         ..Default::default()
     };
 
@@ -217,6 +218,54 @@ fn cursor_panel_offset_default_is_none() {
 }
 
 #[test]
+fn denylist_and_pin_hotkey_defaults_for_old_configs() {
+    // Старый config.json без `settings.denylist` и без
+    // `hotkeys.pin_focused_window` грузится без миграции схемы: денй-лист
+    // пуст, хоткей достраивается дефолтом (тот же паттерн, что
+    // `PlaybackSettings.paused`).
+    let cfg: Config = serde_json::from_value(json!({
+        "schema_version": 1,
+        "settings": { "language": "en" },
+        "hotkeys": { "edit_mode": "Ctrl+Alt+S" }
+    }))
+    .unwrap();
+
+    assert_eq!(cfg.settings.language, "en");
+    assert!(
+        cfg.settings.denylist.is_empty(),
+        "отсутствующий denylist достраивается пустым списком"
+    );
+    assert_eq!(
+        cfg.hotkeys.pin_focused_window.as_deref(),
+        Some("Ctrl+Alt+R"),
+        "отсутствующий хоткей достраивается дефолтом"
+    );
+}
+
+#[test]
+fn denylist_roundtrips() {
+    let config = Config {
+        settings: Settings {
+            denylist: vec![OverlapRule {
+                process_name: Some("obs64.exe".to_string()),
+                title_pattern: Some("*OBS*".to_string()),
+            }],
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+
+    let json = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        json["settings"]["denylist"][0]["process_name"],
+        json!("obs64.exe")
+    );
+
+    let back: Config = serde_json::from_value(json).unwrap();
+    assert_eq!(back.settings.denylist, config.settings.denylist);
+}
+
+#[test]
 fn new_file_sticker_is_centered_and_enabled() {
     let sticker = Sticker::new_file(
         "C:\\pics\\cat.png".into(),
@@ -271,3 +320,16 @@ fn new_pasted_sticker_uses_pasted_source() {
     let json = serde_json::to_value(&sticker).unwrap();
     assert_eq!(json["source"]["kind"], "pasted");
 }
+
+#[test]
+fn zdbg_pasted_source() {
+    let v = json!({
+        "schema_version": 1,
+        "stickers": [{ "kind": "pasted", "path": "pasted/x.png" }],
+        "presets": [{ "name": "P", "stickers": [] }]
+    });
+    eprintln!("value: {v}");
+    let cfg: Result<Config, _> = serde_json::from_value(v);
+    eprintln!("config parse: {cfg:?}");
+}
+

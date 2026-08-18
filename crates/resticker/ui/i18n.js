@@ -19,6 +19,7 @@ const DICT = {
     'tab.presets': 'Пресеты',
     'tab.control': 'Управление',
     'tab.general': 'Общие',
+    'tab.denylist': 'Денй-лист',
 
     'stickers.listLabel': 'Список стикеров',
     'stickers.add': 'Добавить…',
@@ -75,6 +76,19 @@ const DICT = {
     'preset.missingAlert':
       'Пресет применён не полностью — недоступны:\n\n{lines}\n\nЗагружены остальные стикеры.',
 
+    'denylist.listLabel': 'Денй-лист закрепления',
+    'denylist.hint':
+      'Окна, чей процесс или заголовок совпадает с правилом, нельзя закрепить горячей клавишей — они не показываются в списке выбора окна. Больше денй-лист ни на что не влияет.',
+    'denylist.processPlaceholder': 'process_name.exe',
+    'denylist.titlePlaceholder': 'часть заголовка, * — подстановка',
+    'denylist.add': 'Добавить',
+    'denylist.loading': 'Загрузка…',
+    'denylist.empty': 'Денй-лист пуст. Добавьте процесс выше, чтобы запретить его закрепление.',
+    'denylist.noTitlePattern': 'без фильтра по заголовку',
+    'denylist.removeTitle': 'Удалить',
+    'denylist.added': 'Добавлено в денй-лист: {process}',
+    'denylist.removed': 'Правило удалено из денй-листа',
+
     'control.hotkeysLabel': 'Глобальные хоткеи:',
     'control.editMode': 'Режим редактирования',
     'control.toggleAll': 'Показать/скрыть все стикеры',
@@ -118,6 +132,7 @@ const DICT = {
     'tab.presets': 'Presets',
     'tab.control': 'Controls',
     'tab.general': 'General',
+    'tab.denylist': 'Denylist',
 
     'stickers.listLabel': 'Sticker list',
     'stickers.add': 'Add…',
@@ -173,6 +188,19 @@ const DICT = {
     'preset.word.many': 'stickers',
     'preset.missingAlert':
       'Preset applied partially — unavailable:\n\n{lines}\n\nThe rest of the stickers were loaded.',
+
+    'denylist.listLabel': 'Pin denylist',
+    'denylist.hint':
+      'Windows whose process or title matches a rule cannot be pinned via the hotkey and are hidden from the window pick list. The denylist has no other effect.',
+    'denylist.processPlaceholder': 'process_name.exe',
+    'denylist.titlePlaceholder': 'title substring, * wildcard',
+    'denylist.add': 'Add',
+    'denylist.loading': 'Loading…',
+    'denylist.empty': 'The denylist is empty. Add a process above to prevent it from being pinned.',
+    'denylist.noTitlePattern': 'no title filter',
+    'denylist.removeTitle': 'Remove',
+    'denylist.added': 'Added to denylist: {process}',
+    'denylist.removed': 'Rule removed from the denylist',
 
     'control.hotkeysLabel': 'Global hotkeys:',
     'control.editMode': 'Edit mode',

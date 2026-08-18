@@ -80,14 +80,53 @@ fn try_load(path: &Path) -> Result<Config, CoreError> {
     if version > CURRENT_SCHEMA_VERSION as u64 {
         return Err(CoreError::UnknownSchemaVersion(version));
     }
-    let value = if version < CURRENT_SCHEMA_VERSION as u64 {
+    let mut value = if version < CURRENT_SCHEMA_VERSION as u64 {
         // CONFIG.md: перед первой миграцией сохраняется config.bak.
         let _ = fs::copy(path, bak_path(path));
         migrate(value)?
     } else {
         value
     };
+    // Редизайн пинов: старые записи `"kind": "window"` (закреплённые окна)
+    // больше не существуют в модели и не мигрируются никуда — вычищаем их ДО
+    // десериализации, чтобы один мёртвый вариант не уронил загрузку ВСЕГО
+    // конфига (see `strip_legacy_window_stickers`).
+    strip_legacy_window_stickers(&mut value);
     serde_json::from_value(value).map_err(CoreError::Migrate)
+}
+
+/// Вычистить записи с `"kind": "window"` (удалённый вариант `StickerSource`)
+/// из `stickers` и из каждого пресета — старые закреплённые окна были
+/// персистентными стикерами, редизайн пинов сделал закрепление чисто
+/// рантайм-состоянием (SPEC.md, «Закрепление окна»: «нельзя сохранить в
+/// пресет, всегда нужно выставлять вручную»). Решение: НЕ ронять весь
+/// config.json/файл пресета из-за одного мёртвого поля — записи молча
+/// отбрасываются, остальной конфиг грузится как обычно.
+pub fn strip_legacy_window_stickers(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(Value::Array(stickers)) = obj.get_mut("stickers") {
+        stickers.retain(|s| !is_legacy_window_sticker(s));
+    }
+    if let Some(Value::Array(presets)) = obj.get_mut("presets") {
+        for preset in presets {
+            if let Some(Value::Array(stickers)) = preset.get_mut("stickers") {
+                stickers.retain(|s| !is_legacy_window_sticker(s));
+            }
+        }
+    }
+}
+
+/// Запись стикера — удалённый вариант `"kind": "window"`? Тег варианта живёт
+/// внутри поля `source` (внутренняя тегированность `StickerSource`), поэтому
+/// смотрим `source.kind`, а не верхний уровень записи.
+fn is_legacy_window_sticker(sticker: &Value) -> bool {
+    sticker
+        .get("source")
+        .and_then(|source| source.get("kind"))
+        .and_then(Value::as_str)
+        == Some("window")
 }
 
 /// Миграции схемы — чистые функции vN → vN+1 (CONFIG.md, «Миграции»).

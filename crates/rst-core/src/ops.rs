@@ -20,8 +20,8 @@ pub enum OpError {
     /// Стикер с данным id не найден в списке.
     #[error("стикер с id {0} не найден")]
     StickerNotFound(Uuid),
-    /// `relink_file` вызван для стикера, чей источник не `File` (`Pasted`/
-    /// `Window` не поддерживают переуказание пути).
+    /// `relink_file` вызван для стикера, чей источник не `File` (`Pasted`
+    /// не поддерживает переуказание пути).
     #[error("у стикера {0} нет файла для переуказания")]
     NotFileBacked(Uuid),
 }
@@ -302,8 +302,8 @@ pub fn reset_transform_and_size(
 /// логикой, что обычное добавление. `media_type` координатор определяет по
 /// новому файлу заранее (та же проверка расширения, что в `add_sticker`) и
 /// передаёт готовым — здесь нет доступа к `VIDEO_EXTENSIONS`/декодеру.
-/// `Pasted`/`Window`-источники этим действием не переуказываются (SPEC не
-/// описывает такой сценарий для них).
+/// `Pasted`-источник этим действием не переуказывается (SPEC не описывает
+/// такой сценарий для него).
 pub fn relink_file(
     config: &mut Config,
     id: Uuid,
@@ -320,9 +320,7 @@ pub fn relink_file(
             *mt = media_type;
             Ok(())
         }
-        StickerSource::Pasted { .. } | StickerSource::Window { .. } => {
-            Err(OpError::NotFileBacked(id))
-        }
+        StickerSource::Pasted { .. } => Err(OpError::NotFileBacked(id)),
     }
 }
 

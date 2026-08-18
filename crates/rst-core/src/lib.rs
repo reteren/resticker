@@ -16,12 +16,13 @@ pub mod monitor_loss;
 pub mod monitor_rebind;
 pub mod occluders;
 pub mod ops;
+pub mod pinned_window;
 pub mod presets;
 pub mod selection_set;
+pub mod sizing;
 pub mod snap;
 pub mod transform_ops;
 pub mod undo;
-pub mod window_follow;
 
 pub use animation_clock::AnimationClock;
 pub use error::CoreError;

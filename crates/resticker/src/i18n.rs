@@ -82,12 +82,14 @@ fn hotkey_action_label(lang: &str, name: rst_win32::overlay::HotkeyName) -> &'st
             HotkeyName::EditMode => "entering edit mode",
             HotkeyName::ToggleAllStickers => "showing/hiding all stickers",
             HotkeyName::MuteAll => "muting all stickers",
+            HotkeyName::PinFocusedWindow => "pinning/unpinning the focused window",
         }
     } else {
         match name {
             HotkeyName::EditMode => "вход в режим редактирования",
             HotkeyName::ToggleAllStickers => "показ/скрытие всех стикеров",
             HotkeyName::MuteAll => "заглушение всех стикеров",
+            HotkeyName::PinFocusedWindow => "закрепление/открепление окна в фокусе",
         }
     }
 }

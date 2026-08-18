@@ -36,6 +36,13 @@ pub struct Settings {
     /// входа в режим редактирования показывается ровно один раз, дальше
     /// координатор проверяет этот флаг и молчит.
     pub onboarding_shown: bool,
+    /// Денй-лист закрепления (SPEC.md, «Закрепление окна»): хоткей-пин окна,
+    /// чей процесс подпадает под правило, игнорируется, и такое окно скрыто
+    /// из списка выбора в режиме редактирования. Дефолт — пустой список:
+    /// старые `config.json` без этого поля получают `Vec::new()` через
+    /// `#[serde(default)]` на структуре — та же обратная совместимость без
+    /// миграции схемы, что `PlaybackSettings.paused`.
+    pub denylist: Vec<OverlapRule>,
 }
 
 impl Default for Settings {
@@ -52,6 +59,7 @@ impl Default for Settings {
             cursor_panel_offset: None,
             language: "ru".to_string(),
             onboarding_shown: false,
+            denylist: Vec::new(),
         }
     }
 }
@@ -63,6 +71,7 @@ pub struct Hotkeys {
     pub edit_mode: Option<String>,
     pub toggle_all_stickers: Option<String>,
     pub mute_all: Option<String>,
+    pub pin_focused_window: Option<String>,
 }
 
 impl Default for Hotkeys {
@@ -71,6 +80,7 @@ impl Default for Hotkeys {
             edit_mode: Some("Ctrl+Alt+S".to_string()),
             toggle_all_stickers: Some("Ctrl+Alt+H".to_string()),
             mute_all: Some("Ctrl+Alt+M".to_string()),
+            pin_focused_window: Some("Ctrl+Alt+R".to_string()),
         }
     }
 }
@@ -203,36 +213,6 @@ impl Sticker {
             ..Self::default()
         }
     }
-
-    /// Новый стикер-окно (SPEC.md §5, ROADMAP.md M6): `placement` — текущий
-    /// прямоугольник целевого окна на момент закрепления (DIP, координатор
-    /// переводит из физических пикселей трекера), не производный/дефолтный
-    /// размер, как у файловых стикеров — окно уже существует со своими
-    /// размерами. Ничего не рендерится (SPEC §5.2: «визуальной рамки нет») —
-    /// `placement` только для хит-теста/выделения в режиме редактирования и
-    /// как мирроring текущей геометрии окна (`rst_core::window_follow`).
-    pub fn new_window(
-        locator: WindowLocator,
-        monitor_id: MonitorId,
-        cx: f64,
-        cy: f64,
-        w: f64,
-        h: f64,
-    ) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            created_at: Utc::now(),
-            source: StickerSource::Window { window: locator },
-            placement: Placement {
-                monitor_id,
-                cx,
-                cy,
-                w,
-                h,
-            },
-            ..Self::default()
-        }
-    }
 }
 /// Источник стикера (SPEC.md, раздел 2.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,8 +223,6 @@ pub enum StickerSource {
         path: PathBuf,
         media_type: MediaType,
     },
-    /// Закреплённое окно другого приложения (M6).
-    Window { window: WindowLocator },
     /// Вставка из буфера, материализованная в pasted/<uuid>.png (SPEC 2.1).
     Pasted { path: PathBuf },
 }
@@ -273,27 +251,6 @@ pub enum MediaType {
 /// определением `MediaType` при добавлении стикера (`add_sticker`), чтобы
 /// они не разошлись.
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mkv", "mov", "avi"];
-
-/// Как искать окно для стикера-окна (CONFIG.md, «Совпадение окон»):
-/// указывается process_name и/или title_pattern ('*' — подстановка).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WindowLocator {
-    pub process_name: Option<String>,
-    pub title_pattern: Option<String>,
-    pub pin_mode: PinMode,
-}
-
-/// Что именно показывать из окна (CONFIG.md).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PinMode {
-    /// Окно целиком, с рамкой.
-    #[default]
-    Window,
-    /// Только клиентская область.
-    ClientArea,
-}
 
 /// Размещение стикера: логические (DIP) координаты центра относительно
 /// левого верхнего угла своего монитора (ADR-010, CONFIG.md «placement»).

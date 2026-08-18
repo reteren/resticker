@@ -39,6 +39,9 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
         Icon::Play => draw_play(&mut canvas, s),
         Icon::Pause => draw_pause(&mut canvas, s),
         Icon::ResetScale => draw_reset_scale(&mut canvas, s),
+        Icon::Lock => draw_lock(&mut canvas, s),
+        Icon::LockOpen => draw_lock_open(&mut canvas, s),
+        Icon::Plus => draw_plus(&mut canvas, s),
     }
     canvas.into_rgba()
 }
@@ -63,6 +66,13 @@ fn color_of(icon: Icon) -> [u8; 3] {
         Icon::Play => [0x8a, 0xd0, 0x9c],
         Icon::Pause => [0xf0, 0xf0, 0xf0],
         Icon::ResetScale => [0xe8, 0xc8, 0x6a],
+        Icon::Lock => [0xf0, 0xd0, 0x60],
+        // Открытый замок — приглушённый серый: то же «выключено», что
+        // EyeOff/Eye у пары «показать/скрыть».
+        Icon::LockOpen => [0xa8, 0xa8, 0xb2],
+        // «Добавить правило соседства» — нейтральный голубой, как
+        // PresetLoad/Plus у кнопок-действий.
+        Icon::Plus => [0x9f, 0xc2, 0xe8],
     }
 }
 
@@ -374,6 +384,49 @@ fn draw_reset_scale(cv: &mut Canvas, s: f64) {
         ty + 0.14 * s * tip_angle.sin(),
     );
     fill_triangle(cv, point, back1, back2);
+}
+
+/// «Замок» (SPEC «закрепление окон», interact-lock): дужка-кольцо + тело
+/// с узким пазом; нижняя половина кольца перекрывается телом.
+fn draw_lock(cv: &mut Canvas, s: f64) {
+    stroke_ellipse(cv, 0.5 * s, 0.48 * s, 0.15 * s, 0.16 * s, 0.09 * s);
+    fill_rect(cv, 0.30 * s, 0.50 * s, 0.70 * s, 0.74 * s);
+    fill_rect(cv, 0.47 * s, 0.58 * s, 0.53 * s, 0.66 * s);
+}
+
+/// «Замок открытый» — состояние «не заблокировано» в панели свойств
+/// закреплённого окна: то же тело, но дужка разомкнута снизу (дуга-«C»,
+/// разрыв внизу между углами 40° и 140°) — классическая пиктограмма
+/// unlocked.
+fn draw_lock_open(cv: &mut Canvas, s: f64) {
+    let (cx, cy) = (0.5 * s, 0.46 * s);
+    let r = 0.16 * s;
+    let t = 0.09 * s;
+    let h = t / 2.0;
+    // Разрыв дуги внизу (в радианах, экранная ось Y вниз): дужка рисуется
+    // от 140° до 400° (= 40°) по часовой — т.е. весь верх, кроме нижнего
+    // сектора [40°, 140°].
+    let gap_start = 40.0_f64.to_radians();
+    let gap_end = 140.0_f64.to_radians();
+    cv.draw(move |x, y| {
+        let (dx, dy) = (x - cx, y - cy);
+        let dist = (dx * dx + dy * dy).sqrt();
+        if (dist - r).abs() > h {
+            return false;
+        }
+        let angle = dy.atan2(dx).rem_euclid(2.0 * std::f64::consts::PI);
+        !(gap_start..gap_end).contains(&angle)
+    });
+    fill_rect(cv, 0.30 * s, 0.50 * s, 0.70 * s, 0.74 * s);
+    fill_rect(cv, 0.47 * s, 0.58 * s, 0.53 * s, 0.66 * s);
+}
+
+/// «Плюс» — добавление правила соседства в панели свойств закреплённого
+/// окна: два пересекающихся штриха (та же геометрия плюса, что у
+/// `draw_show_all`, но без глаза).
+fn draw_plus(cv: &mut Canvas, s: f64) {
+    line(cv, 0.5 * s, 0.40 * s, 0.5 * s, 0.60 * s, 0.10 * s);
+    line(cv, 0.40 * s, 0.5 * s, 0.60 * s, 0.5 * s, 0.10 * s);
 }
 
 #[cfg(test)]

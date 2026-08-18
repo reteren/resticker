@@ -7,7 +7,7 @@
 
 use uuid::Uuid;
 
-use crate::model::{OverlapRule, Rect, VisibilityMode, WindowLocator};
+use crate::model::{OverlapRule, Rect, VisibilityMode};
 
 /// Класс окна панели задач (SPEC.md §4.3, `never_overlap_taskbar`).
 pub const TASKBAR_WINDOW_CLASS: &str = "Shell_TrayWnd";
@@ -69,39 +69,39 @@ pub fn is_occluder(
 /// «выбран ли чекбокс строки/процесса» ровно этим предикатом, которым маска
 /// решает про окклюдера, — иначе панель и маска могли бы разойтись во мнениях.
 pub fn rule_matches(rule: &OverlapRule, window: &OccluderCandidate) -> bool {
-    let by_path = match (&rule.process_name, &window.exe_path) {
-        (Some(rule_name), Some(exe_path)) => path_eq_ignore_case(rule_name, exe_path),
-        // Правило по процессу, но путь окна неизвестен — не матчим
-        // (консервативно: окно остаётся окклюдером).
+    rule_matches_strs(rule, window.exe_path.as_deref(), &window.title)
+}
+
+/// Правило матчит пару (process_name, title) — общая часть [`rule_matches`]
+/// и [`is_denylisted`]: `process_name` ИЛИ `title_pattern`, тем же
+/// wildcard/регистронезависимым сравнением. Пустое правило (оба `None`) не
+/// матчит ничего.
+fn rule_matches_strs(rule: &OverlapRule, process_name: Option<&str>, title: &str) -> bool {
+    let by_path = match (&rule.process_name, process_name) {
+        (Some(rule_name), Some(name)) => path_eq_ignore_case(rule_name, name),
         _ => false,
     };
     let by_title = match &rule.title_pattern {
-        Some(pattern) => wildcard_match(pattern, &window.title),
+        Some(pattern) => wildcard_match(pattern, title),
         None => false,
     };
     by_path || by_title
 }
 
-/// Совпадает ли [`WindowLocator`] стикера-окна (ROADMAP.md M6, SPEC.md §5)
-/// с живым окном: тот же предикат, что [`rule_matches`] для правил
-/// видимости (M4) — `process_name` ИЛИ `title_pattern`, тем же
-/// wildcard/регистронезависимым сравнением. Пустой локатор (оба `None`) не
-/// матчит ничего: искать окно без единого критерия бессмысленно.
-///
-/// Используется координатором при старте (переустановка `hwnd`, «в конфиг
-/// не пишется» — CONFIG.md, `source.kind == window`) и при добавлении
-/// нового стикера-окна (построение локатора из выбранного окна для
-/// последующего восстановления).
-pub fn locator_matches(locator: &WindowLocator, window: &OccluderCandidate) -> bool {
-    let by_path = match (&locator.process_name, &window.exe_path) {
-        (Some(name), Some(exe_path)) => path_eq_ignore_case(name, exe_path),
-        _ => false,
-    };
-    let by_title = match &locator.title_pattern {
-        Some(pattern) => wildcard_match(pattern, &window.title),
-        None => false,
-    };
-    by_path || by_title
+/// Окно попадает под денй-лист закрепления (SPEC.md, «Закрепление окна»),
+/// если хотя бы одно правило матчит его процесс или заголовок — тот же
+/// предикат, что [`rule_matches`], но над сырыми `(process_name, title)`
+/// вместо [`OccluderCandidate`]: хоткей-пин и список выбора окна в режиме
+/// редактирования получают от Win32 только эти два значения. Пустой
+/// денй-лист не матчит ничего.
+pub fn is_denylisted(
+    process_name: Option<&str>,
+    title: Option<&str>,
+    denylist: &[OverlapRule],
+) -> bool {
+    denylist
+        .iter()
+        .any(|rule| rule_matches_strs(rule, process_name, title.unwrap_or("")))
 }
 
 /// `process_name` в модели — короткое имя (CONFIG.md), но полный путь тоже
@@ -198,7 +198,10 @@ pub fn subtract_rects(base: Rect, holes: &[Rect]) -> Vec<Rect> {
 /// `Vec` — `hole` полностью покрывает `r`.
 fn subtract_one(r: Rect, hole: &Rect) -> Vec<Rect> {
     let (rx0, ry0) = (r.x, r.y);
-    let (rx1, ry1) = (r.x.saturating_add(r.w as i32), r.y.saturating_add(r.h as i32));
+    let (rx1, ry1) = (
+        r.x.saturating_add(r.w as i32),
+        r.y.saturating_add(r.h as i32),
+    );
     let (hx0, hy0) = (hole.x, hole.y);
     let (hx1, hy1) = (
         hole.x.saturating_add(hole.w as i32),
@@ -270,53 +273,6 @@ mod tests {
             process_name: process.map(String::from),
             title_pattern: title.map(String::from),
         }
-    }
-
-    fn locator(process: Option<&str>, title: Option<&str>) -> WindowLocator {
-        WindowLocator {
-            process_name: process.map(String::from),
-            title_pattern: title.map(String::from),
-            ..Default::default()
-        }
-    }
-
-    // --- locator_matches (M6, стикеры-окна) ---
-
-    #[test]
-    fn locator_matches_by_short_process_name() {
-        let w = candidate(Some(r"C:\Program Files\obs-studio\obs64.exe"), "t", "c");
-        assert!(locator_matches(&locator(Some("obs64.exe"), None), &w));
-        assert!(!locator_matches(&locator(Some("other.exe"), None), &w));
-    }
-
-    #[test]
-    fn locator_matches_by_title_wildcard() {
-        let w = candidate(None, "OBS 30.1 - Профиль: Стрим", "c");
-        assert!(locator_matches(&locator(None, Some("OBS *")), &w));
-        assert!(!locator_matches(&locator(None, Some("Chrome *")), &w));
-    }
-
-    #[test]
-    fn locator_empty_matches_nothing() {
-        let w = candidate(Some(r"C:\a\b.exe"), "любой заголовок", "c");
-        assert!(!locator_matches(&locator(None, None), &w));
-    }
-
-    #[test]
-    fn locator_process_rule_no_exe_path_does_not_match() {
-        let w = candidate(None, "t", "c");
-        assert!(!locator_matches(&locator(Some("chrome.exe"), None), &w));
-    }
-
-    #[test]
-    fn locator_matches_by_either_criterion() {
-        // Правило по пути ИЛИ заголовку — как rule_matches: достаточно
-        // совпадения хотя бы одного критерия.
-        let w = candidate(Some(r"C:\a\notepad.exe"), "Wrong Title", "c");
-        assert!(locator_matches(
-            &locator(Some("notepad.exe"), Some("*Never*")),
-            &w
-        ));
     }
 
     // --- wildcard_match ---
@@ -468,6 +424,62 @@ mod tests {
     fn taskbar_setting_does_not_override_always() {
         let w = candidate(None, "", TASKBAR_WINDOW_CLASS);
         assert!(!is_occluder(&w, VisibilityMode::Always, &[], true));
+    }
+
+    // --- is_denylisted (денй-лист закрепления окон) ---
+
+    #[test]
+    fn denylist_matches_by_process_name_only() {
+        let rules = [rule(Some("chrome.exe"), None)];
+        assert!(is_denylisted(Some("chrome.exe"), Some("t"), &rules));
+        assert!(!is_denylisted(Some("other.exe"), Some("t"), &rules));
+    }
+
+    #[test]
+    fn denylist_matches_by_title_wildcard() {
+        let rules = [rule(None, Some("*YouTube*"))];
+        assert!(is_denylisted(None, Some("YouTube - Chrome"), &rules));
+        assert!(!is_denylisted(None, Some("Безымянный - Notepad"), &rules));
+    }
+
+    #[test]
+    fn denylist_empty_never_matches() {
+        assert!(!is_denylisted(Some("chrome.exe"), Some("t"), &[]));
+        assert!(!is_denylisted(None, None, &[]));
+    }
+
+    #[test]
+    fn denylist_non_matching_process_does_not_match() {
+        let rules = [rule(Some("obs64.exe"), Some("OBS *"))];
+        assert!(!is_denylisted(Some("chrome.exe"), Some("Chrome"), &rules));
+    }
+
+    #[test]
+    fn denylist_matches_any_rule_not_just_first() {
+        // Матчит ТРЕТЬЕ правило — первые два не подходят.
+        let rules = [
+            rule(Some("no1.exe"), Some("No Match *")),
+            rule(Some("no2.exe"), Some("Also No *")),
+            rule(Some("target.exe"), None),
+        ];
+        assert!(is_denylisted(Some("target.exe"), Some("t"), &rules));
+
+        // И наоборот: заголовочное правило позади процессных.
+        let rules = [
+            rule(Some("no1.exe"), None),
+            rule(None, Some("*Target Title*")),
+        ];
+        assert!(is_denylisted(
+            Some("x.exe"),
+            Some("My Target Title"),
+            &rules
+        ));
+    }
+
+    #[test]
+    fn denylist_process_rule_without_process_name_does_not_match() {
+        let rules = [rule(Some("chrome.exe"), None)];
+        assert!(!is_denylisted(None, Some("t"), &rules));
     }
 
     // --- clip_rect ---

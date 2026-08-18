@@ -167,6 +167,35 @@ impl WindowHighlight {
             })
             .collect()
     }
+
+    /// Примитивы рамки с произвольным цветом и прозрачностью — та же
+    /// композиция, что [`WindowHighlight::primitives`] (четыре
+    /// [`Primitive::Fill`] из [`WindowHighlight::outline_rects`]), но без
+    /// enum-диспетчеризации по [`HighlightKind`]: цвет и прозрачность задаёт
+    /// вызывающий слой. Нужно для пульса рамки при пин/анпин по хоткею
+    /// (Ctrl+Alt+R): прозрачность анимации меняется каждый кадр, цвет —
+    /// константа акцента проекта `#3c9898`.
+    ///
+    /// `opacity` клампится в `0.0..=1.0` на границе (тот же защитный
+    /// конвеншн, что `thickness_dip.max(0.0)` в [`WindowHighlight::outline_rects`]):
+    /// анимационная кривая вызывающего слоя теоретически может дать
+    /// слегка выпадающий float из крайностей плавающей арифметики, шейдер
+    /// премультиплицирует её без валидации — выходим в допуск сами.
+    pub fn primitives_custom(
+        &self,
+        color: [u8; 3],
+        opacity: f64,
+        thickness_dip: f64,
+    ) -> Vec<Primitive> {
+        self.outline_rects(thickness_dip)
+            .into_iter()
+            .map(|rect| Primitive::Fill {
+                rect,
+                color,
+                opacity: opacity.clamp(0.0, 1.0),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +377,70 @@ mod tests {
         // `solid_sprite` для них тот же, что у виджетов панелей.
         let h = WindowHighlight::new(0.0, 0.0, 640.0, 480.0, 1.0);
         for p in h.primitives(HighlightKind::Hover, HIGHLIGHT_THICKNESS_DIP) {
+            let Primitive::Fill { rect, .. } = p else {
+                panic!("ожидался Fill");
+            };
+            assert!(rect.w >= 0.0 && rect.h >= 0.0, "размеры неотрицательны");
+        }
+    }
+
+    #[test]
+    fn primitives_custom_emits_fills_with_exact_color_and_opacity() {
+        // Произвольный цвет/прозрачность проходят в примитивы без
+        // enum-диспетчеризации — та же геометрия, что у `primitives`.
+        let h = WindowHighlight::new(100.0, 80.0, 60.0, 40.0, 1.0);
+        let color = [0x3c, 0x98, 0x98]; // акцент проекта #3c9898
+        let opacity = 0.37;
+        let prims = h.primitives_custom(color, opacity, 2.0);
+        assert_eq!(prims.len(), 4, "четыре ребра рамки");
+        let rects = h.outline_rects(2.0);
+        for (i, p) in prims.iter().enumerate() {
+            let Primitive::Fill {
+                rect,
+                color: c,
+                opacity: o,
+            } = p
+            else {
+                panic!("примитив {i} — Fill");
+            };
+            assert_eq!(rect, &rects[i], "геометрия ребра {i} — из outline_rects");
+            assert_eq!(*c, color, "цвет ребра {i} — переданный");
+            assert_eq!(*o, opacity, "прозрачность ребра {i} — переданная");
+        }
+    }
+
+    #[test]
+    fn primitives_custom_clamps_opacity_to_unit_range() {
+        // Крайние допустимые значения проходят без изменений.
+        let h = WindowHighlight::new(0.0, 0.0, 100.0, 80.0, 1.0);
+        for opacity in [0.0, 1.0] {
+            let prims = h.primitives_custom([0x3c, 0x98, 0x98], opacity, 2.0);
+            for (i, p) in prims.iter().enumerate() {
+                let Primitive::Fill { opacity: o, .. } = p else {
+                    panic!("примитив {i} — Fill");
+                };
+                assert_eq!(*o, opacity, "граничное значение {opacity} не меняется");
+            }
+        }
+        // Слегка выпадающие float из крайностей анимационной кривой
+        // клампятся на границе — шейдер премультиплицирует opacity без
+        // валидации (тот же защитный конвеншн, что толщина в outline_rects).
+        for (input, expect) in [(-0.25, 0.0), (1.25, 1.0)] {
+            let prims = h.primitives_custom([0x3c, 0x98, 0x98], input, 2.0);
+            for (i, p) in prims.iter().enumerate() {
+                let Primitive::Fill { opacity: o, .. } = p else {
+                    panic!("примитив {i} — Fill");
+                };
+                assert_eq!(*o, expect, "opacity {input} клампится в {expect}");
+            }
+        }
+    }
+
+    #[test]
+    fn primitives_custom_matches_solid_sprite_contract() {
+        // Те же Fill/Box2D, что у `primitives` — путь `solid_sprite` общий.
+        let h = WindowHighlight::new(0.0, 0.0, 640.0, 480.0, 1.0);
+        for p in h.primitives_custom([0x3c, 0x98, 0x98], 0.5, HIGHLIGHT_THICKNESS_DIP) {
             let Primitive::Fill { rect, .. } = p else {
                 panic!("ожидался Fill");
             };

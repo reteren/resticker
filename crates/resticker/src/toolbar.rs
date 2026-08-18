@@ -110,20 +110,11 @@ fn toolbar_top(bounds: &DipRect, screen_h: f64) -> f64 {
 /// `video` — состояние воспроизведения (M5b), только для одиночного
 /// выделения ровно одного `MediaType::Video`-стикера; вызывающий код
 /// обязан передавать `None` в мульти-режиме и для остальных типов стикера.
-///
-/// `is_window` — выделен ровно один стикер-окно (M6, фидбэк пользователя
-/// 2026-08-10): «показать/скрыть» (`TB_EYE`, `Icon::Eye`) не имеет смысла
-/// для живого чужого окна (прятать за шахматкой нечего — окно всегда
-/// рисует себя само), вместо этого та же кнопка становится «открепить»
-/// (`Icon::Exit` — тот же визуальный смысл «выйти из-под контроля
-/// resticker», что у выхода из режима редактирования на панели у курсора);
-/// обработка клика — `handle_toolbar_up` в overlay_manager.rs.
 pub fn build_toolbar(
     bounds: &DipRect,
     opacity: Option<f64>,
     video: Option<VideoToolbarState>,
     screen_h: f64,
-    is_window: bool,
 ) -> Panel {
     let width = if opacity.is_some() {
         TOOLBAR_WIDTH
@@ -163,10 +154,9 @@ pub fn build_toolbar(
         x += TOOLBAR_FIELD_W + TOOLBAR_WIDGET_GAP;
     }
 
-    let eye_icon = if is_window { Icon::Exit } else { Icon::Eye };
     let buttons = [
         (TB_LAYERS, Icon::Layers),
-        (TB_EYE, eye_icon),
+        (TB_EYE, Icon::Eye),
         (TB_ORDER_UP, Icon::OrderUp),
         (TB_ORDER_DOWN, Icon::OrderDown),
         (TB_DUPLICATE, Icon::Duplicate),
@@ -240,7 +230,6 @@ mod tests {
             Some(1.0),
             None,
             SCREEN_H,
-            false,
         );
         assert_eq!(toolbar_cy(&p), 450.0 + TOOLBAR_GAP_Y + TOOLBAR_HEIGHT / 2.0);
         assert!(p.hit_test((960.0, 476.0)));
@@ -257,7 +246,6 @@ mod tests {
             Some(1.0),
             None,
             SCREEN_H,
-            false,
         );
         assert!(p.hit_test((775.0, 476.0)), "левый край тулбара");
         assert!(!p.hit_test((773.0, 476.0)));
@@ -271,7 +259,6 @@ mod tests {
             Some(1.0),
             None,
             SCREEN_H,
-            false,
         );
         assert_eq!(
             toolbar_cy(&p),
@@ -289,7 +276,6 @@ mod tests {
             Some(1.0),
             None,
             screen_h,
-            false,
         );
         assert_eq!(toolbar_cy(&p), 450.0 + TOOLBAR_GAP_Y + TOOLBAR_HEIGHT / 2.0);
         // Один DIP меньше — уже сверху.
@@ -298,7 +284,6 @@ mod tests {
             Some(1.0),
             None,
             screen_h - 1.0,
-            false,
         );
         assert_eq!(toolbar_cy(&p), 350.0 - TOOLBAR_GAP_Y - TOOLBAR_HEIGHT / 2.0);
     }
@@ -314,7 +299,6 @@ mod tests {
             Some(1.0),
             None,
             SCREEN_H,
-            false,
         );
         assert_eq!(toolbar_cy(&p), 950.0 + TOOLBAR_GAP_Y + TOOLBAR_HEIGHT / 2.0);
     }
@@ -326,7 +310,6 @@ mod tests {
             Some(0.85),
             None,
             SCREEN_H,
-            false,
         );
         assert_eq!(p.widget::<Slider>(TB_SLIDER).unwrap().value(), 85);
         assert_eq!(p.widget::<NumericField>(TB_FIELD).unwrap().value(), 85);
@@ -339,7 +322,6 @@ mod tests {
             Some(1.5),
             None,
             SCREEN_H,
-            false,
         );
         assert_eq!(p.widget::<Slider>(TB_SLIDER).unwrap().value(), 100);
         let p = build_toolbar(
@@ -347,7 +329,6 @@ mod tests {
             Some(-0.5),
             None,
             SCREEN_H,
-            false,
         );
         assert_eq!(p.widget::<Slider>(TB_SLIDER).unwrap().value(), 0);
         // Поле по SPEC 3.6 живёт в 1–100: нулевой стикер зеркалится единицей.
@@ -361,7 +342,6 @@ mod tests {
             None,
             None,
             SCREEN_H,
-            false,
         );
         assert!(
             p.widget::<Slider>(TB_SLIDER).is_none(),
@@ -398,7 +378,6 @@ mod tests {
             None,
             None,
             SCREEN_H,
-            false,
         );
         assert_eq!(p.frame().w, TOOLBAR_WIDTH_MULTI);
     }
@@ -420,7 +399,6 @@ mod tests {
             Some(1.0),
             None,
             SCREEN_H,
-            false,
         );
         let expected = [
             (TB_LAYERS, Icon::Layers),
@@ -453,28 +431,10 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_eye_button_becomes_exit_icon_for_window_stickers() {
-        // Фидбэк пользователя 2026-08-10: TB_EYE у стикера-окна — не
-        // «показать/скрыть» (шахматка не имеет смысла для живого чужого
-        // окна), а «открепить» — переиспользует Icon::Exit.
-        let p = build_toolbar(
-            &aabb(960.0, 400.0, 200.0, 100.0),
-            None,
-            None,
-            SCREEN_H,
-            true,
-        );
-        assert_eq!(button_icon(&p, TB_EYE), Icon::Exit);
-        // Остальные кнопки не затронуты флагом.
-        assert_eq!(button_icon(&p, TB_LAYERS), Icon::Layers);
-        assert_eq!(button_icon(&p, TB_DELETE), Icon::Delete);
-    }
-
-    #[test]
     fn toolbar_multi_buttons_in_spec_order_centered_on_bounds() {
         // Union-рамка мультивыделения x ∈ [760, 1160] (центр 960).
         let bounds = aabb(960.0, 400.0, 400.0, 200.0);
-        let p = build_toolbar(&bounds, None, None, SCREEN_H, false);
+        let p = build_toolbar(&bounds, None, None, SCREEN_H);
 
         let expected = [
             (TB_LAYERS, Icon::Layers),
@@ -520,7 +480,6 @@ mod tests {
             Some(1.0),
             None,
             SCREEN_H,
-            false,
         );
         assert!(p.widget::<Button>(TB_PLAY_PAUSE).is_none());
         assert!(p.widget::<Slider>(TB_VOLUME).is_none());
@@ -538,7 +497,6 @@ mod tests {
             Some(1.0),
             Some(video),
             SCREEN_H,
-            false,
         );
         assert_eq!(
             p.frame().w,
@@ -571,7 +529,6 @@ mod tests {
             Some(1.0),
             Some(video),
             SCREEN_H,
-            false,
         );
         assert_eq!(
             button_icon(&p, TB_PLAY_PAUSE),

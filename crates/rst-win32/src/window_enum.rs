@@ -19,9 +19,10 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetWindow,
-    GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SMTO_ABORTIFHUNG,
-    SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow,
+    GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, PWSTR};
 
@@ -294,6 +295,18 @@ pub(crate) fn extended_frame_bounds(hwnd: HWND) -> WindowRect {
     } else {
         WindowRect::default()
     }
+}
+
+/// HWND окна переднего плана (`GetForegroundWindow`) как числовой ключ в
+/// том же формате, что [`WindowInfo::hwnd`] — для хоткей-пина
+/// «закрепить/открепить сфокусированное окно» (SPEC.md, «Закрепление
+/// окна»). `None` — фокуса нет вовсе (редко: между переключениями, пустой
+/// десктоп) — пинить нечего.
+pub fn foreground_hwnd() -> Option<usize> {
+    // SAFETY: GetForegroundWindow — чистый запрос состояния десктопа,
+    // состояния не меняет, безопасен с любого потока.
+    let hwnd = unsafe { GetForegroundWindow() };
+    (!hwnd.0.is_null()).then_some(hwnd.0 as usize)
 }
 
 /// Заголовок окна. Пустая строка — нет заголовка, сбой API или таймаут

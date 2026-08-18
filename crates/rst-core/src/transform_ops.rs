@@ -534,7 +534,14 @@ mod tests {
             opacity: 0.5,
             ..transform(0.0)
         };
-        let out = resize(&p, &t, HandleKind::East, (10.0, 0.0), mods(false, false), true);
+        let out = resize(
+            &p,
+            &t,
+            HandleKind::East,
+            (10.0, 0.0),
+            mods(false, false),
+            true,
+        );
         assert_eq!(out.placement.monitor_id, p.monitor_id);
         assert_close_ctx(out.transform.opacity, 0.5, "opacity");
         assert_close_ctx(out.transform.rotation, 0.0, "rotation");
@@ -557,7 +564,14 @@ mod tests {
         assert_eq!(out.transform, t);
         // Отрицательный стартовый размер (битый конфиг) — состояние не меняется.
         let bad = placement(0.0, 0.0, -5.0, 20.0);
-        let out = resize(&bad, &t, HandleKind::East, (10.0, 0.0), mods(false, false), true);
+        let out = resize(
+            &bad,
+            &t,
+            HandleKind::East,
+            (10.0, 0.0),
+            mods(false, false),
+            true,
+        );
         assert_eq!(out.placement, bad);
     }
 

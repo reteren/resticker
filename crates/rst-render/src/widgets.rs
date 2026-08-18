@@ -20,6 +20,7 @@
 //! слой, виджет фильтрует цифры сам.
 
 use rst_core::hittest::to_local;
+use rst_core::model::OverlapRule;
 
 use crate::selection::Box2D;
 use crate::text;
@@ -82,13 +83,21 @@ pub enum Icon {
     /// «Сбросить масштаб» — тулбар выделения, возвращает размер/поворот/
     /// отражения к натуральным (фидбэк пользователя 2026-08-09).
     ResetScale,
+    /// «Замок» — индикатор interact-lock закреплённого окна (SPEC
+    /// «закрепление окон», замок #2): окно видно, но не принимает ввод.
+    Lock,
+    /// «Замок открытый» — состояние «не заблокировано» в панели свойств
+    /// закреплённого окна (переключатель пары Lock/LockOpen).
+    LockOpen,
+    /// «Плюс» — добавление правила соседства в панели свойств.
+    Plus,
 }
 
 impl Icon {
     /// Все варианты в порядке объявления — для предварительной генерации
     /// кэша иконок (текс-карта `HashMap<Icon, Texture>`, M2_WIRING_PLAN §3)
     /// и тестов генератора `icon_rgba`.
-    pub const ALL: [Icon; 17] = [
+    pub const ALL: [Icon; 20] = [
         Icon::Layers,
         Icon::Eye,
         Icon::EyeOff,
@@ -106,6 +115,9 @@ impl Icon {
         Icon::Play,
         Icon::Pause,
         Icon::ResetScale,
+        Icon::Lock,
+        Icon::LockOpen,
+        Icon::Plus,
     ];
 }
 
@@ -204,6 +216,53 @@ pub mod theme {
     /// `thumb_fraction` может выродиться в единицы DIP, ручка должна
     /// оставаться видимой и кликабельной на глаз.
     pub const SCROLLBAR_MIN_THUMB_H: f64 = 16.0;
+    /// Сторона квадратного бейджа индикатора interact-lock закреплённого
+    /// окна ([`lock_indicator`]), DIP.
+    pub const LOCK_INDICATOR_SIZE: f64 = 16.0;
+    /// Отступ бейджа индикатора от углов окна, DIP.
+    pub const LOCK_INDICATOR_MARGIN: f64 = 4.0;
+    /// Непрозрачность бейджа и иконки индикатора — полупрозрачный, чтобы
+    /// не заслонять содержимое окна.
+    pub const LOCK_INDICATOR_OPACITY: f64 = 0.85;
+    /// Фон бейджа индикатора (тёмный — читается и на светлых окнах).
+    pub const LOCK_INDICATOR_BG: [u8; 3] = [0x1a, 0x1a, 0x1e];
+}
+
+/// Примитивы индикатора interact-lock закреплённого окна (SPEC «закрепление
+/// окон», замок #2): маленький тёмный бейдж с иконкой [`Icon::Lock`] в левом
+/// верхнем углу прямоугольника окна. Окно видно целиком и выглядит обычно —
+/// оно лишь не принимает ввод, поэтому лечение лёгкое, угловое: сплошное
+/// затемнение или шахматка ([`crate::selection::checkerboard_tile`],
+/// `HIDDEN_STICKER_CHECKERBOARD_OPACITY`) неправильно намекали бы, что окно
+/// скрыто.
+///
+/// Возвращает примитивы в порядке «нижний — первым»: фон-бейдж, затем
+/// иконка. Бейдж приводится к стороне окна — очень маленькие окна не дают
+/// вырожденной геометрии.
+pub fn lock_indicator(window_rect: Box2D) -> Vec<Primitive> {
+    let size = theme::LOCK_INDICATOR_SIZE
+        .min(window_rect.w)
+        .min(window_rect.h)
+        .max(0.0);
+    let badge = Box2D {
+        cx: window_rect.cx - window_rect.w / 2.0 + theme::LOCK_INDICATOR_MARGIN + size / 2.0,
+        cy: window_rect.cy - window_rect.h / 2.0 + theme::LOCK_INDICATOR_MARGIN + size / 2.0,
+        w: size,
+        h: size,
+        rotation: 0.0,
+    };
+    vec![
+        Primitive::Fill {
+            rect: badge,
+            color: theme::LOCK_INDICATOR_BG,
+            opacity: theme::LOCK_INDICATOR_OPACITY,
+        },
+        Primitive::Icon {
+            rect: badge,
+            icon: Icon::Lock,
+            opacity: theme::LOCK_INDICATOR_OPACITY,
+        },
+    ]
 }
 
 /// Событие указателя в DIP-координатах монитора (перевод из `WM_MOUSE*` —
@@ -222,8 +281,12 @@ pub enum PointerEvent {
 /// слоя; `Ctrl`-комбинации сюда не приходят — они хоткеи ядра, M2_UI_NOTES §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
-    /// Цифра 0–9.
+    /// Цифра 0–9 (верхний ряд клавиатуры).
     Digit(u8),
+    /// Печатный символ (перевод из `WM_CHAR` — у вызывающего слоя; нужен
+    /// [`TextField`] для произвольных строк, `Digit` остаётся числовым
+    /// полям).
+    Char(char),
     Backspace,
     Enter,
     Escape,
@@ -388,14 +451,35 @@ impl Widget for Button {
                     opacity: 1.0,
                 });
             }
-            ButtonContent::Label(label) => {
+            ButtonContent::Label(label) if !label.is_empty() => {
+                // Текстура текста растрируется в натуральном размере
+                // (`text::text_size`) — растянуть её на весь `content_rect`
+                // (обычно шире надписи, особенно у строк списков вроде
+                // `preset_picker`/`window_pick_list`) значило бы смазать
+                // глиф по горизонтали: конвейер спрайтов (`solid_sprite`)
+                // маппит текстуру на `rect` 1:1, без сохранения пропорций.
+                // Центрируем натуральный размер внутри содержимого кнопки —
+                // тот же приём, что `Label`/`TextField`/`RowLabel` уже
+                // применяют для нерастянутого текста.
+                let (tw, th) = text::text_size(label);
                 out.push(Primitive::Text {
-                    rect: content_rect,
+                    rect: Box2D {
+                        cx: content_rect.cx,
+                        cy: content_rect.cy,
+                        w: tw.min(content_rect.w),
+                        h: th.min(content_rect.h),
+                        rotation: content_rect.rotation,
+                    },
                     text: label.clone(),
                     color: theme::TEXT,
                     opacity: 1.0,
                 });
             }
+            // Пустая подпись — фон-кнопка без своего текста (`window_pick_list`:
+            // строка = эта кнопка под hover/hit-test + отдельный неинтерактивный
+            // виджет с иконкой и текстом поверх неё). Пустой `Primitive::Text`
+            // не несёт содержимого — не эмитим его вовсе.
+            ButtonContent::Label(_) => {}
         }
     }
 
@@ -980,6 +1064,7 @@ impl Widget for NumericField {
         }
         match key {
             Key::Digit(d) => self.insert_digit(d),
+            Key::Char(_) => false,
             Key::Backspace => {
                 if self.caret == 0 {
                     return false;
@@ -1032,11 +1117,316 @@ impl Widget for NumericField {
     }
 }
 
+/// Текстовое поле произвольных строк (SPEC «закрепление окон» — поля
+/// `process_name`/`title_pattern` редактора правил соседства): свободный
+/// ввод через [`Key::Char`], `Backspace`/стрелки, `Enter` — принять,
+/// `Esc` — отменить, `Ctrl+V` — вставка с фильтрацией управляющих символов.
+/// Каретка рисованная; позиция считается в символах (`char`), как у
+/// [`NumericField`] (для произвольных строк — в т.ч. кириллических —
+/// счёт по байтам разрезал бы символы пополам).
+///
+/// Пока поле не в фокусе, текст зеркалит принятое значение
+/// ([`TextField::set_text`]); пустой текст рисуется плейсхолдером
+/// приглушённым, если он задан.
+pub struct TextField {
+    id: WidgetId,
+    bounds: Box2D,
+    max_len: usize,
+    /// Текст: принятое значение; в фокусе — редактируемый буфер.
+    text: String,
+    /// Каретка: индекс символа 0..=len (курсор ПЕРЕД ним).
+    caret: usize,
+    focused: bool,
+    /// Текст на момент получения фокуса — для отмены по `Esc`/потере фокуса.
+    original: String,
+    submitted: Option<String>,
+    cancelled: bool,
+    placeholder: Option<String>,
+}
+
+impl TextField {
+    /// Поле с начальным текстом `text` (обрезается до `max_len` символов).
+    pub fn new(id: WidgetId, bounds: Box2D, text: &str, max_len: usize) -> Self {
+        let text: String = text.chars().take(max_len).collect();
+        Self {
+            id,
+            bounds,
+            max_len,
+            caret: text.chars().count(),
+            original: text.clone(),
+            text,
+            focused: false,
+            submitted: None,
+            cancelled: false,
+            placeholder: None,
+        }
+    }
+
+    /// Поле с плейсхолдером `placeholder` (рисуется приглушённым, пока
+    /// текст пуст).
+    pub fn with_placeholder(
+        id: WidgetId,
+        bounds: Box2D,
+        text: &str,
+        max_len: usize,
+        placeholder: &str,
+    ) -> Self {
+        let mut field = Self::new(id, bounds, text, max_len);
+        field.placeholder = Some(placeholder.to_string());
+        field
+    }
+
+    /// Текущий принятый текст.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Установить текст извне (пересборка панели из `rules` — состояние
+    /// полей живёт в `cfg`, а не в панели). В фокусе редактируемый текст
+    /// не трогаем — пользователь печатает.
+    pub fn set_text(&mut self, text: &str) {
+        if self.focused {
+            return;
+        }
+        self.text = text.chars().take(self.max_len).collect();
+        self.caret = self.text.chars().count();
+    }
+
+    /// Принятый по `Enter` текст с прошлого опроса (сбрасывается).
+    pub fn take_submitted(&mut self) -> Option<String> {
+        self.submitted.take()
+    }
+
+    /// Была ли отмена по `Esc` с прошлого опроса (сбрасывается). Ядру:
+    /// этот `Esc` поглощён полем и не должен выходить из режима редактирования.
+    pub fn take_cancelled(&mut self) -> bool {
+        std::mem::take(&mut self.cancelled)
+    }
+
+    /// Левая координата текста внутри поля.
+    fn text_origin_x(&self) -> f64 {
+        self.bounds.cx - self.bounds.w / 2.0 + theme::FIELD_PAD
+    }
+
+    /// Позиция каретки по X клика: ближайший разрыв между символами.
+    fn caret_from_x(&self, x: f64) -> usize {
+        let rel = x - self.text_origin_x();
+        let mut best = 0;
+        let mut best_dist = f64::INFINITY;
+        for i in 0..=self.text.chars().count() {
+            let d = (text::width_up_to(&self.text, i) - rel).abs();
+            if d < best_dist {
+                best_dist = d;
+                best = i;
+            }
+        }
+        best
+    }
+
+    /// Вставить символ в каретку (управляющие символы отбрасываются).
+    fn insert_char(&mut self, c: char) -> bool {
+        if c.is_control() || self.text.chars().count() >= self.max_len {
+            return false;
+        }
+        let at = self
+            .text
+            .char_indices()
+            .nth(self.caret)
+            .map_or(self.text.len(), |(i, _)| i);
+        self.text.insert(at, c);
+        self.caret += 1;
+        true
+    }
+
+    /// Принять текст и отпустить фокус.
+    fn submit(&mut self) {
+        self.caret = self.text.chars().count();
+        self.focused = false;
+        self.submitted = Some(self.text.clone());
+    }
+
+    /// Отменить: вернуть текст к исходному и отпустить фокус.
+    fn cancel(&mut self) {
+        self.text.clone_from(&self.original);
+        self.caret = self.text.chars().count();
+        self.focused = false;
+        self.cancelled = true;
+    }
+}
+
+impl Widget for TextField {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.bounds
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.bounds = bounds;
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        let border = if self.focused {
+            theme::FIELD_BORDER_FOCUS
+        } else {
+            theme::FIELD_BORDER
+        };
+        out.push(Primitive::Fill {
+            rect: self.bounds,
+            color: border,
+            opacity: 1.0,
+        });
+        out.push(Primitive::Fill {
+            rect: Box2D {
+                w: (self.bounds.w - 2.0).max(0.0),
+                h: (self.bounds.h - 2.0).max(0.0),
+                ..self.bounds
+            },
+            color: theme::FIELD_BG,
+            opacity: 1.0,
+        });
+        // Текст: левый край + отступ, по вертикали — по центру поля. Пустое
+        // поле рисует плейсхолдер приглушённым (если задан).
+        let shown = if self.text.is_empty() {
+            self.placeholder.clone().unwrap_or_default()
+        } else {
+            self.text.clone()
+        };
+        if !shown.is_empty() {
+            let (tw, th) = text::text_size(&shown);
+            out.push(Primitive::Text {
+                rect: Box2D {
+                    cx: self.text_origin_x() + tw / 2.0,
+                    cy: self.bounds.cy,
+                    w: tw,
+                    h: th,
+                    rotation: 0.0,
+                },
+                text: shown,
+                color: theme::TEXT,
+                opacity: if self.text.is_empty() { 0.45 } else { 1.0 },
+            });
+        }
+        // Рисованная каретка (1 DIP шириной, чуть выше строки).
+        if self.focused {
+            let cx = self.text_origin_x() + text::width_up_to(&self.text, self.caret);
+            out.push(Primitive::Fill {
+                rect: Box2D {
+                    cx: cx + 0.5,
+                    cy: self.bounds.cy,
+                    w: 1.0,
+                    h: text::LINE_HEIGHT + 2.0,
+                    rotation: 0.0,
+                },
+                color: theme::CARET,
+                opacity: 1.0,
+            });
+        }
+    }
+
+    fn wants_focus(&self) -> bool {
+        true
+    }
+
+    fn has_focus(&self) -> bool {
+        self.focused
+    }
+
+    fn on_blur(&mut self) {
+        if self.focused {
+            self.cancel();
+        }
+    }
+
+    fn pointer_event(&mut self, ev: PointerEvent) -> bool {
+        let PointerEvent::Down { pos } = ev else {
+            return false;
+        };
+        if !self.hit_test(pos) {
+            return false;
+        }
+        if !self.focused {
+            self.focused = true;
+            self.original.clone_from(&self.text);
+        }
+        self.caret = self.caret_from_x(pos.0);
+        true
+    }
+
+    fn key_event(&mut self, key: Key) -> bool {
+        if !self.focused {
+            return false;
+        }
+        match key {
+            Key::Char(c) => self.insert_char(c),
+            Key::Digit(d) => self.insert_char(char::from(b'0' + d)),
+            Key::Backspace => {
+                if self.caret == 0 {
+                    return false;
+                }
+                let at = self
+                    .text
+                    .char_indices()
+                    .nth(self.caret - 1)
+                    .map_or(0, |(i, _)| i);
+                self.text.remove(at);
+                self.caret -= 1;
+                true
+            }
+            Key::ArrowLeft => {
+                let new = self.caret.saturating_sub(1);
+                std::mem::replace(&mut self.caret, new) != new
+            }
+            Key::ArrowRight => {
+                let new = (self.caret + 1).min(self.text.chars().count());
+                std::mem::replace(&mut self.caret, new) != new
+            }
+            Key::Enter => {
+                self.submit();
+                true
+            }
+            Key::Escape => {
+                self.cancel();
+                true
+            }
+        }
+    }
+
+    fn paste(&mut self, text: &str) -> bool {
+        if !self.focused {
+            return false;
+        }
+        let mut changed = false;
+        for c in text.chars().filter(|c| !c.is_control()) {
+            if !self.insert_char(c) {
+                break;
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 /// Чекбокс панели выбора окон (docs/M4_WINDOW_PICKER_DESIGN.md, §7.1 п. 2
 /// и §7.3): квадрат с галочкой, рисуется примитивами `Fill` — глифов «☐»/«☑»
 /// в битовом шрифте нет (RST_RENDER_AUDIT 2.6). Состояние удерживается
 /// виджетом; ядро забирает переключение [`Checkbox::take_changed`] и пишет
 /// его в `cfg` тем же путём, что кнопки тулбара.
+///
+/// Режим `icon_toggle` ([`Checkbox::icon_toggle`], панель свойств
+/// закреплённого окна) рисует состояние иконкой замка [`Icon::Lock`] /
+/// [`Icon::LockOpen`] на фоне кнопки вместо квадрата с галочкой — семантика
+/// (checked/`take_changed`) та же, меняется только вид.
 pub struct Checkbox {
     id: WidgetId,
     bounds: Box2D,
@@ -1049,6 +1439,9 @@ pub struct Checkbox {
     /// Нажат (указатель зажат внутри), переключение ещё не свершилось.
     armed: bool,
     changed: bool,
+    /// Рисовать состояние иконкой замка на фоне кнопки (вместо квадрата
+    /// с галочкой) — панель свойств закреплённого окна.
+    icon_toggle: bool,
 }
 
 impl Checkbox {
@@ -1062,6 +1455,7 @@ impl Checkbox {
             hovered: false,
             armed: false,
             changed: false,
+            icon_toggle: false,
         }
     }
 
@@ -1079,6 +1473,26 @@ impl Checkbox {
             },
             checked,
         )
+    }
+
+    /// Переключатель в виде кнопки с иконкой замка (панель свойств
+    /// закреплённого окна): сторона [`theme::BUTTON_SIZE`], состояние
+    /// рисуется [`Icon::Lock`] (заблокировано) / [`Icon::LockOpen`]
+    /// (свободно). Клик/переключение — как у обычного чекбокса.
+    pub fn icon_toggle(id: WidgetId, cx: f64, cy: f64, checked: bool) -> Self {
+        let mut cb = Self::new(
+            id,
+            Box2D {
+                cx,
+                cy,
+                w: theme::BUTTON_SIZE,
+                h: theme::BUTTON_SIZE,
+                rotation: 0.0,
+            },
+            checked,
+        );
+        cb.icon_toggle = true;
+        cb
     }
 
     /// Текущее состояние.
@@ -1127,6 +1541,33 @@ impl Widget for Checkbox {
 
     fn draw(&self, out: &mut Vec<Primitive>) {
         let opacity = if self.disabled { 0.45 } else { 1.0 };
+        if self.icon_toggle {
+            // Кнопка с иконкой замка: тот же фон, что у [`Button`], состояние
+            // — иконка Lock (заблокировано) / LockOpen (свободно).
+            let bg = if self.armed {
+                theme::BUTTON_BG_ARMED
+            } else if self.hovered {
+                theme::BUTTON_BG_HOVER
+            } else {
+                theme::BUTTON_BG
+            };
+            out.push(Primitive::Fill {
+                rect: self.bounds,
+                color: bg,
+                opacity,
+            });
+            let pad = theme::BUTTON_PAD;
+            out.push(Primitive::Icon {
+                rect: Box2D {
+                    w: (self.bounds.w - 2.0 * pad).max(0.0),
+                    h: (self.bounds.h - 2.0 * pad).max(0.0),
+                    ..self.bounds
+                },
+                icon: if self.checked { Icon::Lock } else { Icon::LockOpen },
+                opacity,
+            });
+            return;
+        }
         let border = if !self.disabled && (self.armed || self.hovered) {
             theme::FIELD_BORDER_FOCUS
         } else {
@@ -1204,6 +1645,80 @@ impl Widget for Checkbox {
             }
             PointerEvent::Move { .. } => false,
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Неинтерактивная текстовая надпись (подписи чекбоксов и заголовки секций
+/// панели свойств закреплённого окна): рисует [`Primitive::Text`] по левому
+/// краю; хит-теста нет — клики сквозь неё (аналог `RowLabel` панели выбора
+/// окон, но без слота иконки).
+pub struct Label {
+    id: WidgetId,
+    text_rect: Box2D,
+    text: String,
+    /// Приглушённая (заголовок секции) — рисуется полупрозрачной.
+    dim: bool,
+}
+
+impl Label {
+    /// Надпись `text` с левым краем `left` и центром строки `cy` (DIP);
+    /// прямоугольник считается по [`text::text_size`].
+    pub fn new(id: WidgetId, left: f64, cy: f64, text: &str) -> Self {
+        let (tw, th) = text::text_size(text);
+        Self {
+            id,
+            text_rect: Box2D {
+                cx: left + tw / 2.0,
+                cy,
+                w: tw,
+                h: th,
+                rotation: 0.0,
+            },
+            text: text.to_string(),
+            dim: false,
+        }
+    }
+
+    /// Приглушить (заголовок секции) — рисуется полупрозрачным.
+    pub fn set_dim(&mut self, dim: bool) {
+        self.dim = dim;
+    }
+}
+
+impl Widget for Label {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.text_rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.text_rect = bounds;
+    }
+
+    /// Не интерактивна — клики/hover сквозь неё, панель не отдаёт ей
+    /// события указателя.
+    fn hit_test(&self, _pos: Point) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        out.push(Primitive::Text {
+            rect: self.text_rect,
+            text: self.text.clone(),
+            color: theme::TEXT,
+            opacity: if self.dim { 0.5 } else { 1.0 },
+        });
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1445,6 +1960,343 @@ impl Panel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Панель свойств закреплённого окна (SPEC «закрепление окон», задача 3/6):
+// переключатели замков, редактор правил соседства, кнопка «Открепить»
+// ---------------------------------------------------------------------------
+
+/// Идентификатор панели свойств закреплённого окна. Диапазон 300+: тулбар
+/// 0-8, панель у курсора 100+, панель выбора окон 200-204.
+pub const PINNED_PANEL_ID: WidgetId = 300;
+/// Переключатель «запретить перемещение» (move-lock, SPEC «закрепление окон»
+/// #5.1) — кнопка-иконка замка ([`Checkbox::icon_toggle`]).
+pub const PINNED_CHECK_MOVE_LOCK: WidgetId = 301;
+/// Переключатель «запретить ввод» (interact-lock, SPEC «закрепление окон»
+/// #5.2) — кнопка-иконка замка.
+pub const PINNED_CHECK_INTERACT_LOCK: WidgetId = 302;
+/// Кнопка «Открепить» — единственное действие удаления закреплённого окна
+/// (SPEC #9: открепление не закрывает окно).
+pub const PINNED_BTN_UNPIN: WidgetId = 303;
+/// Кнопка «Добавить правило» в шапке списка соседства.
+pub const PINNED_BTN_ADD_RULE: WidgetId = 304;
+/// Подпись переключателя move-lock (не интерактивна).
+const PINNED_LABEL_MOVE_LOCK: WidgetId = 306;
+/// Подпись переключателя interact-lock (не интерактивна).
+const PINNED_LABEL_INTERACT_LOCK: WidgetId = 307;
+/// Заголовок секции правил соседства (не интерактивен).
+const PINNED_LABEL_RULES: WidgetId = 308;
+/// Полоса скролла списка правил (не интерактивна, см. [`ScrollBar`]).
+const PINNED_SCROLLBAR_ID: WidgetId = 305;
+/// Разделитель секции замков и правил соседства (не интерактивен).
+const PINNED_DIVIDER_RULES: WidgetId = 309;
+
+/// Ширина панели, DIP.
+pub const PINNED_PANEL_WIDTH: f64 = 320.0;
+/// Высота строки-секции (переключатель/шапка/кнопка), DIP — кнопка
+/// [`theme::BUTTON_SIZE`] с воздухом.
+pub const PINNED_SECTION_ROW_H: f64 = theme::BUTTON_SIZE + 4.0;
+/// Высота строки правила, DIP — поле [`theme::FIELD_HEIGHT`] с воздухом.
+pub const PINNED_RULE_ROW_H: f64 = theme::FIELD_HEIGHT + 6.0;
+/// Сколько строк правил видно без скролла (виртуализация, как
+/// `PICKER_VISIBLE_ROWS` панели выбора окон).
+pub const PINNED_VISIBLE_RULES: usize = 4;
+/// Внутренний отступ панели, DIP.
+pub const PINNED_PAD: f64 = 6.0;
+/// Зазор между элементами, DIP.
+pub const PINNED_GAP: f64 = 8.0;
+/// Полная высота панели, DIP: отступы + две строки переключателей + шапка
+/// списка + видимые правила + строка кнопки «Открепить».
+pub const PINNED_PANEL_HEIGHT: f64 = 2.0 * PINNED_PAD
+    + 3.0 * PINNED_SECTION_ROW_H
+    + PINNED_VISIBLE_RULES as f64 * PINNED_RULE_ROW_H
+    + theme::BUTTON_SIZE;
+
+/// Поле строки правила соседства — декодируется из `WidgetId` строки
+/// ([`decode_pinned_row_id`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum PinnedRowField {
+    /// Кнопка удаления правила.
+    Remove,
+    /// Поле `process_name`.
+    ProcessName,
+    /// Поле `title_pattern` (маска с `*`).
+    TitlePattern,
+}
+
+/// База идентификаторов строк правил: `PINNED_ROW_BASE + (индекс_правила
+/// << PINNED_ROW_FIELD_BITS) + смещение_поля`. Индекс правила — позиция в
+/// `Vec<OverlapRule>` (правил соседства единицы), смещение — вариант
+/// [`PinnedRowField`]. Кодируется РЕАЛЬНЫЙ индекс (не видимый): вызывающий
+/// слой декодирует id по [`decode_pinned_row_id`] независимо от скролла.
+pub const PINNED_ROW_BASE: WidgetId = 0x10_0000;
+/// Битов сдвига индекса правила в кодировке `WidgetId`.
+pub const PINNED_ROW_FIELD_BITS: u32 = 2;
+
+/// `WidgetId` элемента строки `rule_index` (позиция в списке правил).
+pub fn pinned_row_id(rule_index: usize, field: PinnedRowField) -> WidgetId {
+    PINNED_ROW_BASE + ((rule_index as WidgetId) << PINNED_ROW_FIELD_BITS) + field as WidgetId
+}
+
+/// Разобрать `WidgetId` строки обратно в `(индекс_правила, поле)`; для
+/// идентификаторов, не принадлежащих строкам правил, — `None`.
+pub fn decode_pinned_row_id(id: WidgetId) -> Option<(usize, PinnedRowField)> {
+    if id < PINNED_ROW_BASE {
+        return None;
+    }
+    let raw = id - PINNED_ROW_BASE;
+    let field = match raw & ((1 << PINNED_ROW_FIELD_BITS) - 1) {
+        0 => PinnedRowField::Remove,
+        1 => PinnedRowField::ProcessName,
+        2 => PinnedRowField::TitlePattern,
+        _ => return None,
+    };
+    Some(((raw >> PINNED_ROW_FIELD_BITS) as usize, field))
+}
+
+/// Тонкая неинтерактивная разделительная линия между секциями панели
+/// свойств закреплённого окна — визуально отделяет переключатели замков от
+/// списка правил соседства (тот же неинтерактивный статус, что у [`Label`]:
+/// хит-теста нет, клики сквозь неё).
+struct Divider {
+    id: WidgetId,
+    rect: Box2D,
+}
+
+impl Divider {
+    fn new(id: WidgetId, cx: f64, cy: f64, w: f64) -> Self {
+        Self {
+            id,
+            rect: Box2D {
+                cx,
+                cy,
+                w,
+                h: 1.0,
+                rotation: 0.0,
+            },
+        }
+    }
+}
+
+impl Widget for Divider {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.rect = bounds;
+    }
+
+    fn hit_test(&self, _pos: Point) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        out.push(Primitive::Fill {
+            rect: self.rect,
+            color: theme::PANEL_BORDER,
+            opacity: 0.6,
+        });
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Результат [`build_pinned_panel`]: панель + число строк правил для клампа
+/// скролла вызывающим слоем (скролл валиден в `0..=total_rows - 1`, как
+/// `PickerPanel::total_rows` панели выбора окон).
+pub struct PinnedPanel {
+    /// Собранная панель (замки + видимый срез правил + «Открепить»).
+    pub panel: Panel,
+    /// Всего строк правил.
+    pub total_rows: usize,
+}
+
+/// Собрать панель свойств закреплённого окна (SPEC «закрепление окон» #9):
+/// два переключателя замков ([`Checkbox::icon_toggle`] — иконка [`Icon::Lock`]
+/// / [`Icon::LockOpen`] вместо квадрата с галочкой; `move_locked`/
+/// `interact_locked` — состояние живёт в рантайм-модели закрепления, не в
+/// панели), список правил соседства (по паре [`TextField`] на [`OverlapRule`],
+/// кнопки добавления/удаления — `PINNED_BTN_ADD_RULE`/`PinnedRowField::Remove`)
+/// и кнопка «Открепить». `scroll` — сколько строк правил пропустить сверху
+/// (виртуализация: строятся только строки
+/// `[scroll, scroll + PINNED_VISIBLE_RULES)`, `Panel` не трогается); `frame` —
+/// рамка панели (типовой размер — [`PINNED_PANEL_WIDTH`]×
+/// [`PINNED_PANEL_HEIGHT`]).
+///
+/// Оформление (фидбэк пользователя 2026-08-17, «панель выглядит плохо»):
+/// секции разделены линией [`Divider`], заголовок «Соседние окна» приглушён
+/// и поясняет, что ниже — правила соседства; кнопка «Добавить правило» —
+/// иконка [`Icon::Plus`], поля правил имеют разговорные плейсхолдеры
+/// («процесс chrome.exe» / «маска заголовка окна»), чтобы назначение строк
+/// читалось без подсказки. Подписи/тултипы кнопок — у вызывающего слоя
+/// (`overlay_manager::pinned_panel_tooltip_text`).
+///
+/// Правый край контента всегда резервирует колонку под [`ScrollBar`] —
+/// ширина полей не скачет от наличия скролла (тот же приём, что в
+/// `build_picker_panel` панели выбора окон).
+pub fn build_pinned_panel(
+    rules: &[OverlapRule],
+    move_locked: bool,
+    interact_locked: bool,
+    scroll: usize,
+    frame: Box2D,
+) -> PinnedPanel {
+    let mut panel = Panel::new(PINNED_PANEL_ID, frame);
+    let left = frame.cx - frame.w / 2.0 + PINNED_PAD;
+    let top = frame.cy - frame.h / 2.0;
+    let bottom = frame.cy + frame.h / 2.0;
+    let toggle_cx = left + theme::BUTTON_SIZE / 2.0;
+    let label_left = toggle_cx + theme::BUTTON_SIZE / 2.0 + PINNED_GAP;
+
+    // Секция замков: два переключателя-иконки с подписями.
+    let cy_move = top + PINNED_PAD + PINNED_SECTION_ROW_H / 2.0;
+    panel.add_widget(Checkbox::icon_toggle(
+        PINNED_CHECK_MOVE_LOCK,
+        toggle_cx,
+        cy_move,
+        move_locked,
+    ));
+    panel.add_widget(Label::new(
+        PINNED_LABEL_MOVE_LOCK,
+        label_left,
+        cy_move,
+        "Блокировать перемещение",
+    ));
+    let cy_interact = cy_move + PINNED_SECTION_ROW_H;
+    panel.add_widget(Checkbox::icon_toggle(
+        PINNED_CHECK_INTERACT_LOCK,
+        toggle_cx,
+        cy_interact,
+        interact_locked,
+    ));
+    panel.add_widget(Label::new(
+        PINNED_LABEL_INTERACT_LOCK,
+        label_left,
+        cy_interact,
+        "Блокировать ввод",
+    ));
+
+    // Разделитель секций: замки отделены от правил соседства тонкой линией.
+    let cy_divider = cy_interact + PINNED_SECTION_ROW_H / 2.0;
+    let right_edge = frame.cx + frame.w / 2.0 - PINNED_PAD - theme::SCROLLBAR_WIDTH - PINNED_GAP;
+    panel.add_widget(Divider::new(
+        PINNED_DIVIDER_RULES,
+        (left + right_edge) / 2.0,
+        cy_divider,
+        right_edge - left,
+    ));
+
+    // Шапка списка: приглушённый заголовок + кнопка-иконка «+».
+    let cy_header = cy_interact + PINNED_SECTION_ROW_H;
+    let mut rules_label = Label::new(PINNED_LABEL_RULES, left, cy_header, "Соседние окна");
+    rules_label.set_dim(true);
+    panel.add_widget(rules_label);
+    panel.add_widget(Button::icon(
+        PINNED_BTN_ADD_RULE,
+        right_edge - theme::BUTTON_SIZE / 2.0,
+        cy_header,
+        Icon::Plus,
+    ));
+
+    // Строки правил: одна пара полей + кнопка удаления на правило. Строятся
+    // только видимые строки (виртуализация); обход — по реальным индексам.
+    let list_top = top + PINNED_PAD + 3.0 * PINNED_SECTION_ROW_H;
+    let fields_left = left + theme::BUTTON_SIZE + PINNED_GAP;
+    let field_w = (right_edge - fields_left - PINNED_GAP) / 2.0;
+    for (rule_index, rule) in rules.iter().enumerate() {
+        let visible = rule_index as isize - scroll as isize;
+        if !(0..PINNED_VISIBLE_RULES as isize).contains(&visible) {
+            continue;
+        }
+        let cy = list_top + visible as f64 * PINNED_RULE_ROW_H + PINNED_RULE_ROW_H / 2.0;
+        panel.add_widget(Button::icon(
+            pinned_row_id(rule_index, PinnedRowField::Remove),
+            left + theme::BUTTON_SIZE / 2.0,
+            cy,
+            Icon::Delete,
+        ));
+        for (field, value, placeholder) in [
+            (
+                PinnedRowField::ProcessName,
+                &rule.process_name,
+                "процесс chrome.exe",
+            ),
+            (
+                PinnedRowField::TitlePattern,
+                &rule.title_pattern,
+                "маска заголовка окна",
+            ),
+        ] {
+            let cx = match field {
+                PinnedRowField::ProcessName => fields_left + field_w / 2.0,
+                _ => fields_left + field_w + PINNED_GAP + field_w / 2.0,
+            };
+            panel.add_widget(TextField::with_placeholder(
+                pinned_row_id(rule_index, field),
+                Box2D {
+                    cx,
+                    cy,
+                    w: field_w,
+                    h: theme::FIELD_HEIGHT,
+                    rotation: 0.0,
+                },
+                value.as_deref().unwrap_or(""),
+                64,
+                placeholder,
+            ));
+        }
+    }
+
+    // Полоса скролла — только когда правил больше видимых строк (тот же
+    // приём, что в `build_picker_panel`: скролл колесом — у вызывающего
+    // слоя, виджет лишь визуализирует положение).
+    if rules.len() > PINNED_VISIBLE_RULES {
+        let list_h = PINNED_VISIBLE_RULES as f64 * PINNED_RULE_ROW_H;
+        panel.add_widget(ScrollBar::new(
+            PINNED_SCROLLBAR_ID,
+            Box2D {
+                cx: right_edge + PINNED_GAP + theme::SCROLLBAR_WIDTH / 2.0,
+                cy: list_top + list_h / 2.0,
+                w: theme::SCROLLBAR_WIDTH,
+                h: list_h,
+                rotation: 0.0,
+            },
+            PINNED_VISIBLE_RULES,
+            rules.len(),
+            scroll,
+        ));
+    }
+
+    // Кнопка «Открепить» — внизу, на всю ширину контента.
+    panel.add_widget(Button::new(
+        PINNED_BTN_UNPIN,
+        Box2D {
+            cx: frame.cx,
+            cy: bottom - PINNED_PAD - theme::BUTTON_SIZE / 2.0,
+            w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label("Открепить".to_string()),
+    ));
+
+    PinnedPanel {
+        panel,
+        total_rows: rules.len(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,6 +2379,32 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Регрессия: `Text`-примитив кнопки-надписи не должен растягиваться на
+    /// всю ширину кнопки (конвейер спрайтов маппит текстуру текста на `rect`
+    /// 1:1 без сохранения пропорций — широкий `rect` при короткой надписи
+    /// смазывал бы глиф по горизонтали). Ширина текстового прямоугольника
+    /// обязана совпадать с натуральным размером надписи, не с шириной кнопки.
+    #[test]
+    fn button_label_text_rect_matches_natural_text_size_not_button_width() {
+        let b = Button::new(
+            ID_BTN,
+            rect(50.0, 50.0, 300.0, theme::BUTTON_SIZE),
+            ButtonContent::Label("ok".to_string()),
+        );
+        let mut out = Vec::new();
+        b.draw(&mut out);
+        let Primitive::Text { rect: text_rect, .. } = out[1] else {
+            panic!("второй примитив — Text")
+        };
+        let (tw, th) = text::text_size("ok");
+        assert_eq!(text_rect.w, tw, "ширина текста — натуральная, не 300");
+        assert_eq!(text_rect.h, th);
+        assert!(
+            text_rect.w < 300.0,
+            "надпись короче кнопки — растяжения быть не должно"
+        );
     }
 
     /// Ползунок 0–100, центр (100, 50), ширина 112: ход ручки x ∈ [50, 150].
@@ -2016,5 +2894,515 @@ mod tests {
         assert!(p.widget::<Button>(ID_BTN).is_some());
         assert!(p.widget::<Slider>(ID_BTN).is_none(), "тип не совпал");
         assert!(p.widget::<Button>(999).is_none(), "id не найден");
+    }
+
+    // --- Индикатор interact-lock (SPEC «закрепление окон») ---
+
+    #[test]
+    fn lock_indicator_badge_sits_in_top_left_corner() {
+        let win = rect(200.0, 150.0, 100.0, 60.0);
+        let prims = lock_indicator(win);
+        assert_eq!(prims.len(), 2, "фон-бейдж + иконка");
+        let badge = Box2D {
+            cx: 200.0 - 50.0 + theme::LOCK_INDICATOR_MARGIN + theme::LOCK_INDICATOR_SIZE / 2.0,
+            cy: 150.0 - 30.0 + theme::LOCK_INDICATOR_MARGIN + theme::LOCK_INDICATOR_SIZE / 2.0,
+            w: theme::LOCK_INDICATOR_SIZE,
+            h: theme::LOCK_INDICATOR_SIZE,
+            rotation: 0.0,
+        };
+        match &prims[0] {
+            Primitive::Fill {
+                rect,
+                color,
+                opacity,
+            } => {
+                assert_eq!(*rect, badge);
+                assert_eq!(*color, theme::LOCK_INDICATOR_BG);
+                assert_eq!(*opacity, theme::LOCK_INDICATOR_OPACITY);
+            }
+            other => panic!("первый примитив — Fill, не {other:?}"),
+        }
+        match &prims[1] {
+            Primitive::Icon {
+                rect,
+                icon,
+                opacity,
+            } => {
+                assert_eq!(*rect, badge);
+                assert_eq!(*icon, Icon::Lock);
+                assert_eq!(*opacity, theme::LOCK_INDICATOR_OPACITY);
+            }
+            other => panic!("второй примитив — Icon, не {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lock_indicator_light_treatment_not_full_coverage() {
+        let win = rect(0.0, 0.0, 400.0, 300.0);
+        let prims = lock_indicator(win);
+        assert_eq!(prims.len(), 2, "только бейдж + иконка, окно не заливается");
+        for p in &prims {
+            let rect = match p {
+                Primitive::Fill { rect, .. } | Primitive::Icon { rect, .. } => *rect,
+                other => panic!("только Fill/Icon, не {other:?}"),
+            };
+            let area = rect.w * rect.h;
+            assert!(
+                area < win.w * win.h / 2.0,
+                "бейдж в углу, не на всё окно: {area} >= {}",
+                win.w * win.h / 2.0
+            );
+        }
+    }
+
+    #[test]
+    fn lock_indicator_clamps_to_tiny_windows() {
+        let win = rect(0.0, 0.0, 8.0, 200.0);
+        let prims = lock_indicator(win);
+        let Primitive::Fill { rect, .. } = &prims[0] else {
+            panic!("бейдж — Fill")
+        };
+        assert_eq!(rect.w, 8.0, "бейдж не больше окна по ширине");
+        assert_eq!(rect.h, 8.0);
+    }
+
+    // --- TextField ---
+
+    const ID_TEXT: WidgetId = 5;
+
+    fn text_field(text: &str) -> TextField {
+        TextField::with_placeholder(
+            ID_TEXT,
+            rect(100.0, 50.0, 120.0, theme::FIELD_HEIGHT),
+            text,
+            12,
+            "процесс",
+        )
+    }
+
+    #[test]
+    fn text_field_chars_submit_and_take() {
+        let mut f = text_field("chrome");
+        assert!(f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) }));
+        assert!(f.has_focus());
+        assert!(f.key_event(Key::Char('_')));
+        assert!(f.key_event(Key::Char('1')));
+        f.key_event(Key::Enter);
+        assert_eq!(f.take_submitted().as_deref(), Some("chrome_1"));
+        assert_eq!(f.take_submitted(), None, "событие одноразовое");
+        assert!(!f.has_focus(), "Enter отпускает фокус");
+    }
+
+    #[test]
+    fn text_field_digit_key_also_types() {
+        let mut f = text_field("");
+        f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
+        assert!(f.key_event(Key::Digit(7)));
+        f.key_event(Key::Enter);
+        assert_eq!(f.take_submitted().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn text_field_max_len_limits_input() {
+        let mut f = TextField::new(ID_TEXT, rect(0.0, 0.0, 60.0, 22.0), "", 3);
+        f.pointer_event(PointerEvent::Down { pos: (0.0, 0.0) });
+        assert!(f.key_event(Key::Char('a')));
+        assert!(f.key_event(Key::Char('b')));
+        assert!(f.key_event(Key::Char('c')));
+        assert!(!f.key_event(Key::Char('d')), "max_len = 3");
+        f.key_event(Key::Enter);
+        assert_eq!(f.take_submitted().as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn text_field_backspace_arrows_and_caret_from_click() {
+        let mut f = text_field("abcd");
+        // Поле: левый край 40, текст с x = 44. Клик в x = 47 — каретка перед
+        // первым символом (rel = 3, ровно середина «разрыва» перед 'a').
+        f.pointer_event(PointerEvent::Down { pos: (47.0, 50.0) });
+        assert!(f.key_event(Key::ArrowRight));
+        assert!(f.key_event(Key::Backspace), "удалён первый символ");
+        f.key_event(Key::Enter);
+        assert_eq!(f.take_submitted().as_deref(), Some("bcd"));
+    }
+
+    #[test]
+    fn text_field_caret_is_char_based_for_cyrillic() {
+        let mut f = text_field("окна");
+        // Клик в правый край поля (x = 159) — каретка в конец, за кириллицу.
+        f.pointer_event(PointerEvent::Down { pos: (159.0, 50.0) });
+        assert!(f.key_event(Key::Char('!')));
+        f.key_event(Key::Enter);
+        assert_eq!(f.take_submitted().as_deref(), Some("окна!"));
+    }
+
+    #[test]
+    fn text_field_escape_reverts_to_original() {
+        let mut f = text_field("chrome");
+        f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
+        f.key_event(Key::Char('x'));
+        f.key_event(Key::Escape);
+        assert!(f.take_cancelled());
+        assert_eq!(f.take_submitted(), None);
+        assert!(!f.has_focus());
+        assert_eq!(f.text(), "chrome", "текст вернулся к исходному");
+    }
+
+    #[test]
+    fn text_field_blur_reverts_like_escape() {
+        let mut f = text_field("chrome");
+        f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
+        f.key_event(Key::Char('x'));
+        f.on_blur();
+        assert!(!f.has_focus());
+        assert_eq!(f.text(), "chrome");
+    }
+
+    #[test]
+    fn text_field_paste_filters_control_chars() {
+        let mut f = text_field("");
+        assert!(!f.paste("ab"), "вне фокуса вставка игнорируется");
+        f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
+        assert!(f.paste("a\nb\tc"), "управляющие символы отфильтрованы");
+        f.key_event(Key::Enter);
+        assert_eq!(f.take_submitted().as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn text_field_set_text_syncs_without_event() {
+        let mut f = text_field("old");
+        f.set_text("new value");
+        assert_eq!(f.text(), "new value");
+        assert_eq!(f.take_submitted(), None, "внешняя синхронизация не событие");
+        // В фокусе set_text не трогает редактируемый буфер.
+        f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
+        f.key_event(Key::Char('!'));
+        f.set_text("ignored");
+        f.key_event(Key::Enter);
+        assert_eq!(f.take_submitted().as_deref(), Some("new value!"));
+    }
+
+    #[test]
+    fn text_field_draw_placeholder_when_empty() {
+        let f = text_field("");
+        let mut out = Vec::new();
+        f.draw(&mut out);
+        assert_eq!(out.len(), 3, "рамка + фон + плейсхолдер");
+        let Primitive::Text { text, opacity, .. } = &out[2] else {
+            panic!("третий примитив — Text")
+        };
+        assert_eq!(text, "процесс");
+        assert!(*opacity < 1.0, "плейсхолдер приглушён");
+    }
+
+    #[test]
+    fn text_field_draw_caret_only_when_focused() {
+        let mut f = text_field("text");
+        let mut out = Vec::new();
+        f.draw(&mut out);
+        assert_eq!(out.len(), 3, "рамка + фон + текст");
+        f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
+        out.clear();
+        f.draw(&mut out);
+        assert_eq!(out.len(), 4, "+ рисованная каретка");
+        let Primitive::Fill { rect, .. } = out[3] else {
+            panic!("каретка — Fill")
+        };
+        assert!(rect.w < 1.1 && rect.h > 8.0);
+    }
+
+    // --- Label ---
+
+    const ID_LABEL: WidgetId = 6;
+
+    #[test]
+    fn label_draws_text_and_never_hit() {
+        let l = Label::new(ID_LABEL, 50.0, 30.0, "Правила");
+        let mut out = Vec::new();
+        l.draw(&mut out);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            Primitive::Text { text, opacity, .. } if text == "Правила" && *opacity == 1.0
+        ));
+        assert!(!l.hit_test((50.0, 30.0)), "надпись не интерактивна");
+    }
+
+    #[test]
+    fn label_geometry_from_left_edge_and_dim() {
+        let mut l = Label::new(ID_LABEL, 50.0, 30.0, "ok");
+        let (tw, th) = text::text_size("ok");
+        assert_eq!(
+            l.bounds(),
+            Box2D {
+                cx: 50.0 + tw / 2.0,
+                cy: 30.0,
+                w: tw,
+                h: th,
+                rotation: 0.0
+            }
+        );
+        l.set_dim(true);
+        let mut out = Vec::new();
+        l.draw(&mut out);
+        let Primitive::Text { opacity, .. } = &out[0] else {
+            panic!("Text")
+        };
+        assert_eq!(*opacity, 0.5, "приглушённая подпись");
+    }
+
+    // --- Панель свойств закреплённого окна ---
+
+    fn pinned_frame() -> Box2D {
+        rect(200.0, 200.0, PINNED_PANEL_WIDTH, PINNED_PANEL_HEIGHT)
+    }
+
+    fn rule(process: &str, title: &str) -> OverlapRule {
+        OverlapRule {
+            process_name: Some(process.to_string()),
+            title_pattern: Some(title.to_string()),
+        }
+    }
+
+    #[test]
+    fn pinned_row_id_roundtrip() {
+        for (i, field) in [
+            (0usize, PinnedRowField::Remove),
+            (0, PinnedRowField::ProcessName),
+            (0, PinnedRowField::TitlePattern),
+            (7, PinnedRowField::ProcessName),
+            (4095, PinnedRowField::TitlePattern),
+        ] {
+            let id = pinned_row_id(i, field);
+            assert_eq!(decode_pinned_row_id(id), Some((i, field)));
+        }
+    }
+
+    #[test]
+    fn pinned_row_id_decode_rejects_panel_ids() {
+        for id in [PINNED_PANEL_ID, PINNED_CHECK_MOVE_LOCK, PINNED_BTN_UNPIN, 0] {
+            assert_eq!(decode_pinned_row_id(id), None, "id {id}");
+        }
+    }
+
+    #[test]
+    fn pinned_panel_seeds_locks_and_unpin_click() {
+        let mut p = build_pinned_panel(&[], true, false, 0, pinned_frame()).panel;
+        assert!(p.widget::<Checkbox>(PINNED_CHECK_MOVE_LOCK).unwrap().checked());
+        assert!(!p
+            .widget::<Checkbox>(PINNED_CHECK_INTERACT_LOCK)
+            .unwrap()
+            .checked());
+        // Кнопка «Открепить» — внизу по центру панели.
+        let unpin_b = p.widget::<Button>(PINNED_BTN_UNPIN).unwrap().bounds();
+        let click = (unpin_b.cx, unpin_b.cy);
+        p.pointer_event(PointerEvent::Down { pos: click });
+        p.pointer_event(PointerEvent::Up { pos: click });
+        assert!(
+            p.widget_mut::<Button>(PINNED_BTN_UNPIN).unwrap().take_click(),
+            "«Открепить» кликабельна"
+        );
+    }
+
+    #[test]
+    fn pinned_panel_seeds_rule_fields_from_overlap_rule() {
+        let p = build_pinned_panel(&[rule("chrome", "нет*")], false, false, 0, pinned_frame())
+            .panel;
+        let process = p
+            .widget::<TextField>(pinned_row_id(0, PinnedRowField::ProcessName))
+            .unwrap();
+        assert_eq!(process.text(), "chrome");
+        let title = p
+            .widget::<TextField>(pinned_row_id(0, PinnedRowField::TitlePattern))
+            .unwrap();
+        assert_eq!(title.text(), "нет*");
+        // Пустые поля правила: плейсхолдеры подставлены, текст пуст.
+        let p = build_pinned_panel(
+            &[OverlapRule {
+                process_name: None,
+                title_pattern: None,
+            }],
+            false,
+            false,
+            0,
+            pinned_frame(),
+        )
+        .panel;
+        assert_eq!(
+            p.widget::<TextField>(pinned_row_id(0, PinnedRowField::ProcessName))
+                .unwrap()
+                .text(),
+            ""
+        );
+    }
+
+    #[test]
+    fn pinned_panel_remove_button_click_identifiable_by_id() {
+        let mut p =
+            build_pinned_panel(&[rule("a", "b"), rule("c", "d")], false, false, 0, pinned_frame())
+                .panel;
+        let id = pinned_row_id(1, PinnedRowField::Remove);
+        let b = p.widget::<Button>(id).unwrap().bounds();
+        p.pointer_event(PointerEvent::Down { pos: (b.cx, b.cy) });
+        p.pointer_event(PointerEvent::Up { pos: (b.cx, b.cy) });
+        assert!(
+            p.widget_mut::<Button>(id).unwrap().take_click(),
+            "клик по «удалить правило» второй строки"
+        );
+    }
+
+    #[test]
+    fn pinned_panel_scrollbar_only_when_rules_overflow() {
+        let p = build_pinned_panel(
+            &(0..PINNED_VISIBLE_RULES).map(|_| rule("p", "t")).collect::<Vec<_>>(),
+            false,
+            false,
+            0,
+            pinned_frame(),
+        );
+        assert_eq!(p.total_rows, PINNED_VISIBLE_RULES);
+        assert!(
+            p.panel.widget::<ScrollBar>(PINNED_SCROLLBAR_ID).is_none(),
+            "ровно видимое число правил — скролла нет"
+        );
+        let p = build_pinned_panel(
+            &(0..PINNED_VISIBLE_RULES + 3).map(|_| rule("p", "t")).collect::<Vec<_>>(),
+            false,
+            false,
+            0,
+            pinned_frame(),
+        );
+        assert_eq!(p.total_rows, PINNED_VISIBLE_RULES + 3);
+        assert!(
+            p.panel.widget::<ScrollBar>(PINNED_SCROLLBAR_ID).is_some(),
+            "правил больше видимых строк — скролл есть"
+        );
+    }
+
+    #[test]
+    fn pinned_panel_virtualizes_rows_by_scroll() {
+        let rules: Vec<OverlapRule> = (0..10)
+            .map(|i| rule(&format!("p{i}"), &format!("t{i}")))
+            .collect();
+        let p = build_pinned_panel(&rules, false, false, 2, pinned_frame());
+        assert_eq!(p.total_rows, 10);
+        // Строка 1 (невидимая) не собрана, строка 2 (первая видимая) — есть.
+        assert!(
+            p.panel
+                .widget::<TextField>(pinned_row_id(1, PinnedRowField::ProcessName))
+                .is_none()
+        );
+        assert_eq!(
+            p.panel
+                .widget::<TextField>(pinned_row_id(2, PinnedRowField::ProcessName))
+                .unwrap()
+                .text(),
+            "p2"
+        );
+        // Последняя видимая — индекс 2 + 4 - 1 = 5.
+        assert_eq!(
+            p.panel
+                .widget::<TextField>(pinned_row_id(5, PinnedRowField::TitlePattern))
+                .unwrap()
+                .text(),
+            "t5"
+        );
+        assert!(
+            p.panel
+                .widget::<TextField>(pinned_row_id(6, PinnedRowField::ProcessName))
+                .is_none(),
+            "строка 6 уже за окном скролла"
+        );
+    }
+
+    #[test]
+    fn pinned_panel_add_rule_button_click() {
+        let mut p = build_pinned_panel(&[], false, false, 0, pinned_frame()).panel;
+        let b = p.widget::<Button>(PINNED_BTN_ADD_RULE).unwrap().bounds();
+        p.pointer_event(PointerEvent::Down { pos: (b.cx, b.cy) });
+        p.pointer_event(PointerEvent::Up { pos: (b.cx, b.cy) });
+        assert!(p
+            .widget_mut::<Button>(PINNED_BTN_ADD_RULE)
+            .unwrap()
+            .take_click());
+    }
+
+    /// Иконка-переключатель замка рисует иконку [`Icon::Lock`] в состоянии
+    /// «заблокировано» и [`Icon::LockOpen`] в «свободно» — состояние панели
+    /// читается пиктограммой, а не квадратом с галочкой.
+    #[test]
+    fn pinned_panel_lock_toggles_draw_lock_icons() {
+        for (id, checked, expect) in [
+            (PINNED_CHECK_MOVE_LOCK, true, Icon::Lock),
+            (PINNED_CHECK_MOVE_LOCK, false, Icon::LockOpen),
+            (PINNED_CHECK_INTERACT_LOCK, true, Icon::Lock),
+            (PINNED_CHECK_INTERACT_LOCK, false, Icon::LockOpen),
+        ] {
+            let p = build_pinned_panel(&[], checked, checked, 0, pinned_frame()).panel;
+            let mut prims = Vec::new();
+            p.widget::<Checkbox>(id).unwrap().draw(&mut prims);
+            let mut seen_icon = false;
+            for prim in prims {
+                if let Primitive::Icon { icon, .. } = prim {
+                    seen_icon = true;
+                    assert_eq!(icon, expect, "id {id} checked {checked}");
+                }
+            }
+            assert!(seen_icon, "id {id} checked {checked}: иконка не нарисована");
+        }
+    }
+
+    /// Переключатель замка — кнопка [`theme::BUTTON_SIZE`] (не маленький
+    /// квадрат чекбокса): клик/переключение по центру кнопки работает.
+    #[test]
+    fn pinned_panel_lock_toggle_clicks_like_checkbox() {
+        let mut p = build_pinned_panel(&[], false, false, 0, pinned_frame()).panel;
+        let b = p.widget::<Checkbox>(PINNED_CHECK_MOVE_LOCK).unwrap().bounds();
+        assert_eq!(b.w, theme::BUTTON_SIZE, "иконка-кнопка размера тулбара");
+        p.pointer_event(PointerEvent::Down { pos: (b.cx, b.cy) });
+        p.pointer_event(PointerEvent::Up { pos: (b.cx, b.cy) });
+        assert_eq!(
+            p.widget_mut::<Checkbox>(PINNED_CHECK_MOVE_LOCK)
+                .unwrap()
+                .take_changed(),
+            Some(true),
+            "клик по иконке-замку переключает move-lock"
+        );
+    }
+
+    /// Разделитель секций собран и не интерактивен (клики сквозь него —
+    /// как у [`Label`]).
+    #[test]
+    fn pinned_panel_has_non_interactive_rules_divider() {
+        let p = build_pinned_panel(&[], false, false, 0, pinned_frame()).panel;
+        let d = p.widget::<Divider>(PINNED_DIVIDER_RULES).unwrap();
+        assert!(
+            !d.hit_test((d.bounds().cx, d.bounds().cy)),
+            "разделитель не потребляет клики"
+        );
+        assert!(d.bounds().w > 0.0, "разделитель тянется через контент");
+    }
+
+    /// Плейсхолдеры полей правил поясняют назначение полей и влезают
+    /// в ширину поля (текст не клиппится конвейером примитивов — длинный
+    /// плейсхолдер иначе рисовался бы за рамкой поля).
+    #[test]
+    fn pinned_panel_rule_placeholders_fit_field_width() {
+        let rules = [OverlapRule {
+            process_name: None,
+            title_pattern: None,
+        }];
+        let p = build_pinned_panel(&rules, false, false, 0, pinned_frame()).panel;
+        let process = p
+            .widget::<TextField>(pinned_row_id(0, PinnedRowField::ProcessName))
+            .unwrap();
+        let avail = process.bounds().w - 2.0 * theme::FIELD_PAD;
+        for label in ["процесс chrome.exe", "маска заголовка окна"] {
+            let (tw, _) = text::text_size(label);
+            assert!(
+                tw <= avail,
+                "плейсхолдер {label:?} ({tw} DIP) шире поля ({avail} DIP)"
+            );
+        }
     }
 }

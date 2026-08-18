@@ -23,6 +23,7 @@
           <div class="tab" data-tab="presets"><h3 data-i18n="tab.presets">Пресеты</h3></div>
           <div class="tab" data-tab="control"><h3 data-i18n="tab.control">Управление</h3></div>
           <div class="tab" data-tab="general"><h3 data-i18n="tab.general">Общие</h3></div>
+          <div class="tab" data-tab="denylist"><h3 data-i18n="tab.denylist">Денй-лист</h3></div>
         </header>
 
         <section class="content">
@@ -207,6 +208,45 @@
                   step="1"
                 />
                 <span class="sliderValue" id="battery-fps-limit-value">30</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- ==== Денй-лист ==== -->
+          <div class="panel" data-panel="denylist">
+            <div class="column">
+              <div class="inputGroup">
+                <p class="inputLabel" data-i18n="denylist.listLabel">Денй-лист закрепления</p>
+              </div>
+              <p class="hint" data-i18n="denylist.hint">
+                Окна, чей процесс или заголовок совпадает с правилом, нельзя закрепить горячей
+                клавишей — они не показываются в списке выбора окна. Больше денй-лист ни на что
+                не влияет.
+              </p>
+              <div class="inputGroup denylistAddRow">
+                <input
+                  type="text"
+                  class="textInput"
+                  id="denylist-process"
+                  placeholder="process_name.exe"
+                  data-i18n-placeholder="denylist.processPlaceholder"
+                />
+                <input
+                  type="text"
+                  class="textInput"
+                  id="denylist-title"
+                  placeholder="часть заголовка, * — подстановка"
+                  data-i18n-placeholder="denylist.titlePlaceholder"
+                />
+                <button class="button compact" id="add-denylist-rule" disabled data-i18n="denylist.add">
+                  Добавить
+                </button>
+              </div>
+              <div class="stickerList" id="denylist-list">
+                <p class="emptyHint" data-i18n="denylist.loading">Загрузка…</p>
+              </div>
+              <div class="inputGroup">
+                <span class="status" id="denylist-status"></span>
               </div>
             </div>
           </div>

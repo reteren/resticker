@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::Context;
-use rst_core::model::{Config, Hotkeys, Settings};
+use rst_core::model::{Config, Hotkeys, OverlapRule, Settings};
 use tauri::{Emitter, Manager, WindowEvent};
 use uuid::Uuid;
 
@@ -259,6 +259,39 @@ fn import_preset(path: String, overlay: tauri::State<OverlayHandle>) {
     overlay.send(OverlayCommand::ImportPreset(PathBuf::from(path)));
 }
 
+/// Вкладка «Денй-лист» (SPEC.md, «Закрепление окна»): добавить правило —
+/// совпавшие окна нельзя закрепить хоткеем и не видно в списке выбора.
+/// `process_name` обязателен (UI не даёт отправить без него), `title_pattern`
+/// опционален ('*' — подстановка, CONFIG.md «Совпадение окон»). Пробельные
+/// строки нормализуются в `None`; правило «оба `None`» координатор не
+/// добавит (такое не матчит ничего) — см. обработчик `AddDenylistRule`.
+#[tauri::command]
+fn add_denylist_rule(
+    process_name: String,
+    title_pattern: Option<String>,
+    overlay: tauri::State<OverlayHandle>,
+) {
+    overlay.send(OverlayCommand::AddDenylistRule(OverlapRule {
+        process_name: trim_non_empty(process_name),
+        title_pattern: title_pattern.and_then(trim_non_empty),
+    }));
+}
+
+/// Удалить правило денй-листа по индексу строки списка (у `OverlapRule` нет
+/// id — адрес строки и есть её индекс; тот же принцип, что у пунктов
+/// подменю пресетов в трее: индекс вместо идентификатора).
+#[tauri::command]
+fn remove_denylist_rule(index: usize, overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::RemoveDenylistRule(index));
+}
+
+/// Строка после trim; пустая/пробельная — `None` (поля-критерии правила
+/// денй-листа не хранят пустые значения: `""` матчил бы заголовок `""`).
+fn trim_non_empty(s: String) -> Option<String> {
+    let trimmed = s.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// Показать файл в проводнике (SPEC.md, раздел 10 — «показать в
 /// проводнике»). Не трогает `cfg`/координатор — чисто читающее действие
 /// над файловой системой, `explorer.exe` сам подсвечивает файл в открытом
@@ -367,6 +400,8 @@ fn main() -> anyhow::Result<()> {
             delete_preset,
             export_preset,
             import_preset,
+            add_denylist_rule,
+            remove_denylist_rule,
         ])
         .setup(move |app| {
             if !silent_start {
@@ -536,5 +571,13 @@ mod tests {
     fn parse_id_accepts_valid_uuid() {
         let id = Uuid::new_v4();
         assert_eq!(parse_id(&id.to_string()).unwrap(), id);
+    }
+
+    #[test]
+    fn trim_non_empty_drops_empty_and_whitespace() {
+        assert_eq!(trim_non_empty("chrome.exe".to_string()).as_deref(), Some("chrome.exe"));
+        assert_eq!(trim_non_empty("  chrome.exe  ".to_string()).as_deref(), Some("chrome.exe"));
+        assert_eq!(trim_non_empty("".to_string()), None);
+        assert_eq!(trim_non_empty("   ".to_string()), None);
     }
 }

@@ -50,8 +50,13 @@ pub use texture::Texture;
 pub use ui_textures::{TextureFactory, UiTextures};
 pub use video::VideoTextures;
 pub use widgets::{
-    Button, ButtonContent, Checkbox, EventResult, Icon, Key, NumericField, Panel, PointerEvent,
-    Primitive, ScrollBar, Slider, Widget, WidgetId, box_contains, theme,
+    Button, ButtonContent, Checkbox, EventResult, Icon, Key, Label, NumericField, Panel,
+    PINNED_BTN_ADD_RULE, PINNED_BTN_UNPIN, PINNED_CHECK_INTERACT_LOCK, PINNED_CHECK_MOVE_LOCK,
+    PINNED_GAP, PINNED_PAD, PINNED_PANEL_HEIGHT, PINNED_PANEL_ID, PINNED_PANEL_WIDTH,
+    PINNED_ROW_BASE, PINNED_ROW_FIELD_BITS, PINNED_RULE_ROW_H, PINNED_SECTION_ROW_H,
+    PINNED_VISIBLE_RULES, PinnedPanel, PinnedRowField, PointerEvent, Primitive, ScrollBar,
+    Slider, TextField, Widget, WidgetId, box_contains, build_pinned_panel, decode_pinned_row_id,
+    lock_indicator, pinned_row_id, theme,
 };
 pub use window_highlight::{HIGHLIGHT_THICKNESS_DIP, HighlightKind, WindowHighlight};
 pub use window_target::WindowTarget;

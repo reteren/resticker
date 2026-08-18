@@ -21,6 +21,7 @@ let renameTargetId = null;
 const statusEl = document.getElementById('status');
 const stickerStatusEl = document.getElementById('sticker-status');
 const presetStatusEl = document.getElementById('preset-status');
+const denylistStatusEl = document.getElementById('denylist-status');
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -61,6 +62,7 @@ async function loadConfig() {
   renderControl();
   renderStickers();
   renderPresets();
+  renderDenylist();
 }
 
 // ==== Вкладка «Общие» ====
@@ -112,6 +114,7 @@ document.getElementById('language').addEventListener('change', (e) => {
   applyStaticTranslations(draftSettings.language);
   renderStickers();
   renderPresets();
+  renderDenylist();
 });
 
 // ==== Вкладка «Управление» (хоткеи) ====
@@ -490,6 +493,110 @@ listen('preset-missing-elements', (event) => {
   if (missing.length === 0) return;
   const lines = missing.map((m) => `• ${m.path ?? m[1]}`).join('\n');
   alert(t('preset.missingAlert', { lines }));
+});
+
+// ==== Вкладка «Денй-лист» (закрепление окон) ====
+
+// Правила — OverlapRule { process_name, title_pattern } из
+// cfg.settings.denylist (crates/rst-core/src/model.rs). Id у правила нет,
+// поэтому строки адресуются индексом списка; канал команд FIFO, индексы UI
+// и координатора не расходятся. Список рендерится из draftSettings, а не из
+// config: сразу после add/remove диск может отставать от координатора на
+// гонку invoke→get_config, черновик же правим мы сами (см. ниже).
+function sameDenylistRule(a, b) {
+  return (a?.process_name ?? null) === (b?.process_name ?? null)
+    && (a?.title_pattern ?? null) === (b?.title_pattern ?? null);
+}
+
+function renderDenylist() {
+  const list = document.getElementById('denylist-list');
+  list.innerHTML = '';
+  const rules = draftSettings.denylist ?? [];
+  if (rules.length === 0) {
+    list.innerHTML = `<p class="emptyHint">${t('denylist.empty')}</p>`;
+    return;
+  }
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i];
+    const row = document.createElement('div');
+    row.className = 'stickerRow';
+    row.innerHTML = `
+      <div class="stickerInfo">
+        <span class="stickerName">${escapeHtml(rule.process_name ?? '')}</span>
+        <span class="stickerMeta">${escapeHtml(rule.title_pattern ?? t('denylist.noTitlePattern'))}</span>
+      </div>
+      <div class="stickerActions">
+        <button class="button compact danger" data-action="remove" data-index="${i}" title="${t('denylist.removeTitle')}">✕</button>
+      </div>
+    `;
+    list.appendChild(row);
+  }
+}
+
+const denylistProcessInput = document.getElementById('denylist-process');
+const denylistTitleInput = document.getElementById('denylist-title');
+const addDenylistBtn = document.getElementById('add-denylist-rule');
+
+function updateAddDenylistBtn() {
+  addDenylistBtn.disabled = !denylistProcessInput.value.trim();
+}
+
+denylistProcessInput.addEventListener('input', updateAddDenylistBtn);
+for (const input of [denylistProcessInput, denylistTitleInput]) {
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !addDenylistBtn.disabled) addDenylistBtn.click();
+  });
+}
+
+addDenylistBtn.addEventListener('click', async () => {
+  const processName = denylistProcessInput.value.trim();
+  const titlePattern = denylistTitleInput.value.trim() || null;
+  if (!processName) return;
+  const rule = { process_name: processName, title_pattern: titlePattern };
+  try {
+    await invoke('add_denylist_rule', { processName, titlePattern });
+    await loadConfig();
+    // Гонка invoke→get_config: свежепрочитанный config мог ещё не содержать
+    // только что сохранённое правило (координатор пишет файл асинхронно).
+    // Достраиваем черновик сами — иначе Apply/OK отправит update_settings
+    // со старым списком и молча откатит добавление.
+    if (!(config.settings.denylist ?? []).some((r) => sameDenylistRule(r, rule))) {
+      draftSettings.denylist = [...(draftSettings.denylist ?? []), rule];
+      renderDenylist();
+    }
+    setStatus(t('denylist.added', { process: processName }));
+    denylistStatusEl.textContent = '';
+    denylistProcessInput.value = '';
+    denylistTitleInput.value = '';
+    updateAddDenylistBtn();
+  } catch (err) {
+    denylistStatusEl.textContent = t('error.generic', { err });
+  }
+});
+
+document.getElementById('denylist-list').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-action="remove"]');
+  if (!btn) return;
+  const index = Number(btn.dataset.index);
+  const removed = (draftSettings.denylist ?? [])[index];
+  if (!removed) return;
+  try {
+    await invoke('remove_denylist_rule', { index });
+    await loadConfig();
+    // Та же гонка с диском, что при добавлении: если свежепрочитанный
+    // config всё ещё содержит удалённое правило, убираем его из черновика
+    // сами — иначе Apply/OK вернёт его через update_settings.
+    if ((config.settings.denylist ?? []).some((r) => sameDenylistRule(r, removed))) {
+      const i = (draftSettings.denylist ?? []).findIndex((r) => sameDenylistRule(r, removed));
+      if (i >= 0) {
+        draftSettings.denylist.splice(i, 1);
+        renderDenylist();
+      }
+    }
+    setStatus(t('denylist.removed'));
+  } catch (err) {
+    denylistStatusEl.textContent = t('error.generic', { err });
+  }
 });
 
 // ==== Подвал: Применить / ОК / Отмена ====
