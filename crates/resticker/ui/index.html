@@ -123,6 +123,33 @@
                 <button class="button compact" id="clear-hotkey-mute-all">×</button>
               </div>
 
+              <div class="inputGroup">
+                <p class="inputLabel" data-i18n="control.pinFocusedWindow">Закрепить активное окно</p>
+                <input
+                  type="text"
+                  class="textInput hotkeyInput"
+                  id="hotkey-pin"
+                  readonly
+                  placeholder="Не задан"
+                  data-i18n-placeholder="control.notSet"
+                  style="max-width: 160px"
+                />
+                <button class="button compact" id="clear-hotkey-pin">×</button>
+              </div>
+
+              <div class="inputGroup">
+                <p class="inputLabel" data-i18n="control.pinSoundVolume">Громкость закрепления окна</p>
+                <input
+                  type="range"
+                  class="slider"
+                  id="pin-sound-volume"
+                  min="0"
+                  max="100"
+                  step="1"
+                />
+                <span class="sliderValue" id="pin-sound-volume-value">100</span>
+              </div>
+
               <p class="hint" data-i18n="control.hintClick">Клик по полю, затем нажмите комбинацию клавиш.</p>
               <p class="hint" data-i18n="control.hintRestart">Изменения хоткеев применяются после перезапуска resticker.</p>
             </div>
@@ -223,6 +250,11 @@
                 клавишей — они не показываются в списке выбора окна. Больше денй-лист ни на что
                 не влияет.
               </p>
+              <div class="inputGroup">
+                <select class="textInput" id="denylist-process-picker" style="max-width: 260px">
+                  <option value="" data-i18n="denylist.pickWindow">Выбрать открытое окно…</option>
+                </select>
+              </div>
               <div class="inputGroup denylistAddRow">
                 <input
                   type="text"

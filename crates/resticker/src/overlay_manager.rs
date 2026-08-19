@@ -52,11 +52,11 @@ use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::animation as media_animation;
 use rst_media::paste;
 use rst_render::{
-    Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon, Key,
-    NumericField, Panel, PinnedRowField, PointerEvent, Primitive, RenderError, SelectionBox,
-    Slider, Sprite, Texture, TextField, TextureAtlas, VideoTextures, WidgetId, WindowHighlight,
-    WindowTarget, edit_overlay, lock_indicator, marquee_visuals, pinned_row_id, rasterize,
-    solid_sprite, theme,
+    Box2D, Button, ButtonContent, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon,
+    Key, Label, NumericField, Panel, PinnedRowField, PointerEvent, Primitive, RenderError,
+    SelectionBox, Slider, Sprite, Texture, TextField, TextureAtlas, VideoTextures, WidgetId,
+    WindowHighlight, WindowTarget, edit_overlay, lock_indicator, marquee_visuals, pinned_row_id,
+    rasterize, solid_sprite, theme,
 };
 use rst_video::VideoSource;
 use rst_win32::Win32Error;
@@ -506,6 +506,118 @@ impl TooltipState {
     }
 }
 
+/// Длительность пульса рамки при пин/анпин по хоткею (запрос пользователя
+/// 2026-08-18): 0 → 100% за 0.5 с, 100 → 0% за следующие 0.5 с, итого 1 с.
+const PIN_FLASH_DURATION: Duration = Duration::from_secs(1);
+/// Длительность фазы подъёма пульса, с.
+const PIN_FLASH_RISE: Duration = Duration::from_millis(500);
+/// Шаг перепланирования кадра пульса — тот же принцип «ноль пробуждений в
+/// покое» (ADR-006), что у тултипа: 16 мс ≈ 60 Гц, дешевле некуда.
+const PIN_FLASH_STEP: Duration = Duration::from_millis(16);
+/// Цвет рамки пульса — акцент проекта: тот же `#3c9898`, что `--accent` в
+/// настройках (НЕ синий `SLIDER_FILL` D3D-темы — тот для другой семантики).
+const PIN_FLASH_COLOR: [u8; 3] = [0x3c, 0x98, 0x98];
+
+/// Высота МИНИМАЛЬНОЙ панели свойств закреплённого окна, DIP: отступы +
+/// кнопка «Открепить» (замки/правила соседства скрыты из UI по решению
+/// пользователя 2026-08-18 — см. доккомент `rebuild_pinned_panel`).
+const PINNED_MINIMAL_PANEL_HEIGHT: f64 = 2.0 * rst_render::PINNED_PAD + theme::BUTTON_SIZE;
+
+/// Активный пульс рамки закрепляемого/открепляемого окна (Ctrl+Alt+R):
+/// `hwnd` целевого окна + момент старта. Временное состояние, живёт ровно
+/// `PIN_FLASH_DURATION` (истекает в цикле `run()`), рисуется ВСЕГДА — и в
+/// обычном режиме, и в edit-mode: пин — фича нормального режима, пульс —
+/// его визуальный отклик, редравы крутит планировщик анимаций тем же
+/// дедлайном, что тултип/анимации стикеров (см. `next_deadline`).
+struct PinFlash {
+    hwnd: isize,
+    started_at: Instant,
+}
+
+impl PinFlash {
+    fn new(hwnd: isize) -> Self {
+        Self {
+            hwnd,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Прозрачность рамки сейчас: линейный треугольник — 0→1 за первую
+    /// половину, 1→0 за вторую (0 после истечения).
+    fn opacity(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if elapsed >= PIN_FLASH_DURATION {
+            return 0.0;
+        }
+        if elapsed < PIN_FLASH_RISE {
+            elapsed.as_secs_f64() / PIN_FLASH_RISE.as_secs_f64()
+        } else {
+            1.0 - (elapsed.as_secs_f64() - PIN_FLASH_RISE.as_secs_f64()) / PIN_FLASH_RISE.as_secs_f64()
+        }
+    }
+
+    /// Следующий момент, когда пульс нужно перерисовать (амплитуда снова
+    /// изменится) — `None`, когда анимация завершена и больше не меняется.
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        (now.saturating_duration_since(self.started_at) < PIN_FLASH_DURATION)
+            .then(|| now + PIN_FLASH_STEP)
+    }
+
+    /// Истёк ли пульс — пора вычищать из `EditState::pin_flashes`.
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) >= PIN_FLASH_DURATION
+    }
+}
+
+/// Длительность показа баннера предупреждений оверлея (конфликт хоткея и
+/// т.п.) — короткоживущий, авто-dismiss; шаг перепланирования — тот же
+/// `PIN_FLASH_STEP` (16 мс ≈ 60 Гц).
+const BANNER_DURATION: Duration = Duration::from_secs(5);
+/// Высота баннера, DIP.
+const BANNER_HEIGHT: f64 = 28.0;
+/// Внутренний отступ текста баннера, DIP.
+const BANNER_PAD: f64 = 12.0;
+/// Зазор баннера от верхнего края монитора, DIP.
+const BANNER_TOP_GAP: f64 = 8.0;
+/// `WidgetId` панели баннера (локальное пространство оверлея, свободное от
+/// остальных панелей: PINNED_* — 300+, toolbar/picker/preset — свои базы).
+const BANNER_PANEL_ID: WidgetId = 901;
+
+/// Короткоживущий баннер-предупреждение, который resticker рисует САМ в
+/// оверлее (решение координатора 2026-08-18: tray-баллун `Shell_NotifyIcon`
+/// молча не рендерится на Windows 11 25H2 — доказано живым стендом —
+/// поэтому критические предупреждения не должны полагаться на него одного;
+/// баллун остаётся безвредным fallback для ОС, где он ещё работает).
+/// Авто-dismiss через `BANNER_DURATION`, дедлайн — тот же паттерн, что у
+/// [`PinFlash`]/тултипа.
+struct BannerState {
+    text: String,
+    monitor_id: MonitorId,
+    shown_at: Instant,
+}
+
+impl BannerState {
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        (now.saturating_duration_since(self.shown_at) < BANNER_DURATION).then(|| now + PIN_FLASH_STEP)
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.shown_at) >= BANNER_DURATION
+    }
+}
+
+/// Показать баннер предупреждения на мониторе `monitor_id` (обычно
+/// primary — там живут глобальные хоткеи, там же их конфликты). Перезаписывает
+/// предыдущий баннер (новое предупреждение важнее старого). Текст — уже
+/// локализованный, как у `i18n::hotkey_conflict_notification`.
+fn show_banner(edit: &mut EditState, monitor_id: &MonitorId, text: String) {
+    edit.banner = Some(BannerState {
+        text,
+        monitor_id: monitor_id.clone(),
+        shown_at: Instant::now(),
+    });
+}
+
 pub enum OverlayCommand {
     AddSticker(PathBuf),
     /// Заменить `cfg.settings` целиком (окно настроек, вкладка «Общие») —
@@ -857,10 +969,12 @@ struct EditState {
     /// стикерах, либо на закреплённом окне, клик по одному снимает другое.
     /// `None` — ни одно закреплённое окно не выделено.
     pinned_selection: Option<isize>,
-    /// Открытая панель свойств закреплённого окна (замки, правила
-    /// соседства, «Открепить»; `rst_render::build_pinned_panel`) — есть,
-    /// пока `pinned_selection` указывает на окно, панель пересобирается на
-    /// каждое изменение (тот же паттерн, что `window_picker`).
+    /// Открытая панель свойств закреплённого окна (минимальная: только
+    /// «Открепить» — замки/правила соседства скрыты из UI по решению
+    /// пользователя 2026-08-18, код остался спящим; см. `rebuild_pinned_panel`)
+    /// — есть, пока `pinned_selection` указывает на окно, панель
+    /// пересобирается на каждое изменение (тот же паттерн, что
+    /// `window_picker`).
     pinned_panel: Option<PinnedPanelState>,
     /// Активный жест перемещения/ресайза выделенного закреплённого окна
     /// (SPEC «Закрепление окна», пункт 9: «move/resize handles reusing the
@@ -876,6 +990,18 @@ struct EditState {
     /// SPEC, пункт 4); `maintain_pinned_windows` возвращает их в слоты на
     /// потере фокуса. Рантайм-состояние движка закрепления, не конфиг.
     surfaced_pins: HashSet<isize>,
+    /// Активные пульсы рамки при пин/анпин по хоткею Ctrl+Alt+R
+    /// ([`PinFlash`]; запрос пользователя 2026-08-18) — временные состояния
+    /// на 1 с: пуш в `pin_window`/`unpin_window` (оба направления, по
+    /// подтверждению пользователя), истечение и чистка — в цикле `run()`
+    /// (тот же паттерн транзиентного тайминга, что `tooltip`). Рисуются
+    /// ВСЕГДА, вне зависимости от `active`: пин — фича нормального режима.
+    pin_flashes: Vec<PinFlash>,
+    /// Активный баннер предупреждения оверлея ([`BannerState`]; решение
+    /// координатора 2026-08-18 — заменяет невидимый на Win11 25H2
+    /// tray-баллун для критических предупреждений). Рисуется в оверлее на
+    /// своём мониторе, живёт `BANNER_DURATION`, чистится в цикле `run()`.
+    banner: Option<BannerState>,
     /// Анимация только что добавленного стикера (M5a,
     /// docs/M5A_ANIMATION_DESIGN.md §5; потоковый вариант — ROADMAP.md M5a
     /// «потоковый режим») — `add_sticker` собирает атлас/открывает
@@ -1006,12 +1132,14 @@ struct WindowPickListState {
     scroll: usize,
 }
 
-/// Открытая панель свойств закреплённого окна (SPEC «Закрепление окна»,
-/// пункт 9; `rst_render::build_pinned_panel`) — панель + hwnd, чьи свойства
-/// она правит (запись в `EditState::pinned_windows` ищется по нему), монитор
-/// и скролл списка правил. Пересобирается на каждое изменение правил/замков
-/// и на каждый новый снимок трекера (окно могло переехать на другой
-/// монитор) — тот же паттерн, что `WindowPickerState`.
+/// Открытая панель свойств закреплённого окна (минимальная версия по
+/// решению пользователя 2026-08-18 — только кнопка «Открепить»; см.
+/// `rebuild_pinned_panel`) — панель + hwnd, чьи свойства она правит
+/// (запись в `EditState::pinned_windows` ищется по нему), монитор. Скролл
+/// списка правил сохранён в поле, но в минимальной версии всегда 0.
+/// Пересобирается на каждый новый снимок трекера (окно могло переехать на
+/// другой монитор, пока панель открыта) — тот же паттерн, что
+/// `WindowPickerState`.
 struct PinnedPanelState {
     hwnd: isize,
     panel: Panel,
@@ -1398,7 +1526,7 @@ fn run(
         .as_deref()
         .and_then(|s| HotkeyCombo::parse(s).ok());
     // «Закрепить/открепить сфокусированное окно» (редизайн пинов,
-    // `hotkeys.pin_focused_window`, дефолт «Ctrl+Alt+R») — тот же
+    // `hotkeys.pin_focused_window`, дефолт «Ctrl+Alt+T») — тот же
     // опциональный паттерн, что у трёх предыдущих; на пустое/непарсящееся
     // значение регистрируется дефолт (дефолт задан в `Hotkeys::default()`).
     let pin_focused_hotkey = cfg
@@ -1406,7 +1534,7 @@ fn run(
         .pin_focused_window
         .as_deref()
         .and_then(|s| HotkeyCombo::parse(s).ok())
-        .or_else(|| HotkeyCombo::parse("Ctrl+Alt+R").ok())
+        .or_else(|| HotkeyCombo::parse("Ctrl+Alt+T").ok())
         .expect("дефолтный пин-хоткей — валидная комбинация");
 
     // M3: окно на каждый подключённый монитор, а не один захардкоженный
@@ -1739,6 +1867,8 @@ fn run(
         pinned_panel: None,
         pinned_gesture: None,
         surfaced_pins: HashSet::new(),
+        pin_flashes: Vec::new(),
+        banner: None,
         pending_animation: None,
         pending_video: None,
         marquee: None,
@@ -2283,6 +2413,11 @@ fn run(
                 // (редизайн пинов, SPEC «Закрепление окна», пункт 1) —
                 // работает независимо от режима редактирования.
                 toggle_focused_pin(&mut edit, &cfg, &monitor_bounds, &mut window_pins);
+                // Пульс рамки при пин/анпин стартовал в `pin_window`/
+                // `unpin_window` — нужен немедленный редрав (первый кадр
+                // пульса), дальше кадры крутит планировщик анимаций своим
+                // дедлайном (см. `PinFlash::next_deadline`).
+                need_redraw = true;
             }
             OverlayMessage::Event(monitor_id, OverlayEvent::DpiChanged { dpi, size }) => {
                 // Окно уже переехало на рекомендованный прямоугольник
@@ -2347,7 +2482,18 @@ fn run(
                     crate::i18n::hotkey_conflict_notification(&cfg.settings.language, name, &combo);
                 let _ = edit
                     .coordinator_tx
-                    .send(CoordinatorRequest::ShowNotification { title, body });
+                    .send(CoordinatorRequest::ShowNotification {
+                        title,
+                        body: body.clone(),
+                    });
+                // Баннер оверлея (решение координатора 2026-08-18): баллун
+                // трея на Windows 11 25H2 молча не рендерится (доказано
+                // живым стендом) — а баннер рисует сам resticker своим
+                // render pipeline, его гарантированно видно. Показываем на
+                // primary (там зарегистрированы глобальные хоткеи), текст —
+                // тот же локализованный.
+                show_banner(&mut edit, &primary_id, body);
+                need_redraw = true;
             }
             OverlayMessage::Event(_, OverlayEvent::MonitorsChanged(new_infos)) => {
                 // Диффинг — всегда против ЖИВОГО состояния (`monitors_map`),
@@ -2807,6 +2953,30 @@ fn run(
                 // одинаково для статичных и анимированных стикеров (UV по
                 // умолчанию — вся текстура).
                 let now = Instant::now();
+                // Пульсы рамки при пин/анпин (запрос пользователя
+                // 2026-08-18) — пока хоть один жив, редрав нужен: прозрачность
+                // меняется каждый кадр. Истёкшие (старше 1 с) вычищаем здесь
+                // же — иначе копились бы вечно.
+                if edit
+                    .pin_flashes
+                    .iter()
+                    .any(|f| !f.expired(now))
+                {
+                    need_redraw = true;
+                }
+                edit.pin_flashes.retain(|f| !f.expired(now));
+                // Баннер предупреждений (конфликт хоткея и т.п.) — тот же
+                // паттерн: жив — редрав нужен, истёк — вычищаем.
+                if edit
+                    .banner
+                    .as_ref()
+                    .is_some_and(|b| !b.expired(now))
+                {
+                    need_redraw = true;
+                }
+                if edit.banner.as_ref().is_some_and(|b| b.expired(now)) {
+                    edit.banner = None;
+                }
                 // Тултип ещё анимируется (задержка показа или плавное
                 // появление, фидбэк пользователя 2026-08-10) — редрав нужен,
                 // даже если ни одна анимация стикера/видео сейчас не тикает.
@@ -3026,7 +3196,28 @@ fn run(
             .tooltip
             .as_ref()
             .and_then(|t| t.next_deadline(Instant::now()));
-        let next_tick_deadline = [next_anim_deadline, next_video_deadline, next_tooltip_deadline]
+        // Пульс рамки при пин/анпин (запрос пользователя 2026-08-18) — тот
+        // же общий канал `AnimationTick`: пока пульс жив (1 с), планировщику
+        // нужен дедлайн, иначе кадр не перерисуется сам по себе (в обычном
+        // режиме без стикеров/видео «ноль пробуждений в покое», ADR-006).
+        let next_flash_deadline = edit
+            .pin_flashes
+            .iter()
+            .filter_map(|f| f.next_deadline(Instant::now()))
+            .min();
+        // Баннер предупреждений — пока жив, планировщику нужен дедлайн (тот
+        // же канал `AnimationTick`, что у пульса/тултипа).
+        let next_banner_deadline = edit
+            .banner
+            .as_ref()
+            .and_then(|b| b.next_deadline(Instant::now()));
+        let next_tick_deadline = [
+            next_anim_deadline,
+            next_video_deadline,
+            next_tooltip_deadline,
+            next_flash_deadline,
+            next_banner_deadline,
+        ]
             .into_iter()
             .flatten()
             .min();
@@ -5310,15 +5501,21 @@ fn rebuild_window_pick_list(
 }
 
 /// Пересобрать панель свойств закреплённого окна (SPEC «Закрепление окна»,
-/// пункт 9; [`rst_render::build_pinned_panel`]) — есть, пока `pinned_selection`
-/// указывает на живое окно этого снимка (`None` — окно пропало/чужой
-/// монитор/открепилось, панель закрывается тем же принципом «недостающий
-/// элемент — не паника», что у остальных pinned-функций). Позиционируется
-/// под окном или над ним, если снизу не хватает места (тот же приём, что
-/// `toolbar_top`), горизонтально зажата в границы экрана монитора. Скролл
-/// списка правил сохраняется между пересборками (сбрасывается только при
-/// смене выделенного окна), клампится к актуальному числу правил — то же,
-/// что делает `rebuild_window_pick_list` для своего скролла.
+/// пункт 9) — есть, пока `pinned_selection` указывает на живое окно этого
+/// снимка (`None` — окно пропало/чужой монитор/открепилось, панель
+/// закрывается тем же принципом «недостающий элемент — не паника», что у
+/// остальных pinned-функций). Позиционируется под окном или над ним, если
+/// снизу не хватает места (тот же приём, что `toolbar_top`), горизонтально
+/// зажата в границы экрана монитора.
+///
+/// МИНИМАЛЬНАЯ версия (решение пользователя 2026-08-18: «почему нет
+/// функции порядка между окнами? …я никогда не просил этого, не знаю,
+/// что это»): замки и соседские правила скрыты из UI — панель предлагает
+/// ТОЛЬКО «Открепить». `rst_render::build_pinned_panel` (полная панель с
+/// замками/правилами) больше не вызывается, но НЕ удалён — код замков/
+/// правил и их принуждение (`suspend_pin_enforcement`/`resume_pin_enforcement`,
+/// `resolve_topmost_neighbor`, строки панели) остаются в репозитории в
+/// спящем виде: будущий раунд вернёт UI, вернув этот вызов.
 fn rebuild_pinned_panel(
     edit: &mut EditState,
     window_snapshot: &[WindowInfo],
@@ -5328,7 +5525,7 @@ fn rebuild_pinned_panel(
         edit.pinned_panel = None;
         return;
     };
-    let Some(pinned) = edit.pinned_windows.iter().find(|p| p.hwnd == hwnd) else {
+    let Some(_pinned) = edit.pinned_windows.iter().find(|p| p.hwnd == hwnd) else {
         edit.pinned_panel = None;
         return;
     };
@@ -5341,43 +5538,42 @@ fn rebuild_pinned_panel(
     let bounds = &monitor_bounds[&monitor_id];
     let screen_w = bounds.bounds_px.w as f64 / bounds.scale;
     let screen_h = bounds.bounds_px.h as f64 / bounds.scale;
-    let scroll = edit
-        .pinned_panel
-        .as_ref()
-        .filter(|p| p.hwnd == hwnd)
-        .map_or(0, |p| p.scroll);
-    let clamped_scroll = pinned
-        .neighbor_rules
-        .len()
-        .saturating_sub(rst_render::PINNED_VISIBLE_RULES)
-        .min(scroll);
     let top = placement.cy + placement.h / 2.0 + toolbar::TOOLBAR_GAP_Y;
-    let top = if top + rst_render::PINNED_PANEL_HEIGHT <= screen_h {
+    let top = if top + PINNED_MINIMAL_PANEL_HEIGHT <= screen_h {
         top
     } else {
-        placement.cy - placement.h / 2.0 - toolbar::TOOLBAR_GAP_Y - rst_render::PINNED_PANEL_HEIGHT
+        placement.cy - placement.h / 2.0 - toolbar::TOOLBAR_GAP_Y - PINNED_MINIMAL_PANEL_HEIGHT
     };
     let left = (placement.cx - rst_render::PINNED_PANEL_WIDTH / 2.0)
         .clamp(0.0, (screen_w - rst_render::PINNED_PANEL_WIDTH).max(0.0));
     let frame = Box2D {
         cx: left + rst_render::PINNED_PANEL_WIDTH / 2.0,
-        cy: top + rst_render::PINNED_PANEL_HEIGHT / 2.0,
+        cy: top + PINNED_MINIMAL_PANEL_HEIGHT / 2.0,
         w: rst_render::PINNED_PANEL_WIDTH,
-        h: rst_render::PINNED_PANEL_HEIGHT,
+        h: PINNED_MINIMAL_PANEL_HEIGHT,
         rotation: 0.0,
     };
-    let built = rst_render::build_pinned_panel(
-        &pinned.neighbor_rules,
-        pinned.lock_move,
-        pinned.lock_interact,
-        clamped_scroll,
-        frame,
-    );
+    // Минимальная панель: фон + единственная кнопка «Открепить» (тот же
+    // `PINNED_BTN_UNPIN`, что у полной панели — `handle_pinned_panel_up`
+    // опрашивает именно его, остальные его ветки (замки/правила) просто
+    // не сработают: виджетов с теми id в панели нет).
+    let mut panel = Panel::new(rst_render::PINNED_PANEL_ID, frame);
+    panel.add_widget(Button::new(
+        rst_render::PINNED_BTN_UNPIN,
+        Box2D {
+            cx: frame.cx,
+            cy: frame.cy,
+            w: (frame.w - 2.0 * rst_render::PINNED_PAD).max(0.0),
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label("Открепить".to_string()),
+    ));
     edit.pinned_panel = Some(PinnedPanelState {
         hwnd,
-        panel: built.panel,
+        panel,
         monitor_id,
-        scroll: clamped_scroll,
+        scroll: 0,
     });
 }
 
@@ -5597,13 +5793,20 @@ fn handle_preset_picker_up(
 /// Закрепить окно `hwnd` из списка выбора (редизайн пинов, SPEC.md
 /// «Закрепление окна») — НОВЫЙ рантайм-путь вместо `add_window_sticker`:
 /// никакого `Sticker` в config.json, никакого `config::save`. Только:
-/// (1) `WindowPins::pin` — полный topmost (дефолт нового пина; соседские
-/// правила назначаются позже в edit-mode, задача координатора);
+/// (1) `WindowPins::pin` — полный topmost одним `SetWindowPos(HWND_TOPMOST)`,
+/// позиция НЕ трогается (порт механики PowerToys «Always On Top»: там пин
+/// тоже одноразовый `SetWindowPos` без move — «pin = set WS_EX_TOPMOST,
+/// unpin = clear it»);
 /// (2) кламп размера до 90% монитора по каждой оси
 /// ([`pinned_window::clamp_to_monitor_max`]) — окно уже fullscreen/больше
-/// монитора при закреплении; позиция окна не трогается;
+/// монитора при закреплении; снят был 2026-08-18 при портировании PowerToys
+/// («зачем вообще что-то менять»), возвращён по прямому запросу пользователя
+/// 2026-08-19 («закреплённые окна не могли быть больше чем 90% от размера
+/// монитора»); только размер, позиция не трогается;
 /// (3) запись в [`EditState::pinned_windows`] — единственный реестр
-/// закреплённых окон, чисто рантайм.
+/// закреплённых окон, чисто рантайм;
+/// (4) пуш флэша рамки ([`EditState::pin_flashes`]) — визуальный отклик
+/// на пин/анпин по хоткею.
 /// Общий вход для списка (этот срез) и хоткея (задача проводки) — тот же
 /// путь, что заявлен SPEC: «клик в списке пинит так же, как хоткей».
 ///
@@ -5679,6 +5882,7 @@ fn pin_window(
         }
     }
     edit.pinned_windows.push(PinnedWindow::new(hwnd as isize));
+    edit.pin_flashes.push(PinFlash::new(hwnd as isize));
     true
 }
 
@@ -5735,6 +5939,16 @@ fn resolve_topmost_neighbor(
 /// (3) Move-lock: для окна с `lock_move` фактический rect из снимка
 ///     скармливается в [`WindowPins::enforce_move_lock`] — snap-back при
 ///     расхождении; свёрнутое окно пропускается (rect от DWM мусорный).
+/// (4) Topmost-backstop (порт механики PowerToys «Always On Top», задача 1):
+///     для full-topmost пина (пустые соседские правила) — одноразовая
+///     реактивная коррекция [`WindowPins::reassert_topmost_if_needed`]:
+///     снял кто-то `WS_EX_TOPMOST` — вернуть тем же `SetWindowPos`, что и
+///     пин. Никаких таймеров: `Windows(Changed)` и так приходит по смене
+///     переднего плана (трекер классифицирует `EVENT_SYSTEM_FOREGROUND` как
+///     полное перечисление) — та же модель, что у PowerToys. Окна
+///     соседского слота НЕ бэкстопятся: им `WS_EX_TOPMOST` противопоказан
+///     по построению (полоса topmost игнорирует относительный z-order),
+///     бэкстоп поднял бы их из слота в топ.
 ///
 /// `surfaced` — hwnd'ы, временно поднятые поверх — живёт в
 /// `EditState::surfaced_pins` и поддерживается самой функцией (вставляется
@@ -5778,6 +5992,11 @@ fn maintain_pinned_windows(
             } else {
                 window_pins.enforce_slot(win_hwnd, above);
             }
+        } else {
+            // Topmost-backstop (порт PowerToys «Always On Top», задача 1):
+            // full-topmost пины — одноразовая реактивная коррекция снятого
+            // WS_EX_TOPMOST (см. доккомент функции, пункт 4).
+            window_pins.reassert_topmost_if_needed(win_hwnd);
         }
         if pinned.lock_move {
             if let Some(win) = window_snapshot.iter().find(|w| w.hwnd == hwnd && !w.iconic) {
@@ -5847,10 +6066,13 @@ fn resume_pin_enforcement(edit: &EditState, window_pins: &mut WindowPins) {
 /// выделение/панель свойств закрываются. Реальное окно НЕ закрывается и
 /// фокус НЕ трогается — окно просто остаётся там, куда его положит обычный
 /// z-order Windows после снятия topmost (SPEC: «no forced refocus»).
+/// Пульс рамки — по подтверждению пользователя (2026-08-18) на ОБА
+/// направления: пин и анпин.
 fn unpin_window(edit: &mut EditState, window_pins: &mut WindowPins, hwnd: usize) {
     if let Err(e) = window_pins.unpin(hwnd) {
         tracing::warn!(hwnd, error = %e, "не удалось открепить окно");
     }
+    edit.pin_flashes.push(PinFlash::new(hwnd as isize));
     edit.pinned_windows.retain(|p| p.hwnd != hwnd as isize);
     if edit.pinned_selection == Some(hwnd as isize) {
         edit.pinned_selection = None;
@@ -5918,7 +6140,13 @@ fn toggle_focused_pin(
     ) {
         return;
     }
-    pin_window(edit, &fresh_snapshot, monitor_bounds, window_pins, hwnd);
+    if pin_window(edit, &fresh_snapshot, monitor_bounds, window_pins, hwnd) {
+        // Звук только на закрепление хоткеем (запрос пользователя
+        // 2026-08-19: «когда ты закрепляешь биндом» — конкретно этот путь,
+        // не клик по списку окон и не анпин); своя громкость, не через
+        // AudioMixer стикеров (rst_win32::sound doc comment).
+        rst_win32::sound::play_pin_sound(cfg.settings.pin_sound_volume);
+    }
 }
 
 /// Опросить клик по строке списка окон после `Up` (M6, `window_pick_list.rs`,
@@ -6012,6 +6240,11 @@ fn sync_pinned_rule_text_fields(edit: &mut EditState, hwnd: isize, rule_count: u
 /// место панели без `Enter`) и кнопка «Открепить». Замки — рантайм-флаги
 /// `PinnedWindow`, без `config::save`/undo (SPEC: «нельзя сохранить в
 /// пресет, всегда нужно выставлять вручную»).
+///
+/// МИНИМАЛЬНАЯ панель (решение пользователя 2026-08-18) содержит только
+/// кнопку «Открепить» — ветки замков/правил ниже не срабатывают (виджетов
+/// с теми id в панели нет), но оставлены: будущий раунд, вернувший полную
+/// панель, получит опрос действий обратно без изменений.
 fn handle_pinned_panel_up(
     edit: &mut EditState,
     window_snapshot: &[WindowInfo],
@@ -8032,6 +8265,41 @@ fn redraw(
         primitives_to_sprites(&prims, ui_cache, renderer, monitor_id, text_scale, &mut frame);
     }
 
+    // Пульс рамки при пин/анпин по хоткею (запрос пользователя 2026-08-18) —
+    // рисуется ВСЕГДА, не только в `edit.active`: пин — фича нормального
+    // режима, пульс — его визуальный отклик. Прозрачность — треугольник
+    // 0→1 за 0.5 с, 1→0 за следующие 0.5 с; цвет — акцент проекта `#3c9898`
+    // (тот же, что `--accent` настроек; `primitives_custom` — примитив
+    // задачи 3/6). Редравы во время пульса держит планировщик анимаций
+    // (`PinFlash::next_deadline`), кадр не зависит от `edit.active`.
+    let flash_now = Instant::now();
+    for flash in &edit.pin_flashes {
+        if flash.expired(flash_now) {
+            continue;
+        }
+        let Some((win_monitor, placement)) =
+            pinned_window_dip_placement(flash.hwnd, window_snapshot, monitor_bounds)
+        else {
+            continue;
+        };
+        if win_monitor != *monitor_id {
+            continue;
+        }
+        let highlight = WindowHighlight::new(
+            placement.cx - placement.w / 2.0,
+            placement.cy - placement.h / 2.0,
+            placement.w,
+            placement.h,
+            1.0,
+        );
+        let prims = highlight.primitives_custom(
+            PIN_FLASH_COLOR,
+            flash.opacity(flash_now),
+            HIGHLIGHT_THICKNESS_DIP,
+        );
+        primitives_to_sprites(&prims, ui_cache, renderer, monitor_id, text_scale, &mut frame);
+    }
+
     // Тулбар и панель у курсора — над рамками выделения, под модалом
     // (раздел 11). Тулбар следует за монитором выделенного стикера; панель
     // у курсора и марка — за `edit.cursor_monitor` (M3, см. выше).
@@ -8130,6 +8398,37 @@ fn redraw(
         if confirm.monitor_id == *monitor_id {
             let mut prims = Vec::new();
             confirm.panel.draw(&mut prims);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
+    }
+
+    // Баннер предупреждений (решение координатора 2026-08-18: конфликт
+    // хоткея и прочие критические сообщения — вместо невидимого на
+    // Win11 25H2 tray-баллуна) — поверх всего, на своём мониторе, у
+    // верхнего края по центру. Панель + надпись — те же виджеты, что у
+    // остального UI; размер по тексту (`Label` сам считает ширину).
+    if let Some(banner) = &edit.banner {
+        if banner.monitor_id == *monitor_id {
+            let screen_w = width_px as f64 / scale as f64;
+            let (tw, th) = rst_render::text_size(&banner.text);
+            let banner_frame = Box2D {
+                cx: screen_w / 2.0,
+                cy: BANNER_TOP_GAP + BANNER_HEIGHT / 2.0,
+                w: tw + 2.0 * BANNER_PAD,
+                h: BANNER_HEIGHT,
+                rotation: 0.0,
+            };
+            let mut panel = Panel::new(BANNER_PANEL_ID, banner_frame);
+            panel.add_widget(Label::new(
+                0,
+                banner_frame.cx - tw / 2.0,
+                banner_frame.cy + (BANNER_HEIGHT - th) / 2.0,
+                &banner.text,
+            ));
+            let mut prims = Vec::new();
+            panel.draw(&mut prims);
             primitives_to_sprites(
                 &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
             );
@@ -9009,6 +9308,8 @@ mod tests {
             pinned_panel: None,
             pinned_gesture: None,
             surfaced_pins: HashSet::new(),
+            pin_flashes: Vec::new(),
+            banner: None,
             pending_animation: None,
             pending_video: None,
             marquee: None,
@@ -9311,6 +9612,7 @@ mod tests {
             vec![PinnedWindow::new(hwnd as isize)],
             "запись в рантайм-реестре — дефолт: full topmost, без замков, без соседей"
         );
+        assert_eq!(edit.pin_flashes.len(), 1, "пин запускает пульс рамки");
         assert!(cfg.stickers.is_empty(), "никакого Sticker в cfg.stickers");
         assert!(
             !config_path.exists(),
@@ -9377,14 +9679,17 @@ mod tests {
 
     #[test]
     fn pin_window_clamps_oversized_to_90_percent_of_monitor() {
+        // Кламп размера вернули по запросу пользователя 2026-08-19
+        // («закреплённые окна не могли быть больше чем 90% от размера
+        // монитора»). «Fullscreen»-окно 1920×1080 на мониторе 1920×1080 →
+        // кламп до 1728×972 (90% по каждой оси, независимо) тем же
+        // move_resize, что использует драг стикера-окна; topmost (порт
+        // PowerToys) не меняется — кламп только про размер.
         use windows::Win32::Foundation::RECT;
         use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
         let (_cfg, _config_path, _snapshot, monitor_bounds, wnd) = pin_flow_harness();
         let hwnd = wnd.0.0 as usize;
-        // «Fullscreen»-окно 1920×1080 на мониторе 1920×1080 → кламп до
-        // 1728×972 (90% по каждой оси, независимо) тем же move_resize, что
-        // использует драг стикера-окна.
         let snapshot = vec![WindowInfo {
             hwnd,
             rect: WindowRect {
@@ -9402,6 +9707,10 @@ mod tests {
         let mut window_pins = WindowPins::new();
 
         assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(
+            window_pins.is_pinned(hwnd),
+            "окно закреплено (WS_EX_TOPMOST + маркер)"
+        );
 
         // SAFETY: чтение прямоугольника живого окна.
         let mut rect = RECT::default();
@@ -9448,6 +9757,106 @@ mod tests {
         let mut after = RECT::default();
         unsafe { GetWindowRect(wnd.0, &mut after) }.expect("GetWindowRect");
         assert_eq!(after, before, "окно в пределах 90% — ресайза быть не должно");
+    }
+
+    #[test]
+    fn unpin_window_pushes_flash() {
+        // Пульс рамки — на ОБА направления по подтверждению пользователя
+        // (2026-08-18): открепили — тоже мигаем.
+        let (_cfg, _config_path, _snapshot, _monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        let mut edit = mask_gate_edit_state();
+        let mut window_pins = WindowPins::new();
+
+        unpin_window(&mut edit, &mut window_pins, hwnd);
+
+        assert_eq!(edit.pin_flashes.len(), 1, "анпин запускает пульс рамки");
+        assert_eq!(edit.pin_flashes[0].hwnd, hwnd as isize);
+    }
+
+    #[test]
+    fn pin_flash_triangle_wave_opacity() {
+        // Треугольник: 0→1 за первую 0.5 с, 1→0 за вторую, 0 после 1 с.
+        let base = Instant::now();
+        let flash = PinFlash { hwnd: 1, started_at: base };
+        let at = |secs: f64| base + Duration::from_secs_f64(secs);
+        assert!((flash.opacity(at(0.0)) - 0.0).abs() < 1e-9);
+        assert!((flash.opacity(at(0.25)) - 0.5).abs() < 1e-9);
+        assert!((flash.opacity(at(0.5)) - 1.0).abs() < 1e-9, "пик в середине");
+        assert!((flash.opacity(at(0.75)) - 0.5).abs() < 1e-9);
+        assert_eq!(flash.opacity(at(1.0)), 0.0, "ровно в 1 с — уже 0");
+        assert_eq!(flash.opacity(at(2.0)), 0.0);
+    }
+
+    #[test]
+    fn pin_flash_next_deadline_and_expiry() {
+        let base = Instant::now();
+        let flash = PinFlash { hwnd: 1, started_at: base };
+        assert!(
+            flash.next_deadline(base).is_some(),
+            "живой пульс держит планировщик на коротком шаге"
+        );
+        let after = base + PIN_FLASH_DURATION + Duration::from_millis(1);
+        assert!(flash.expired(after), "истёк за пределами 1 с");
+        assert_eq!(flash.next_deadline(after), None, "дедлайна больше нет");
+    }
+
+    #[test]
+    fn banner_shows_with_monitor_and_expires_after_duration() {
+        // Баннер оверлея (решение координатора 2026-08-18 — замена
+        // невидимого на Win11 25H2 tray-баллуна): ставится на свой монитор,
+        // живёт BANNER_DURATION, потом авто-dismiss через `expired`.
+        let mut edit = mask_gate_edit_state();
+        let text = "Комбинация Ctrl+Alt+R уже используется другим приложением".to_string();
+        show_banner(&mut edit, &monitor_id("main"), text.clone());
+
+        let banner = edit.banner.as_ref().expect("баннер установлен");
+        assert_eq!(banner.text, text);
+        assert_eq!(banner.monitor_id, monitor_id("main"));
+        let base = banner.shown_at;
+        assert!(banner.next_deadline(base).is_some(), "живой баннер держит дедлайн");
+        let expired = base + BANNER_DURATION + Duration::from_millis(1);
+        assert!(banner.expired(expired), "баннер истекает за BANNER_DURATION");
+        assert_eq!(banner.next_deadline(expired), None);
+
+        // Повторный показ перезаписывает предыдущий (новое важнее).
+        show_banner(&mut edit, &monitor_id("main"), "другой конфликт".to_string());
+        assert_eq!(edit.banner.as_ref().unwrap().text, "другой конфликт");
+    }
+
+    #[test]
+    fn rebuild_pinned_panel_is_minimal_unpin_only() {
+        // Панель свойств закреплённого окна урезана (решение пользователя
+        // 2026-08-18): только «Открепить» — ни замков, ни правил соседства.
+        let (_cfg, _config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        let mut edit = mask_gate_edit_state();
+        let mut window_pins = WindowPins::new();
+
+        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        edit.pinned_selection = Some(hwnd as isize);
+        rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
+
+        let state = edit.pinned_panel.as_ref().expect("панель собрана");
+        assert_eq!(state.hwnd, hwnd as isize);
+        assert!(
+            state
+                .panel
+                .widget::<Button>(rst_render::PINNED_BTN_UNPIN)
+                .is_some(),
+            "кнопка «Открепить» на месте — тот же id, что опрашивает handle_pinned_panel_up"
+        );
+        for hidden in [
+            rst_render::PINNED_CHECK_MOVE_LOCK,
+            rst_render::PINNED_CHECK_INTERACT_LOCK,
+            rst_render::PINNED_BTN_ADD_RULE,
+        ] {
+            assert!(
+                state.panel.widget::<Button>(hidden).is_none()
+                    && state.panel.widget::<Checkbox>(hidden).is_none(),
+                "виджет {hidden} скрыт из UI (замки/правила в спящем коде)"
+            );
+        }
     }
 
     #[test]
@@ -10569,6 +10978,8 @@ mod tests {
             pinned_panel: None,
             pinned_gesture: None,
             surfaced_pins: HashSet::new(),
+            pin_flashes: Vec::new(),
+            banner: None,
             pending_animation: None,
             pending_video: None,
             marquee: None,

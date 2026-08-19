@@ -43,6 +43,12 @@ pub struct Settings {
     /// `#[serde(default)]` на структуре — та же обратная совместимость без
     /// миграции схемы, что `PlaybackSettings.paused`.
     pub denylist: Vec<OverlapRule>,
+    /// Громкость звука закрепления окна хоткеем, проценты 0..=100 (запрос
+    /// пользователя 2026-08-19). Независима от `AudioMixer`/`mute_all` —
+    /// это UI-отклик на действие, не звук стикера, отдельный канал
+    /// громкости (`rst_win32::sound::play_pin_sound`), не завязан на
+    /// микшер видео-стикеров.
+    pub pin_sound_volume: u8,
 }
 
 impl Default for Settings {
@@ -60,6 +66,7 @@ impl Default for Settings {
             language: "ru".to_string(),
             onboarding_shown: false,
             denylist: Vec::new(),
+            pin_sound_volume: 100,
         }
     }
 }
@@ -80,7 +87,7 @@ impl Default for Hotkeys {
             edit_mode: Some("Ctrl+Alt+S".to_string()),
             toggle_all_stickers: Some("Ctrl+Alt+H".to_string()),
             mute_all: Some("Ctrl+Alt+M".to_string()),
-            pin_focused_window: Some("Ctrl+Alt+R".to_string()),
+            pin_focused_window: Some("Ctrl+Alt+T".to_string()),
         }
     }
 }

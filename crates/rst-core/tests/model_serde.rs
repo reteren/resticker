@@ -237,7 +237,7 @@ fn denylist_and_pin_hotkey_defaults_for_old_configs() {
     );
     assert_eq!(
         cfg.hotkeys.pin_focused_window.as_deref(),
-        Some("Ctrl+Alt+R"),
+        Some("Ctrl+Alt+T"),
         "отсутствующий хоткей достраивается дефолтом"
     );
 }

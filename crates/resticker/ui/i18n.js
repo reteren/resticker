@@ -79,6 +79,7 @@ const DICT = {
     'denylist.listLabel': 'Денй-лист закрепления',
     'denylist.hint':
       'Окна, чей процесс или заголовок совпадает с правилом, нельзя закрепить горячей клавишей — они не показываются в списке выбора окна. Больше денй-лист ни на что не влияет.',
+    'denylist.pickWindow': 'Выбрать открытое окно…',
     'denylist.processPlaceholder': 'process_name.exe',
     'denylist.titlePlaceholder': 'часть заголовка, * — подстановка',
     'denylist.add': 'Добавить',
@@ -93,12 +94,14 @@ const DICT = {
     'control.editMode': 'Режим редактирования',
     'control.toggleAll': 'Показать/скрыть все стикеры',
     'control.muteAll': 'Заглушить всё',
+    'control.pinFocusedWindow': 'Закрепить активное окно',
+    'control.pinSoundVolume': 'Громкость закрепления окна',
     'control.notSet': 'Не задан',
     'control.recording': 'Нажмите комбинацию…',
     'control.hintClick': 'Клик по полю, затем нажмите комбинацию клавиш.',
     'control.hintRestart': 'Изменения хоткеев применяются после перезапуска resticker.',
     'control.hintRequired':
-      '«Режим редактирования» — обязательная комбинация (нельзя очистить). Остальные два — опциональны.',
+      '«Режим редактирования» — обязательная комбинация (нельзя очистить). Остальные — опциональны.',
 
     'general.startupLabel': 'Запуск:',
     'general.autostart': 'Автозапуск с Windows',
@@ -192,6 +195,7 @@ const DICT = {
     'denylist.listLabel': 'Pin denylist',
     'denylist.hint':
       'Windows whose process or title matches a rule cannot be pinned via the hotkey and are hidden from the window pick list. The denylist has no other effect.',
+    'denylist.pickWindow': 'Pick an open window…',
     'denylist.processPlaceholder': 'process_name.exe',
     'denylist.titlePlaceholder': 'title substring, * wildcard',
     'denylist.add': 'Add',
@@ -206,12 +210,14 @@ const DICT = {
     'control.editMode': 'Edit mode',
     'control.toggleAll': 'Show/hide all stickers',
     'control.muteAll': 'Mute all',
+    'control.pinFocusedWindow': 'Pin focused window',
+    'control.pinSoundVolume': 'Pin sound volume',
     'control.notSet': 'Not set',
     'control.recording': 'Press a combination…',
     'control.hintClick': 'Click a field, then press a key combination.',
     'control.hintRestart': 'Hotkey changes apply after restarting resticker.',
     'control.hintRequired':
-      '"Edit mode" is required (cannot be cleared). The other two are optional.',
+      '"Edit mode" is required (cannot be cleared). The others are optional.',
 
     'general.startupLabel': 'Startup:',
     'general.autostart': 'Launch with Windows',

@@ -285,6 +285,47 @@ fn remove_denylist_rule(index: usize, overlay: tauri::State<OverlayHandle>) {
     overlay.send(OverlayCommand::RemoveDenylistRule(index));
 }
 
+/// Список открытых окон для пикера денй-листа (запрос пользователя
+/// 2026-08-19: «хочу как окна выбирать только процессы для денай листа» —
+/// раньше `process_name.exe` приходилось печатать руками). Читает то же
+/// перечисление, что нативный пикер оверлея (`window_pick_list.rs`), но
+/// напрямую с потока Tauri-команды — чтение без побочных эффектов, поход
+/// через канал координатора не нужен. Схлопывает по процессу (одна строка
+/// на процесс, а не на окно — денй-лист матчит по `process_name`, не по
+/// конкретному HWND), берёт первый по z-order заголовок как подпись, само
+/// resticker.exe из списка исключено (денй-лист на себя бессмыслен).
+/// Возвращает `(process_name, title)` — пары вместо структуры: `resticker`
+/// не тянет `serde` напрямую (сериализуется транзитивно через `tauri`),
+/// кортеж примитивов не требует лишней зависимости в Cargo.toml.
+#[tauri::command]
+fn list_open_processes() -> Vec<(String, String)> {
+    let self_exe = std::env::current_exe().ok();
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for win in rst_win32::window_enum::enumerate() {
+        if win.title.trim().is_empty() || win.exe_path.as_os_str().is_empty() {
+            continue;
+        }
+        if self_exe.as_deref() == Some(win.exe_path.as_path()) {
+            continue;
+        }
+        let Some(process_name) = win
+            .exe_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if !seen.insert(process_name.clone()) {
+            continue;
+        }
+        result.push((process_name, win.title));
+    }
+    result.sort_by_key(|a| a.0.to_lowercase());
+    result
+}
+
 /// Строка после trim; пустая/пробельная — `None` (поля-критерии правила
 /// денй-листа не хранят пустые значения: `""` матчил бы заголовок `""`).
 fn trim_non_empty(s: String) -> Option<String> {
@@ -316,6 +357,36 @@ fn config_path() -> anyhow::Result<PathBuf> {
 fn main() -> anyhow::Result<()> {
     let log_path = logging::init()?;
     tracing::info!(path = %log_path.display(), "логирование инициализировано");
+
+    // `panic = "abort"` (Cargo.toml, release-профиль) — паника на ЛЮБОМ
+    // потоке мгновенно валит весь процесс, а GUI-подсистема (windows_subsystem
+    // = "windows" выше) означает, что stderr никуда не подключён: без этого
+    // хука паника просто исчезает — процесс молча пропадает из списка
+    // процессов, ни единой строки в логе, ни записи в Windows Error Reporting
+    // (найдено вживую 2026-08-18: resticker тихо умер, конфиг/сборка были в
+    // порядке, причина осталась бы неизвестной без этого). Хук ставится ДО
+    // спавна остальных потоков (окна оверлея на каждый монитор, трей,
+    // хоткей-поток), чтобы покрыть панику где угодно, не только в main.
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "неизвестно".to_string());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "паника без сообщения".to_string());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(
+            thread = %std::thread::current().name().unwrap_or("<unnamed>"),
+            location = %location,
+            message = %message,
+            backtrace = %backtrace,
+            "ПАНИКА — процесс сейчас завершится (panic = \"abort\")"
+        );
+    }));
 
     // Второй экземпляр (автозапуск + ручной запуск, повторный клик по
     // ярлыку) поднял бы второй набор WS_EX_TOPMOST оверлей-окон на тех же
@@ -402,6 +473,7 @@ fn main() -> anyhow::Result<()> {
             import_preset,
             add_denylist_rule,
             remove_denylist_rule,
+            list_open_processes,
         ])
         .setup(move |app| {
             if !silent_start {

@@ -44,6 +44,10 @@ document.getElementById('tabs').addEventListener('click', (e) => {
   for (const s of document.querySelectorAll('.panel')) {
     s.classList.toggle('active', s.dataset.panel === tab);
   }
+  // Свежий снимок открытых окон при каждом заходе на вкладку — окна
+  // открываются/закрываются, пока настройки открыты, список не должен
+  // залипать на состоянии момента запуска (запрос пользователя 2026-08-19).
+  if (tab === 'denylist') refreshDenylistProcessPicker();
 });
 
 // ==== Загрузка конфига ====
@@ -63,6 +67,7 @@ async function loadConfig() {
   renderStickers();
   renderPresets();
   renderDenylist();
+  refreshDenylistProcessPicker();
 }
 
 // ==== Вкладка «Общие» ====
@@ -123,13 +128,28 @@ const HOTKEY_FIELDS = [
   ['hotkey-edit', 'edit_mode'],
   ['hotkey-toggle-all', 'toggle_all_stickers'],
   ['hotkey-mute-all', 'mute_all'],
+  ['hotkey-pin', 'pin_focused_window'],
 ];
 
 function renderControl() {
   for (const [elId, key] of HOTKEY_FIELDS) {
     document.getElementById(elId).value = draftHotkeys[key] ?? '';
   }
+  const volume = draftSettings.pin_sound_volume ?? 100;
+  document.getElementById('pin-sound-volume').value = volume;
+  document.getElementById('pin-sound-volume-value').textContent = String(volume);
 }
+
+// Громкость звука закрепления окна хоткеем (запрос пользователя
+// 2026-08-19) — cfg.settings, не хоткей, но живёт визуально на этой
+// вкладке рядом с самим хоткеем пина; тот же слайдер-паттерн, что
+// battery-fps-limit в «Общие».
+const pinVolumeSlider = document.getElementById('pin-sound-volume');
+const pinVolumeValue = document.getElementById('pin-sound-volume-value');
+pinVolumeSlider.addEventListener('input', () => {
+  pinVolumeValue.textContent = pinVolumeSlider.value;
+  draftSettings.pin_sound_volume = Number(pinVolumeSlider.value);
+});
 
 function codeToKeyToken(code) {
   if (code.startsWith('Key') && code.length === 4) return code.slice(3);
@@ -193,6 +213,10 @@ document.getElementById('clear-hotkey-toggle-all').addEventListener('click', () 
 document.getElementById('clear-hotkey-mute-all').addEventListener('click', () => {
   draftHotkeys.mute_all = null;
   document.getElementById('hotkey-mute-all').value = '';
+});
+document.getElementById('clear-hotkey-pin').addEventListener('click', () => {
+  draftHotkeys.pin_focused_window = null;
+  document.getElementById('hotkey-pin').value = '';
 });
 
 // ==== Вкладка «Стикеры» ====
@@ -536,6 +560,41 @@ function renderDenylist() {
 const denylistProcessInput = document.getElementById('denylist-process');
 const denylistTitleInput = document.getElementById('denylist-title');
 const addDenylistBtn = document.getElementById('add-denylist-rule');
+const denylistProcessPicker = document.getElementById('denylist-process-picker');
+
+// Пикер процессов из открытых окон (запрос пользователя 2026-08-19: раньше
+// process_name.exe приходилось печатать руками) — тот же принцип, что
+// нативный window_pick_list.rs у оверлея, но списком в <select>: эта панель
+// живёт в Tauri-вебвью, а не в D3D-рендере, отдельный набор виджетов не
+// нужен, обычный select — родной контрол ОС, ничего лишнего верстать.
+// Текстовое поле остаётся рабочим и без пикера — ручной ввод не убран,
+// пикер только избавляет от необходимости печатать точное имя.
+async function refreshDenylistProcessPicker() {
+  let processes = [];
+  try {
+    processes = await invoke('list_open_processes');
+  } catch {
+    return; // тихо — пикер необязателен, ручной ввод всё ещё работает
+  }
+  const previous = denylistProcessPicker.value;
+  denylistProcessPicker.innerHTML = `<option value="">${t('denylist.pickWindow')}</option>`;
+  for (const [processName, title] of processes) {
+    const opt = document.createElement('option');
+    opt.value = processName;
+    opt.textContent = `${title} — ${processName}`;
+    denylistProcessPicker.appendChild(opt);
+  }
+  // Сохранить выбор, если тот же процесс всё ещё в списке (обновление по
+  // смене вкладки не должно сбрасывать то, что пользователь уже выбрал).
+  if (processes.some(([p]) => p === previous)) denylistProcessPicker.value = previous;
+}
+
+denylistProcessPicker.addEventListener('change', () => {
+  if (!denylistProcessPicker.value) return;
+  denylistProcessInput.value = denylistProcessPicker.value;
+  updateAddDenylistBtn();
+  denylistProcessInput.focus();
+});
 
 function updateAddDenylistBtn() {
   addDenylistBtn.disabled = !denylistProcessInput.value.trim();
