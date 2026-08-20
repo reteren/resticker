@@ -52,7 +52,7 @@ use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::animation as media_animation;
 use rst_media::paste;
 use rst_render::{
-    Box2D, Button, ButtonContent, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon,
+    Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon,
     Key, Label, NumericField, Panel, PinnedRowField, PointerEvent, Primitive, RenderError,
     SelectionBox, Slider, Sprite, Texture, TextField, TextureAtlas, VideoTextures, WidgetId,
     WindowHighlight, WindowTarget, edit_overlay, lock_indicator, marquee_visuals, pinned_row_id,
@@ -507,21 +507,39 @@ impl TooltipState {
 }
 
 /// Длительность пульса рамки при пин/анпин по хоткею (запрос пользователя
-/// 2026-08-18): 0 → 100% за 0.5 с, 100 → 0% за следующие 0.5 с, итого 1 с.
-const PIN_FLASH_DURATION: Duration = Duration::from_secs(1);
+/// 2026-08-18, вдвое увеличено по запросу 2026-08-19: «в 2 раза длиннее в
+/// плане проигрывания анимации»): 0 → 100% за 1 с, 100 → 0% за следующую
+/// 1 с, итого 2 с.
+const PIN_FLASH_DURATION: Duration = Duration::from_secs(2);
 /// Длительность фазы подъёма пульса, с.
-const PIN_FLASH_RISE: Duration = Duration::from_millis(500);
+const PIN_FLASH_RISE: Duration = Duration::from_secs(1);
 /// Шаг перепланирования кадра пульса — тот же принцип «ноль пробуждений в
 /// покое» (ADR-006), что у тултипа: 16 мс ≈ 60 Гц, дешевле некуда.
 const PIN_FLASH_STEP: Duration = Duration::from_millis(16);
-/// Цвет рамки пульса — акцент проекта: тот же `#3c9898`, что `--accent` в
-/// настройках (НЕ синий `SLIDER_FILL` D3D-темы — тот для другой семантики).
-const PIN_FLASH_COLOR: [u8; 3] = [0x3c, 0x98, 0x98];
+/// Цвет рамки пульса ПРИ ЗАКРЕПЛЕНИИ — акцент проекта: тот же `#3c9898`,
+/// что `--accent` в настройках (НЕ синий `SLIDER_FILL` D3D-темы — тот для
+/// другой семантики).
+const PIN_FLASH_COLOR_PIN: [u8; 3] = [0x3c, 0x98, 0x98];
+/// Цвет рамки пульса ПРИ ОТКРЕПЛЕНИИ (запрос пользователя 2026-08-19:
+/// «обводка становится красного цвета, а не цвета cyan») — красный, чтобы
+/// визуально отличаться от закрепления и читаться как «окно освобождено»,
+/// не «окно занято».
+const PIN_FLASH_COLOR_UNPIN: [u8; 3] = [0xd0, 0x3c, 0x3c];
+/// Толщина рамки пульса — в 1.5 раза толще обычной рамки выделения
+/// (`HIGHLIGHT_THICKNESS_DIP`, запрос пользователя 2026-08-19: «обводку в
+/// 1.5 раза больше»); намеренно отдельная константа — амбарная рамка
+/// выделения закреплённого окна в edit-mode (`HighlightKind::Pin`,
+/// `pinned_selection`) толщину не меняет, только пульс пин/анпин.
+const PIN_FLASH_THICKNESS_DIP: f64 = 1.5 * HIGHLIGHT_THICKNESS_DIP;
 
-/// Высота МИНИМАЛЬНОЙ панели свойств закреплённого окна, DIP: отступы +
-/// кнопка «Открепить» (замки/правила соседства скрыты из UI по решению
-/// пользователя 2026-08-18 — см. доккомент `rebuild_pinned_panel`).
-const PINNED_MINIMAL_PANEL_HEIGHT: f64 = 2.0 * rst_render::PINNED_PAD + theme::BUTTON_SIZE;
+/// Какое действие запустило пульс — определяет цвет рамки
+/// ([`PinFlash::color`]): закрепление — акцент проекта, открепление —
+/// красный (запрос пользователя 2026-08-19).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PinFlashKind {
+    Pin,
+    Unpin,
+}
 
 /// Активный пульс рамки закрепляемого/открепляемого окна (Ctrl+Alt+R):
 /// `hwnd` целевого окна + момент старта. Временное состояние, живёт ровно
@@ -532,13 +550,24 @@ const PINNED_MINIMAL_PANEL_HEIGHT: f64 = 2.0 * rst_render::PINNED_PAD + theme::B
 struct PinFlash {
     hwnd: isize,
     started_at: Instant,
+    kind: PinFlashKind,
 }
 
 impl PinFlash {
-    fn new(hwnd: isize) -> Self {
+    fn new(hwnd: isize, kind: PinFlashKind) -> Self {
         Self {
             hwnd,
             started_at: Instant::now(),
+            kind,
+        }
+    }
+
+    /// Цвет рамки для текущего действия — см. [`PIN_FLASH_COLOR_PIN`]/
+    /// [`PIN_FLASH_COLOR_UNPIN`].
+    fn color(&self) -> [u8; 3] {
+        match self.kind {
+            PinFlashKind::Pin => PIN_FLASH_COLOR_PIN,
+            PinFlashKind::Unpin => PIN_FLASH_COLOR_UNPIN,
         }
     }
 
@@ -2413,6 +2442,18 @@ fn run(
                 // (редизайн пинов, SPEC «Закрепление окна», пункт 1) —
                 // работает независимо от режима редактирования.
                 toggle_focused_pin(&mut edit, &cfg, &monitor_bounds, &mut window_pins);
+                // `pinned_window_dip_placement`, который рисует пульс, читает
+                // координаторский `window_snapshot` — он обновляется только
+                // асинхронно, по следующему `Windows(Changed)` от трекера
+                // (баг, живой репорт пользователя 2026-08-19: «свечение
+                // перестало появляться при закреплении»). Без этой строки
+                // первый(е) кадр(ы) пульса рисуются раньше, чем окно попадёт
+                // в снимок — рамка не находит `placement` и просто не рисуется,
+                // а к моменту, когда снимок наконец обновится, пульс уже
+                // истёк или почти истёк. Разовое перечисление здесь — тот же
+                // приём и та же цена, что у `pending_open_pick_list` выше и у
+                // внутреннего `enumerate()` в `toggle_focused_pin`.
+                window_snapshot = rst_win32::window_enum::enumerate();
                 // Пульс рамки при пин/анпин стартовал в `pin_window`/
                 // `unpin_window` — нужен немедленный редрав (первый кадр
                 // пульса), дальше кадры крутит планировщик анимаций своим
@@ -5508,14 +5549,15 @@ fn rebuild_window_pick_list(
 /// снизу не хватает места (тот же приём, что `toolbar_top`), горизонтально
 /// зажата в границы экрана монитора.
 ///
-/// МИНИМАЛЬНАЯ версия (решение пользователя 2026-08-18: «почему нет
+/// УРЕЗАННАЯ версия (решение пользователя 2026-08-18: «почему нет
 /// функции порядка между окнами? …я никогда не просил этого, не знаю,
-/// что это»): замки и соседские правила скрыты из UI — панель предлагает
-/// ТОЛЬКО «Открепить». `rst_render::build_pinned_panel` (полная панель с
-/// замками/правилами) больше не вызывается, но НЕ удалён — код замков/
-/// правил и их принуждение (`suspend_pin_enforcement`/`resume_pin_enforcement`,
-/// `resolve_topmost_neighbor`, строки панели) остаются в репозитории в
-/// спящем виде: будущий раунд вернёт UI, вернув этот вызов.
+/// что это»): соседские правила скрыты из UI, но замки (`lock_move`/
+/// `lock_interact`) остаются — панель строится через
+/// `rst_render::build_pinned_lock_panel`. Полная панель с разделом правил
+/// (`rst_render::build_pinned_panel`) больше не вызывается, но НЕ удалена —
+/// код правил и их учёт (`resolve_topmost_neighbor`, строки панели)
+/// остаются в репозитории в спящем виде: будущий раунд вернёт UI, вернув
+/// этот вызов.
 fn rebuild_pinned_panel(
     edit: &mut EditState,
     window_snapshot: &[WindowInfo],
@@ -5525,7 +5567,7 @@ fn rebuild_pinned_panel(
         edit.pinned_panel = None;
         return;
     };
-    let Some(_pinned) = edit.pinned_windows.iter().find(|p| p.hwnd == hwnd) else {
+    let Some(pinned) = edit.pinned_windows.iter().find(|p| p.hwnd == hwnd) else {
         edit.pinned_panel = None;
         return;
     };
@@ -5539,36 +5581,23 @@ fn rebuild_pinned_panel(
     let screen_w = bounds.bounds_px.w as f64 / bounds.scale;
     let screen_h = bounds.bounds_px.h as f64 / bounds.scale;
     let top = placement.cy + placement.h / 2.0 + toolbar::TOOLBAR_GAP_Y;
-    let top = if top + PINNED_MINIMAL_PANEL_HEIGHT <= screen_h {
+    let top = if top + rst_render::PINNED_LOCK_PANEL_HEIGHT <= screen_h {
         top
     } else {
-        placement.cy - placement.h / 2.0 - toolbar::TOOLBAR_GAP_Y - PINNED_MINIMAL_PANEL_HEIGHT
+        placement.cy - placement.h / 2.0 - toolbar::TOOLBAR_GAP_Y - rst_render::PINNED_LOCK_PANEL_HEIGHT
     };
     let left = (placement.cx - rst_render::PINNED_PANEL_WIDTH / 2.0)
         .clamp(0.0, (screen_w - rst_render::PINNED_PANEL_WIDTH).max(0.0));
     let frame = Box2D {
         cx: left + rst_render::PINNED_PANEL_WIDTH / 2.0,
-        cy: top + PINNED_MINIMAL_PANEL_HEIGHT / 2.0,
+        cy: top + rst_render::PINNED_LOCK_PANEL_HEIGHT / 2.0,
         w: rst_render::PINNED_PANEL_WIDTH,
-        h: PINNED_MINIMAL_PANEL_HEIGHT,
+        h: rst_render::PINNED_LOCK_PANEL_HEIGHT,
         rotation: 0.0,
     };
-    // Минимальная панель: фон + единственная кнопка «Открепить» (тот же
-    // `PINNED_BTN_UNPIN`, что у полной панели — `handle_pinned_panel_up`
-    // опрашивает именно его, остальные его ветки (замки/правила) просто
-    // не сработают: виджетов с теми id в панели нет).
-    let mut panel = Panel::new(rst_render::PINNED_PANEL_ID, frame);
-    panel.add_widget(Button::new(
-        rst_render::PINNED_BTN_UNPIN,
-        Box2D {
-            cx: frame.cx,
-            cy: frame.cy,
-            w: (frame.w - 2.0 * rst_render::PINNED_PAD).max(0.0),
-            h: theme::BUTTON_SIZE,
-            rotation: 0.0,
-        },
-        ButtonContent::Label("Открепить".to_string()),
-    ));
+    // Урезанная панель: замки + «Открепить», без раздела правил соседства
+    // (см. доккомент `rst_render::build_pinned_lock_panel`).
+    let panel = rst_render::build_pinned_lock_panel(pinned.lock_move, pinned.lock_interact, frame);
     edit.pinned_panel = Some(PinnedPanelState {
         hwnd,
         panel,
@@ -5882,7 +5911,7 @@ fn pin_window(
         }
     }
     edit.pinned_windows.push(PinnedWindow::new(hwnd as isize));
-    edit.pin_flashes.push(PinFlash::new(hwnd as isize));
+    edit.pin_flashes.push(PinFlash::new(hwnd as isize, PinFlashKind::Pin));
     true
 }
 
@@ -6072,7 +6101,7 @@ fn unpin_window(edit: &mut EditState, window_pins: &mut WindowPins, hwnd: usize)
     if let Err(e) = window_pins.unpin(hwnd) {
         tracing::warn!(hwnd, error = %e, "не удалось открепить окно");
     }
-    edit.pin_flashes.push(PinFlash::new(hwnd as isize));
+    edit.pin_flashes.push(PinFlash::new(hwnd as isize, PinFlashKind::Unpin));
     edit.pinned_windows.retain(|p| p.hwnd != hwnd as isize);
     if edit.pinned_selection == Some(hwnd as isize) {
         edit.pinned_selection = None;
@@ -6127,6 +6156,12 @@ fn toggle_focused_pin(
     };
     if edit.pinned_windows.iter().any(|p| p.hwnd == hwnd as isize) {
         unpin_window(edit, window_pins, hwnd);
+        // Звук на открепление хоткеем тоже (запрос пользователя 2026-08-19:
+        // «когда я откреплял окно звук тоже проигрывался» — симметрично
+        // пину ниже, тем же файлом/громкостью; кнопка «Открепить» на
+        // панели свойств звук не проигрывает — тот же принцип «только
+        // хоткей», что у пина).
+        rst_win32::sound::play_pin_sound(cfg.settings.pin_sound_volume);
         return;
     }
     let fresh_snapshot = rst_win32::window_enum::enumerate();
@@ -6143,8 +6178,9 @@ fn toggle_focused_pin(
     if pin_window(edit, &fresh_snapshot, monitor_bounds, window_pins, hwnd) {
         // Звук только на закрепление хоткеем (запрос пользователя
         // 2026-08-19: «когда ты закрепляешь биндом» — конкретно этот путь,
-        // не клик по списку окон и не анпин); своя громкость, не через
-        // AudioMixer стикеров (rst_win32::sound doc comment).
+        // не клик по списку окон и не анпин-кнопка на панели); своя
+        // громкость, не через AudioMixer стикеров (rst_win32::sound doc
+        // comment).
         rst_win32::sound::play_pin_sound(cfg.settings.pin_sound_volume);
     }
 }
@@ -6241,10 +6277,10 @@ fn sync_pinned_rule_text_fields(edit: &mut EditState, hwnd: isize, rule_count: u
 /// `PinnedWindow`, без `config::save`/undo (SPEC: «нельзя сохранить в
 /// пресет, всегда нужно выставлять вручную»).
 ///
-/// МИНИМАЛЬНАЯ панель (решение пользователя 2026-08-18) содержит только
-/// кнопку «Открепить» — ветки замков/правил ниже не срабатывают (виджетов
-/// с теми id в панели нет), но оставлены: будущий раунд, вернувший полную
-/// панель, получит опрос действий обратно без изменений.
+/// УРЕЗАННАЯ панель (решение пользователя 2026-08-18) содержит замки и
+/// «Открепить» — ветки замков ниже срабатывают, ветки правил соседства
+/// (виджетов с теми id в панели нет) — нет, но оставлены: будущий раунд,
+/// вернувший полную панель, получит опрос действий обратно без изменений.
 fn handle_pinned_panel_up(
     edit: &mut EditState,
     window_snapshot: &[WindowInfo],
@@ -8293,9 +8329,9 @@ fn redraw(
             1.0,
         );
         let prims = highlight.primitives_custom(
-            PIN_FLASH_COLOR,
+            flash.color(),
             flash.opacity(flash_now),
-            HIGHLIGHT_THICKNESS_DIP,
+            PIN_FLASH_THICKNESS_DIP,
         );
         primitives_to_sprites(&prims, ui_cache, renderer, monitor_id, text_scale, &mut frame);
     }
@@ -9022,6 +9058,7 @@ fn load_static(renderer: &Renderer, path: &Path) -> Option<Texture> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rst_render::Widget as _;
 
     fn bounds(x: i32, y: i32, w: u32, h: u32) -> Rect {
         Rect { x, y, w, h }
@@ -9776,29 +9813,41 @@ mod tests {
 
     #[test]
     fn pin_flash_triangle_wave_opacity() {
-        // Треугольник: 0→1 за первую 0.5 с, 1→0 за вторую, 0 после 1 с.
+        // Треугольник: 0→1 за первую 1 с, 1→0 за вторую, 0 после 2 с
+        // (запрос пользователя 2026-08-19: длительность вдвое больше).
         let base = Instant::now();
-        let flash = PinFlash { hwnd: 1, started_at: base };
+        let flash = PinFlash { hwnd: 1, started_at: base, kind: PinFlashKind::Pin };
         let at = |secs: f64| base + Duration::from_secs_f64(secs);
         assert!((flash.opacity(at(0.0)) - 0.0).abs() < 1e-9);
-        assert!((flash.opacity(at(0.25)) - 0.5).abs() < 1e-9);
-        assert!((flash.opacity(at(0.5)) - 1.0).abs() < 1e-9, "пик в середине");
-        assert!((flash.opacity(at(0.75)) - 0.5).abs() < 1e-9);
-        assert_eq!(flash.opacity(at(1.0)), 0.0, "ровно в 1 с — уже 0");
-        assert_eq!(flash.opacity(at(2.0)), 0.0);
+        assert!((flash.opacity(at(0.5)) - 0.5).abs() < 1e-9);
+        assert!((flash.opacity(at(1.0)) - 1.0).abs() < 1e-9, "пик в середине");
+        assert!((flash.opacity(at(1.5)) - 0.5).abs() < 1e-9);
+        assert_eq!(flash.opacity(at(2.0)), 0.0, "ровно в 2 с — уже 0");
+        assert_eq!(flash.opacity(at(4.0)), 0.0);
     }
 
     #[test]
     fn pin_flash_next_deadline_and_expiry() {
         let base = Instant::now();
-        let flash = PinFlash { hwnd: 1, started_at: base };
+        let flash = PinFlash { hwnd: 1, started_at: base, kind: PinFlashKind::Pin };
         assert!(
             flash.next_deadline(base).is_some(),
             "живой пульс держит планировщик на коротком шаге"
         );
         let after = base + PIN_FLASH_DURATION + Duration::from_millis(1);
-        assert!(flash.expired(after), "истёк за пределами 1 с");
+        assert!(flash.expired(after), "истёк за пределами длительности");
         assert_eq!(flash.next_deadline(after), None, "дедлайна больше нет");
+    }
+
+    #[test]
+    fn pin_flash_color_differs_by_kind() {
+        // Запрос пользователя 2026-08-19: анпин красный, не cyan закрепления.
+        let now = Instant::now();
+        let pin = PinFlash { hwnd: 1, started_at: now, kind: PinFlashKind::Pin };
+        let unpin = PinFlash { hwnd: 1, started_at: now, kind: PinFlashKind::Unpin };
+        assert_eq!(pin.color(), PIN_FLASH_COLOR_PIN);
+        assert_eq!(unpin.color(), PIN_FLASH_COLOR_UNPIN);
+        assert_ne!(pin.color(), unpin.color());
     }
 
     #[test]
@@ -9825,9 +9874,9 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_pinned_panel_is_minimal_unpin_only() {
+    fn rebuild_pinned_panel_has_unpin_and_locks_no_rules() {
         // Панель свойств закреплённого окна урезана (решение пользователя
-        // 2026-08-18): только «Открепить» — ни замков, ни правил соседства.
+        // 2026-08-18): «Открепить» + замки — но без правил соседства.
         let (_cfg, _config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
         let hwnd = wnd.0.0 as usize;
         let mut edit = mask_gate_edit_state();
@@ -9846,17 +9895,100 @@ mod tests {
                 .is_some(),
             "кнопка «Открепить» на месте — тот же id, что опрашивает handle_pinned_panel_up"
         );
-        for hidden in [
+        for present in [
             rst_render::PINNED_CHECK_MOVE_LOCK,
             rst_render::PINNED_CHECK_INTERACT_LOCK,
-            rst_render::PINNED_BTN_ADD_RULE,
         ] {
             assert!(
-                state.panel.widget::<Button>(hidden).is_none()
-                    && state.panel.widget::<Checkbox>(hidden).is_none(),
-                "виджет {hidden} скрыт из UI (замки/правила в спящем коде)"
+                state.panel.widget::<Checkbox>(present).is_some(),
+                "чекбокс замка {present} должен быть на панели"
             );
         }
+        assert!(
+            state
+                .panel
+                .widget::<Button>(rst_render::PINNED_BTN_ADD_RULE)
+                .is_none(),
+            "кнопка «Добавить правило» скрыта из UI (правила в спящем коде — \
+             PINNED_LABEL_RULES/PINNED_SCROLLBAR_ID не публичны в rst_render, \
+             непроверяемы отсюда, но не строятся в build_pinned_lock_panel)"
+        );
+    }
+
+    #[test]
+    fn handle_pinned_panel_up_toggles_move_lock() {
+        let (_cfg, _config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        let mut edit = mask_gate_edit_state();
+        let mut window_pins = WindowPins::new();
+
+        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        edit.pinned_selection = Some(hwnd as isize);
+        rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
+
+        let state = edit.pinned_panel.as_mut().expect("панель собрана");
+        let pos = state
+            .panel
+            .widget::<Checkbox>(rst_render::PINNED_CHECK_MOVE_LOCK)
+            .expect("чекбокс move-lock на панели")
+            .bounds();
+        let pos = (pos.cx, pos.cy);
+        state.panel.pointer_event(PointerEvent::Down { pos });
+
+        assert!(handle_pinned_panel_up(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            pos,
+        ));
+
+        let pinned = edit
+            .pinned_windows
+            .iter()
+            .find(|p| p.hwnd == hwnd as isize)
+            .expect("окно остаётся в реестре");
+        assert!(pinned.lock_move, "клик по чекбоксу включает move-lock");
+        assert!(!pinned.lock_interact, "interact-lock не тронут");
+        assert!(edit.pinned_panel.is_some(), "панель пересобрана, а не закрыта");
+    }
+
+    #[test]
+    fn handle_pinned_panel_up_toggles_interact_lock() {
+        let (_cfg, _config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        let mut edit = mask_gate_edit_state();
+        let mut window_pins = WindowPins::new();
+
+        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        edit.pinned_selection = Some(hwnd as isize);
+        rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
+
+        let state = edit.pinned_panel.as_mut().expect("панель собрана");
+        let pos = state
+            .panel
+            .widget::<Checkbox>(rst_render::PINNED_CHECK_INTERACT_LOCK)
+            .expect("чекбокс interact-lock на панели")
+            .bounds();
+        let pos = (pos.cx, pos.cy);
+        state.panel.pointer_event(PointerEvent::Down { pos });
+
+        assert!(handle_pinned_panel_up(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            pos,
+        ));
+
+        let pinned = edit
+            .pinned_windows
+            .iter()
+            .find(|p| p.hwnd == hwnd as isize)
+            .expect("окно остаётся в реестре");
+        assert!(pinned.lock_interact, "клик по чекбоксу включает interact-lock");
+        assert!(!pinned.lock_move, "move-lock не тронут");
+        assert!(edit.pinned_panel.is_some(), "панель пересобрана, а не закрыта");
     }
 
     #[test]

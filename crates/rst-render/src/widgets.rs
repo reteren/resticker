@@ -2010,6 +2010,14 @@ pub const PINNED_PANEL_HEIGHT: f64 = 2.0 * PINNED_PAD
     + 3.0 * PINNED_SECTION_ROW_H
     + PINNED_VISIBLE_RULES as f64 * PINNED_RULE_ROW_H
     + theme::BUTTON_SIZE;
+/// Высота УРЕЗАННОЙ панели ([`build_pinned_lock_panel`]), DIP: отступы + две
+/// строки переключателей замков + зазор + строка кнопки «Открепить» — без
+/// раздела правил соседства (тот остаётся только в [`build_pinned_panel`]).
+/// Больше [`PINNED_PANEL_ID`]-минимума вызывающего слоя (`PINNED_MINIMAL_
+/// PANEL_HEIGHT` в `overlay_manager`, только «Открепить»), меньше
+/// [`PINNED_PANEL_HEIGHT`] (тот резервирует место под список правил).
+pub const PINNED_LOCK_PANEL_HEIGHT: f64 =
+    2.0 * PINNED_PAD + 2.0 * PINNED_SECTION_ROW_H + PINNED_GAP + theme::BUTTON_SIZE;
 
 /// Поле строки правила соседства — декодируется из `WidgetId` строки
 /// ([`decode_pinned_row_id`]).
@@ -2295,6 +2303,76 @@ pub fn build_pinned_panel(
         panel,
         total_rows: rules.len(),
     }
+}
+
+/// Собрать УРЕЗАННУЮ панель свойств закреплённого окна: только секция замков
+/// (переключатели [`PINNED_CHECK_MOVE_LOCK`]/[`PINNED_CHECK_INTERACT_LOCK`],
+/// та же пара [`Checkbox::icon_toggle`]/[`Icon::Lock`]/[`Icon::LockOpen`], что
+/// в [`build_pinned_panel`]) и кнопка «Открепить» ([`PINNED_BTN_UNPIN`]) —
+/// без раздела правил соседства/z-order. Тот раздел решением пользователя
+/// 2026-08-18 убран из UI и намеренно НЕ воспроизведён здесь; полная версия
+/// с правилами остаётся нетронутой в [`build_pinned_panel`] для будущего
+/// возврата.
+///
+/// Использует ТЕ ЖЕ id виджетов, что и [`build_pinned_panel`]
+/// (`PINNED_CHECK_MOVE_LOCK`/`PINNED_CHECK_INTERACT_LOCK`/`PINNED_BTN_UNPIN`),
+/// поэтому `overlay_manager::handle_pinned_panel_up` опрашивает эту панель
+/// без изменений — виджетов с id раздела правил (`PINNED_LABEL_RULES`,
+/// `PINNED_BTN_ADD_RULE`, `PINNED_SCROLLBAR_ID`) в результате нет, их ветки
+/// просто не сработают. `frame` — рамка панели (типовой размер —
+/// [`PINNED_PANEL_WIDTH`]×[`PINNED_LOCK_PANEL_HEIGHT`]).
+pub fn build_pinned_lock_panel(move_locked: bool, interact_locked: bool, frame: Box2D) -> Panel {
+    let mut panel = Panel::new(PINNED_PANEL_ID, frame);
+    let left = frame.cx - frame.w / 2.0 + PINNED_PAD;
+    let top = frame.cy - frame.h / 2.0;
+    let bottom = frame.cy + frame.h / 2.0;
+    let toggle_cx = left + theme::BUTTON_SIZE / 2.0;
+    let label_left = toggle_cx + theme::BUTTON_SIZE / 2.0 + PINNED_GAP;
+
+    // Секция замков: два переключателя-иконки с подписями (см.
+    // `build_pinned_panel` — идентичная раскладка).
+    let cy_move = top + PINNED_PAD + PINNED_SECTION_ROW_H / 2.0;
+    panel.add_widget(Checkbox::icon_toggle(
+        PINNED_CHECK_MOVE_LOCK,
+        toggle_cx,
+        cy_move,
+        move_locked,
+    ));
+    panel.add_widget(Label::new(
+        PINNED_LABEL_MOVE_LOCK,
+        label_left,
+        cy_move,
+        "Блокировать перемещение",
+    ));
+    let cy_interact = cy_move + PINNED_SECTION_ROW_H;
+    panel.add_widget(Checkbox::icon_toggle(
+        PINNED_CHECK_INTERACT_LOCK,
+        toggle_cx,
+        cy_interact,
+        interact_locked,
+    ));
+    panel.add_widget(Label::new(
+        PINNED_LABEL_INTERACT_LOCK,
+        label_left,
+        cy_interact,
+        "Блокировать ввод",
+    ));
+
+    // Кнопка «Открепить» — внизу, на всю ширину контента (см.
+    // `build_pinned_panel` — идентичная раскладка).
+    panel.add_widget(Button::new(
+        PINNED_BTN_UNPIN,
+        Box2D {
+            cx: frame.cx,
+            cy: bottom - PINNED_PAD - theme::BUTTON_SIZE / 2.0,
+            w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label("Открепить".to_string()),
+    ));
+
+    panel
 }
 
 #[cfg(test)]
@@ -3157,6 +3235,10 @@ mod tests {
         rect(200.0, 200.0, PINNED_PANEL_WIDTH, PINNED_PANEL_HEIGHT)
     }
 
+    fn pinned_lock_frame() -> Box2D {
+        rect(200.0, 200.0, PINNED_PANEL_WIDTH, PINNED_LOCK_PANEL_HEIGHT)
+    }
+
     fn rule(process: &str, title: &str) -> OverlapRule {
         OverlapRule {
             process_name: Some(process.to_string()),
@@ -3404,5 +3486,88 @@ mod tests {
                 "плейсхолдер {label:?} ({tw} DIP) шире поля ({avail} DIP)"
             );
         }
+    }
+
+    // --- Урезанная панель свойств закреплённого окна (build_pinned_lock_panel) ---
+
+    /// Та же иконка-семантика, что у `pinned_panel_lock_toggles_draw_lock_icons`,
+    /// но для урезанной панели: `Icon::Lock` в состоянии «заблокировано»,
+    /// `Icon::LockOpen` в «свободно».
+    #[test]
+    fn pinned_lock_panel_toggles_draw_lock_icons() {
+        for (id, checked, expect) in [
+            (PINNED_CHECK_MOVE_LOCK, true, Icon::Lock),
+            (PINNED_CHECK_MOVE_LOCK, false, Icon::LockOpen),
+            (PINNED_CHECK_INTERACT_LOCK, true, Icon::Lock),
+            (PINNED_CHECK_INTERACT_LOCK, false, Icon::LockOpen),
+        ] {
+            let p = build_pinned_lock_panel(checked, checked, pinned_lock_frame());
+            let mut prims = Vec::new();
+            p.widget::<Checkbox>(id).unwrap().draw(&mut prims);
+            let mut seen_icon = false;
+            for prim in prims {
+                if let Primitive::Icon { icon, .. } = prim {
+                    seen_icon = true;
+                    assert_eq!(icon, expect, "id {id} checked {checked}");
+                }
+            }
+            assert!(seen_icon, "id {id} checked {checked}: иконка не нарисована");
+        }
+    }
+
+    /// Клик по переключателю замка урезанной панели работает как обычный
+    /// `Checkbox` (тот же контракт, что `pinned_panel_lock_toggle_clicks_like_checkbox`).
+    #[test]
+    fn pinned_lock_panel_toggle_clicks_like_checkbox() {
+        let mut p = build_pinned_lock_panel(false, false, pinned_lock_frame());
+        let b = p.widget::<Checkbox>(PINNED_CHECK_MOVE_LOCK).unwrap().bounds();
+        assert_eq!(b.w, theme::BUTTON_SIZE, "иконка-кнопка размера тулбара");
+        p.pointer_event(PointerEvent::Down { pos: (b.cx, b.cy) });
+        p.pointer_event(PointerEvent::Up { pos: (b.cx, b.cy) });
+        assert_eq!(
+            p.widget_mut::<Checkbox>(PINNED_CHECK_MOVE_LOCK)
+                .unwrap()
+                .take_changed(),
+            Some(true),
+            "клик по иконке-замку переключает move-lock"
+        );
+    }
+
+    /// Кнопка «Открепить» присутствует и растянута на всю ширину контента
+    /// (та же раскладка, что у полной панели).
+    #[test]
+    fn pinned_lock_panel_has_unpin_button() {
+        let frame = pinned_lock_frame();
+        let p = build_pinned_lock_panel(false, false, frame);
+        let b = p.widget::<Button>(PINNED_BTN_UNPIN).unwrap().bounds();
+        assert_eq!(
+            b.w,
+            (frame.w - 2.0 * PINNED_PAD).max(0.0),
+            "«Открепить» растянута на ширину контента"
+        );
+        assert!(
+            b.cy > frame.cy,
+            "«Открепить» в нижней части урезанной панели"
+        );
+    }
+
+    /// Раздел правил соседства/z-order отсутствует в урезанной панели —
+    /// решение пользователя 2026-08-18 держит его вне UI, `build_pinned_panel`
+    /// (с разделом) остаётся нетронутым для будущего возврата.
+    #[test]
+    fn pinned_lock_panel_omits_neighbor_rule_widgets() {
+        let p = build_pinned_lock_panel(false, false, pinned_lock_frame());
+        assert!(
+            p.widget::<Label>(PINNED_LABEL_RULES).is_none(),
+            "заголовок «Соседние окна» не должен строиться"
+        );
+        assert!(
+            p.widget::<Button>(PINNED_BTN_ADD_RULE).is_none(),
+            "кнопка «Добавить правило» не должна строиться"
+        );
+        assert!(
+            p.widget::<ScrollBar>(PINNED_SCROLLBAR_ID).is_none(),
+            "полоса скролла списка правил не должна строиться"
+        );
     }
 }
