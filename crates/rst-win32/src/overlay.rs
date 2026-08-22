@@ -38,6 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW,
     PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+    GW_HWNDPREV, GetWindow, HWND_TOPMOST,
     SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA, WM_APP,
     WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY,
@@ -444,6 +445,65 @@ impl OverlayWindow {
                 bounds_px.w as i32,
                 bounds_px.h as i32,
                 SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .is_ok()
+        }
+    }
+
+    /// Поднять оверлей над закреплёнными окнами, если хоть одно из них
+    /// стоит ВЫШЕ него в z-order.
+    ///
+    /// Зачем: закреплённое окно тоже живёт в topmost-полосе
+    /// ([`crate::window_pin::WindowPins::pin`] ставит ему `WS_EX_TOPMOST`), а
+    /// система при активации кладёт активное окно на верх полосы — выше
+    /// нашего оверлея. Вся графика, которую оверлей рисует поверх окна
+    /// (бейдж «закреплено», индикаторы замков, рамка-пульс), уходит под окно
+    /// и становится невидимой; пользователь видит её лишь мгновение в
+    /// момент пина (репорт 2026-08-21).
+    ///
+    /// Условие «выше нас стоит именно НАШ пин», а не «мы не первые»:
+    /// проверять `GW_HWNDPREV == null` бессмысленно — над оверлеем всегда
+    /// есть системные окна, и такая проверка вырождалась бы в безусловный
+    /// `SetWindowPos` на каждом снимке трекера (измерено воркером-
+    /// исследователем 2026-08-21: `GetWindow` — 0.3–0.5 мкс,
+    /// `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)` — 14–16 мкс). Обход
+    /// вверх дешевле и заодно сам себя останавливает: после подъёма пин
+    /// оказывается ниже, следующий снимок ничего не находит и не трогает
+    /// z-order — z-order-войны с чужими topmost-приложениями не возникает.
+    ///
+    /// `SWP_NOACTIVATE` обязателен: оверлей `WS_EX_NOACTIVATE` и фокус не
+    /// забирает. Возвращает `true`, если подъём реально выполнялся.
+    pub fn raise_above_pinned(&self, pinned: &[usize]) -> bool {
+        if pinned.is_empty() {
+            return false;
+        }
+        // SAFETY: hwnd — наше живое окно; GetWindow — чтение z-order.
+        let mut above = unsafe { GetWindow(self.hwnd, GW_HWNDPREV) };
+        let mut found = false;
+        while let Ok(hwnd) = above {
+            if hwnd.0.is_null() {
+                break;
+            }
+            if pinned.contains(&(hwnd.0 as usize)) {
+                found = true;
+                break;
+            }
+            // SAFETY: hwnd получен из GetWindow, чтение z-order живого окна.
+            above = unsafe { GetWindow(hwnd, GW_HWNDPREV) };
+        }
+        if !found {
+            return false;
+        }
+        // SAFETY: наше окно; SetWindowPos без активации и без движения.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )
             .is_ok()
         }

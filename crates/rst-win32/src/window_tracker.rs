@@ -26,7 +26,8 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWi
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, GWLP_USERDATA,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_SYSTEM_MOVESIZEEND, GWLP_USERDATA,
     GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, IsWindow, KillTimer, MSG, OBJID_WINDOW,
     PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW,
     TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_APP, WM_CLOSE, WM_DESTROY, WM_TIMER,
@@ -340,6 +341,12 @@ fn install_hooks(state: &mut WndState) {
         // плана меняет фактическую видимую площадь окклюдера и обязана
         // будить пересчёт.
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+        // Конец перетаскивания/ресайза окна пользователем. Само движение
+        // видно и по `LOCATIONCHANGE`, но ПОСЛЕ отпускания кнопки события
+        // больше не приходят — а координатору нужен ровно один снимок с
+        // уже отпущенным окном: на нём он применяет магнит к кромкам
+        // монитора и кламп размера (репорт пользователя 2026-08-21).
+        (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND),
     ] {
         // SAFETY: win_event_proc — валидный `WINEVENTPROC`; hmodule/idprocess/
         // idthread = 0/None — весь процесс, любой поток (WINEVENT_OUTOFCONTEXT
@@ -553,7 +560,9 @@ fn classify_event(event: u32, in_cache: bool) -> Option<PendingOp> {
         EVENT_OBJECT_DESTROY => Some(PendingOp::Destroyed),
         EVENT_SYSTEM_MINIMIZESTART => Some(PendingOp::Minimized(true)),
         EVENT_SYSTEM_MINIMIZEEND => Some(PendingOp::Minimized(false)),
-        EVENT_OBJECT_LOCATIONCHANGE if in_cache => Some(PendingOp::LocationChanged),
+        EVENT_OBJECT_LOCATIONCHANGE | EVENT_SYSTEM_MOVESIZEEND if in_cache => {
+            Some(PendingOp::LocationChanged)
+        }
         _ => None,
     }
 }

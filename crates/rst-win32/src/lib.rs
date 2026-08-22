@@ -16,6 +16,7 @@ pub mod single_instance;
 pub mod sound;
 pub mod tray;
 pub mod virtual_desktops;
+pub mod dwm;
 pub mod window_enum;
 mod window_icon;
 pub mod window_pick;

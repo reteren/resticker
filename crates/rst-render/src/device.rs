@@ -23,7 +23,7 @@ use crate::atlas::{AtlasFrame, TextureAtlas};
 use crate::sprite::Sprite;
 use crate::texture::Texture;
 use crate::video::VideoTextures;
-use crate::window_target::WindowTarget;
+use crate::window_target::{PresentSync, WindowTarget};
 use crate::{RenderError, shader};
 
 /// Константный буфер шейдера спрайта: строго float4 под HLSL-упаковку
@@ -667,7 +667,19 @@ impl Device {
     /// Спрайт с `video: Some` (M5b) рисуется через `mainVideoPS` — тот же
     /// путь, без изменений в вызове.
     pub fn draw(&self, target: &WindowTarget, sprites: &[Sprite]) -> Result<(), RenderError> {
-        self.draw_common(target, sprites, &[])
+        self.draw_common(target, sprites, &[], PresentSync::default())
+    }
+
+    /// Как [`Self::draw`], но с явным режимом ожидания показа
+    /// ([`PresentSync`]): нужен пути «кадр идёт вровень с чужим окном», где
+    /// такт задаёт ожидание композиции ДО сборки кадра, а не `Present`.
+    pub fn draw_with_sync(
+        &self,
+        target: &WindowTarget,
+        sprites: &[Sprite],
+        sync: PresentSync,
+    ) -> Result<(), RenderError> {
+        self.draw_common(target, sprites, &[], sync)
     }
 
     /// Как [`Self::draw`], но каждый спрайт вырезается по своей маске
@@ -683,7 +695,18 @@ impl Device {
         sprites: &[Sprite],
         masks: &[Option<&Texture>],
     ) -> Result<(), RenderError> {
-        self.draw_common(target, sprites, masks)
+        self.draw_common(target, sprites, masks, PresentSync::default())
+    }
+
+    /// Как [`Self::draw_masked`], но с явным режимом ожидания показа.
+    pub fn draw_masked_with_sync(
+        &self,
+        target: &WindowTarget,
+        sprites: &[Sprite],
+        masks: &[Option<&Texture>],
+        sync: PresentSync,
+    ) -> Result<(), RenderError> {
+        self.draw_common(target, sprites, masks, sync)
     }
 
     /// Общий путь отрисовки для [`Self::draw`] и [`Self::draw_masked`]:
@@ -697,6 +720,7 @@ impl Device {
         target: &WindowTarget,
         sprites: &[Sprite],
         masks: &[Option<&Texture>],
+        sync: PresentSync,
     ) -> Result<(), RenderError> {
         let (w, h) = target.size();
         let Some(rtv) = target.rtv() else {
@@ -858,7 +882,7 @@ impl Device {
                 self.context.Draw(6, 0);
             }
         }
-        target.present()
+        target.present(sync)
     }
 
     /// Создать маску перекрытия (M4, docs/M4_MASK_RENDER_DESIGN.md §3):

@@ -42,13 +42,68 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
         Icon::Lock => draw_lock(&mut canvas, s),
         Icon::LockOpen => draw_lock_open(&mut canvas, s),
         Icon::Plus => draw_plus(&mut canvas, s),
+        // Единственная растровая иконка — рисунок пользователя, см.
+        // `pinned_badge_rgba`.
+        Icon::Pinned => return pinned_badge_rgba(size_px),
     }
     canvas.into_rgba()
 }
 
+/// PNG-булавка, присланная пользователем (2026-08-21) для бейджа «окно
+/// закреплено»: 64×64, straight alpha, штрих одним серым тоном
+/// (`#626262`) на прозрачном фоне.
+const PINNED_BADGE_PNG: &[u8] = include_bytes!("../assets/pinned_badge.png");
+
+/// Бейдж-булавка в RGBA `size_px`×`size_px`.
+///
+/// Отличается от остальных иконок тем, что не рисуется примитивами:
+/// пользователь дал конкретный рисунок, и повторять его вручную значило бы
+/// получить похожую, но другую булавку. Из исходника берётся только АЛЬФА —
+/// цвет заменяется на [`PINNED_BADGE_COLOR`]: оригинальный серый штрих
+/// тонет на тёмном фоне бейджа ([`crate::widgets::theme::LOCK_INDICATOR_BG`]),
+/// а форма и сглаживание сохраняются как есть.
+///
+/// Декодирование не кэшируется здесь намеренно: иконки растрируются один раз
+/// на размер и живут в кэше текстур вызывающего слоя (`ui_textures`).
+fn pinned_badge_rgba(size_px: u32) -> Vec<u8> {
+    let decoded = image::load_from_memory(PINNED_BADGE_PNG);
+    let mut rgba = match decoded {
+        Ok(img) => img.into_rgba8(),
+        Err(e) => {
+            // Битый ресурс — не повод ронять оверлей: пустой бейдж честнее
+            // паники, а в логе видно причину.
+            tracing::warn!(error = %e, "иконка-булавка не декодировалась");
+            return vec![0u8; (size_px * size_px * 4) as usize];
+        }
+    };
+    if rgba.width() != size_px || rgba.height() != size_px {
+        rgba = image::imageops::resize(
+            &rgba,
+            size_px,
+            size_px,
+            image::imageops::FilterType::Lanczos3,
+        );
+    }
+    for px in rgba.pixels_mut() {
+        let alpha = px.0[3];
+        px.0 = [
+            PINNED_BADGE_COLOR[0],
+            PINNED_BADGE_COLOR[1],
+            PINNED_BADGE_COLOR[2],
+            alpha,
+        ];
+    }
+    rgba.into_raw()
+}
+
+/// Цвет штриха булавки поверх тёмного бейджа.
+const PINNED_BADGE_COLOR: [u8; 3] = [0xf0, 0xf0, 0xf0];
+
 /// Цвет иконки (иконки различаются и формой, и цветом — кнопки не монохромны).
 fn color_of(icon: Icon) -> [u8; 3] {
     match icon {
+        // Растровая иконка красится в `pinned_badge_rgba`, сюда не попадает.
+        Icon::Pinned => PINNED_BADGE_COLOR,
         Icon::Layers => [0xcf, 0xcf, 0xd6],
         Icon::Eye => [0xf0, 0xf0, 0xf0],
         Icon::EyeOff => [0xa8, 0xa8, 0xb2],

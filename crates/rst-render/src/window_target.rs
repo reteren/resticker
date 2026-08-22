@@ -146,12 +146,14 @@ impl WindowTarget {
         self.rtv.clone()
     }
 
-    /// Представить кадр (vsync). Потеря устройства возвращается отдельным
-    /// вариантом ошибки: устройство и цель надо пересоздать (ARCHITECTURE.md,
+    /// Представить кадр. Потеря устройства возвращается отдельным вариантом
+    /// ошибки: устройство и цель надо пересоздать (ARCHITECTURE.md,
     /// раздел 11).
-    pub(crate) fn present(&self) -> Result<(), RenderError> {
+    ///
+    /// `sync` выбирает интервал ожидания — см. [`PresentSync`].
+    pub(crate) fn present(&self, sync: PresentSync) -> Result<(), RenderError> {
         // SAFETY: swapchain жив и принадлежит self.
-        let hr = unsafe { self.swapchain.Present(1, DXGI_PRESENT(0)) };
+        let hr = unsafe { self.swapchain.Present(sync.interval(), DXGI_PRESENT(0)) };
         hr.ok().map_err(|e| {
             let code = e.code();
             if code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET {
@@ -160,6 +162,39 @@ impl WindowTarget {
                 RenderError::Windows(e)
             }
         })
+    }
+}
+
+/// Как ждать показа кадра в [`WindowTarget::present`].
+///
+/// Замер (воркер-исследователь, 2026-08-21): `Present(1)` блокирует ровно
+/// один период кадра — 5.6 мс на 179 Гц, около 16.7 мс на 60 Гц, — и
+/// поскольку геометрию мы сэмплируем ДО этого ожидания, содержимое кадра к
+/// моменту показа успевает устареть ровно на кадр. Именно это и видно как
+/// «обводка отстаёт от окна» при перетаскивании. `Present(0)` возвращается
+/// за 0.046 мс: если такт задаёт не он, а ожидание композиции DWM ПЕРЕД
+/// сборкой кадра ([`rst_win32::dwm::wait_for_composition`] у вызывающего),
+/// то сэмпл геометрии оказывается вплотную к показу и лаг падает до
+/// единиц миллисекунд.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PresentSync {
+    /// Ждать вертикальной синхронизации внутри `Present` — режим по
+    /// умолчанию для обычных кадров (анимации, видео, статика): такт задаёт
+    /// сам `Present`, лишних пробуждений нет.
+    #[default]
+    VSync,
+    /// Не ждать в `Present` вовсе. Только для кадров, такт которым задаёт
+    /// вызывающий (см. доккомент типа); иначе кадры будут отправляться
+    /// быстрее, чем DWM их композирует, и часть просто отбросится.
+    Immediate,
+}
+
+impl PresentSync {
+    fn interval(self) -> u32 {
+        match self {
+            Self::VSync => 1,
+            Self::Immediate => 0,
+        }
     }
 }
 

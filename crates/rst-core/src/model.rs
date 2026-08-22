@@ -49,6 +49,14 @@ pub struct Settings {
     /// громкости (`rst_win32::sound::play_pin_sound`), не завязан на
     /// микшер видео-стикеров.
     pub pin_sound_volume: u8,
+    /// Держать обводку на закреплённом окне всё время, пока оно закреплено
+    /// (запрос пользователя 2026-08-22: «outline on selected window»). Без
+    /// неё единственный постоянный признак закрепления — бейдж-булавка в
+    /// углу, а сама рамка лишь мигает в момент закрепления. Дефолт `false`:
+    /// рамка поверх ЧУЖОГО окна на всё время — заметное вмешательство в его
+    /// интерфейс, включать её должен сам пользователь. Старые `config.json`
+    /// без поля получают `false` через `#[serde(default)]` на структуре.
+    pub outline_pinned_windows: bool,
 }
 
 impl Default for Settings {
@@ -67,6 +75,7 @@ impl Default for Settings {
             onboarding_shown: false,
             denylist: Vec::new(),
             pin_sound_volume: 100,
+            outline_pinned_windows: false,
         }
     }
 }

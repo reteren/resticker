@@ -91,13 +91,18 @@ pub enum Icon {
     LockOpen,
     /// «Плюс» — добавление правила соседства в панели свойств.
     Plus,
+    /// «Кнопка-булавка» — бейдж «окно закреплено» в левом верхнем углу
+    /// закреплённого окна ([`pin_indicator`]). Единственная растровая
+    /// иконка: рисунок дал пользователь (2026-08-21), и перерисовывать его
+    /// примитивами значило бы получить похожую, но другую булавку.
+    Pinned,
 }
 
 impl Icon {
     /// Все варианты в порядке объявления — для предварительной генерации
     /// кэша иконок (текс-карта `HashMap<Icon, Texture>`, M2_WIRING_PLAN §3)
     /// и тестов генератора `icon_rgba`.
-    pub const ALL: [Icon; 20] = [
+    pub const ALL: [Icon; 21] = [
         Icon::Layers,
         Icon::Eye,
         Icon::EyeOff,
@@ -118,6 +123,7 @@ impl Icon {
         Icon::Lock,
         Icon::LockOpen,
         Icon::Plus,
+        Icon::Pinned,
     ];
 }
 
@@ -159,6 +165,24 @@ pub enum Primitive {
         color: [u8; 3],
         opacity: f64,
     },
+}
+
+impl Primitive {
+    /// Сдвинуть примитив на `(dx, dy)` DIP.
+    ///
+    /// Нужен слою, который догоняет уже отрисованную панель до её актуальной
+    /// позиции, не пересобирая виджеты (панель инструментов закреплённого
+    /// окна едет вместе с окном каждый кадр — `overlay_manager`).
+    pub fn translate(&mut self, dx: f64, dy: f64) {
+        let rect = match self {
+            Primitive::Fill { rect, .. }
+            | Primitive::Icon { rect, .. }
+            | Primitive::Rgba { rect, .. }
+            | Primitive::Text { rect, .. } => rect,
+        };
+        rect.cx += dx;
+        rect.cy += dy;
+    }
 }
 
 /// Палитра и метрики UI (DIP). Значения подобраны под затемнение 50%
@@ -226,6 +250,91 @@ pub mod theme {
     pub const LOCK_INDICATOR_OPACITY: f64 = 0.85;
     /// Фон бейджа индикатора (тёмный — читается и на светлых окнах).
     pub const LOCK_INDICATOR_BG: [u8; 3] = [0x1a, 0x1a, 0x1e];
+
+    /// Палитра окна настроек (Half-Life 2 / Source VGUI), перенесённая
+    /// один-в-один из `crates/resticker/ui/styles.css` — те же значения
+    /// переменных `--bg`, `--border-*`, `--btn-*`, `--check-*`, `--accent`.
+    /// Применяется к панелям со стилем [`super::WidgetStyle::Settings`]
+    /// (сейчас — панель инструментов закреплённого окна), чтобы оверлей и
+    /// окно настроек читались как один продукт.
+    ///
+    /// Одно сознательное расхождение: в вебвью у панели есть
+    /// `backdrop-filter: blur(4px)`, поэтому там фон живёт при
+    /// непрозрачности 0.6. Оверлей размывать нечем (композитор рисует
+    /// поверх произвольного окна), и при 0.6 без размытия панель читалась бы
+    /// как грязное пятно — берём [`SETTINGS_BG_OPACITY`] повыше.
+    pub mod settings {
+        /// `--bg`: rgba(118, 118, 118, 0.6).
+        pub const BG: [u8; 3] = [0x76, 0x76, 0x76];
+        /// `--border-light` — светлая грань «поднятой» рамки (сверху слева).
+        pub const BORDER_LIGHT: [u8; 3] = [0xbb, 0xba, 0xba];
+        /// `--border-dark` — тёмная грань (снизу справа).
+        pub const BORDER_DARK: [u8; 3] = [0x43, 0x43, 0x43];
+        /// `--btn-bg` / `--btn-light` / `--btn-dark`.
+        pub const BTN_BG: [u8; 3] = [0x7b, 0x7b, 0x7b];
+        pub const BTN_BG_HOVER: [u8; 3] = [0x8c, 0x8c, 0x8c];
+        pub const BTN_LIGHT: [u8; 3] = [0xbb, 0xbb, 0xbb];
+        pub const BTN_DARK: [u8; 3] = [0x45, 0x45, 0x45];
+        /// `--check-bg` / `--check-light` / `--check-dark`.
+        pub const CHECK_BG: [u8; 3] = [0x55, 0x55, 0x55];
+        pub const CHECK_BG_HOVER: [u8; 3] = [0x63, 0x63, 0x63];
+        pub const CHECK_LIGHT: [u8; 3] = [0xba, 0xba, 0xba];
+        pub const CHECK_DARK: [u8; 3] = [0x42, 0x43, 0x43];
+        /// `--text`: белый, а не мягкий [`super::TEXT`] оверлея.
+        pub const TEXT: [u8; 3] = [0xff, 0xff, 0xff];
+        /// Толщина грани, DIP (в CSS — 1 px).
+        pub const BEVEL: f64 = 1.0;
+        /// Непрозрачность фона панели — см. доккомент модуля.
+        pub const BG_OPACITY: f64 = 0.82;
+        /// Непрозрачность иконки выключенного переключателя (в CSS
+        /// неактивная вкладка живёт на `opacity: 0.5`).
+        pub const ICON_OFF_OPACITY: f64 = 0.5;
+    }
+}
+
+/// Оформление виджета: тёмная схема оверлея (по умолчанию) либо стилистика
+/// окна настроек (Source VGUI, [`theme::settings`]).
+///
+/// Стиль выбирает СБОРЩИК панели, а не сам виджет: панель инструментов
+/// закреплённого окна строится в стиле настроек целиком
+/// ([`build_pinned_lock_panel`]), тулбар и остальные панели остаются
+/// тёмными.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WidgetStyle {
+    /// Тёмная схема оверлея ([`theme::PANEL_BG`] и соседи).
+    #[default]
+    Overlay,
+    /// Стилистика окна настроек ([`theme::settings`]).
+    Settings,
+}
+
+/// Грани «объёмной» рамки VGUI: светлая сверху и слева, тёмная снизу и
+/// справа (`raised == true`) либо наоборот — «вдавленное» поле
+/// (`raised == false`, так в настройках нарисованы поля ввода и чекбоксы).
+/// Ровно те же четыре односторонние границы, что задаёт CSS настроек.
+fn settings_bevel(out: &mut Vec<Primitive>, rect: Box2D, raised: bool, opacity: f64) {
+    let (light, dark) = (theme::settings::BORDER_LIGHT, theme::settings::BORDER_DARK);
+    let (top_left, bottom_right) = if raised { (light, dark) } else { (dark, light) };
+    let t = theme::settings::BEVEL;
+    let half_w = rect.w / 2.0;
+    let half_h = rect.h / 2.0;
+    let mut edge = |cx: f64, cy: f64, w: f64, h: f64, color: [u8; 3]| {
+        out.push(Primitive::Fill {
+            rect: Box2D {
+                cx,
+                cy,
+                w: w.max(0.0),
+                h: h.max(0.0),
+                rotation: rect.rotation,
+            },
+            color,
+            opacity,
+        });
+    };
+    edge(rect.cx, rect.cy - half_h + t / 2.0, rect.w, t, top_left);
+    edge(rect.cx - half_w + t / 2.0, rect.cy, t, rect.h, top_left);
+    edge(rect.cx, rect.cy + half_h - t / 2.0, rect.w, t, bottom_right);
+    edge(rect.cx + half_w - t / 2.0, rect.cy, t, rect.h, bottom_right);
 }
 
 /// Примитивы индикатора interact-lock закреплённого окна (SPEC «закрепление
@@ -240,12 +349,33 @@ pub mod theme {
 /// иконка. Бейдж приводится к стороне окна — очень маленькие окна не дают
 /// вырожденной геометрии.
 pub fn lock_indicator(window_rect: Box2D) -> Vec<Primitive> {
+    indicator_badge(window_rect, 1, Icon::Lock)
+}
+
+/// Примитивы бейджа «окно закреплено» (запрос пользователя 2026-08-21:
+/// «небольшую иконку слева сверху на окно, что оно закреплено») — та же
+/// угловая раскладка, что у [`lock_indicator`], слот 0 (крайний левый).
+/// Рисуется для КАЖДОГО закреплённого окна, независимо от замков: пин —
+/// состояние, которое иначе видно только по поведению окна.
+pub fn pin_indicator(window_rect: Box2D) -> Vec<Primitive> {
+    indicator_badge(window_rect, 0, Icon::Pinned)
+}
+
+/// Бейдж угловых индикаторов закреплённого окна: квадрат стороной
+/// [`theme::LOCK_INDICATOR_SIZE`] в левом верхнем углу, `slot` — позиция в
+/// ряду слева направо (0 — пин, 1 — замок). Бейдж приводится к стороне окна:
+/// очень маленькие окна не дают вырожденной геометрии.
+fn indicator_badge(window_rect: Box2D, slot: usize, icon: Icon) -> Vec<Primitive> {
     let size = theme::LOCK_INDICATOR_SIZE
         .min(window_rect.w)
         .min(window_rect.h)
         .max(0.0);
+    let step = size + theme::LOCK_INDICATOR_MARGIN;
     let badge = Box2D {
-        cx: window_rect.cx - window_rect.w / 2.0 + theme::LOCK_INDICATOR_MARGIN + size / 2.0,
+        cx: window_rect.cx - window_rect.w / 2.0
+            + theme::LOCK_INDICATOR_MARGIN
+            + size / 2.0
+            + slot as f64 * step,
         cy: window_rect.cy - window_rect.h / 2.0 + theme::LOCK_INDICATOR_MARGIN + size / 2.0,
         w: size,
         h: size,
@@ -259,7 +389,7 @@ pub fn lock_indicator(window_rect: Box2D) -> Vec<Primitive> {
         },
         Primitive::Icon {
             rect: badge,
-            icon: Icon::Lock,
+            icon,
             opacity: theme::LOCK_INDICATOR_OPACITY,
         },
     ]
@@ -370,6 +500,8 @@ pub struct Button {
     id: WidgetId,
     bounds: Box2D,
     content: ButtonContent,
+    /// Оформление (см. [`WidgetStyle`]).
+    style: WidgetStyle,
     hovered: bool,
     /// Нажата (указатель зажат внутри), клик ещё не свершился.
     armed: bool,
@@ -377,12 +509,19 @@ pub struct Button {
 }
 
 impl Button {
+    /// Та же кнопка в заданном оформлении (см. [`WidgetStyle`]).
+    pub fn with_style(mut self, style: WidgetStyle) -> Self {
+        self.style = style;
+        self
+    }
+
     /// Кнопка с содержимым в прямоугольнике `bounds` (DIP).
     pub fn new(id: WidgetId, bounds: Box2D, content: ButtonContent) -> Self {
         Self {
             id,
             bounds,
             content,
+            style: WidgetStyle::default(),
             hovered: false,
             armed: false,
             clicked: false,
@@ -425,18 +564,24 @@ impl Widget for Button {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
-        let bg = if self.armed {
-            theme::BUTTON_BG_ARMED
-        } else if self.hovered {
-            theme::BUTTON_BG_HOVER
-        } else {
-            theme::BUTTON_BG
+        let settings = self.style == WidgetStyle::Settings;
+        let bg = match (settings, self.armed, self.hovered) {
+            (true, _, true) => theme::settings::BTN_BG_HOVER,
+            (true, _, _) => theme::settings::BTN_BG,
+            (false, true, _) => theme::BUTTON_BG_ARMED,
+            (false, _, true) => theme::BUTTON_BG_HOVER,
+            (false, _, _) => theme::BUTTON_BG,
         };
         out.push(Primitive::Fill {
             rect: self.bounds,
             color: bg,
             opacity: 1.0,
         });
+        if settings {
+            // Нажатая кнопка в VGUI «проваливается» — грани меняются местами
+            // (`.button:active` в styles.css).
+            settings_bevel(out, self.bounds, !self.armed, 1.0);
+        }
         let pad = theme::BUTTON_PAD;
         let content_rect = Box2D {
             w: (self.bounds.w - 2.0 * pad).max(0.0),
@@ -471,7 +616,11 @@ impl Widget for Button {
                         rotation: content_rect.rotation,
                     },
                     text: label.clone(),
-                    color: theme::TEXT,
+                    color: if settings {
+                        theme::settings::TEXT
+                    } else {
+                        theme::TEXT
+                    },
                     opacity: 1.0,
                 });
             }
@@ -1431,6 +1580,8 @@ pub struct Checkbox {
     id: WidgetId,
     bounds: Box2D,
     checked: bool,
+    /// Оформление (см. [`WidgetStyle`]).
+    style: WidgetStyle,
     /// Недоступен (строки, которые нельзя выразить правилом, панель задач
     /// при `never_overlap_taskbar` — §2.3, §7.8): рисуется приглушённым,
     /// хит-тест отключён.
@@ -1451,12 +1602,19 @@ impl Checkbox {
             id,
             bounds,
             checked,
+            style: WidgetStyle::default(),
             disabled: false,
             hovered: false,
             armed: false,
             changed: false,
             icon_toggle: false,
         }
+    }
+
+    /// Тот же чекбокс в заданном оформлении (см. [`WidgetStyle`]).
+    pub fn with_style(mut self, style: WidgetStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// Чекбокс стандартного размера (`theme::CHECKBOX_SIZE`) с центром
@@ -1542,21 +1700,35 @@ impl Widget for Checkbox {
     fn draw(&self, out: &mut Vec<Primitive>) {
         let opacity = if self.disabled { 0.45 } else { 1.0 };
         if self.icon_toggle {
-            // Кнопка с иконкой замка: тот же фон, что у [`Button`], состояние
-            // — иконка Lock (заблокировано) / LockOpen (свободно).
-            let bg = if self.armed {
-                theme::BUTTON_BG_ARMED
-            } else if self.hovered {
-                theme::BUTTON_BG_HOVER
-            } else {
-                theme::BUTTON_BG
+            // Кнопка с иконкой замка: фон как у [`Button`], состояние —
+            // иконка Lock (заблокировано) / LockOpen (свободно).
+            let settings = self.style == WidgetStyle::Settings;
+            let bg = match (settings, self.armed, self.hovered) {
+                (true, _, true) => theme::settings::CHECK_BG_HOVER,
+                (true, _, _) => theme::settings::CHECK_BG,
+                (false, true, _) => theme::BUTTON_BG_ARMED,
+                (false, _, true) => theme::BUTTON_BG_HOVER,
+                (false, _, _) => theme::BUTTON_BG,
             };
             out.push(Primitive::Fill {
                 rect: self.bounds,
                 color: bg,
                 opacity,
             });
+            if settings {
+                // Переключатель — «вдавленное» поле, как `.checkmark` в
+                // настройках; нажатие временно поднимает его.
+                settings_bevel(out, self.bounds, self.armed, opacity);
+            }
             let pad = theme::BUTTON_PAD;
+            // Иконка нужного состояния уже несёт смысл; выключенный замок
+            // дополнительно приглушается — тот же приём, что у неактивной
+            // вкладки настроек (`opacity: 0.5`).
+            let icon_opacity = if settings && !self.checked {
+                opacity * theme::settings::ICON_OFF_OPACITY
+            } else {
+                opacity
+            };
             out.push(Primitive::Icon {
                 rect: Box2D {
                     w: (self.bounds.w - 2.0 * pad).max(0.0),
@@ -1564,7 +1736,7 @@ impl Widget for Checkbox {
                     ..self.bounds
                 },
                 icon: if self.checked { Icon::Lock } else { Icon::LockOpen },
-                opacity,
+                opacity: icon_opacity,
             });
             return;
         }
@@ -1742,6 +1914,9 @@ impl Widget for Label {
 pub struct Panel {
     id: WidgetId,
     frame: Box2D,
+    /// Оформление панели и её фона (виджетам стиль назначается отдельно —
+    /// см. [`WidgetStyle`]).
+    style: WidgetStyle,
     /// Виджеты в порядке отрисовки: первый — нижний.
     widgets: Vec<Box<dyn Widget>>,
     focus: Option<usize>,
@@ -1755,11 +1930,18 @@ impl Panel {
         Self {
             id,
             frame,
+            style: WidgetStyle::default(),
             widgets: Vec::new(),
             focus: None,
             capture: None,
             hovered: None,
         }
+    }
+
+    /// Панель в заданном оформлении (см. [`WidgetStyle`]).
+    pub fn with_style(mut self, style: WidgetStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// Добавить виджет поверх уже добавленных.
@@ -1827,6 +2009,20 @@ impl Panel {
 
     /// Примитивы отрисовки: фон панели, затем виджеты в порядке добавления.
     pub fn draw(&self, out: &mut Vec<Primitive>) {
+        if self.style == WidgetStyle::Settings {
+            // Полупрозрачный серый прямоугольник с объёмной рамкой — модалка
+            // окна настроек (`.wrapper` в styles.css).
+            out.push(Primitive::Fill {
+                rect: self.frame,
+                color: theme::settings::BG,
+                opacity: theme::settings::BG_OPACITY,
+            });
+            settings_bevel(out, self.frame, true, theme::settings::BG_OPACITY);
+            for w in &self.widgets {
+                w.draw(out);
+            }
+            return;
+        }
         out.push(Primitive::Fill {
             rect: self.frame,
             color: theme::PANEL_BORDER,
@@ -1992,6 +2188,41 @@ const PINNED_DIVIDER_RULES: WidgetId = 309;
 
 /// Ширина панели, DIP.
 pub const PINNED_PANEL_WIDTH: f64 = 320.0;
+
+/// Кнопка «Показывать только на…»: открывает список окон, чтобы выбрать
+/// окно-хозяина (запрос пользователя 2026-08-22).
+pub const PINNED_BTN_ADD_HOST: WidgetId = 340;
+/// Первая строка списка окон-хозяев; `PINNED_HOST_ROW_BASE + индекс` —
+/// кнопка «убрать это правило».
+pub const PINNED_HOST_ROW_BASE: WidgetId = 350;
+/// Надпись строки правила (неинтерактивная) — тот же приём разделения
+/// «кнопка + надпись», что в списках выбора окон.
+const PINNED_HOST_LABEL_BASE: WidgetId = 380;
+/// Заголовок секции правил.
+const PINNED_LABEL_HOSTS: WidgetId = 339;
+/// Сколько строк правил панель показывает без прокрутки: правил обычно
+/// одно-два, а панель живёт ВНУТРИ окна и не должна разрастаться.
+pub const PINNED_VISIBLE_HOSTS: usize = 4;
+
+/// Высота панели инструментов закреплённого окна при `hosts` правилах.
+/// Секция правил появляется целиком (заголовок + строки + кнопка), поэтому
+/// высота считается здесь, а не берётся константой.
+pub fn pinned_lock_panel_height(hosts: usize) -> f64 {
+    let rows = hosts.min(PINNED_VISIBLE_HOSTS) as f64;
+    PINNED_LOCK_PANEL_HEIGHT
+        + PINNED_GAP
+        + PINNED_SECTION_ROW_H // заголовок секции
+        + rows * PINNED_SECTION_ROW_H
+        + PINNED_SECTION_ROW_H // кнопка «Показывать только на…»
+}
+
+/// Минимальная ширина панели инструментов закреплённого окна, DIP.
+/// Панель рисуется ВНУТРИ окна (`overlay_manager::rebuild_pinned_panel`) и
+/// поэтому ужимается под узкие окна — но не ниже этой границы: слева от
+/// подписи стоят переключатель ([`theme::BUTTON_SIZE`]) и отступы
+/// ([`PINNED_PAD`] + [`PINNED_GAP`]), а самой длинной подписи
+/// («Блокировать перемещение») нужно около 150 DIP.
+pub const PINNED_LOCK_PANEL_MIN_WIDTH: f64 = 210.0;
 /// Высота строки-секции (переключатель/шапка/кнопка), DIP — кнопка
 /// [`theme::BUTTON_SIZE`] с воздухом.
 pub const PINNED_SECTION_ROW_H: f64 = theme::BUTTON_SIZE + 4.0;
@@ -2192,7 +2423,7 @@ pub fn build_pinned_panel(
         PINNED_LABEL_INTERACT_LOCK,
         label_left,
         cy_interact,
-        "Блокировать ввод",
+        "Блокировать клики",
     ));
 
     // Разделитель секций: замки отделены от правил соседства тонкой линией.
@@ -2321,8 +2552,13 @@ pub fn build_pinned_panel(
 /// `PINNED_BTN_ADD_RULE`, `PINNED_SCROLLBAR_ID`) в результате нет, их ветки
 /// просто не сработают. `frame` — рамка панели (типовой размер —
 /// [`PINNED_PANEL_WIDTH`]×[`PINNED_LOCK_PANEL_HEIGHT`]).
-pub fn build_pinned_lock_panel(move_locked: bool, interact_locked: bool, frame: Box2D) -> Panel {
-    let mut panel = Panel::new(PINNED_PANEL_ID, frame);
+pub fn build_pinned_lock_panel(
+    move_locked: bool,
+    interact_locked: bool,
+    hosts: &[String],
+    frame: Box2D,
+) -> Panel {
+    let mut panel = Panel::new(PINNED_PANEL_ID, frame).with_style(WidgetStyle::Settings);
     let left = frame.cx - frame.w / 2.0 + PINNED_PAD;
     let top = frame.cy - frame.h / 2.0;
     let bottom = frame.cy + frame.h / 2.0;
@@ -2332,12 +2568,10 @@ pub fn build_pinned_lock_panel(move_locked: bool, interact_locked: bool, frame: 
     // Секция замков: два переключателя-иконки с подписями (см.
     // `build_pinned_panel` — идентичная раскладка).
     let cy_move = top + PINNED_PAD + PINNED_SECTION_ROW_H / 2.0;
-    panel.add_widget(Checkbox::icon_toggle(
-        PINNED_CHECK_MOVE_LOCK,
-        toggle_cx,
-        cy_move,
-        move_locked,
-    ));
+    panel.add_widget(
+        Checkbox::icon_toggle(PINNED_CHECK_MOVE_LOCK, toggle_cx, cy_move, move_locked)
+            .with_style(WidgetStyle::Settings),
+    );
     panel.add_widget(Label::new(
         PINNED_LABEL_MOVE_LOCK,
         label_left,
@@ -2345,32 +2579,89 @@ pub fn build_pinned_lock_panel(move_locked: bool, interact_locked: bool, frame: 
         "Блокировать перемещение",
     ));
     let cy_interact = cy_move + PINNED_SECTION_ROW_H;
-    panel.add_widget(Checkbox::icon_toggle(
-        PINNED_CHECK_INTERACT_LOCK,
-        toggle_cx,
-        cy_interact,
-        interact_locked,
-    ));
+    panel.add_widget(
+        Checkbox::icon_toggle(
+            PINNED_CHECK_INTERACT_LOCK,
+            toggle_cx,
+            cy_interact,
+            interact_locked,
+        )
+        .with_style(WidgetStyle::Settings),
+    );
     panel.add_widget(Label::new(
         PINNED_LABEL_INTERACT_LOCK,
         label_left,
         cy_interact,
-        "Блокировать ввод",
+        "Блокировать клики",
     ));
+
+    // Секция «Показывать только на этих окнах» (запрос пользователя
+    // 2026-08-22): пока список пуст, окно закреплено поверх всего; как
+    // только в нём появляется окно-хозяин, закреплённое окно видно только
+    // когда этот хозяин активен.
+    let mut cy = cy_interact + PINNED_SECTION_ROW_H + PINNED_GAP;
+    panel.add_widget(Label::new(
+        PINNED_LABEL_HOSTS,
+        left,
+        cy,
+        "Показывать только на окнах:",
+    ));
+    for (i, host) in hosts.iter().take(PINNED_VISIBLE_HOSTS).enumerate() {
+        cy += PINNED_SECTION_ROW_H;
+        let remove_cx = frame.cx + frame.w / 2.0 - PINNED_PAD - theme::BUTTON_SIZE / 2.0;
+        panel.add_widget(
+            Button::new(
+                PINNED_HOST_ROW_BASE + i as WidgetId,
+                Box2D {
+                    cx: remove_cx,
+                    cy,
+                    w: theme::BUTTON_SIZE,
+                    h: theme::BUTTON_SIZE,
+                    rotation: 0.0,
+                },
+                ButtonContent::Label("×".to_string()),
+            )
+            .with_style(WidgetStyle::Settings),
+        );
+        panel.add_widget(Label::new(
+            PINNED_HOST_LABEL_BASE + i as WidgetId,
+            left,
+            cy,
+            host,
+        ));
+    }
+    cy += PINNED_SECTION_ROW_H;
+    panel.add_widget(
+        Button::new(
+            PINNED_BTN_ADD_HOST,
+            Box2D {
+                cx: frame.cx,
+                cy,
+                w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
+                h: theme::BUTTON_SIZE,
+                rotation: 0.0,
+            },
+            ButtonContent::Label("Показывать только на…".to_string()),
+        )
+        .with_style(WidgetStyle::Settings),
+    );
 
     // Кнопка «Открепить» — внизу, на всю ширину контента (см.
     // `build_pinned_panel` — идентичная раскладка).
-    panel.add_widget(Button::new(
-        PINNED_BTN_UNPIN,
-        Box2D {
-            cx: frame.cx,
-            cy: bottom - PINNED_PAD - theme::BUTTON_SIZE / 2.0,
-            w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
-            h: theme::BUTTON_SIZE,
-            rotation: 0.0,
-        },
-        ButtonContent::Label("Открепить".to_string()),
-    ));
+    panel.add_widget(
+        Button::new(
+            PINNED_BTN_UNPIN,
+            Box2D {
+                cx: frame.cx,
+                cy: bottom - PINNED_PAD - theme::BUTTON_SIZE / 2.0,
+                w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
+                h: theme::BUTTON_SIZE,
+                rotation: 0.0,
+            },
+            ButtonContent::Label("Открепить".to_string()),
+        )
+        .with_style(WidgetStyle::Settings),
+    );
 
     panel
 }
@@ -2976,13 +3267,44 @@ mod tests {
 
     // --- Индикатор interact-lock (SPEC «закрепление окон») ---
 
+    /// Бейдж-булавка занимает крайний левый слот верхнего угла, замок —
+    /// следующий за ним (иначе они рисовались бы друг поверх друга).
+    #[test]
+    fn pin_badge_takes_first_slot_and_lock_follows() {
+        let win = rect(200.0, 150.0, 100.0, 60.0);
+        let pin = pin_indicator(win);
+        let lock = lock_indicator(win);
+        let (Primitive::Fill { rect: pin_rect, .. }, Primitive::Fill { rect: lock_rect, .. }) =
+            (&pin[0], &lock[0])
+        else {
+            panic!("первый примитив каждого бейджа — Fill");
+        };
+        assert_eq!(
+            pin_rect.cx,
+            200.0 - 50.0 + theme::LOCK_INDICATOR_MARGIN + theme::LOCK_INDICATOR_SIZE / 2.0,
+            "булавка прижата к левому верхнему углу окна"
+        );
+        assert_eq!(pin_rect.cy, lock_rect.cy, "бейджи в одном ряду");
+        assert_eq!(
+            lock_rect.cx - pin_rect.cx,
+            theme::LOCK_INDICATOR_SIZE + theme::LOCK_INDICATOR_MARGIN,
+            "замок стоит следующим слотом, без наложения"
+        );
+        assert!(matches!(pin[1], Primitive::Icon { icon: Icon::Pinned, .. }));
+    }
+
     #[test]
     fn lock_indicator_badge_sits_in_top_left_corner() {
         let win = rect(200.0, 150.0, 100.0, 60.0);
         let prims = lock_indicator(win);
         assert_eq!(prims.len(), 2, "фон-бейдж + иконка");
         let badge = Box2D {
-            cx: 200.0 - 50.0 + theme::LOCK_INDICATOR_MARGIN + theme::LOCK_INDICATOR_SIZE / 2.0,
+            cx: 200.0 - 50.0
+                + theme::LOCK_INDICATOR_MARGIN
+                + theme::LOCK_INDICATOR_SIZE / 2.0
+                // слот 1: слева от замка стоит булавка «окно закреплено»
+                + theme::LOCK_INDICATOR_SIZE
+                + theme::LOCK_INDICATOR_MARGIN,
             cy: 150.0 - 30.0 + theme::LOCK_INDICATOR_MARGIN + theme::LOCK_INDICATOR_SIZE / 2.0,
             w: theme::LOCK_INDICATOR_SIZE,
             h: theme::LOCK_INDICATOR_SIZE,
@@ -3501,7 +3823,7 @@ mod tests {
             (PINNED_CHECK_INTERACT_LOCK, true, Icon::Lock),
             (PINNED_CHECK_INTERACT_LOCK, false, Icon::LockOpen),
         ] {
-            let p = build_pinned_lock_panel(checked, checked, pinned_lock_frame());
+            let p = build_pinned_lock_panel(checked, checked, &[], pinned_lock_frame());
             let mut prims = Vec::new();
             p.widget::<Checkbox>(id).unwrap().draw(&mut prims);
             let mut seen_icon = false;
@@ -3519,7 +3841,7 @@ mod tests {
     /// `Checkbox` (тот же контракт, что `pinned_panel_lock_toggle_clicks_like_checkbox`).
     #[test]
     fn pinned_lock_panel_toggle_clicks_like_checkbox() {
-        let mut p = build_pinned_lock_panel(false, false, pinned_lock_frame());
+        let mut p = build_pinned_lock_panel(false, false, &[], pinned_lock_frame());
         let b = p.widget::<Checkbox>(PINNED_CHECK_MOVE_LOCK).unwrap().bounds();
         assert_eq!(b.w, theme::BUTTON_SIZE, "иконка-кнопка размера тулбара");
         p.pointer_event(PointerEvent::Down { pos: (b.cx, b.cy) });
@@ -3538,7 +3860,7 @@ mod tests {
     #[test]
     fn pinned_lock_panel_has_unpin_button() {
         let frame = pinned_lock_frame();
-        let p = build_pinned_lock_panel(false, false, frame);
+        let p = build_pinned_lock_panel(false, false, &[], frame);
         let b = p.widget::<Button>(PINNED_BTN_UNPIN).unwrap().bounds();
         assert_eq!(
             b.w,
@@ -3556,7 +3878,7 @@ mod tests {
     /// (с разделом) остаётся нетронутым для будущего возврата.
     #[test]
     fn pinned_lock_panel_omits_neighbor_rule_widgets() {
-        let p = build_pinned_lock_panel(false, false, pinned_lock_frame());
+        let p = build_pinned_lock_panel(false, false, &[], pinned_lock_frame());
         assert!(
             p.widget::<Label>(PINNED_LABEL_RULES).is_none(),
             "заголовок «Соседние окна» не должен строиться"

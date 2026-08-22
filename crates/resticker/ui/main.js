@@ -81,6 +81,8 @@ function renderGeneral() {
   document.getElementById('hide-from-capture').checked = !!draftSettings.hide_from_capture;
   document.getElementById('never-overlap-taskbar').checked =
     !!draftSettings.never_overlap_taskbar;
+  document.getElementById('outline-pinned-windows').checked =
+    !!draftSettings.outline_pinned_windows;
   const fps = draftSettings.battery_fps_limit ?? 30;
   document.getElementById('battery-fps-limit').value = fps;
   document.getElementById('battery-fps-limit-value').textContent = String(fps);
@@ -94,6 +96,7 @@ const GENERAL_CHECKBOXES = [
   ['skip-delete-confirmation', 'skip_delete_confirmation'],
   ['hide-from-capture', 'hide_from_capture'],
   ['never-overlap-taskbar', 'never_overlap_taskbar'],
+  ['outline-pinned-windows', 'outline_pinned_windows'],
 ];
 
 for (const [elId, key] of GENERAL_CHECKBOXES) {

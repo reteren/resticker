@@ -42,16 +42,26 @@
 //!   тем же `SetWindowPos`, что и `pin`. Вызывается координатором по смене
 //!   переднего плана (событие уже стучится через [`crate::window_tracker`]),
 //!   таймеров/непрерывных циклов принуждения не заводит.
-//! * **Move-lock** — реактивный snap-back: [`WindowPins::set_move_lock`]
+//! * **Move-lock** — «окно нельзя двигать». Три эшелона: страж ввода
+//!   [`input_guard`] глотает нажатие мыши по заголовку/рамке (драг не
+//!   начинается вовсе), он же обрывает уже начатый модальный цикл через
+//!   `EVENT_SYSTEM_MOVESIZESTART` + `WM_CANCELMODE`, а описанный ниже
+//!   реактивный snap-back остаётся третьим эшелоном — для программных
+//!   перемещений (чужой `SetWindowPos`, Win+стрелки, snap-раскладки), где
+//!   нажатия мыши нет вовсе. Сам snap-back: [`WindowPins::set_move_lock`]
 //!   хранит «правильный» прямоугольник per-hwnd (в DWM-координатах
 //!   `extended_frame_bounds`, как у снимков трекера),
 //!   [`WindowPins::enforce_move_lock`] сравнивает с фактическим и при
 //!   расхождении принудительно возвращает окно `SetWindowPos`'ом. Драг
 //!   окна пользователем в этот момент не трогается (см. доккомент
 //!   `enforce_move_lock`): snap-back происходит один раз после отпускания.
-//! * **Interact-lock** — настоящий `EnableWindow(hwnd, FALSE)` через
-//!   [`WindowPins::set_interact_lock`]; состояние хранится, чтобы
-//!   [`WindowPins::unpin`] мог гарантированно вернуть окну ввод.
+//! * **Interact-lock** — «с окном нельзя взаимодействовать»: тот же страж
+//!   [`input_guard`] глотает клики по СОДЕРЖИМОМУ окна и колесо, но не
+//!   трогает заголовок и рамки — окно с этим замком по-прежнему можно
+//!   двигать (это и есть смысл разделения двух замков).
+//!   `EnableWindow(hwnd, FALSE)`, стоявший здесь до 2026-08-21, отбирал у
+//!   окна вообще всё, включая перемещение, и заставлял систему пищать на
+//!   каждый клик — см. [`WindowPins::set_interact_lock`].
 //!
 //! Обе блокировки — рантайм-состояние, per-hwnd, обе по умолчанию ВЫКЛ.
 //! У структуры нет понятия «режим редактирования»: гейтинг вызовов на
@@ -61,16 +71,15 @@
 use std::collections::{HashMap, HashSet};
 
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_SUCCESS, HANDLE, HWND, RECT, SetLastError,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetAsyncKeyState, GetCapture, VK_LBUTTON,
+    ERROR_ACCESS_DENIED, ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, SetLastError, WPARAM,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetDesktopWindow, GetForegroundWindow, GetPropW, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, GW_HWNDPREV, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsWindow,
-    RemovePropW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPlacement, SetWindowPos,
+    GUI_INMOVESIZE, GUITHREADINFO, GetGUIThreadInfo, GetPropW, GetWindow, GetWindowLongPtrW,
+    GetWindowPlacement, IsIconic, PostMessageW, SW_MINIMIZE, SW_SHOWMAXIMIZED,
+    ShowWindowAsync, WM_CANCELMODE,
+    GetWindowRect, GetWindowThreadProcessId, GW_HWNDPREV, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOP,
+    HWND_TOPMOST, IsWindow, RemovePropW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetPropW, SetWindowPlacement, SetWindowPos,
     WINDOWPLACEMENT, WS_EX_TOPMOST,
 };
 use windows::core::{HRESULT, PCWSTR, w};
@@ -168,26 +177,128 @@ impl WindowPins {
         Ok(())
     }
 
+    /// Убрать закреплённое окно с экрана, пока не активен ни один его
+    /// «хозяин» (правила «показывать только на этих окнах», решение
+    /// [`rst_core::pinned_window::host_action`]) — сворачиванием.
+    ///
+    /// Почему именно сворачивание, а не `SW_HIDE`, не DWM-cloak и не вынос
+    /// за экран (выбор пользователя 2026-08-22): свёрнутое окно остаётся в
+    /// панели задач и в Alt+Tab, поэтому пользователь в любой момент может
+    /// вызвать его сам — это часть постановки задачи. `SW_HIDE`/cloak
+    /// убирают окно и из панели задач, и из Alt+Tab; вынос за экран рискует
+    /// тем, что приложение запомнит позицию вне экрана при закрытии.
+    ///
+    /// `ShowWindowAsync`, а не `ShowWindow`: команда чужому окну не должна
+    /// блокировать координатор на чужой очереди сообщений (окно может
+    /// «задуматься» — координатор при этом обязан продолжать рисовать).
+    pub fn hide_until_host(&self, hwnd: HWND) -> bool {
+        // SAFETY: ShowWindowAsync безопасен для чужого и мёртвого окна —
+        // просто вернёт FALSE.
+        unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) }.as_bool()
+    }
+
+    /// Вернуть окно, свёрнутое [`Self::hide_until_host`]: развернуть БЕЗ
+    /// активации и заново утвердить topmost.
+    ///
+    /// `SW_SHOWNOACTIVATE` принципиален: хозяин только что стал активным
+    /// окном, и забирать у него фокус ради нашего показа нельзя — окно
+    /// должно всплыть НАД ним, оставив ввод там, где его ждёт пользователь.
+    /// Разворот сбрасывает `WS_EX_TOPMOST` у части приложений, поэтому
+    /// сразу же переутверждаем его тем же путём, что и обычная коррекция.
+    pub fn show_for_host(&self, hwnd: HWND) -> bool {
+        // SAFETY: см. `hide_until_host`.
+        let shown = unsafe { ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE) }.as_bool();
+        self.reassert_topmost_if_needed(hwnd);
+        shown
+    }
+
+    /// Снять НАШ маркер с окон, которых нет в книжке закреплений, — уборка
+    /// после аварийного завершения прошлого запуска.
+    ///
+    /// Зачем это нужно (репорт пользователя 2026-08-21: «программа не очень
+    /// хочет закреплять и откреплять Проводник и Блокнот, остальные норм»):
+    /// маркер [`PIN_PROP_NAME`] живёт на ЧУЖОМ окне, а не у нас, поэтому
+    /// переживает наш процесс. Если resticker завершился жёстко (крэш,
+    /// `taskkill`, выключение питания) с закреплённым окном, маркер
+    /// остаётся на нём навсегда — до закрытия самого окна. Дальше любой
+    /// новый запуск отказывается закреплять такое окно
+    /// ([`Win32Error::AlreadyPinned`]), а открепить его нельзя: в книжке
+    /// нового запуска этого окна нет. Долгоживущие системные окна
+    /// (Проводник, Блокнот) переживают десятки наших перезапусков и копят
+    /// такие «вечные» маркеры, а браузеры и редакторы закрываются вместе с
+    /// маркером — отсюда и «остальные норм».
+    ///
+    /// Единственность процесса гарантируется `single_instance`, поэтому
+    /// любой чужой для книжки маркер — заведомо наш собственный мусор, а не
+    /// метка живого второго экземпляра.
+    ///
+    /// Возвращает число вычищенных окон. Ошибки игнорируются: окно могло
+    /// умереть между перечислением и снятием, а UIPI-отказ на чужом
+    /// повышенном окне не наша беда (мы его и закрепить не смогли бы).
+    pub fn clear_orphan_markers(&self, windows: &[WindowInfo]) -> usize {
+        let mut cleared = 0;
+        for win in windows {
+            if self.pinned.contains_key(&win.hwnd) {
+                continue;
+            }
+            let hwnd = hwnd_from_usize(win.hwnd);
+            // SAFETY: GetPropW безопасен для чужих и мёртвых окон.
+            if unsafe { GetPropW(hwnd, PIN_PROP_NAME) }.0.is_null() {
+                continue;
+            }
+            // SAFETY: RemovePropW безопасен для чужих окон; отказ игнорируем.
+            if unsafe { RemovePropW(hwnd, PIN_PROP_NAME) }.is_ok() {
+                cleared += 1;
+            }
+        }
+        cleared
+    }
+
+    /// Перенять окно, на котором уже стоит наш маркер, но которого нет в
+    /// книжке, — то есть осиротевшее закрепление прошлого запуска (см.
+    /// [`Self::clear_orphan_markers`]). Отличается от [`Self::pin`] ровно
+    /// одним: не считает существующий маркер ошибкой.
+    ///
+    /// Нужен как второй рубеж к стартовой уборке: окно могло быть скрыто
+    /// или свёрнуто в момент уборки (перечисление его не отдаёт), а всплыть
+    /// позже — пользователь не должен упираться в «уже закреплено» и
+    /// невозможность открепить.
+    pub fn adopt(&mut self, marker: u64, target: usize) -> Result<(), Win32Error> {
+        let target_hwnd = hwnd_from_usize(target);
+        // SAFETY: IsWindow безопасен для любых значений, включая мёртвые.
+        if !unsafe { IsWindow(Some(target_hwnd)) }.as_bool() {
+            return Err(Win32Error::PinWindowGone);
+        }
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        // SAFETY: то же, что в `pin`.
+        unsafe { SetWindowPos(target_hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags) }
+            .map_err(map_pin_err)?;
+        // SAFETY: то же, что в `pin` — перезапись значения маркера.
+        unsafe {
+            SetPropW(target_hwnd, PIN_PROP_NAME, Some(marker_to_handle(marker)))
+                .map_err(map_pin_err)?;
+        }
+        self.pinned.insert(target, marker);
+        Ok(())
+    }
+
     /// Снять закрепление с таргета: снять `WS_EX_TOPMOST` (`SetWindowPos`
     /// с `HWND_NOTOPMOST` — парная операция к [`Self::pin`]), снять маркер
     /// `RemovePropW` и очистить книжку. Идемпотентно: незакреплённое/уже
     /// уничтоженное окно — `Ok` без действий (маркер умер вместе с окном,
     /// либо был снят извне). Единственная ошибка — [`Win32Error::PinAccessDenied`].
     ///
-    /// Открепление заодно освобождает обе блокировки (редизайн пинов):
-    /// move-lock просто забывается, а interact-locked окну возвращается
-    /// ввод (`EnableWindow(TRUE)`) — иначе откреплённое окно осталось бы
-    /// навсегда неинтерактивным. Фокус при этом НЕ трогается (SPEC:
-    /// «unpin … no forced refocus»).
+    /// Открепление заодно освобождает обе блокировки (редизайн пинов): обе
+    /// забываются и снимаются со стража ввода [`input_guard`] — иначе
+    /// откреплённое окно осталось бы под чужими правилами навсегда
+    /// (нельзя двигать / нельзя кликать). Фокус при этом НЕ трогается
+    /// (SPEC: «unpin … no forced refocus»); ничего восстанавливать в самом
+    /// окне не нужно — страж работает снаружи, стилей окна не меняет.
     pub fn unpin(&mut self, target: usize) -> Result<(), Win32Error> {
         self.pinned.remove(&target);
         self.move_locked.remove(&(target as isize));
-        if self.interact_locked.remove(&(target as isize)) {
-            // SAFETY: EnableWindow безопасен и для уже уничтоженного окна
-            // (вернёт ошибку, которую игнорируем — снимать не с чего).
-            let _ = unsafe { EnableWindow(hwnd_from_usize(target), true) };
-            interact_guard::remove_locked(hwnd_from_usize(target));
-        }
+        self.interact_locked.remove(&(target as isize));
+        self.sync_guard(hwnd_from_usize(target));
         let target_hwnd = hwnd_from_usize(target);
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
         // SAFETY: SetWindowPos безопасен и для уже уничтоженного окна
@@ -252,12 +363,11 @@ impl WindowPins {
         let mut events = Vec::with_capacity(destroyed.len());
         for target in destroyed {
             self.pinned.remove(&target);
-            // Блокировки мертвого окна тоже чистим (запись в `interact_locked`
-            // не даст `unpin`-восстановления позже, окна уже нет).
+            // Блокировки мертвого окна тоже чистим: иначе запись висела бы
+            // в страже ввода и на переиспользованном системой hwnd.
             self.move_locked.remove(&(target as isize));
-            if self.interact_locked.remove(&(target as isize)) {
-                interact_guard::remove_locked(hwnd_from_usize(target));
-            }
+            self.interact_locked.remove(&(target as isize));
+            self.sync_guard(hwnd_from_usize(target));
             events.push(PinEvent::TargetDestroyed { target });
         }
         events
@@ -476,6 +586,7 @@ impl WindowPins {
                             bottom: dwm.y + dwm.h,
                         },
                     );
+                    self.sync_guard(hwnd);
                     return;
                 }
             }
@@ -484,6 +595,7 @@ impl WindowPins {
         } else {
             self.move_locked.remove(&key);
         }
+        self.sync_guard(hwnd);
     }
 
     /// Реактивная проверка move-lock (редизайн пинов, блокировка №1):
@@ -533,18 +645,38 @@ impl WindowPins {
             // вызов после `WM_EXITSIZEMOVE` вернёт окно на эталон.
             return false;
         }
-        // Эталон — в DWM-координатах (`extended_frame_bounds`, как в снимках
-        // трекера), а `SetWindowPos` работает в `GetWindowRect`-координатах.
-        // Смещение между системами константно (метрики рамки окна от позиции
-        // не зависят) — считаем его прямо сейчас и переводим эталон в
-        // GetWindowRect-пространство.
-        let mut gwr = RECT::default();
-        // SAFETY: окно живо (проверка выше); GetWindowRect — чтение экранного
-        // прямоугольника, безопасно и для чужих окон.
-        if unsafe { GetWindowRect(hwnd, &mut gwr) }.is_err() {
-            // Окно умерло между проверкой и чтением — snap-back не наш клиент,
-            // чистим, чтобы не копилось.
+        if !self.set_dwm_bounds(hwnd, good) {
+            // Окно умерло между проверкой и перестановкой — чистим, чтобы
+            // состояние не копилось.
             self.move_locked.remove(&key);
+            return false;
+        }
+        true
+    }
+
+    /// Поставить окну ТАКИЕ границы, чтобы его DWM-габариты
+    /// (`DWMWA_EXTENDED_FRAME_BOUNDS` — та же система координат, в которой
+    /// живут снимки трекера и весь UI поверх окна) совпали с `target`.
+    ///
+    /// Зачем отдельный примитив: `SetWindowPos` работает в
+    /// `GetWindowRect`-координатах, которые у окон Win11 отличаются от
+    /// DWM-габаритов на невидимые поля ресайза (сверху ~1 px, по бокам и
+    /// снизу ~7–8 px). Складывать эти пространства напрямую — значит
+    /// systematically промахиваться на размер рамки и, при повторных
+    /// применениях, дрейфовать. Смещение между системами от позиции не
+    /// зависит (метрики рамки постоянны), поэтому считаем его здесь и
+    /// применяем один раз.
+    ///
+    /// `false` — окна нет или система отказала.
+    pub fn set_dwm_bounds(&self, hwnd: HWND, target: RECT) -> bool {
+        // SAFETY: IsWindow безопасен для любых значений.
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            return false;
+        }
+        let mut gwr = RECT::default();
+        // SAFETY: GetWindowRect — чтение экранного прямоугольника, безопасно
+        // и для чужих окон.
+        if unsafe { GetWindowRect(hwnd, &mut gwr) }.is_err() {
             return false;
         }
         let dwm = extended_frame_bounds(hwnd);
@@ -552,8 +684,26 @@ impl WindowPins {
         let dy = dwm.y - gwr.top;
         let dw = dwm.w - (gwr.right - gwr.left);
         let dh = dwm.h - (gwr.bottom - gwr.top);
+        let good = target;
         let good_w = good.right - good.left;
         let good_h = good.bottom - good.top;
+        if is_maximized(hwnd) {
+            // Развёрнутое окно `SetWindowPos` ужать нельзя честно: стиль
+            // `WS_MAXIMIZE` остаётся, и система вправе вернуть окну полный
+            // размер на следующем же пересчёте. Единственный корректный
+            // выход из развёрнутого состояния с ОДНОВРЕМЕННОЙ установкой
+            // нормального прямоугольника — `SetWindowPlacement`
+            // (`SW_SHOWNOACTIVATE` не трогает фокус).
+            return self
+                .move_resize(
+                    hwnd.0 as usize,
+                    good.left - dx,
+                    good.top - dy,
+                    good_w - dw,
+                    good_h - dh,
+                )
+                .is_ok();
+        }
         let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
         // SAFETY: окно живо; SetWindowPos потокобезопасен для чужого окна,
         // флаги исключают активацию/смену z-order. Цель — GetWindowRect,
@@ -573,169 +723,262 @@ impl WindowPins {
     }
 
     /// Включить/выключить interact-lock для `hwnd` (редизайн пинов,
-    /// блокировка №2): настоящий `EnableWindow(hwnd, FALSE)` — в
-    /// заблокированное окно не доходят ни клики, ни клавиатура. Состояние
-    /// per-hwnd — в `interact_locked` (см. доккомент поля): оно нужно
-    /// [`Self::unpin`], чтобы гарантированно вернуть окну ввод при
-    /// откреплении. Визуальный индикатор поверх заблокированного окна —
-    /// рендеринг-забота другой задачи; здесь только сам механизм.
+    /// блокировка №2): в заблокированное окно не доходят клики по его
+    /// СОДЕРЖИМОМУ (клиентская область, меню, системное меню, полосы
+    /// прокрутки) и колесо мыши. Заголовок, рамки и кнопки свернуть/
+    /// развернуть/закрыть остаются рабочими — окно по-прежнему можно
+    /// двигать и закрыть. Механизм — страж ввода [`input_guard`]
+    /// (глобальный `WH_MOUSE_LL`), состояние per-hwnd — в `interact_locked`.
+    ///
+    /// ПОЧЕМУ НЕ `EnableWindow(hwnd, FALSE)` (как было до 2026-08-21):
+    /// `WS_DISABLED` гасит окно ЦЕЛИКОМ, вместе с заголовком — «замок на
+    /// взаимодействие» отбирал заодно и перемещение окна, чего он делать не
+    /// должен (репорт пользователя). Плюс система играла на каждый клик по
+    /// disabled-окну системный «динг», который приходилось глушить тем же
+    /// хуком. Хук без `EnableWindow` решает обе проблемы разом: стили чужого
+    /// окна не трогаются вовсе, восстанавливать при откреплении нечего.
     ///
     /// Гейтинг на edit-mode — на вызывающем, как и у move-lock (в
     /// edit-mode блокировки приостановлены, SPEC).
     ///
-    /// Решение по краевому случаю «блокируем окно, которое сейчас держит
-    /// фокус»: Win32 НЕ двигает фокус сам при `EnableWindow(FALSE)` —
-    /// фокус остаётся на заблокированном окне, и ввод с клавиатуры молча
-    /// пропадает (окно его не получает, другие окна — тоже), пока
-    /// пользователь не кликнет куда-нибудь. Мы делаем одну best-effort
-    /// попытку снять фокус с окна (`SetForegroundWindow(GetDesktopWindow())`,
-    /// результат игнорируется — у фонового процесса Windows вправе
-    /// отказать); `SetFocus` здесь заведомо бесполезен: он требует окна,
-    /// привязанного к очереди ВЫЗЫВАЮЩЕГО потока, а таргет — чужое окно
-    /// другого потока. Если ОС отказала и фокус остался на заблокированном
-    /// окне — последствие ограничено: ввод «молчит» до первого клика, без
-    /// краша и потери данных. В реальном потоке resticker блокировка
-    /// включается при выходе из edit-mode, когда таргет фокуса НЕ держит
-    /// (фокус у оверлея), поэтому краевой случай практически не
-    /// достигается — но задокументирован на случай прямого вызова.
-    ///
-    /// ПОБОЧНЫЙ ЭФФЕКТ WS_DISABLED и его устранение: клик по заблокированному
-    /// окну заставил бы Windows сыграть системный «динг» — это встроенное
-    /// поведение ОС для disabled top-level окон (окно не получает вообще
-    /// никакого сообщения — ни `WM_MOUSEACTIVATE`, ни `WM_LBUTTONDOWN`;
-    /// система сама обрабатывает клик и играет звук, проверено живым тестом
-    /// `interact_guard_swallows_real_click_on_locked_window`). Механизм,
-    /// который этот звук глушит, — [`interact_guard`]: глобальный
-    /// `WH_MOUSE_LL`-хук проглатывает клики, попадающие в прямоугольник
-    /// заблокированного окна, ДО системного input-routing. Здесь (на
-    /// `locked == true`) окно регистрируется в хуке, на `false` — снимается.
-    /// Почему это нельзя сделать перехватом сообщений в wndproc — доккомент
-    /// модуля `interact_guard`.
+    /// ЧЕСТНАЯ ГРАНИЦА: блокируется мышь, не клавиатура. Окно, оставшееся
+    /// с фокусом, продолжит принимать ввод с клавиатуры; фокус здесь
+    /// сознательно НЕ отбирается (у фонового процесса Windows и так вправе
+    /// отказать в `SetForegroundWindow`, а молча «съеденный» ввод хуже
+    /// честно работающей клавиатуры). Полная блокировка клавиатуры —
+    /// отдельный `WH_KEYBOARD_LL`, возможная следующая фаза.
     pub fn set_interact_lock(&mut self, hwnd: HWND, locked: bool) {
         let key = hwnd.0 as isize;
         if locked {
-            // SAFETY: GetForegroundWindow — безопасное чтение состояния
-            // десктопа; сравнение хэндлов — числовое.
-            if unsafe { GetForegroundWindow() } == hwnd {
-                // SAFETY: GetDesktopWindow всегда валиден; SetForegroundWindow
-                // может вернуть FALSE (foreground-lock) — это best-effort,
-                // результат сознательно игнорируется (см. доккомент).
-                let _ = unsafe { SetForegroundWindow(GetDesktopWindow()) };
-            }
             self.interact_locked.insert(key);
         } else {
             self.interact_locked.remove(&key);
         }
-        // SAFETY: EnableWindow безопасен с любого потока и для чужого окна;
-        // на мёртвом окне просто вернёт ошибку, которую игнорируем.
-        let _ = unsafe { EnableWindow(hwnd, !locked) };
-        if locked {
-            interact_guard::add_locked(hwnd);
-        } else {
-            interact_guard::remove_locked(hwnd);
-        }
+        self.sync_guard(hwnd);
+    }
+
+    /// Привести регистрацию `hwnd` в страже ввода в соответствие с книжками
+    /// `move_locked`/`interact_locked`. Единственная точка, где обе
+    /// блокировки встречаются: страж — один хук на процесс, и обе политики
+    /// он должен видеть вместе (окно может быть заблокировано и на
+    /// перемещение, и на взаимодействие одновременно).
+    fn sync_guard(&self, hwnd: HWND) {
+        let key = hwnd.0 as isize;
+        input_guard::set_policy(
+            hwnd,
+            input_guard::Policy {
+                move_locked: self.move_locked.contains_key(&key),
+                interact_locked: self.interact_locked.contains(&key),
+            },
+        );
     }
 }
 
-/// Поглощение кликов по interact-locked окнам (побочный эффект блокировки
-/// №2): системный «динг» при клике по заблокированному окну.
+/// Единый мышиный «страж» обеих блокировок (редизайн пинов): один глобальный
+/// `WH_MOUSE_LL` на выделенном потоке-помпе, который решает по КАЖДОМУ нажатию
+/// кнопки/колесу, доставить его окну или выбросить из input-очереди.
 ///
-/// МЕХАНИЗМ БИПА (подтверждён живым тестом `interact_guard_swallows_real_click_on_locked_window`,
-/// запуск вручную — см. его доккомент): `EnableWindow(hwnd, FALSE)` ставит
-/// `WS_DISABLED`. Клик по такому top-level окну СИСТЕМА обрабатывает сама:
-/// hit-test и активация обходят окно (ему НЕ приходят ни `WM_NCHITTEST`, ни
-/// `WM_MOUSEACTIVATE`, ни `WM_LBUTTONDOWN` — проверено сообщениями wndproc),
-/// клик выбрасывается, а win32k играет системный звук. Это поведение ОС,
-/// resticker его не вызывает (`MessageBeep`/`Beep` в workspace не
-/// встречаются); оно целиком провоцируется самим disabled-состоянием.
+/// ПОЧЕМУ ХУК, А НЕ `EnableWindow`/реактивный snap-back:
+/// * `EnableWindow(hwnd, FALSE)` (как было у interact-lock) гасит окно
+///   ЦЕЛИКОМ — вместе с заголовком, кнопками свернуть/закрыть и системным
+///   меню. То есть «замок на взаимодействие» отбирал и перемещение окна, чего
+///   он делать не должен (репорт пользователя 2026-08-20). Плюс `WS_DISABLED`
+///   заставляет win32k играть системный «динг» на каждый клик.
+/// * Реактивный snap-back move-lock'а ([`WindowPins::enforce_move_lock`])
+///   структурно не способен НЕ ДАТЬ сдвинуть окно: модальный цикл
+///   перетаскивания (`WM_ENTERSIZEMOVE`) крутится в процессе самого окна и
+///   переставляет его на каждый `WM_MOUSEMOVE`, а мы узнаём о движении только
+///   из снимка трекера (дебаунс 16 мс) и возвращаем окно ПОСЛЕ. На видео это
+///   выглядит как «окно свободно ездит ~0.8 с и телепортируется назад».
 ///
-/// Почему фикс именно хук: раз окно не получает вообще никакого сообщения,
-/// перехватить бип в wndproc НЕЧЕМ — ни у своего окна (сообщения нет), ни у
-/// чужого (Notepad и т.п., смена wndproc через `SetWindowLongPtrW(GWLP_WNDPROC)`
-/// для чужого процесса и так запрещена — `ERROR_ACCESS_DENIED`). Единственная
-/// точка, где клик ещё можно убрать ДО системной обработки — глобальный
-/// низкоуровневый хук мыши `WH_MOUSE_LL` на собственном потоке с помпом
-/// сообщений: если нажатие кнопки пришлось в экранный прямоугольник
-/// interact-locked окна и это окно — реальная цель клика в этой точке (верхнее
-/// видимое НЕ-transparent окно z-order, содержащее точку), хук возвращает
-/// ненулевое значение. Событие выбрасывается из input-очереди ЕЩЁ ДО того, как
-/// win32k начнёт hit-testing: ни бипа, ни попытки активации, ни доставки клика
-/// не происходит вовсе (проверено тем же тестом — окно не получает ни одного
-/// сообщения клика/активации при активном хуке). `EnableWindow(FALSE)` при этом
-/// остаётся главным механизмом блокировки (клавиатура и все сообщения), а хук
-/// закрывает только единственный случай, где система запищала бы —
-/// «пользователь кликнул заблокированное окно».
+/// ТРИ ЭШЕЛОНА MOVE-LOCK (первый — здесь):
+/// 1. Глотать button-down, если hit-test точки даёт «перетащить/ресайзить»
+///    (`HTCAPTION`, рамки, `HTGROWBOX`). Драг просто не начинается — окно не
+///    сдвигается ни на пиксель.
+/// 2. `EVENT_SYSTEM_MOVESIZESTART` (хук WinEvent на этом же потоке) →
+///    `PostMessageW(WM_CANCELMODE)`: обрывает уже НАЧАВШИЙСЯ модальный цикл.
+///    Ловит пути мимо LL-хука — тач/перо, Alt+Space → «Переместить»,
+///    промах кэша hit-test'а.
+/// 3. [`WindowPins::enforce_move_lock`] — snap-back для программных move'ов
+///    (`SetWindowPos` чужого кода, Win+стрелки, snap-раскладки), где нажатия
+///    мыши нет вовсе.
 ///
-/// Жизненный цикл — refcount по содержимому множества: хук ставится, когда
-/// появляется первое interact-locked окно, и снимается (с завершением потока)
-/// после последнего unlock/unpin/сноса — «промпт-снятие» на выходе из
-/// блокировки соблюдено. Состояние — process-global (`OnceLock`): глобальный
-/// хук может быть ровно один, а `WindowPins` в приложении один.
-mod interact_guard {
-    use std::collections::HashSet;
-    use std::sync::atomic::{AtomicBool, Ordering};
+/// INTERACT-LOCK — только «содержимое» окна: глотаются `HTCLIENT`, меню,
+/// системное меню, полосы прокрутки и КОЛЕСО; заголовок, кнопки свернуть/
+/// развернуть/закрыть и рамки не трогаются. Поэтому окно с одним лишь
+/// interact-lock'ом по-прежнему можно двигать — ровно то поведение, которого
+/// не хватало. `EnableWindow` не вызывается вообще, `WS_DISABLED` не
+/// ставится, системного «динга» нет по построению.
+///
+/// РЕШЕНИЕ ПРИ НЕОПРЕДЕЛЁННОСТИ — FAIL-OPEN (см. `should_swallow_button`):
+/// interact-lock глотает нажатие, только если точка ДОКАЗАННО относится к
+/// содержимому. Первая версия фикса доверяла геометрической оценке всегда, и
+/// у окон с собственным заголовком (Electron/Chrome/VS Code/Steam), где
+/// клиентская область покрывает всё окно, замок кликов снова отбирал
+/// перетаскивание — репорт 2026-08-21. Теперь сомнение трактуется в пользу
+/// перемещения.
+///
+/// ЧЕСТНЫЕ ОГРАНИЧЕНИЯ (без них блокировка выглядела бы сильнее, чем есть):
+/// * Клавиатура НЕ блокируется: interact-lock — про мышь. Окно с фокусом
+///   по-прежнему принимает ввод с клавиатуры (отдельный `WH_KEYBOARD_LL` —
+///   потенциальная следующая фаза).
+/// * Окна процессов с более высоким уровнем целостности (elevated) UIPI
+///   закрывает: LL-хук для них не вызывается, `WM_NCHITTEST` не доходит —
+///   блокировка на них не держится (тот же класс ограничений, что и
+///   [`Win32Error::PinAccessDenied`] у самого закрепления).
+/// * Колесо ловится по позиции КУРСОРА. Если «прокрутка неактивных окон»
+///   выключена и курсор вне заблокированного окна, колесо уходит в
+///   сфокусированное окно мимо нас.
+///
+/// БЮДЖЕТ КОЛБЭКА — жёсткий: `HKCU\Control Panel\Desktop\LowLevelHooksTimeout`
+/// на машине пользователя = 1 мс (дефолт, когда ключа нет, — 300 мс).
+/// Превышение = Windows МОЛЧА снимает хук, без ошибки и уведомления. Отсюда
+/// два решения:
+/// * Hit-test НИКОГДА не запрашивается из колбэка: `SendMessage(WM_NCHITTEST)`
+///   — синхронный вызов в чужой процесс, это десятки мс на «задумавшемся»
+///   окне. Вместо этого отдельный поток-пробник [`ht_probe`] опрашивает
+///   `SendMessageTimeoutW(..., SMTO_ABORTIFHUNG)` по позиции курсора и кладёт
+///   результат в кэш; колбэк только читает кэш (промах — геометрическая
+///   оценка, см. `ht_from_geometry`).
+/// * Цель клика ищется одним `WindowFromPoint` + `GetAncestor(GA_ROOT)`, а не
+///   обходом всего z-order десктопа (сотни окон × 3 win32-вызова).
+///   `WindowFromPoint` сам пропускает `WS_EX_TRANSPARENT` (клик-сквозные
+///   оверлеи resticker) — ровно та же семантика, что была у обхода.
+/// * Все локи в колбэке — `try_lock`: занято (координатор в этот момент
+///   правит карту) — пропускаем событие, а не блокируемся.
+///
+/// Плюс сторож: если хук всё-таки сняли, поток-пробник замечает «мышь
+/// движется, а событий нет» и просит поток-помп переустановить хук.
+///
+/// Жизненный цикл — refcount по содержимому карты: хуки и потоки поднимаются
+/// при первом заблокированном окне и снимаются после последнего
+/// unlock/unpin/сноса. Состояние process-global (`OnceLock`): глобальный хук
+/// может быть ровно один, а `WindowPins` в приложении один.
+mod input_guard {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{mpsc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
     use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::HiDpi::PhysicalToLogicalPointForPerMonitorDPI;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+    use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetDesktopWindow, GetMessageW, GetWindow, GetWindowLongPtrW,
-        GetWindowRect, GW_CHILD, GW_HWNDNEXT, GWL_EXSTYLE, IsWindowVisible, MSG, MSLLHOOKSTRUCT,
-        PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_MOUSE_LL,
-        WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
-        WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
-        WM_XBUTTONUP, WS_EX_TRANSPARENT,
+        CHILDID_SELF, CallNextHookEx, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT,
+        GWL_EXSTYLE, GetAncestor, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+        GetWindowRect, HHOOK, HTBORDER, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
+        HTCLIENT, HTGROWBOX, HTHSCROLL, HTLEFT, HTMENU, HTNOWHERE, HTRIGHT, HTSYSMENU, HTTOP,
+        HTTOPLEFT, HTTOPRIGHT, HTVSCROLL, IsWindowVisible, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW,
+        PostMessageW, PostThreadMessageW, SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG,
+        SetWindowsHookExW, SendMessageTimeoutW, UnhookWindowsHookEx, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
+        WM_APP, WM_CANCELMODE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
+        WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+        WS_EX_TRANSPARENT,
     };
 
-    use super::HWND;
+    use super::{HWND, IsWindow};
+
+    /// Что именно заблокировано у окна. Обе блокировки независимы и
+    /// комбинируются: `move_locked` без `interact_locked` — «окно нельзя
+    /// двигать, но можно пользоваться», `interact_locked` без `move_locked` —
+    /// «нельзя пользоваться, но можно двигать» (ровно то, что сломал старый
+    /// `EnableWindow(FALSE)`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Policy {
+        pub(super) move_locked: bool,
+        pub(super) interact_locked: bool,
+    }
+
+    impl Policy {
+        fn is_empty(self) -> bool {
+            !self.move_locked && !self.interact_locked
+        }
+    }
 
     struct GuardState {
-        locked: Mutex<HashSet<isize>>,
+        locked: Mutex<HashMap<isize, Policy>>,
         hook: Mutex<Option<ActiveHook>>,
     }
 
-struct ActiveHook {
+    struct ActiveHook {
         tid: u32,
         thread: Option<std::thread::JoinHandle<()>>,
+        prober: Option<std::thread::JoinHandle<()>>,
     }
 
     static STATE: OnceLock<GuardState> = OnceLock::new();
 
     fn state() -> &'static GuardState {
         STATE.get_or_init(|| GuardState {
-            locked: Mutex::new(HashSet::new()),
+            locked: Mutex::new(HashMap::new()),
             hook: Mutex::new(None),
         })
     }
 
-    /// Кнопка мыши сейчас «поглощена» (см. `SWALLOWED_DOWN`). Отдельный атомик:
-    /// в колбэке хука нельзя блокироваться на `state().locked`, а для
-    /// down/up-пар достаточно одного флага (см. `interact_mouse_proc`).
+    /// Кнопка мыши сейчас «поглощена» (down проглочен — глотаем и его up).
+    /// Отдельный атомик: в колбэке нельзя блокироваться на карте, а для
+    /// down/up-пар достаточно одного флага (см. `guard_mouse_proc`).
+    ///
+    /// Сбрасывается при любой смене жизненного цикла хука: если хук исчез
+    /// между `down` и `up` (система сняла его по таймауту, либо блокировку
+    /// сняли), незакрытый флаг съел бы следующий чужой `up` в любом
+    /// приложении — потерянное отпускание кнопки выглядит как застрявший
+    /// драг (ревью 2026-08-21).
     static SWALLOWED_DOWN: AtomicBool = AtomicBool::new(false);
 
-    /// Зарегистрировать окно как interact-locked; при первом окне — поставить
-    /// хук. Не блокирующий, никогда не падает.
-    pub(super) fn add_locked(hwnd: HWND) {
+    /// Момент последнего события, дошедшего до колбэка (мс от `epoch()`).
+    /// Сторож в потоке-пробнике сравнивает его с фактом движения мыши: хук,
+    /// снятый системой по таймауту, снимается МОЛЧА — узнать о нём можно
+    /// только по тишине (см. доккомент модуля).
+    static LAST_EVENT_MS: AtomicU64 = AtomicU64::new(0);
+
+    /// Поток-помп, которому шлётся `WM_APP_REINSTALL` (0 — помпа нет).
+    static PUMP_TID: AtomicU32 = AtomicU32::new(0);
+
+    /// Просьба потоку-помпу переустановить `WH_MOUSE_LL` (сторож).
+    const WM_APP_REINSTALL: u32 = WM_APP + 0x1a;
+
+    fn epoch() -> Instant {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        *EPOCH.get_or_init(Instant::now)
+    }
+
+    fn now_ms() -> u64 {
+        epoch().elapsed().as_millis() as u64
+    }
+
+    /// Привести регистрацию окна в страже к `policy`. Идемпотентно:
+    /// пустая политика — запись удаляется, при опустошении карты хуки и
+    /// потоки снимаются. Не блокирующая для вызывающего (координатора),
+    /// никогда не паникует.
+    pub(super) fn set_policy(hwnd: HWND, policy: Policy) {
         let key = hwnd.0 as isize;
-        let need_install = {
+        let (need_install, need_uninstall) = {
             let mut locked = state().locked.lock().unwrap();
-            locked.insert(key) && locked.len() == 1
+            let was_empty = locked.is_empty();
+            if policy.is_empty() {
+                locked.remove(&key);
+                caption_cache::forget(hwnd);
+            } else {
+                locked.insert(key, policy);
+            }
+            (
+                // Не «переход из пустой карты», а «карта непуста»: прошлая
+                // установка могла провалиться (нет интерактивного десктопа,
+                // отказ системы), и тогда единственный шанс подняться —
+                // следующий вызов. `install_hook` идемпотентен, живой хук
+                // повторно не ставится (ревью 2026-08-21, пункт 5.2).
+                !locked.is_empty(),
+                !was_empty && locked.is_empty(),
+            )
         };
         if need_install {
             install_hook();
         }
-    }
-
-    /// Снять регистрацию окна; при последнем окне — снять хук и завершить
-    /// поток. Не блокирующий, никогда не падает.
-    pub(super) fn remove_locked(hwnd: HWND) {
-        let key = hwnd.0 as isize;
-        let need_uninstall = {
-            let mut locked = state().locked.lock().unwrap();
-            locked.remove(&key) && locked.is_empty()
-        };
         if need_uninstall {
             uninstall_hook();
         }
@@ -749,119 +992,349 @@ struct ActiveHook {
         *slot = start_hook_thread();
     }
 
-    /// Запустить поток-помп и поставить `WH_MOUSE_LL`. Возвращает `None`, если
-    /// `SetWindowsHookExW` не сработал (например, сессия без интерактивного
-    /// десктопа) — тогда поглощение просто не активно, остальная блокировка
-    /// (`EnableWindow(FALSE)`) работает как раньше.
+    /// Поставить `WH_MOUSE_LL`. `None` — сессия без интерактивного десктопа
+    /// или отказ системы.
+    fn install_mouse_hook() -> Option<HHOOK> {
+        // SAFETY: WH_MOUSE_LL с dwThreadId = 0 вызывается в контексте
+        // УСТАНОВИВШЕГО потока (инъекции в чужие процессы нет), поэтому lpfn —
+        // обычная функция этого модуля, а hmod — текущий модуль.
+        let hook = unsafe {
+            SetWindowsHookExW(
+                WH_MOUSE_LL,
+                Some(guard_mouse_proc),
+                Some(GetModuleHandleW(None).unwrap_or_default().into()),
+                0,
+            )
+        };
+        match hook {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "замки окна: не удалось поставить WH_MOUSE_LL — блокировки мыши не работают"
+                );
+                None
+            }
+        }
+    }
+
+    /// Поток-помп: владелец `WH_MOUSE_LL` и WinEvent-хука
+    /// `EVENT_SYSTEM_MOVESIZESTART` (второй эшелон move-lock'а). Оба хука
+    /// требуют цикла сообщений на СВОЁМ потоке — отсюда общий помп.
     fn start_hook_thread() -> Option<ActiveHook> {
         let (ready_tx, ready_rx) = mpsc::channel::<Option<u32>>();
         let thread = std::thread::Builder::new()
-            .name("resticker-interact-guard".into())
-            .spawn({
-                move || {
-                    // SAFETY: WH_MOUSE_LL вызывается в контексте установившего
-                    // ПОТОКА (не инъекция в другие процессы), поэтому lpfn —
-                    // обычная функция этого модуля, а hmod — текущий модуль;
-                    // dwThreadId = 0 — глобально для сессии.
-                    let hook = unsafe {
-                        SetWindowsHookExW(
-                            WH_MOUSE_LL,
-                            Some(interact_mouse_proc),
-                            Some(GetModuleHandleW(None).unwrap_or_default().into()),
-                            0,
-                        )
-                    };
-                    let hook = match hook {
-                        Ok(h) => h,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "interact-lock: не удалось поставить WH_MOUSE_LL — клики по заблокированному окну будут давать системный бип"
-                            );
-                            let _ = ready_tx.send(None);
-                            return;
+            .name("resticker-input-guard".into())
+            .spawn(move || {
+                let Some(first) = install_mouse_hook() else {
+                    let _ = ready_tx.send(None);
+                    return;
+                };
+                let mut hook = Some(first);
+                // SAFETY: движение/ресайз чужого окна — out-of-context хук
+                // (WINEVENT_OUTOFCONTEXT), колбэк доставляется в очередь
+                // ЭТОГО потока; idprocess/idthread = 0 — вся сессия.
+                let move_hook = unsafe {
+                    SetWinEventHook(
+                        EVENT_SYSTEM_MOVESIZESTART,
+                        EVENT_SYSTEM_MOVESIZESTART,
+                        None,
+                        Some(movesize_proc),
+                        0,
+                        0,
+                        WINEVENT_OUTOFCONTEXT,
+                    )
+                };
+                if move_hook.0.is_null() {
+                    tracing::warn!(
+                        "замок перемещения: EVENT_SYSTEM_MOVESIZESTART не поставлен — второй эшелон (обрыв уже начатого драга) недоступен"
+                    );
+                }
+                // SAFETY: GetCurrentThreadId не может провалиться.
+                let tid = unsafe { GetCurrentThreadId() };
+                PUMP_TID.store(tid, Ordering::Release);
+                LAST_EVENT_MS.store(now_ms(), Ordering::Relaxed);
+                let _ = ready_tx.send(Some(tid));
+                let mut msg = MSG::default();
+                // SAFETY: стандартный msg-loop потока-помпа; колбэк хука
+                // система вызывает синхронно на этом потоке между итерациями
+                // GetMessageW. Выход — по WM_QUIT из uninstall_hook.
+                unsafe {
+                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        if msg.message == WM_APP_REINSTALL {
+                            if let Some(old) = hook.take() {
+                                let _ = UnhookWindowsHookEx(old);
+                            }
+                            // Между проглоченным down и его up хук исчез —
+                            // парность больше не действует (ревью, пункт 1.3).
+                            SWALLOWED_DOWN.store(false, Ordering::Relaxed);
+                            match install_mouse_hook() {
+                                Some(h) => {
+                                    hook = Some(h);
+                                    LAST_EVENT_MS.store(now_ms(), Ordering::Relaxed);
+                                    tracing::warn!(
+                                        "замки окна: WH_MOUSE_LL был снят системой (превышен LowLevelHooksTimeout) — переустановлен"
+                                    );
+                                }
+                                // Помп НЕ убиваем: сторож попробует снова
+                                // (иначе обе блокировки умирали бы навсегда и
+                                // молча — ревью, пункт 5.2).
+                                None => tracing::warn!(
+                                    "замки окна: переустановить WH_MOUSE_LL не удалось — повторю по сторожу"
+                                ),
+                            }
                         }
-                    };
-                    let tid = unsafe { GetCurrentThreadId() };
-                    let _ = ready_tx.send(Some(tid));
-                    let mut msg = MSG::default();
-                    // SAFETY: стандартный msg-loop потока-помпа; колбэк хука
-                    // вызывается системой синхронно из этого потока между
-                    // итерациями GetMessageW, TranslateMessage/DispatchMessageW
-                    // здесь не нужны. Выход — по WM_QUIT из uninstall_hook.
-                    unsafe {
-                        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
                     }
-                    // SAFETY: unhook из потока-владельца хука.
-                    let _ = unsafe { UnhookWindowsHookEx(hook) };
+                }
+                PUMP_TID.store(0, Ordering::Release);
+                SWALLOWED_DOWN.store(false, Ordering::Relaxed);
+                // SAFETY: оба хука сняты с потока-владельца и больше не
+                // используются.
+                unsafe {
+                    if let Some(h) = hook.take() {
+                        let _ = UnhookWindowsHookEx(h);
+                    }
+                    if !move_hook.0.is_null() {
+                        let _ = UnhookWinEvent(move_hook);
+                    }
                 }
             })
-            .expect("interact-guard: не удалось создать поток");
+            .expect("input-guard: не удалось создать поток");
         match ready_rx.recv() {
             Ok(Some(tid)) => Some(ActiveHook {
                 tid,
                 thread: Some(thread),
+                prober: ht_probe::start(),
             }),
             _ => None,
         }
     }
 
     fn uninstall_hook() {
-        let slot = &mut state().hook.lock().unwrap();
-        let Some(active) = slot.take() else {
-            return;
-        };
-        let Some(thread) = active.thread else {
+        let active = state().hook.lock().unwrap().take();
+        let Some(active) = active else {
             return;
         };
         // SAFETY: WM_QUIT в поток-помп — штатное завершение GetMessageW
-        // (вернёт 0), поток снимет хук и выйдет; join дождётся этого.
+        // (вернёт 0), поток снимет хуки и выйдет; join дождётся этого.
         unsafe {
             let _ = PostThreadMessageW(active.tid, WM_QUIT, WPARAM(0), LPARAM(0));
         }
-        let _ = thread.join();
+        if let Some(thread) = active.thread {
+            let _ = thread.join();
+        }
+        SWALLOWED_DOWN.store(false, Ordering::Relaxed);
+        ht_probe::stop(active.prober);
     }
 
-    /// Диагностика для ignored-тестов: поставлен ли WH_MOUSE_LL сейчас.
+    /// Диагностика для ignored-тестов: поставлен ли хук сейчас.
     #[cfg(test)]
     pub(super) fn hook_active() -> bool {
         state().hook.lock().unwrap().is_some()
     }
 
+    /// Диагностика для тестов: политика, зарегистрированная за окном.
+    #[cfg(test)]
+    pub(super) fn policy_of(hwnd: HWND) -> Option<Policy> {
+        state()
+            .locked
+            .lock()
+            .unwrap()
+            .get(&(hwnd.0 as isize))
+            .copied()
+    }
+
     /// Колбэк `WH_MOUSE_LL`. Ненулевой возврат выбрасывает событие из
-    /// input-очереди ещё до системного hit-testing/активации — бипа нет.
+    /// input-очереди ещё ДО системного hit-testing/активации — окно не
+    /// получает ни `WM_NCHITTEST`, ни `WM_MOUSEACTIVATE`, ни самого клика,
+    /// модальный цикл перетаскивания не запускается.
     ///
-    /// Глотаем только нажатия/отпускания кнопок (не `WM_MOUSEMOVE`):
-    /// движение мыши над заблокированным окном должно работать как обычно.
-    /// Down/up-пары трекаются `SWALLOWED_DOWN`: если нажатие поглощено, его
-    /// отпускание тоже поглощаем, но отпускание после drag, начавшегося вне
-    /// заблокированного окна, не трогаем (иначе сломали бы перетаскивание,
-    /// завершающееся над заблокированным окном).
-    unsafe extern "system" fn interact_mouse_proc(
+    /// Бюджет — микросекунды (см. доккомент модуля): только `try_lock`,
+    /// один `WindowFromPoint` и чтение кэша hit-test'а.
+    unsafe extern "system" fn guard_mouse_proc(
         code: i32,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
         if code >= 0 {
+            LAST_EVENT_MS.store(now_ms(), Ordering::Relaxed);
             let msg = wparam.0 as u32;
-            if is_down_message(msg) {
-                // Снимок множества под коротким локом: клон маленький (обычно
-                // 1–3 окна), сам z-order-обход — без удержания лока.
-                let locked = state().locked.lock().unwrap().clone();
-                // SAFETY: lparam от системы указывает на живую MSLLHOOKSTRUCT
-                // на время вызова колбэка (контракт WH_MOUSE_LL).
-                let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-                if click_hits_locked_window(ms.pt, &locked) {
-                    SWALLOWED_DOWN.store(true, Ordering::Relaxed);
-                    return LRESULT(1);
+            // SAFETY: lparam от системы указывает на живую MSLLHOOKSTRUCT на
+            // время вызова колбэка (контракт WH_MOUSE_LL).
+            let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+            if msg == WM_MOUSEMOVE {
+                // Движение мыши никогда не глотается — только будит пробника,
+                // чтобы к моменту нажатия у нас был свежий настоящий hit-test.
+                ht_probe::wake();
+            } else if is_down_message(msg) || is_wheel_message(msg) {
+                if let Some((hwnd, policy)) = locked_target_at(ms.pt) {
+                    let swallow = if is_wheel_message(msg) {
+                        policy.interact_locked
+                    } else {
+                        should_swallow_button(hwnd, ms.pt, policy)
+                    };
+                    if swallow {
+                        if is_down_message(msg) {
+                            SWALLOWED_DOWN.store(true, Ordering::Relaxed);
+                        }
+                        return LRESULT(1);
+                    }
                 }
-                SWALLOWED_DOWN.store(false, Ordering::Relaxed);
+                if is_down_message(msg) {
+                    SWALLOWED_DOWN.store(false, Ordering::Relaxed);
+                }
             } else if is_up_message(msg) && SWALLOWED_DOWN.swap(false, Ordering::Relaxed) {
+                // Down проглочен — глотаем и парный up. Up после драга,
+                // начавшегося ВНЕ заблокированного окна, не трогаем (иначе
+                // сломали бы перетаскивание, завершающееся над ним).
                 return LRESULT(1);
             }
         }
         // SAFETY: CallNextHookEx передаёт событие дальше по цепочке хуков.
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
+    /// Глотать ли нажатие кнопки по заблокированному окну в точке `pt`.
+    ///
+    /// ГЛАВНОЕ ПРАВИЛО (репорт 2026-08-21, вторая итерация): замок кликов
+    /// НИКОГДА не должен мешать таскать окно. Поэтому решение
+    /// **fail-open**: клик глотается, только если точка ДОКАЗАННО относится к
+    /// содержимому окна. Доказательством считается либо свежий настоящий
+    /// `WM_NCHITTEST` от самого окна, либо геометрия — но геометрии верим
+    /// лишь у окон с НАСТОЯЩЕЙ неклиентской полосой заголовка
+    /// (`has_real_caption`).
+    ///
+    /// Почему так: у приложений с собственным заголовком (Chrome, Discord и
+    /// прочий Electron, VS Code, Steam, WinUI3, Tauri) клиентская область
+    /// покрывает всё окно, включая нарисованный ими заголовок. Геометрия для
+    /// такого окна отвечает `HTCLIENT` ВЕЗДЕ — и первая версия фикса глотала
+    /// нажатие по заголовку, то есть замок кликов снова отбирал перемещение.
+    /// Теперь при неопределённости клик проходит: цена — редкий пропущенный
+    /// клик по содержимому (когда окно не ответило на опрос), выгода —
+    /// перетаскивание не ломается никогда.
+    ///
+    /// Move-lock таким ограничением не связан: у него есть второй и третий
+    /// эшелоны (`movesize_proc` + `enforce_move_lock`), поэтому промах
+    /// геометрии для него не фатален.
+    fn should_swallow_button(hwnd: HWND, pt: POINT, policy: Policy) -> bool {
+        if let Some(ht) = ht_probe::hit_test(hwnd, pt) {
+            if policy.move_locked && is_move_ht(ht) {
+                return true;
+            }
+            return policy.interact_locked
+                && is_interact_ht(ht)
+                && !geometry_contradicts_content(hwnd, pt);
+        }
+        let ht = ht_from_geometry(hwnd, pt);
+        if policy.move_locked && is_move_ht(ht) {
+            return true;
+        }
+        policy.interact_locked && ht == HTCLIENT && has_real_caption(hwnd)
+    }
+
+    /// Геометрия ПРОТИВОРЕЧИТ ответу окна «здесь содержимое».
+    ///
+    /// Проверка есть только у окон с настоящим системным заголовком: там мы
+    /// знаем неклиентскую полосу точно (её считаем мы сами, в физических
+    /// координатах), и если точка лежит в ней, а окно ответило `HTCLIENT` —
+    /// верить окну нельзя. Два известных источника такого расхождения
+    /// (оба найдены ревью 2026-08-21):
+    /// * РАЗНАЯ DPI-осведомлённость процессов. Мы per-monitor aware и шлём
+    ///   физическую точку, а DPI-unaware приложение читает её через свою
+    ///   виртуализацию — точка с полосы заголовка попадает в его логическую
+    ///   клиентскую область, и ответ `HTCLIENT` выглядит правдоподобно.
+    ///   Фильтр `HTNOWHERE`/`HTERROR` в `ht_probe::probe` такое не ловит.
+    /// * Устаревший на пару пикселей кэш у самой границы заголовка и
+    ///   содержимого (курсор быстро перешёл вниз и сразу нажал).
+    ///
+    /// В обоих случаях цена ошибки — заблокированное перетаскивание, то есть
+    /// ровно то, что запрещено (см. `should_swallow_button`), поэтому при
+    /// расхождении клик пропускается. У окон с собственным заголовком
+    /// геометрия ничего не знает и в спор не вступает — там ответ окна
+    /// остаётся единственным и главным источником.
+    fn geometry_contradicts_content(hwnd: HWND, pt: POINT) -> bool {
+        has_real_caption(hwnd) && ht_from_geometry(hwnd, pt) != HTCLIENT
+    }
+
+    /// У окна есть НАСТОЯЩАЯ неклиентская полоса заголовка (система рисует
+    /// заголовок сама, клиентская область начинается ниже). Признак —
+    /// вертикальный зазор между верхом окна и верхом клиентской области.
+    ///
+    /// Порог 12 px разделяет два мира: у обычного окна Win32 полоса — высота
+    /// заголовка (примерно 31 px при 100 процентах) плюс рамка, у окна с
+    /// собственным заголовком (`WM_NCCALCSIZE` съедает неклиентскую область)
+    /// зазор нулевой или в пределах невидимой рамки ресайза Windows 11
+    /// (около 8 px).
+    const REAL_CAPTION_MIN_PX: i32 = 12;
+
+    fn has_real_caption(hwnd: HWND) -> bool {
+        // Сначала — прямой ответ DWM: зона кнопок заголовка непуста ТОЛЬКО у
+        // окон, которым системный заголовок рисует сам DWM. У окна с
+        // собственным заголовком (Chrome/Electron/VS Code/Steam) она пуста —
+        // это независимое подтверждение «системного заголовка нет», причём
+        // работающее и для окон с высоким уровнем целостности (запрос идёт в
+        // dwm.exe, а не в процесс окна, UIPI его не режет). Кэшируется
+        // потоком-пробником — в колбэке только чтение (см. `caption_cache`).
+        if let Some(known) = caption_cache::get(hwnd) {
+            return known;
+        }
+        // SAFETY: все вызовы — чтения геометрии живого/чужого окна.
+        unsafe {
+            let mut wr = RECT::default();
+            if GetWindowRect(hwnd, &mut wr).is_err() {
+                return false;
+            }
+            let mut cr = RECT::default();
+            if GetClientRect(hwnd, &mut cr).is_err() {
+                return false;
+            }
+            let mut tl = POINT {
+                x: cr.left,
+                y: cr.top,
+            };
+            if !ClientToScreen(hwnd, &mut tl).as_bool() {
+                return false;
+            }
+            tl.y - wr.top >= REAL_CAPTION_MIN_PX
+        }
+    }
+
+    /// Второй эшелон move-lock'а: пользователь всё-таки вошёл в модальный
+    /// цикл перемещения/ресайза (тач, перо, Alt+Space → «Переместить», промах
+    /// кэша hit-test'а) — обрываем цикл `WM_CANCELMODE`'ом. `DefWindowProc`
+    /// на это сообщение отпускает захват мыши и выходит из цикла, окно
+    /// остаётся там, где было на момент старта; остаточное расхождение
+    /// подберёт [`WindowPins::enforce_move_lock`] (третий эшелон).
+    unsafe extern "system" fn movesize_proc(
+        _hook: HWINEVENTHOOK,
+        event: u32,
+        hwnd: HWND,
+        idobject: i32,
+        idchild: i32,
+        _tid: u32,
+        _time: u32,
+    ) {
+        if event != EVENT_SYSTEM_MOVESIZESTART
+            || idobject != OBJID_WINDOW.0
+            || idchild != CHILDID_SELF as i32
+        {
+            return;
+        }
+        let move_locked = state()
+            .locked
+            .try_lock()
+            .ok()
+            .and_then(|m| m.get(&(hwnd.0 as isize)).copied())
+            .is_some_and(|p| p.move_locked);
+        if !move_locked {
+            return;
+        }
+        // SAFETY: PostMessageW безопасен для чужого/мёртвого окна (вернёт
+        // ошибку, которую игнорируем). Именно Post, не Send: колбэк
+        // WinEvent'а не должен блокироваться в чужом процессе.
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+        }
     }
 
     fn is_down_message(msg: u32) -> bool {
@@ -881,35 +1354,93 @@ struct ActiveHook {
         matches!(msg, WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP)
     }
 
-    /// Попадает ли клик в точке `pt` в interact-locked окно из `locked` и
-    /// является ли это окно реальной целью клика (см. `is_effective_click_target`).
-    /// Чистая функция над переданным множеством — так её можно покрыть
-    /// unit-тестами без реального хука.
-    fn click_hits_locked_window(pt: POINT, locked: &HashSet<isize>) -> bool {
-        for &key in locked {
-            let hwnd = HWND(key as *mut core::ffi::c_void);
-            if !locked_window_receives_click_at(hwnd, pt) {
-                continue;
-            }
-            if is_effective_click_target(hwnd, pt) {
-                return true;
-            }
-        }
-        false
+    fn is_wheel_message(msg: u32) -> bool {
+        matches!(msg, WM_MOUSEWHEEL | WM_MOUSEHWHEEL)
     }
 
-    /// Живое видимое disabled-окно, чей прямоугольник содержит `pt` и которое
-    /// не прозрачно для кликов. Двойная фильтрация: отсекает записи-«призраки»
-    /// (окно уничтожено или ввод возвращён извне, а запись в множестве ещё
-    /// есть) и не глотает клики, которые система и так не доставила бы окну.
+    /// Hit-test-коды, означающие «пользователь берётся ЗА ОКНО» — заголовок,
+    /// рамки, уголок ресайза. Именно их глотает move-lock. Кнопки заголовка
+    /// (`HTCLOSE`/`HTMINBUTTON`/`HTMAXBUTTON`) сюда НЕ входят: закрыть или
+    /// свернуть закреплённое окно пользователь вправе — замок про положение,
+    /// а не про существование окна.
+    pub(super) fn is_move_ht(ht: u32) -> bool {
+        matches!(
+            ht,
+            HTCAPTION
+                | HTLEFT
+                | HTRIGHT
+                | HTTOP
+                | HTTOPLEFT
+                | HTTOPRIGHT
+                | HTBOTTOM
+                | HTBOTTOMLEFT
+                | HTBOTTOMRIGHT
+                | HTBORDER
+                | HTGROWBOX
+        )
+    }
+
+    /// Hit-test-коды «содержимого» окна — их глотает interact-lock. Заголовок
+    /// и рамки сюда НЕ входят: interact-lock не должен мешать двигать окно
+    /// (ради этого он и переписан с `EnableWindow(FALSE)` на хук).
+    pub(super) fn is_interact_ht(ht: u32) -> bool {
+        matches!(ht, HTCLIENT | HTMENU | HTSYSMENU | HTVSCROLL | HTHSCROLL)
+    }
+
+    /// Заблокированное окно, которому система доставила бы клик в `pt`.
+    /// `WindowFromPoint` уже учитывает и видимость, и `WS_EX_TRANSPARENT`
+    /// (клик-сквозные оверлеи resticker), и z-order — один вызов вместо
+    /// обхода всего десктопа. `GetAncestor(GA_ROOT)`: попасть можно в
+    /// дочерний контрол, а заблокировано top-level окно.
+    fn locked_target_at(pt: POINT) -> Option<(HWND, Policy)> {
+        // SAFETY: WindowFromPoint/GetAncestor — чтения состояния десктопа,
+        // безопасны для любых координат.
+        let root = unsafe {
+            let child = window_from_point(pt);
+            if child.0.is_null() {
+                return None;
+            }
+            GetAncestor(child, GA_ROOT)
+        };
+        if root.0.is_null() {
+            return None;
+        }
+        let policy = state()
+            .locked
+            .try_lock()
+            .ok()?
+            .get(&(root.0 as isize))
+            .copied()?;
+        Some((root, policy))
+    }
+
+    /// `WindowFromPoint` в обёртке: сигнатура в `windows` принимает POINT по
+    /// значению, выделено для читаемости `unsafe`-блока выше.
+    unsafe fn window_from_point(pt: POINT) -> HWND {
+        // SAFETY: см. вызывающий код.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(pt) }
+    }
+
+    /// Дешёвая (без z-order) проверка «курсор над заблокированным окном» —
+    /// для потока-пробника, который так решает, кого опрашивать. Блокирующий
+    /// лок здесь допустим: вызывается НЕ из колбэка хука.
+    fn locked_window_under_blocking(pt: POINT) -> Option<isize> {
+        let map = state().locked.lock().ok()?;
+        map.keys()
+            .copied()
+            .find(|&key| locked_window_receives_click_at(super::hwnd_from_isize(key), pt))
+    }
+
+    /// Живое видимое НЕ-transparent окно, чей прямоугольник содержит `pt`.
+    /// Отсекает записи-«призраки» (окно уничтожено, а запись в карте ещё
+    /// есть). `IsWindowEnabled` здесь СОЗНАТЕЛЬНО не проверяется: страж
+    /// больше не вызывает `EnableWindow(FALSE)`, заблокированное окно
+    /// остаётся enabled — прежняя проверка сделала бы предикат вечно ложным.
     fn locked_window_receives_click_at(hwnd: HWND, pt: POINT) -> bool {
-        // SAFETY: IsWindowVisible/IsWindowEnabled/GetWindowLongPtrW/GetWindowRect
-        // безопасны для чужих и мёртвых хэндлов.
+        // SAFETY: IsWindowVisible/GetWindowLongPtrW/GetWindowRect безопасны
+        // для чужих и мёртвых хэндлов.
         unsafe {
             if !IsWindowVisible(hwnd).as_bool() {
-                return false;
-            }
-            if IsWindowEnabled(hwnd).as_bool() {
                 return false;
             }
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
@@ -920,234 +1451,618 @@ struct ActiveHook {
             if GetWindowRect(hwnd, &mut rect).is_err() {
                 return false;
             }
-            pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom
+            rect_contains(&rect, pt)
         }
     }
 
-    /// Является ли `target` окном, которому система доставила бы клик в `pt`:
-    /// первое видимое НЕ-transparent окно в z-order сверху, содержащее `pt`.
-    /// Обход — `GetWindow(desktop, GW_CHILD)` (верх z-order) вниз по
-    /// `GW_HWNDNEXT`; `WS_EX_TRANSPARENT`-окна (клик-сквозные, у resticker так
-    /// устроены оверлеи) пропускаются — система и сама роутит клик сквозь них
-    /// на окно ниже.
-    fn is_effective_click_target(target: HWND, pt: POINT) -> bool {
-        let mut current = unsafe { GetWindow(GetDesktopWindow(), GW_CHILD) };
-        let zorder = std::iter::from_fn(move || match current {
-            Ok(hwnd) if !hwnd.0.is_null() => {
-                // SAFETY: GetWindow — чтение z-order живого десктопа.
-                current = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
-                Some(hwnd)
-            }
-            _ => None,
-        });
-        target_wins_click(target, pt, zorder)
+    fn rect_contains(rect: &RECT, pt: POINT) -> bool {
+        pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom
     }
 
-    /// Чистое решение «кто выигрывает клик в точке `pt`»: перебираем окна
-    /// z-order сверху вниз (переданы итератором — для тестируемости без
-    /// живого десктопа). Как только встречаем `target` — он верхний, клик
-    /// уходит в него (true). Раньше него встречаем видимый НЕ-transparent
-    /// блокер с точкой в прямоугольнике — клик уходит в блокер (false).
-    fn target_wins_click(
-        target: HWND,
-        pt: POINT,
-        zorder: impl Iterator<Item = HWND>,
-    ) -> bool {
-        for hwnd in zorder {
-            if hwnd == target {
-                return true;
-            }
-            if window_blocks_click_at(hwnd, pt) {
-                return false;
-            }
-        }
-        false
-    }
-
-    fn window_blocks_click_at(hwnd: HWND, pt: POINT) -> bool {
-        // SAFETY: то же, что у `locked_window_receives_click_at`.
+    /// Грубая оценка hit-test'а по геометрии — запасной путь, когда кэш
+    /// пробника пуст (первое нажатие, окно «задумалось», UIPI).
+    ///
+    /// ЧЕСТНО О ТОЧНОСТИ: оценка врёт на приложениях с собственным
+    /// заголовком (Electron/Tauri/Chrome/VS Code/Discord/Steam рисуют
+    /// «заголовок» внутри клиентской области и отвечают `HTCAPTION` из неё) —
+    /// там клиентский прямоугольник покрывает почти всё окно, и мы вернём
+    /// `HTCLIENT`. Поэтому это именно fallback: основной источник —
+    /// настоящий `WM_NCHITTEST` из [`ht_probe`].
+    pub(super) fn ht_from_geometry(hwnd: HWND, pt: POINT) -> u32 {
+        // SAFETY: все вызовы — чтения геометрии, безопасны для чужих окон.
         unsafe {
-            if !IsWindowVisible(hwnd).as_bool() {
-                return false;
+            let mut wr = RECT::default();
+            if GetWindowRect(hwnd, &mut wr).is_err() || !rect_contains(&wr, pt) {
+                return HTNOWHERE;
             }
-            let mut rect = RECT::default();
-            if GetWindowRect(hwnd, &mut rect).is_err() {
-                return false;
+            let mut cr = RECT::default();
+            if GetClientRect(hwnd, &mut cr).is_err() {
+                return HTCAPTION;
             }
-            if !(pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom) {
-                return false;
+            let mut tl = POINT {
+                x: cr.left,
+                y: cr.top,
+            };
+            let mut br = POINT {
+                x: cr.right,
+                y: cr.bottom,
+            };
+            if ClientToScreen(hwnd, &mut tl).as_bool() && ClientToScreen(hwnd, &mut br).as_bool() {
+                let client = RECT {
+                    left: tl.x,
+                    top: tl.y,
+                    right: br.x,
+                    bottom: br.y,
+                };
+                if rect_contains(&client, pt) {
+                    return HTCLIENT;
+                }
             }
-            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            ex & WS_EX_TRANSPARENT.0 == 0
+            // Внутри окна, но вне клиентской области — заголовок или рамка;
+            // для обеих блокировок это один и тот же класс решений.
+            HTCAPTION
         }
+    }
+
+    /// Кэш признака «у окна настоящий системный заголовок» (`DWM`-ответ, см.
+    /// `has_real_caption`). Наполняется потоком-пробником, читается колбэком
+    /// хука через `try_lock`: сам запрос в DWM стоит десятки микросекунд —
+    /// заметная доля бюджета колбэка (1 мс), поэтому в колбэке его нет.
+    mod caption_cache {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_BUTTON_BOUNDS, DwmGetWindowAttribute};
+
+        use super::HWND;
+
+        /// Стиль окна может смениться на лету (frameless-режим, полноэкранный
+        /// вид) — запись живёт недолго и переспрашивается.
+        const TTL: Duration = Duration::from_secs(2);
+
+        static CACHE: Mutex<Option<HashMap<isize, (bool, Instant)>>> = Mutex::new(None);
+
+        /// Известный (свежий) ответ для окна. `None` — не спрашивали, ответ
+        /// протух или карта занята: вызывающий решает по геометрии.
+        pub(super) fn get(hwnd: HWND) -> Option<bool> {
+            let guard = CACHE.try_lock().ok()?;
+            let map = guard.as_ref()?;
+            let &(value, at) = map.get(&(hwnd.0 as isize))?;
+            (at.elapsed() <= TTL).then_some(value)
+        }
+
+        /// Спросить DWM и запомнить (вызывается только из потока-пробника).
+        pub(super) fn refresh(hwnd: HWND) {
+            let key = hwnd.0 as isize;
+            let fresh = {
+                let Ok(guard) = CACHE.lock() else {
+                    return;
+                };
+                guard
+                    .as_ref()
+                    .and_then(|m| m.get(&key))
+                    .is_some_and(|&(_, at)| at.elapsed() <= TTL)
+            };
+            if fresh {
+                return;
+            }
+            let Some(value) = query_dwm(hwnd) else {
+                return; // DWM не ответил — пусть решает геометрия
+            };
+            if let Ok(mut guard) = CACHE.lock() {
+                guard
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key, (value, Instant::now()));
+            }
+        }
+
+        /// Убрать запись окна (снятие блокировки/открепление).
+        pub(super) fn forget(hwnd: HWND) {
+            if let Ok(mut guard) = CACHE.lock() {
+                if let Some(map) = guard.as_mut() {
+                    map.remove(&(hwnd.0 as isize));
+                }
+            }
+        }
+
+        /// Непустая зона кнопок заголовка ⇒ системный заголовок есть.
+        /// `None` — DWM не ответил (окно умирает, композитор не знает окна).
+        fn query_dwm(hwnd: HWND) -> Option<bool> {
+            let mut rect = RECT::default();
+            // SAFETY: rect — валидный буфер под RECT; запрос идёт в DWM и
+            // безопасен для чужих окон.
+            let ok = unsafe {
+                DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_CAPTION_BUTTON_BOUNDS,
+                    (&raw mut rect).cast(),
+                    size_of::<RECT>() as u32,
+                )
+            }
+            .is_ok();
+            ok.then_some(rect.right > rect.left && rect.bottom > rect.top)
+        }
+    }
+
+    /// Асинхронный опрос настоящего `WM_NCHITTEST` у чужого окна.
+    ///
+    /// Почему отдельный поток: `SendMessage*` в чужой процесс — синхронное
+    /// ожидание чужой очереди сообщений (десятки мс на загруженном окне), а
+    /// бюджет колбэка LL-хука на этой машине 1 мс (см. доккомент модуля).
+    /// Колбэк только КЛАДЁТ запрос (`request`) и ЧИТАЕТ результат
+    /// (`hit_test`), оба — через `try_lock`, без единого блокирующего вызова.
+    ///
+    /// `SMTO_ABORTIFHUNG` (а не `SMTO_BLOCK`) принципиален: колбэк LL-хука
+    /// приходит как ОТПРАВЛЕННОЕ сообщение, и блокирующий режим заморозил бы
+    /// его доставку на время опроса.
+    mod ht_probe {
+        use super::*;
+
+        /// Результат опроса годен, если точка нажатия рядом с опрошенной и
+        /// он не протух. Допуск узкий: у самой границы заголовка и
+        /// содержимого широкая полоса давала бы устаревший `HTCLIENT` для
+        /// точки, уже попавшей на заголовок (ревью 2026-08-21), а промах
+        /// кэша безопасен — это fail-open.
+        const TOLERANCE_PX: i32 = 3;
+        const FRESH: Duration = Duration::from_millis(1_000);
+        /// Как часто обновлять ответ для НЕПОДВИЖНОГО курсора над
+        /// заблокированным окном.
+        const REFRESH: Duration = Duration::from_millis(80);
+        /// Такт опроса, пока курсор над заблокированным окном.
+        const TICK: Duration = Duration::from_millis(10);
+        /// Потолок ожидания чужого окна. Пробник живёт на своём потоке и
+        /// никого не задерживает, поэтому таймаут щедрый: Electron-окно под
+        /// нагрузкой отвечает не за 30 мс, а промах опроса означает откат к
+        /// геометрии, которая для таких окон врёт (см. `should_swallow_button`).
+        const PROBE_TIMEOUT_MS: u32 = 80;
+        /// Сторож: столько тишины при движущейся мыши считаем «хук сняли».
+        const SILENCE_MS: u64 = 2_000;
+        /// Не просить переустановку чаще этого интервала.
+        const REINSTALL_COOLDOWN_MS: u64 = 5_000;
+
+        /// Когда сторож в последний раз просил переустановить хук (мс от
+        /// `epoch()`); 0 — не просил ни разу.
+        static LAST_REINSTALL_MS: AtomicU64 = AtomicU64::new(0);
+
+        #[derive(Clone, Copy)]
+        struct Sample {
+            key: isize,
+            pt: POINT,
+            ht: u32,
+            at: Instant,
+        }
+
+        static LAST: Mutex<Option<Sample>> = Mutex::new(None);
+        static STOP: AtomicBool = AtomicBool::new(false);
+        static WORKER: OnceLock<Mutex<Option<std::thread::Thread>>> = OnceLock::new();
+
+        fn worker_slot() -> &'static Mutex<Option<std::thread::Thread>> {
+            WORKER.get_or_init(|| Mutex::new(None))
+        }
+
+        /// Разбудить пробника (вызывается из колбэка на любом движении мыши).
+        /// Никогда не блокирует: занятый лок — просто пропуск такта.
+        pub(super) fn wake() {
+            if let Ok(worker) = worker_slot().try_lock() {
+                if let Some(thread) = worker.as_ref() {
+                    thread.unpark();
+                }
+            }
+        }
+
+        /// Настоящий hit-test точки для `hwnd`, если он у нас есть и свежий.
+        /// `None` — опроса нет (окно не ответило, курсор только что пришёл,
+        /// UIPI): решение принимает вызывающий по геометрии, консервативно.
+        pub(super) fn hit_test(hwnd: HWND, pt: POINT) -> Option<u32> {
+            let key = hwnd.0 as isize;
+            LAST.try_lock().ok().and_then(|g| *g).filter(|s| {
+                s.key == key
+                    && (s.pt.x - pt.x).abs() <= TOLERANCE_PX
+                    && (s.pt.y - pt.y).abs() <= TOLERANCE_PX
+                    && s.at.elapsed() <= FRESH
+            }).map(|s| s.ht)
+        }
+
+        pub(super) fn start() -> Option<std::thread::JoinHandle<()>> {
+            STOP.store(false, Ordering::Release);
+            let handle = std::thread::Builder::new()
+                .name("resticker-ht-probe".into())
+                .spawn(|| {
+                    if let Ok(mut slot) = worker_slot().lock() {
+                        *slot = Some(std::thread::current());
+                    }
+                    probe_loop();
+                    if let Ok(mut slot) = worker_slot().lock() {
+                        *slot = None;
+                    }
+                })
+                .ok()?;
+            Some(handle)
+        }
+
+        pub(super) fn stop(handle: Option<std::thread::JoinHandle<()>>) {
+            STOP.store(true, Ordering::Release);
+            wake();
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
+            if let Ok(mut last) = LAST.lock() {
+                *last = None;
+            }
+        }
+
+        /// Пробник ведёт кэш САМ, по живой позиции курсора, а не по заявкам из
+        /// колбэка: так свежий ответ есть даже тогда, когда пользователь
+        /// подвёл курсор и нажал сразу, без промежуточных `WM_MOUSEMOVE`.
+        /// Пока курсор не над заблокированным окном, цикл ничего не делает и
+        /// спит.
+        fn probe_loop() {
+            let mut watchdog_at = Instant::now();
+            let mut watchdog_cursor = cursor_pos();
+            while !STOP.load(Ordering::Acquire) {
+                let pt = cursor_pos();
+                if let Some(key) = super::locked_window_under_blocking(pt) {
+                    super::caption_cache::refresh(super::super::hwnd_from_isize(key));
+                    if needs_probe(key, pt) {
+                        if let Some(ht) = probe(key, pt) {
+                            if let Ok(mut last) = LAST.lock() {
+                                *last = Some(Sample {
+                                    key,
+                                    pt,
+                                    ht,
+                                    at: Instant::now(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if watchdog_at.elapsed() >= Duration::from_millis(SILENCE_MS) {
+                    let cursor = cursor_pos();
+                    watchdog_if_silent(cursor, watchdog_cursor);
+                    watchdog_cursor = cursor;
+                    watchdog_at = Instant::now();
+                }
+                std::thread::park_timeout(TICK);
+            }
+        }
+
+        /// Опрашивать ли точку заново: другого окна, сдвинувшегося курсора или
+        /// протухшего ответа достаточно.
+        fn needs_probe(key: isize, pt: POINT) -> bool {
+            let Ok(last) = LAST.lock() else {
+                return true;
+            };
+            match last.as_ref() {
+                Some(s) => {
+                    s.key != key
+                        || s.pt.x != pt.x
+                        || s.pt.y != pt.y
+                        || s.at.elapsed() >= REFRESH
+                }
+                None => true,
+            }
+        }
+
+        fn cursor_pos() -> POINT {
+            let mut pt = POINT::default();
+            // SAFETY: GetCursorPos пишет в наш стек, ошибку игнорируем
+            // (сессия без десктопа — вернём (0,0), сторож просто промолчит).
+            unsafe {
+                let _ = GetCursorPos(&mut pt);
+            }
+            pt
+        }
+
+        /// Мышь движется, а колбэк молчит — единственный наблюдаемый признак
+        /// того, что система сняла LL-хук по превышению
+        /// `LowLevelHooksTimeout` (уведомления об этом нет). Просим поток-помп
+        /// поставить хук заново.
+        fn watchdog_if_silent(cursor: POINT, previous: POINT) {
+            if cursor.x == previous.x && cursor.y == previous.y {
+                return; // мышь неподвижна — тишина законна
+            }
+            if now_ms().saturating_sub(LAST_EVENT_MS.load(Ordering::Relaxed)) < SILENCE_MS {
+                return;
+            }
+            // Переустановка могла и не удаться (сессия без десктопа): просить
+            // её чаще, чем раз в `REINSTALL_COOLDOWN_MS`, бессмысленно —
+            // получился бы поток сообщений в помп (ревью 2026-08-21, 5.3).
+            let last_request = LAST_REINSTALL_MS.load(Ordering::Relaxed);
+            let now = now_ms();
+            if last_request != 0 && now.saturating_sub(last_request) < REINSTALL_COOLDOWN_MS {
+                return;
+            }
+            let tid = PUMP_TID.load(Ordering::Acquire);
+            if tid == 0 {
+                return;
+            }
+            LAST_REINSTALL_MS.store(now, Ordering::Relaxed);
+            // SAFETY: PostThreadMessageW безопасен; мёртвый tid — ошибка,
+            // которую игнорируем (поток-помп как раз завершается).
+            unsafe {
+                let _ = PostThreadMessageW(tid, WM_APP_REINSTALL, WPARAM(0), LPARAM(0));
+            }
+        }
+
+        /// Настоящий `WM_NCHITTEST` у чужого окна. `None` — окно мертво,
+        /// «задумалось» (`SMTO_ABORTIFHUNG`), закрыто UIPI или ответило
+        /// бессмысленным для нас кодом (`HTNOWHERE`/`HTERROR` при том, что
+        /// точка внутри окна, — верный признак несовпадения систем координат
+        /// при разной DPI-осведомлённости процессов).
+        fn probe(key: isize, pt: POINT) -> Option<u32> {
+            let hwnd = super::super::hwnd_from_isize(key);
+            // SAFETY: IsWindow безопасен для любых значений.
+            if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                return None;
+            }
+            // Точка приходит из хука в ФИЗИЧЕСКИХ пикселях (наш процесс
+            // per-monitor aware), а окно прочитает lParam в СВОЁМ
+            // DPI-пространстве: USER32 координаты в сообщении не
+            // транслирует. У DPI-unaware цели на масштабе 125-200% это дало
+            // бы правдоподобно неверный ответ (точка с заголовка попадает в
+            // логическую клиентскую область) — то есть проглоченный клик по
+            // заголовку и сломанное перетаскивание. `PhysicalToLogicalPoint            // ForPerMonitorDPI` переводит точку в пространство именно этого
+            // окна; для цели с нашей осведомлённостью это тождество.
+            // HT-код безразмерный, обратный перевод не нужен.
+            let mut pt = pt;
+            // SAFETY: пишет в нашу переменную; неудача (окно умерло, точка
+            // вне окна) оставляет её нетронутой — тогда шлём как есть.
+            unsafe {
+                let _ = PhysicalToLogicalPointForPerMonitorDPI(Some(hwnd), &mut pt);
+            }
+            // MAKELPARAM(x, y) — координаты экранные, младшие 16 бит каждая
+            // (получатель разворачивает знак через GET_X_LPARAM).
+            let packed = (((pt.y as u16 as u32) << 16) | (pt.x as u16 as u32)) as isize;
+            let mut result: usize = 0;
+            // SAFETY: SendMessageTimeoutW с SMTO_ABORTIFHUNG не зависает на
+            // мёртвом/повисшем окне; result пишется только при успехе.
+            let ok = unsafe {
+                SendMessageTimeoutW(
+                    hwnd,
+                    WM_NCHITTEST,
+                    WPARAM(0),
+                    LPARAM(packed),
+                    SEND_MESSAGE_TIMEOUT_FLAGS(SMTO_ABORTIFHUNG.0),
+                    PROBE_TIMEOUT_MS,
+                    Some(&mut result),
+                )
+            };
+            if ok.0 == 0 {
+                return None;
+            }
+            let ht = result as u32;
+            (ht != HTNOWHERE && ht != HTERROR_CODE).then_some(ht)
+        }
+
+        /// `HTERROR` (-2) в 32-битном виде: окно ответило «ошибка».
+        const HTERROR_CODE: u32 = -2i32 as u32;
     }
 
     #[cfg(test)]
     pub(super) mod tests {
         use super::*;
         use windows::Win32::Foundation::POINT;
-        use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-        use windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW;
 
-        fn pt(x: i32, y: i32) -> POINT {
-            POINT { x, y }
-        }
-
-        /// Создать окно interact-guard-теста. Позиции УНИКАЛЬНЫ для каждого
-        /// теста (и в стороне от (0,0), где живут окна остальных тестов
-        /// модуля) — окна создаются только для проверок прямоугольников/
-        /// стилей, сам z-order в unit-тестах НЕ используется (см. ниже).
-        fn window_for(x: i32, y: i32) -> crate::window_pin::tests::TestWindow {
-            crate::window_pin::tests::TestWindow::create_at_topmost(x, y, 240, 170)
-        }
-
-        fn center(hwnd: HWND) -> POINT {
-            unsafe {
-                let mut r = RECT::default();
-                GetWindowRect(hwnd, &mut r).unwrap();
-                pt((r.left + r.right) / 2, (r.top + r.bottom) / 2)
-            }
-        }
-
-        /// Множество с одним hwnd.
-        fn locked_with(hwnd: HWND) -> HashSet<isize> {
-            let mut s = HashSet::new();
-            s.insert(hwnd.0 as isize);
-            s
-        }
-
-        /// Вызвать `click_hits_locked_window` с ПОДМЕНЁННЫМ источником
-        /// z-order (вместо живого десктопа): unit-тесты передают собственные
-        /// окна в нужном порядке, и результат не зависит от параллельных
-        /// тестов/реальных окон десктопа. Живой z-order покрывается отдельным
-        /// `#[ignore]`-тестом.
-        fn click_with_zorder(pt: POINT, locked: &HashSet<isize>, zorder: Vec<HWND>) -> bool {
-            let locked = locked.clone();
-            for &hwnd in &zorder {
-                if locked.contains(&(hwnd.0 as isize)) {
-                    return target_wins_click(hwnd, pt, zorder.iter().copied());
-                }
-            }
-            false
-        }
-
+        /// Move-lock глотает «взяться за окно» и НЕ трогает содержимое —
+        /// иначе замок перемещения запрещал бы ещё и пользоваться окном.
         #[test]
-        fn swallows_click_on_locked_window() {
-            let win = window_for(140, 140);
-            let hwnd = win.0;
-            // interact-lock: окно реально disabled (как после set_interact_lock).
-            unsafe { let _ = EnableWindow(hwnd, false); };
-            let c = center(hwnd);
-            let set = locked_with(hwnd);
+        fn move_ht_covers_caption_and_frame_only() {
+            assert!(is_move_ht(HTCAPTION));
+            assert!(is_move_ht(HTBOTTOMRIGHT));
+            assert!(is_move_ht(HTGROWBOX));
+            assert!(!is_move_ht(HTCLIENT));
+            assert!(!is_move_ht(HTNOWHERE));
+        }
+
+        /// Interact-lock глотает содержимое и НЕ трогает заголовок/рамки —
+        /// ровно тот баг, из-за которого «замок взаимодействия» отбирал
+        /// перемещение окна (репорт 2026-08-20).
+        #[test]
+        fn interact_ht_leaves_caption_movable() {
+            assert!(is_interact_ht(HTCLIENT));
+            assert!(is_interact_ht(HTVSCROLL));
+            assert!(!is_interact_ht(HTCAPTION));
+            assert!(!is_interact_ht(HTBOTTOMRIGHT));
+            assert!(!is_interact_ht(HTBORDER));
+        }
+
+        /// `has_real_caption` — единственный сигнал, по которому геометрии
+        /// вообще можно верить у interact-lock'а: окно с настоящим
+        /// системным заголовком отличается от окна, рисующего заголовок
+        /// само (там клиентская область покрывает всё, и геометрия ответила
+        /// бы `HTCLIENT` даже в заголовке).
+        #[test]
+        fn real_caption_detected_only_for_system_caption() {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+            };
+
+            let with_caption = crate::window_pin::tests::TestWindow::create_with(
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            );
             assert!(
-                click_with_zorder(c, &set, vec![hwnd]),
-                "клик по центру interact-locked окна должен поглощаться"
+                has_real_caption(with_caption.0),
+                "окно со штатным заголовком должно опознаваться"
+            );
+
+            let without = crate::window_pin::tests::TestWindow::create_with(WS_POPUP | WS_VISIBLE);
+            assert!(
+                !has_real_caption(without.0),
+                "окно без неклиентской полосы не должно считаться заголовочным"
             );
         }
 
+        /// Расхождение «окно сказало содержимое, а геометрия видит
+        /// неклиентскую полосу» трактуется в пользу перетаскивания —
+        /// но только у окон с настоящим системным заголовком: у окна с
+        /// собственным заголовком геометрия не знает ничего и спорить не
+        /// вправе (ревью 2026-08-21, пункт 1.1).
         #[test]
-        fn does_not_swallow_outside_locked_rect() {
-            let win = window_for(1600, 1600);
-            let hwnd = win.0;
-            unsafe { let _ = EnableWindow(hwnd, false); };
-            let set = locked_with(hwnd);
+        fn geometry_only_argues_for_windows_with_system_caption() {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+            };
+
+            let framed = crate::window_pin::tests::TestWindow::create_with(
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            );
+            let mut wr = RECT::default();
+            // SAFETY: окно живо.
+            unsafe { GetWindowRect(framed.0, &mut wr) }.unwrap();
+            let caption = POINT {
+                x: (wr.left + wr.right) / 2,
+                y: wr.top + 2,
+            };
+            let inside = POINT {
+                x: (wr.left + wr.right) / 2,
+                y: (wr.top + wr.bottom) / 2,
+            };
             assert!(
-                !click_hits_locked_window(pt(10, 10), &set),
-                "клик вне прямоугольника заблокированного окна не поглощается"
+                geometry_contradicts_content(framed.0, caption),
+                "точка на заголовке обязана опровергать ответ «это содержимое»"
             );
             assert!(
-                !click_hits_locked_window(pt(1600 + 30, 1600 + 200), &set),
-                "клик под прямоугольником не поглощается"
+                !geometry_contradicts_content(framed.0, inside),
+                "точка в клиентской области ничему не противоречит"
             );
-        }
 
-        #[test]
-        fn does_not_swallow_when_enabled_window_covers_locked() {
-            let locked = window_for(320, 320);
-            unsafe { let _ = EnableWindow(locked.0, false); };
-            let cover = crate::window_pin::tests::TestWindow::create_at_topmost(330, 330, 120, 120);
-            let set = locked_with(locked.0);
-            let c = center(cover.0);
-            // Злой (enabled) блокер стоит НАД заблокированным в z-order —
-            // клик уходит в него.
+            // Окно без системного заголовка: геометрия молчит всегда.
+            let frameless =
+                crate::window_pin::tests::TestWindow::create_with(WS_POPUP | WS_VISIBLE);
+            // SAFETY: окно живо.
+            unsafe { GetWindowRect(frameless.0, &mut wr) }.unwrap();
+            let top_edge = POINT {
+                x: (wr.left + wr.right) / 2,
+                y: wr.top + 2,
+            };
             assert!(
-                !click_with_zorder(c, &set, vec![cover.0, locked.0]),
-                "клик по перекрывающему enabled-окну поверх заблокированного не поглощается"
+                !geometry_contradicts_content(frameless.0, top_edge),
+                "у окна с собственным заголовком геометрия не вправе спорить"
             );
-            // Тот же клик при z-order без блокера снова уходит в
-            // заблокированное.
-            assert!(click_with_zorder(c, &set, vec![locked.0]));
         }
 
+        /// Пустая политика снимает запись: не осталось заблокированных окон —
+        /// не осталось и хуков (refcount по содержимому карты).
         #[test]
-        fn transparent_overlay_does_not_block_swallow() {
-            // Оверлей resticker — WS_EX_TRANSPARENT (клик-сквозной): он НЕ
-            // должен отменять поглощение клика, уходящего в заблокированное
-            // окно под ним (система сама роутит клик сквозь прозрачное окно).
-            let locked = window_for(500, 500);
-            unsafe { let _ = EnableWindow(locked.0, false); };
-            let overlay = crate::window_pin::tests::TestWindow::create_at_topmost(500, 500, 400, 300);
-            unsafe {
-                let _ = SetWindowLongPtrW(overlay.0, GWL_EXSTYLE, WS_EX_TRANSPARENT.0 as isize);
-            }
-            let set = locked_with(locked.0);
-            let c = center(locked.0);
-            assert!(click_with_zorder(c, &set, vec![overlay.0, locked.0]));
+        fn empty_policy_removes_registration() {
+            let hwnd = HWND(0x7fff_0001 as *mut core::ffi::c_void);
+            set_policy(
+                hwnd,
+                Policy {
+                    move_locked: true,
+                    interact_locked: false,
+                },
+            );
+            assert!(state().locked.lock().unwrap().contains_key(&(hwnd.0 as isize)));
+            set_policy(
+                hwnd,
+                Policy {
+                    move_locked: false,
+                    interact_locked: false,
+                },
+            );
+            assert!(!state().locked.lock().unwrap().contains_key(&(hwnd.0 as isize)));
         }
 
-        #[test]
-        fn does_not_swallow_for_unregistered_disabled_window() {
-            // Окно disabled, но НЕ в множестве interact-lock — чужие
-            // disabled-окна (модальные диалоги и т.п.) мы не трогаем.
-            let win = window_for(1000, 1000);
-            let hwnd = win.0;
-            unsafe { let _ = EnableWindow(hwnd, false); };
-            let empty = HashSet::new();
-            assert!(!click_hits_locked_window(pt(1120, 1085), &empty));
-        }
-
-        #[test]
-        fn stale_dead_window_is_ignored() {
-            let win = window_for(1200, 1200);
-            let hwnd = win.0;
-            let mut set = HashSet::new();
-            set.insert(hwnd.0 as isize);
-            drop(win); // окно уничтожено — запись-призрак
-            assert!(!click_hits_locked_window(pt(1320, 1285), &set));
-        }
-
-        #[test]
-        #[ignore = "живой z-order десктопа; запуск вручную: cargo test -p rst-win32 interact_guard -- --ignored"]
-        fn real_desktop_zorder_swallow() {
-            // Сквозная проверка настоящего обхода десктопа: клик по видимому
-            // disabled-окну, созданному последним (оно наверху z-order),
-            // поглощается. Может флакать при параллельном запуске с другими
-            // тестами, создающими topmost-окна — потому и ignored.
-            let win = window_for(700, 700);
-            let hwnd = win.0;
-            unsafe { let _ = EnableWindow(hwnd, false); };
-            let set = locked_with(hwnd);
-            let c = center(hwnd);
-            assert!(click_hits_locked_window(c, &set));
-        }
     }
 }
 
 /// Пользователь В ЭТОТ МОМЕНТ тащит `hwnd` настоящим OS-драгом — модальный
-/// цикл перетаскивания заголовка (`WM_ENTERSIZEMOVE` → `WM_EXITSIZEMOVE`),
-/// который удерживает захват мыши (`GetCapture`) на перемещаемом окне.
-/// Эвристика, а не хук: у resticker нет подкласса чужого окна, а сам факт
-/// «окно в модальном цикле» наружу не выставляется — поэтому по
-/// `GetCapture() == hwnd` (захват модального цикла принадлежит именно
-/// перемещаемому окну) + «левая кнопка нажата». Для обычного драга заголовка
-/// левой кнопкой оба условия выполняются весь драг целиком. Сценарии вне
-/// нашего кейса, где первое условие ложно, не двигают окно и, значит, не
-/// порождают location-change — на enforce не влияют.
+/// цикл перемещения/ресайза (`WM_ENTERSIZEMOVE` → `WM_EXITSIZEMOVE`) в
+/// процессе самого окна.
+///
+/// Источник правды — `GetGUIThreadInfo` потока-владельца окна: флаг
+/// `GUI_INMOVESIZE` + `hwndMoveSize == hwnd`. Это ЕДИНСТВЕННЫЙ способ
+/// узнать о чужом модальном цикле снаружи: подкласса чужого окна у нас нет.
+///
+/// БЫЛО (баг до 2026-08-21): `GetCapture() == hwnd`. `GetCapture` возвращает
+/// окно с захватом мыши в очереди ВЫЗЫВАЮЩЕГО потока — для чужого окна это
+/// всегда NULL, то есть предикат был вечно ложным и «не драться с живым
+/// драгом» никогда не срабатывало.
 fn user_is_dragging_window(hwnd: HWND) -> bool {
-    // SAFETY: GetCapture/GetAsyncKeyState — потокобезопасные чтения
-    // глобального состояния ввода, ресурсов не создают и не требуют; на
-    // мёртвом hwnd сравнение хэндлов — простое числовое, безопасно.
-    unsafe { GetCapture() == hwnd && GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 }
+    // SAFETY: GetWindowThreadProcessId безопасен для чужих и мёртвых окон
+    // (0 — окна нет); GetGUIThreadInfo пишет в наш стек и для чужого потока
+    // легален (это и есть его назначение — межпоточная диагностика ввода).
+    unsafe {
+        let tid = GetWindowThreadProcessId(hwnd, None);
+        if tid == 0 {
+            return false;
+        }
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(tid, &mut info).is_err() {
+            return false;
+        }
+        info.flags.contains(GUI_INMOVESIZE) && info.hwndMoveSize == hwnd
+    }
+}
+
+/// Окно свёрнуто (`IsIconic`) — платформенно-чистая обёртка для
+/// координатора: он решает по этому признаку, прятать окно или уже нечего
+/// (см. `rst_core::pinned_window::host_action`).
+pub fn is_window_minimized(hwnd: usize) -> bool {
+    // SAFETY: IsIconic безопасен для чужих и мёртвых окон.
+    unsafe { IsIconic(hwnd_from_usize(hwnd)) }.as_bool()
+}
+
+/// Прервать модальный цикл перемещения/ресайза, который пользователь ведёт
+/// над `hwnd` прямо сейчас (`WM_CANCELMODE`).
+///
+/// Зачем координатору: потолок размера закреплённого окна нельзя навязать,
+/// пока цикл жив. Реактивная коррекция каждые 16 мс — это тяга-перетяга с
+/// рукой пользователя (дрожь, репорты 2026-08-17 и 2026-08-21), а ожидание
+/// конца жеста означает «окно всё-таки выросло, а потом прыгнуло назад».
+/// Единственный способ остановить рост ровно на границе — закончить сам
+/// жест: `DefWindowProc` на `WM_CANCELMODE` отпускает захват мыши и выходит
+/// из цикла, окно остаётся там, где было, и следующая же коррекция ставит
+/// ему предельный размер один раз, без спора.
+///
+/// Именно `Post`, а не `Send`: ждать чужую очередь сообщений из координатора
+/// нельзя, а цикл сам её качает и заберёт сообщение на ближайшей итерации.
+pub fn cancel_user_gesture(hwnd: usize) {
+    let hwnd = hwnd_from_usize(hwnd);
+    // SAFETY: PostMessageW безопасен для чужого и мёртвого окна (вернёт
+    // ошибку, которую игнорируем).
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Окно развёрнуто на весь монитор (`SW_SHOWMAXIMIZED`) — платформенно-чистая
+/// обёртка для координатора: разворот это тоже «расширение до 100%», и
+/// принудительный потолок размера обязан его снимать, но не бесконечно (см.
+/// `enforce_pinned_geometry`: повторный разворот в течение секунды не
+/// оспаривается, иначе спор с приложением, которое разворачивает себя само,
+/// превратился бы в мигание).
+pub fn is_window_maximized(hwnd: usize) -> bool {
+    is_maximized(hwnd_from_usize(hwnd))
+}
+
+/// Окно развёрнуто на весь монитор (`SW_SHOWMAXIMIZED`). Отдельная
+/// проверка нужна там, где мы навязываем окну размер: развёрнутому окну
+/// `SetWindowPos` меняет прямоугольник, но не снимает `WS_MAXIMIZE`.
+fn is_maximized(hwnd: HWND) -> bool {
+    let mut placement = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: placement заполнена (length обязателен); GetWindowPlacement
+    // безопасен для чужих и мёртвых окон.
+    unsafe { GetWindowPlacement(hwnd, &mut placement) }.is_ok()
+        && placement.showCmd == SW_SHOWMAXIMIZED.0 as u32
+}
+
+/// Пользователь ПРЯМО СЕЙЧАС тащит или ресайзит это окно (модальный цикл
+/// `WM_ENTERSIZEMOVE` в процессе окна) — платформенно-чистая обёртка над
+/// [`user_is_dragging_window`] для координатора: тому нужно знать, «жест ещё
+/// идёт» или «пользователь уже отпустил», чтобы не драться с рукой и
+/// применять магнит/кламп размера ровно один раз после отпускания.
+pub fn is_user_dragging(hwnd: usize) -> bool {
+    user_is_dragging_window(hwnd_from_usize(hwnd))
 }
 
 /// Окно живо И несёт наш маркер. Мёртвое окно — `false`; живое окно с
@@ -1174,6 +2089,11 @@ fn map_pin_err(e: windows::core::Error) -> Win32Error {
 }
 
 fn hwnd_from_usize(hwnd: usize) -> HWND {
+    HWND(hwnd as *mut core::ffi::c_void)
+}
+
+/// То же, но из сырого `HWND.0` (ключи книжек блокировок — `isize`).
+fn hwnd_from_isize(hwnd: isize) -> HWND {
     HWND(hwnd as *mut core::ffi::c_void)
 }
 
@@ -1210,8 +2130,6 @@ mod tests {
     /// Скрытое окно текущего тест-потока (тот же паттерн, что
     /// `TestWindow` в input.rs): нити сообщений не требует — для
     /// `IsWindow`/`SetPropW`/`SetWindowPos`/`DestroyWindow` помп не нужен.
-    /// `pub(super)`: используется и тестами `interact_guard` (предикат
-    /// поглощения кликов).
     pub(super) struct TestWindow(pub(super) HWND);
 
     impl TestWindow {
@@ -1227,28 +2145,7 @@ mod tests {
             Self::create_with(WS_OVERLAPPED | WS_VISIBLE)
         }
 
-        /// Видимое окно в topmost-полосе на явной позиции (тесты
-        /// `interact_guard`): topmost гарантирует детерминированный z-order
-        /// относительно чужих окон десктопа (оверлеев resticker в т.ч.),
-        /// позиция задаётся явно, чтобы параллельные тесты не пересекались.
-        pub(super) fn create_at_topmost(x: i32, y: i32, w: i32, h: i32) -> Self {
-            let win = Self::create_with(WS_OVERLAPPED | WS_VISIBLE);
-            // SAFETY: окно живо; позиционирование без активации/ресайза.
-            unsafe {
-                let _ = SetWindowPos(
-                    win.0,
-                    Some(HWND_TOPMOST),
-                    x,
-                    y,
-                    w,
-                    h,
-                    SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                );
-            }
-            win
-        }
-
-        fn create_with(style: WINDOW_STYLE) -> Self {
+        pub(super) fn create_with(style: WINDOW_STYLE) -> Self {
             // SAFETY: GetModuleHandleW(None) — хэндл текущего модуля.
             let hinstance = unsafe { GetModuleHandleW(None) }.expect("хэндл модуля");
             let wc = WNDCLASSEXW {
@@ -1845,27 +2742,27 @@ mod tests {
         assert!(!pins.enforce_move_lock(hwnd, RECT::default()));
     }
 
-    /// Реальный OS-драг move-locked окна (репорт 2026-08-17): закрепляем
-    /// настоящее видимое окно, включаем move-lock, затем инъекцией реальной
-    /// мыши (SendInput) тащим окно за настоящий заголовок и на каждом шаге
-    /// кормим [`WindowPins::enforce_move_lock`] тем же rect, что скармливал
-    /// бы трекер (`extended_frame_bounds`, как в `maintain_pinned_windows`).
+    /// Реальный OS-драг move-locked окна (репорты 2026-08-17 и 2026-08-20):
+    /// настоящее видимое окно тащат за настоящий заголовок инъекцией мыши
+    /// (`SendInput` — полный путь input-routing, включая LL-хуки).
     ///
-    /// До фикса каждый такой шаг давал snap-back (тяга-перетяга: окно тащит
-    /// мышь, а приложение возвращает его на эталон каждый тик снимка) —
-    /// тест это ловит по `snapped == true` во время драга. После фикса
-    /// move-lock не дерётся с драгом, а ровно один раз возвращает окно на
-    /// эталон ПОСЛЕ отпускания кнопки.
+    /// Фаза A (контроль): БЕЗ замка драг обязан реально двигать окно —
+    /// иначе тест не воспроизвёл перетаскивание и фаза B ничего не значит.
+    /// Фаза B (фикс): с move-lock'ом окно не должно сдвинуться НИ НА ПИКСЕЛЬ:
+    /// страж ввода глотает нажатие по заголовку, модальный цикл не
+    /// запускается. До фикса (реактивный snap-back) окно свободно ездило всё
+    /// время драга и телепортировалось назад только после отпускания — ровно
+    /// то, что видно на видео пользователя.
     #[test]
     #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 window_pin -- --ignored"]
-    fn move_lock_does_not_fight_live_drag() {
+    fn move_lock_blocks_live_drag() {
         use std::time::{Duration, Instant};
+        use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetCapture, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
+            GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
             MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
             VK_LBUTTON,
         };
-        use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::WindowsAndMessaging::{
             GetCursorPos, GetSystemMetrics, GetWindowRect, HWND_TOP, SM_CYCAPTION, SetCursorPos,
             SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, WindowFromPoint,
@@ -1892,82 +2789,45 @@ mod tests {
             }
         }
 
+        fn inject(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32) {
+            // SAFETY: SendInput — системная инъекция ввода.
+            let sent =
+                unsafe { SendInput(&[mouse_input(flags, dx, dy)], size_of::<INPUT>() as i32) };
+            assert_eq!(sent, 1, "SendInput не применился");
+        }
+
+        fn window_rect(hwnd: HWND) -> RECT {
+            let mut r = RECT::default();
+            // SAFETY: окно живо.
+            unsafe { GetWindowRect(hwnd, &mut r) }.expect("GetWindowRect");
+            r
+        }
+
+        fn tracker_rect(hwnd: HWND) -> RECT {
+            let dwm = extended_frame_bounds(hwnd);
+            RECT {
+                left: dwm.x,
+                top: dwm.y,
+                right: dwm.x + dwm.w,
+                bottom: dwm.y + dwm.h,
+            }
+        }
+
         #[derive(Debug)]
         struct Step {
-            /// `left` окна ДО этого tick'а enforce (позиция, куда ушёл драг).
+            /// `left` окна на этом шаге драга (куда его увела мышь).
             window_left: i32,
-            /// Сработал ли на этом шаге snap-back (возврат на эталон).
+            /// Сработал ли snap-back (третий эшелон) на этом шаге.
             snapped: bool,
-            /// Захват модального цикла принадлежит окну (наш эвристический
-            /// признак «пользователь тащит именно это окно»).
-            our_capture: bool,
-            /// Левая кнопка ещё нажата (этот шаг — внутри драга).
+            /// Окно в модальном цикле перемещения (`GUI_INMOVESIZE`).
+            dragging: bool,
+            /// Левая кнопка ещё нажата — шаг внутри драга.
             lbutton_down: bool,
-            /// Позиция курсора после инъекции движения (проверка, что
-            /// инъекция реально двигает мышь в этом сеансе).
+            /// Позиция курсора: проверка, что инъекция реально двигает мышь.
             cursor: (i32, i32),
         }
 
-        let win = RealWindow::create();
-        let hwnd = win.hwnd;
-        let mut pins = WindowPins::new();
-
-        // Положить окно в известное место ВТОРОГО монитора (физические px
-        // виртуального десктопа; второй монитор здесь свободен — на основном
-        // может жить полноэкранное приложение, которое съедало бы инъекцию).
-        // Позиция подбирается так, чтобы заголовок не перекрывали чужие окна.
-        let place = (-1700i32, 500i32);
-        // SAFETY: окно живо; флаги исключают активацию/смену полосы z-order.
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                Some(HWND_TOP),
-                place.0,
-                place.1,
-                200,
-                150,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        }
-        .expect("позиционирование тестового окна");
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Точка в заголовке: центр по X, середина по высоте caption.
-        let mut baseline = RECT::default();
-        // SAFETY: окно живо.
-        unsafe { GetWindowRect(hwnd, &mut baseline) }.expect("GetWindowRect");
-        let caption_h = unsafe { GetSystemMetrics(SM_CYCAPTION) };
-        let cx = baseline.left + (baseline.right - baseline.left) / 2;
-        let cy = baseline.top + caption_h / 2;
-        // Диагностика: окно, которому достанется клик в точке (cx, cy), —
-        // обязано быть нашим, иначе драг не начнётся (полноэкранное чужое
-        // окно сверху съест инъекцию). На занятом десктопе (игра/стрим на
-        // мониторе) так и есть — тест тогда честно пропускает реальный драг
-        // (env busy), а не падает: сам механизм уже покрыт unit-тестами.
-        // SAFETY: WindowFromPoint — чтение hwnd под точкой, безопасно.
-        let hit = unsafe { WindowFromPoint(POINT { x: cx, y: cy }) };
-        if hit != hwnd {
-            eprintln!(
-                "live drag: десктоп занят (клик в ({cx},{cy}) достанется чужому окну {hit:?}, \
-                 не нашему {hwnd:?}) — реальный драг пропущен, механизм покрыт unit-тестами"
-            );
-            return;
-        }
-        pins.set_move_lock(hwnd, true);
-
-        // SAFETY: SetCursorPos — установка курсора в экранных координатах.
-        let _ = unsafe { SetCursorPos(cx, cy) };
-        std::thread::sleep(Duration::from_millis(80));
-
-        // Зажать левую кнопку: DefWindowProc входит в модальный цикл
-        // перетаскивания (WM_ENTERSIZEMOVE) и берёт захват мыши на окно.
-        // SAFETY: SendInput — системная инъекция ввода.
-        let sent =
-            unsafe { SendInput(&[mouse_input(MOUSEEVENTF_LEFTDOWN, 0, 0)], size_of::<INPUT>() as i32) };
-        assert_eq!(sent, 1, "SendInput(LEFTDOWN) не применился");
-        std::thread::sleep(Duration::from_millis(120));
-
-        let deltas: [(i32, i32); 10] = [
+        const DELTAS: [(i32, i32); 10] = [
             (15, 0),
             (15, 8),
             (15, 8),
@@ -1979,144 +2839,171 @@ mod tests {
             (15, 8),
             (15, 0),
         ];
-        let mut steps: Vec<Step> = Vec::new();
-        for (i, (dx, dy)) in deltas.iter().enumerate() {
-            // SAFETY: инъекция относительного движения мыши.
-            let sent = unsafe {
-                SendInput(&[mouse_input(MOUSEEVENTF_MOVE, *dx, *dy)], size_of::<INPUT>() as i32)
-            };
-            assert_eq!(sent, 1, "SendInput(MOVE) шаг {i}");
-            std::thread::sleep(Duration::from_millis(16));
 
-            // Позиция после шага драга — ДО enforce (видна «голая» реакция
-            // окна на мышь, без нашего влияния).
-            let mut wr = RECT::default();
-            // SAFETY: окно живо.
-            unsafe { GetWindowRect(hwnd, &mut wr) }.expect("GetWindowRect");
+        let win = RealWindow::create();
+        let hwnd = win.hwnd;
+        let mut pins = WindowPins::new();
 
-            // То же, что делает координатор: снимок трекера → enforce_move_lock.
-            let dwm = extended_frame_bounds(hwnd);
-            let rect = RECT {
-                left: dwm.x,
-                top: dwm.y,
-                right: dwm.x + dwm.w,
-                bottom: dwm.y + dwm.h,
-            };
-            let snapped = pins.enforce_move_lock(hwnd, rect);
-
-            // SAFETY: чтения глобального состояния ввода.
-            let our_capture = unsafe { GetCapture() } == hwnd;
-            let lbutton_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
-            let mut cur = POINT::default();
-            // SAFETY: GetCursorPos — чтение позиции курсора.
-            let _ = unsafe { GetCursorPos(&mut cur) };
-            steps.push(Step {
-                window_left: wr.left,
-                snapped,
-                our_capture,
-                lbutton_down,
-                cursor: (cur.x, cur.y),
-            });
-        }
-
-        // Отпустить кнопку — модальный цикл завершён (WM_EXITSIZEMOVE).
-        // SAFETY: инъекция отпускания кнопки.
-        let sent =
-            unsafe { SendInput(&[mouse_input(MOUSEEVENTF_LEFTUP, 0, 0)], size_of::<INPUT>() as i32) };
-        assert_eq!(sent, 1, "SendInput(LEFTUP) не применился");
-
-        // После отпускания кормить enforce, пока окно не вернётся на эталон
-        // (реальный трекер сам доставил бы снимок — здесь кормим вручную).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut post_release_snaps = 0u32;
-        let mut final_rect = RECT::default();
-        loop {
-            let dwm = extended_frame_bounds(hwnd);
-            let rect = RECT {
-                left: dwm.x,
-                top: dwm.y,
-                right: dwm.x + dwm.w,
-                bottom: dwm.y + dwm.h,
-            };
-            if pins.enforce_move_lock(hwnd, rect) {
-                post_release_snaps += 1;
+        // Положить окно в известное место ВТОРОГО монитора (физические px
+        // виртуального десктопа; второй монитор здесь свободен — на основном
+        // может жить полноэкранное приложение, которое съедало бы инъекцию).
+        let place = (-1700i32, 500i32);
+        let put_at_baseline = || {
+            // SAFETY: окно живо; флаги исключают активацию/смену полосы z-order.
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOP),
+                    place.0,
+                    place.1,
+                    200,
+                    150,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
             }
-            // SAFETY: окно живо.
-            unsafe { GetWindowRect(hwnd, &mut final_rect) }.expect("GetWindowRect");
-            if final_rect == baseline {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "окно не вернулось на эталон за 5 с: текущий {final_rect:?}, эталон {baseline:?}"
-            );
-            std::thread::sleep(Duration::from_millis(16));
-        }
-
-        // Сводка для `--nocapture`: тряска видна как snap-back'и во время
-        // драга и как окно, не доехавшее за мышью.
-        let during: Vec<&Step> = steps.iter().filter(|s| s.lbutton_down).collect();
-        let snaps = during.iter().filter(|s| s.snapped).count();
-        let xs: Vec<i32> = during.iter().map(|s| s.window_left).collect();
-        let (min_x, max_x) = if xs.is_empty() {
-            (0, 0)
-        } else {
-            (*xs.iter().min().unwrap(), *xs.iter().max().unwrap())
+            .expect("позиционирование тестового окна");
+            std::thread::sleep(Duration::from_millis(200));
         };
-        let spread = max_x - min_x;
-        let cursor_moved = steps
+        put_at_baseline();
+
+        // Точка в заголовке: центр по X, середина по высоте caption.
+        let baseline = window_rect(hwnd);
+        // SAFETY: GetSystemMetrics — чтение системной метрики.
+        let caption_h = unsafe { GetSystemMetrics(SM_CYCAPTION) };
+        let cx = baseline.left + (baseline.right - baseline.left) / 2;
+        let cy = baseline.top + caption_h / 2;
+        // Диагностика: клик в (cx, cy) обязан достаться нашему окну, иначе
+        // драг не начнётся (чужое полноэкранное окно сверху съест инъекцию).
+        // На занятом десктопе тест честно пропускает реальный драг, а не
+        // падает: сам механизм покрыт unit-тестами.
+        // SAFETY: WindowFromPoint — чтение hwnd под точкой, безопасно.
+        let hit = unsafe { WindowFromPoint(POINT { x: cx, y: cy }) };
+        if hit != hwnd {
+            eprintln!(
+                "live drag: десктоп занят (клик в ({cx},{cy}) достанется чужому окну {hit:?}, \
+                 не нашему {hwnd:?}) — реальный драг пропущен, механизм покрыт unit-тестами"
+            );
+            return;
+        }
+
+        // Один сеанс драга за заголовок с кормлением enforce на каждом шаге
+        // (ровно то, что делает координатор по снимку трекера).
+        let drag = |pins: &mut WindowPins| -> Vec<Step> {
+            // SAFETY: SetCursorPos — установка курсора в экранных координатах.
+            let _ = unsafe { SetCursorPos(cx, cy) };
+            std::thread::sleep(Duration::from_millis(120));
+            inject(MOUSEEVENTF_LEFTDOWN, 0, 0);
+            std::thread::sleep(Duration::from_millis(120));
+            let mut steps = Vec::new();
+            for (dx, dy) in DELTAS {
+                inject(MOUSEEVENTF_MOVE, dx, dy);
+                std::thread::sleep(Duration::from_millis(16));
+                let wr = window_rect(hwnd);
+                let snapped = pins.enforce_move_lock(hwnd, tracker_rect(hwnd));
+                let mut cur = POINT::default();
+                // SAFETY: чтения глобального состояния ввода/курсора.
+                let (lbutton_down, cursor) = unsafe {
+                    let down = GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0;
+                    let _ = GetCursorPos(&mut cur);
+                    (down, (cur.x, cur.y))
+                };
+                steps.push(Step {
+                    window_left: wr.left,
+                    snapped,
+                    dragging: user_is_dragging_window(hwnd),
+                    lbutton_down,
+                    cursor,
+                });
+            }
+            inject(MOUSEEVENTF_LEFTUP, 0, 0);
+            std::thread::sleep(Duration::from_millis(200));
+            steps
+        };
+
+        let spread = |steps: &[Step]| -> i32 {
+            let xs: Vec<i32> = steps
+                .iter()
+                .filter(|s| s.lbutton_down)
+                .map(|s| s.window_left)
+                .collect();
+            match (xs.iter().min(), xs.iter().max()) {
+                (Some(min), Some(max)) => max - min,
+                _ => 0,
+            }
+        };
+
+        // --- Фаза A: БЕЗ замка. Инъекция обязана реально таскать окно.
+        let free = drag(&mut pins);
+        let free_spread = spread(&free);
+        let cursor_moved = free
             .first()
-            .zip(steps.last())
+            .zip(free.last())
             .map(|(a, b)| a.cursor != b.cursor)
             .unwrap_or(false);
         eprintln!(
-            "live drag: шагов во время драга={}, snap-back'ов во время драга={}, \
-             разброс left=[{min_x}..{max_x}] ({spread}px), курсор двигался={cursor_moved}, \
-             захват наш={}, финал={final_rect:?} эталон={baseline:?}, \
-             snap-back'ов после отпускания={post_release_snaps}",
-            during.len(),
-            snaps,
-            during.iter().any(|s| s.our_capture),
+            "live drag: без замка разброс left={free_spread}px, курсор двигался={cursor_moved}, \
+             модальный цикл замечен={}",
+            free.iter().any(|s| s.dragging)
+        );
+        assert!(
+            free_spread > 50,
+            "окно не уехало при драге БЕЗ замка — тест не воспроизвёл перетаскивание: {free:#?}"
+        );
+        // Предикат «пользователь тащит окно» обязан срабатывать на живом
+        // драге: на нём стоит защита от драки snap-back'а с рукой
+        // пользователя. Старый `GetCapture() == hwnd` был вечно ложным для
+        // чужого окна — это и был баг (см. `user_is_dragging_window`).
+        assert!(
+            free.iter().any(|s| s.dragging),
+            "GUI_INMOVESIZE не замечен ни на одном шаге живого драга: {free:#?}"
         );
 
-        // Гарантия move-lock: после отпускания окно вернулось на эталон.
-        assert_eq!(final_rect, baseline, "после драга окно обязано вернуться на эталон");
-        // Драг реально шёл (окно уезжало от эталона) — иначе тест не воспроизвёл
-        // перетаскивание и проверки бессмысленны.
-        assert!(spread > 50, "окно не уехало при драге — тест не воспроизвёл перетаскивание");
-        // Захват модального цикла обязан принадлежать окну: на нём стоит
-        // эвристика `user_is_dragging_window`, без этого фикс не найдёт драг.
+        // --- Фаза B: С замком. Окно не должно сдвинуться вовсе.
+        put_at_baseline();
+        let baseline = window_rect(hwnd);
+        pins.set_move_lock(hwnd, true);
+        // Дать потоку-стражу поставить WH_MOUSE_LL.
+        std::thread::sleep(Duration::from_millis(300));
         assert!(
-            during.iter().any(|s| s.our_capture),
-            "заголовок не схвачен окном (GetCapture никогда не был нашим) — драг не начался? {steps:#?}"
+            input_guard::hook_active(),
+            "страж ввода должен быть активен при move-lock"
         );
-        // Главная проверка фикса: во время драга move-lock НЕ дерётся с рукой
-        // пользователя покадрово. До фикса каждый шаг с уехавшим окном давал
-        // snap-back — окно дёргалось между «сдвинуто» и «эталон» на каждом
-        // тике снимка трекера (~16 мс), что и есть тряска/телепорты репорта.
+        let locked = drag(&mut pins);
+        let locked_spread = spread(&locked);
+        let snaps = locked.iter().filter(|s| s.snapped).count();
+        eprintln!(
+            "live drag: с замком разброс left={locked_spread}px, snap-back'ов={snaps}, \
+             модальный цикл замечен={}",
+            locked.iter().any(|s| s.dragging)
+        );
         assert_eq!(
-            snaps, 0,
-            "move-lock дёргал окно во время живого драга ({snaps} snap-back'ов на {} шагов) — \
-             тяга-перетяга с рукой пользователя. Шаги: {steps:#?}",
-            during.len(),
+            locked_spread, 0,
+            "move-locked окно сдвинулось во время драга на {locked_spread}px — \
+             нажатие по заголовку не было проглочено: {locked:#?}"
         );
-        // Нет вечного snap-back-цикла на покое: после возврата на эталон
-        // следующий снимок трекера не должен снова дёргать окно.
-        let dwm = extended_frame_bounds(hwnd);
-        let at_rest = RECT {
-            left: dwm.x,
-            top: dwm.y,
-            right: dwm.x + dwm.w,
-            bottom: dwm.y + dwm.h,
-        };
-        assert!(
-            !pins.enforce_move_lock(hwnd, at_rest),
-            "покоящееся окно на эталоне не должно снова snap-back'аться"
+        assert_eq!(
+            window_rect(hwnd),
+            baseline,
+            "move-locked окно уехало с эталона за время драга"
         );
+        // Раз окно не двигалось, третьему эшелону нечего возвращать.
+        assert_eq!(snaps, 0, "snap-back сработал, хотя окно не двигалось: {locked:#?}");
+
+        // Нет вечного snap-back-цикла на покое: следующий снимок трекера не
+        // должен дёргать неподвижное окно.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            assert!(
+                !pins.enforce_move_lock(hwnd, tracker_rect(hwnd)),
+                "покоящееся окно на эталоне не должно snap-back'аться"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        pins.set_move_lock(hwnd, false);
     }
 
     #[test]
-    fn interact_lock_disables_and_reenables_window() {
+    fn interact_lock_never_disables_window() {
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
         let hwnd = target.0;
@@ -2124,14 +3011,59 @@ mod tests {
         let style = |h: HWND| unsafe { GetWindowLongPtrW(h, GWL_STYLE) } as u32;
 
         pins.set_interact_lock(hwnd, true);
+        // РЕГРЕССИЯ (репорт 2026-08-20): раньше здесь стоял
+        // `EnableWindow(FALSE)`, и `WS_DISABLED` отбирал у окна ВСЁ, включая
+        // перемещение за заголовок. Теперь блокировка живёт только в страже
+        // ввода: стили чужого окна не трогаются вовсе.
         // SAFETY: IsWindowEnabled — чтение состояния живого окна.
-        assert!(!unsafe { IsWindowEnabled(hwnd) }.as_bool(), "ввод заблокирован");
-        assert_ne!(style(hwnd) & WS_DISABLED.0, 0, "EnableWindow ставит WS_DISABLED");
+        assert!(
+            unsafe { IsWindowEnabled(hwnd) }.as_bool(),
+            "interact-lock не должен делать окно disabled"
+        );
+        assert_eq!(style(hwnd) & WS_DISABLED.0, 0, "WS_DISABLED не ставится");
 
         pins.set_interact_lock(hwnd, false);
         // SAFETY: IsWindowEnabled — чтение состояния живого окна.
-        assert!(unsafe { IsWindowEnabled(hwnd) }.as_bool(), "ввод возвращён");
+        assert!(unsafe { IsWindowEnabled(hwnd) }.as_bool());
         assert_eq!(style(hwnd) & WS_DISABLED.0, 0);
+    }
+
+    /// Осиротевший маркер прошлого запуска: окно помечено, но нашей книжки
+    /// оно не знает. Такое окно обязано убираться стартовой уборкой, а если
+    /// всплыло позже — перениматься (репорт 2026-08-21: Проводник и Блокнот
+    /// переживают наши перезапуски и копят «вечные» маркеры).
+    #[test]
+    fn orphan_marker_is_cleared_and_adoptable() {
+        let target = TestWindow::create();
+        let hwnd = target.0;
+        let mut previous_run = WindowPins::new();
+        previous_run.pin(MARKER, key(hwnd)).expect("пин прошлого запуска");
+        // Прошлый запуск «умер» без unpin — маркер остался на окне.
+        drop(previous_run);
+
+        let mut pins = WindowPins::new();
+        assert!(pins.is_pinned(key(hwnd)), "маркер пережил процесс");
+        assert!(
+            matches!(pins.pin(MARKER, key(hwnd)), Err(Win32Error::AlreadyPinned)),
+            "обычный пин обязан отказать — иначе мы бы затирали чужую метку вслепую"
+        );
+
+        // Второй рубеж: перенять окно можно всегда.
+        pins.adopt(MARKER, key(hwnd)).expect("перенять осиротевшее окно");
+        pins.unpin(key(hwnd)).expect("и открепить его");
+        assert!(!pins.is_pinned(key(hwnd)), "маркер снят");
+
+        // Первый рубеж: стартовая уборка снимает маркер по снимку окон.
+        let mut previous_run = WindowPins::new();
+        previous_run.pin(MARKER, key(hwnd)).expect("пин прошлого запуска");
+        drop(previous_run);
+        let fresh = WindowPins::new();
+        let snapshot = vec![WindowInfo {
+            hwnd: key(hwnd),
+            ..Default::default()
+        }];
+        assert_eq!(fresh.clear_orphan_markers(&snapshot), 1);
+        assert!(!fresh.is_pinned(key(hwnd)), "уборка сняла осиротевший маркер");
     }
 
     #[test]
@@ -2141,15 +3073,14 @@ mod tests {
         pins.pin(MARKER, key(target.0)).expect("пин");
         pins.set_move_lock(target.0, true);
         pins.set_interact_lock(target.0, true);
-        // SAFETY: чтение состояния живого окна.
-        assert!(!unsafe { IsWindowEnabled(target.0) }.as_bool());
+        let policy = input_guard::policy_of(target.0).expect("окно зарегистрировано в страже");
+        assert!(policy.move_locked && policy.interact_locked);
 
         pins.unpin(key(target.0)).expect("unpin");
 
-        // Открепление вернуло ввод и забыло move-lock: enforce не двигает
-        // окно даже при расхождении rect'а.
-        // SAFETY: чтение состояния живого окна.
-        assert!(unsafe { IsWindowEnabled(target.0) }.as_bool());
+        // Открепление сняло окно со стража и забыло move-lock: enforce не
+        // двигает окно даже при расхождении rect'а.
+        assert_eq!(input_guard::policy_of(target.0), None);
         let mut rect = RECT::default();
         // SAFETY: чтение прямоугольника живого окна.
         unsafe { GetWindowRect(target.0, &mut rect) }.expect("GetWindowRect");
@@ -2487,8 +3418,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "требует реальный десктоп и реальный ввод; запуск вручную: cargo test -p rst-win32 window_pin interact_guard_swallows_real_click -- --ignored"]
-    fn interact_guard_swallows_real_click_on_locked_window() {
+    #[ignore = "требует реальный десктоп и реальный ввод; запуск вручную: cargo test -p rst-win32 window_pin input_guard_swallows_real_click -- --ignored"]
+    fn input_guard_swallows_real_click_on_locked_window() {
         use std::time::Duration;
         use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -2541,18 +3472,9 @@ mod tests {
         // SAFETY: окно живо.
         unsafe { GetWindowRect(hwnd, &mut rect) }.expect("GetWindowRect");
         let (cx, cy) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
-        let fg_before = unsafe { GetForegroundWindow() };
 
-        // --- Фаза 1: МЕХАНИЗМ БИПА. Окно disabled БЕЗ interact-guard'а (голая
-        // EnableWindow) → реальный клик по нему. Факт (проверен этим тестом):
-        // окно НЕ получает ни WM_MOUSEACTIVATE, ни WM_NCHITTEST, ни
-        // WM_LBUTTONDOWN — система сама обрабатывает клик по disabled top-level
-        // окну (играет звук) и лишь шлёт окну служебное WM_NCACTIVATE/WM_ACTIVATE
-        // из неудачной попытки активации. Именно поэтому перехват в wndproc
-        // бесполезен (ловить нечего), а фикс — WH_MOUSE_LL (фаза 2).
-        // SAFETY: EnableWindow безопасен для своего окна.
-        unsafe { let _ = EnableWindow(hwnd, false); };
-        assert!(!unsafe { IsWindowEnabled(hwnd) }.as_bool());
+        // --- Фаза 1: БАЗА. Окно не заблокировано — реальный клик проходит
+        // весь системный input-routing и доходит до wndproc.
         win.clear_log();
         click_at(cx, cy);
         let msgs = win.log.lock().unwrap().clone();
@@ -2563,50 +3485,56 @@ mod tests {
             "клик должен попадать в тестовое окно (point=({cx},{cy}), hit={hit:?})"
         );
         assert!(
-            !win.received_any(&[WM_MOUSEACTIVATE, 0x0084, WM_LBUTTONDOWN]),
-            "механизм: клик по disabled top-level окну НЕ доходит до wndproc (нет WM_MOUSEACTIVATE/WM_NCHITTEST/WM_LBUTTONDOWN) — бип играет система до диспетчеризации; сообщения: {msgs:?}"
-        );
-        assert!(
-            win.received_any(&[WM_NCACTIVATE, WM_ACTIVATE]),
-            "механизм: система должна обработать клик против окна (WM_NCACTIVATE/WM_ACTIVATE из неудачной активации); сообщения: {msgs:?}"
+            win.received_any(&[WM_MOUSEACTIVATE, WM_LBUTTONDOWN]),
+            "база: незаблокированное окно должно получать клик; сообщения: {msgs:?}"
         );
 
-        // --- Фаза 2: ФИКС. Регистрируем окно в interact-lock (ставится
-        // WH_MOUSE_LL на своём потоке-помпе) → тот же клик поглощается ДО
-        // системного input-routing: окно не получает НИ ОДНОГО сообщения
-        // клика/активации (даже WM_NCACTIVATE) — бипа нет, foreground не
-        // трогается, ввод по-прежнему заблокирован.
+        // --- Фаза 2: ФИКС. interact-lock (страж ввода, WH_MOUSE_LL на своём
+        // потоке-помпе) → тот же клик по КЛИЕНТСКОЙ области поглощается ДО
+        // системного input-routing: окно не получает ни одного сообщения
+        // клика/активации, foreground не трогается.
         pins.set_interact_lock(hwnd, true);
         assert!(
-            interact_guard::hook_active(),
+            input_guard::hook_active(),
             "WH_MOUSE_LL должен быть активен после set_interact_lock"
         );
         // Дать потоку-помпу хука войти в GetMessageW.
         std::thread::sleep(Duration::from_millis(200));
+        let fg_before = unsafe { GetForegroundWindow() };
         win.clear_log();
         click_at(cx, cy);
         let msgs2 = win.log.lock().unwrap().clone();
         assert!(
             !win.received_any(&[WM_MOUSEACTIVATE, WM_LBUTTONDOWN, 0x0084, WM_NCACTIVATE, WM_ACTIVATE]),
-            "клик по interact-locked окну должен быть поглощён ДО системного input-routing (иначе будет бип); сообщения: {msgs2:?}"
+            "клик по interact-locked окну должен быть поглощён ДО системного input-routing; сообщения: {msgs2:?}"
         );
         assert_eq!(
             unsafe { GetForegroundWindow() },
             fg_before,
             "поглощённый клик не должен менять foreground"
         );
+        // РЕГРЕССИЯ (репорт 2026-08-20): interact-lock больше НЕ ставит
+        // WS_DISABLED — иначе он отбирал бы у окна и перемещение, и кнопки
+        // заголовка, и заставлял систему пищать на каждый клик.
         assert!(
-            !unsafe { IsWindowEnabled(hwnd) }.as_bool(),
-            "окно по-прежнему заблокировано (ввод реально не доходит)"
+            unsafe { IsWindowEnabled(hwnd) }.as_bool(),
+            "interact-lock не должен делать окно disabled (иначе ломается перемещение)"
         );
 
-        // Снять блокировку — хук снимается, окну возвращается ввод.
+        // Снять блокировку — хук снимается, клик снова доходит до окна.
         pins.set_interact_lock(hwnd, false);
         assert!(
-            !interact_guard::hook_active(),
+            !input_guard::hook_active(),
             "WH_MOUSE_LL должен сняться после последнего unlock"
         );
-        assert!(unsafe { IsWindowEnabled(hwnd) }.as_bool(), "ввод возвращён");
+        std::thread::sleep(Duration::from_millis(100));
+        win.clear_log();
+        click_at(cx, cy);
+        let msgs3 = win.log.lock().unwrap().clone();
+        assert!(
+            win.received_any(&[WM_MOUSEACTIVATE, WM_LBUTTONDOWN]),
+            "после снятия блокировки клик должен снова доходить; сообщения: {msgs3:?}"
+        );
     }
 
     #[test]

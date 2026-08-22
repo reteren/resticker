@@ -96,6 +96,9 @@ const DICT = {
     'control.muteAll': 'Заглушить всё',
     'control.pinFocusedWindow': 'Закрепить активное окно',
     'control.pinSoundVolume': 'Громкость закрепления окна',
+    'general.outlinePinned': 'Обводка на закреплённом окне',
+    'general.outlinePinnedHint':
+      'Пока окно закреплено, вокруг него держится рамка. Без опции закрепление видно только по булавке в углу окна.',
     'control.notSet': 'Не задан',
     'control.recording': 'Нажмите комбинацию…',
     'control.hintClick': 'Клик по полю, затем нажмите комбинацию клавиш.',
@@ -212,6 +215,9 @@ const DICT = {
     'control.muteAll': 'Mute all',
     'control.pinFocusedWindow': 'Pin focused window',
     'control.pinSoundVolume': 'Pin sound volume',
+    'general.outlinePinned': 'Outline on pinned window',
+    'general.outlinePinnedHint':
+      'Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.',
     'control.notSet': 'Not set',
     'control.recording': 'Press a combination…',
     'control.hintClick': 'Click a field, then press a key combination.',

@@ -20,7 +20,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow,
-    GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
     SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW,
 };
@@ -278,6 +278,32 @@ fn window_flags(hwnd: HWND) -> WindowFlags {
 /// `pub(crate)`: переиспользуется `window_tracker` для точечного обновления
 /// rect одного окна на `EVENT_OBJECT_LOCATIONCHANGE`/`MINIMIZEEND`, не через
 /// полное `enumerate()` (M4_WINDOW_TRACKER_DESIGN.md §4).
+/// Прямоугольник окна ПРЯМО СЕЙЧАС, мимо кэша трекера (те же
+/// DWM-координаты `DWMWA_EXTENDED_FRAME_BOUNDS`, что у [`WindowInfo::rect`]).
+///
+/// Зачем при живом трекере: снимок трекера дебаунсится (16 мс) и приходит
+/// после полного перечисления, поэтому во время ПЕРЕТАСКИВАНИЯ окна
+/// пользователем он отстаёт — нарисованная по нему рамка/бейдж/панель
+/// «отлетают» от окна (репорт 2026-08-21). Для нескольких закреплённых окон
+/// прямой опрос DWM стоит единицы микросекунд на окно и снимает отставание.
+///
+/// `None` — окна нет, оно скрыто, свёрнуто или DWM не отдал границы:
+/// вызывающий в этом случае честно откатывается к снимку.
+pub fn live_rect(hwnd: usize) -> Option<WindowRect> {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: все три предиката безопасны для чужих и мёртвых хэндлов.
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool()
+            || !IsWindowVisible(hwnd).as_bool()
+            || IsIconic(hwnd).as_bool()
+        {
+            return None;
+        }
+    }
+    let rect = extended_frame_bounds(hwnd);
+    (rect.w != 0 && rect.h != 0).then_some(rect)
+}
+
 pub(crate) fn extended_frame_bounds(hwnd: HWND) -> WindowRect {
     let mut rect = RECT::default();
     // SAFETY: `rect` — валидный буфер под RECT, hwnd — из EnumWindows.

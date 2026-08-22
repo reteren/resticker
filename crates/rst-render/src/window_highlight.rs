@@ -43,8 +43,11 @@ impl HighlightKind {
     /// Цвет рамки, RGB.
     pub const fn color(self) -> [u8; 3] {
         match self {
-            // Янтарный — пин.
-            Self::Pin => [0xff, 0xb3, 0x00],
+            // Акцент проекта `#3c9898` — тот же cyan, что у пульса
+            // закрепления и `--accent` в окне настроек (запрос пользователя
+            // 2026-08-22: рамка выделения закреплённого окна была янтарной и
+            // выбивалась из палитры продукта).
+            Self::Pin => [0x3c, 0x98, 0x98],
             // Акцент проекта (тот же синий, что SLIDER_FILL) — наведение.
             Self::Hover => [0x4f, 0x9c, 0xff],
         }
@@ -331,8 +334,8 @@ mod tests {
         assert_ne!(HighlightKind::Pin.color(), HighlightKind::Hover.color());
         assert_eq!(
             HighlightKind::Pin.color(),
-            [0xff, 0xb3, 0x00],
-            "пин — янтарный"
+            [0x3c, 0x98, 0x98],
+            "пин — акцент проекта (cyan), тот же, что у пульса закрепления"
         );
         assert_eq!(
             HighlightKind::Hover.color(),

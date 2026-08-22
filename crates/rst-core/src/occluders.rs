@@ -99,7 +99,22 @@ pub fn is_denylisted(
     title: Option<&str>,
     denylist: &[OverlapRule],
 ) -> bool {
-    denylist
+    any_rule_matches(process_name, title, denylist)
+}
+
+/// Хотя бы одно правило матчит окно `(process_name, title)` — общий предикат
+/// над сырой парой значений, которую отдаёт Win32.
+///
+/// Отдельное имя рядом с [`is_denylisted`] не дублирование, а разделение
+/// смыслов: денй-лист ЗАПРЕЩАЕТ закрепление, а те же по форме правила
+/// «показывать только на этих окнах» ([`crate::pinned_window::host_action`])
+/// наоборот РАЗРЕШАЮТ показ. Одна реализация, два читаемых вызова.
+pub fn any_rule_matches(
+    process_name: Option<&str>,
+    title: Option<&str>,
+    rules: &[OverlapRule],
+) -> bool {
+    rules
         .iter()
         .any(|rule| rule_matches_strs(rule, process_name, title.unwrap_or("")))
 }
