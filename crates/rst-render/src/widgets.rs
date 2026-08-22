@@ -2192,28 +2192,15 @@ pub const PINNED_PANEL_WIDTH: f64 = 320.0;
 /// Кнопка «Показывать только на…»: открывает список окон, чтобы выбрать
 /// окно-хозяина (запрос пользователя 2026-08-22).
 pub const PINNED_BTN_ADD_HOST: WidgetId = 340;
-/// Первая строка списка окон-хозяев; `PINNED_HOST_ROW_BASE + индекс` —
-/// кнопка «убрать это правило».
-pub const PINNED_HOST_ROW_BASE: WidgetId = 350;
-/// Надпись строки правила (неинтерактивная) — тот же приём разделения
-/// «кнопка + надпись», что в списках выбора окон.
-const PINNED_HOST_LABEL_BASE: WidgetId = 380;
-/// Заголовок секции правил.
-const PINNED_LABEL_HOSTS: WidgetId = 339;
-/// Сколько строк правил панель показывает без прокрутки: правил обычно
-/// одно-два, а панель живёт ВНУТРИ окна и не должна разрастаться.
-pub const PINNED_VISIBLE_HOSTS: usize = 4;
+
 
 /// Высота панели инструментов закреплённого окна при `hosts` правилах.
 /// Секция правил появляется целиком (заголовок + строки + кнопка), поэтому
 /// высота считается здесь, а не берётся константой.
-pub fn pinned_lock_panel_height(hosts: usize) -> f64 {
-    let rows = hosts.min(PINNED_VISIBLE_HOSTS) as f64;
-    PINNED_LOCK_PANEL_HEIGHT
-        + PINNED_GAP
-        + PINNED_SECTION_ROW_H // заголовок секции
-        + rows * PINNED_SECTION_ROW_H
-        + PINNED_SECTION_ROW_H // кнопка «Показывать только на…»
+pub fn pinned_lock_panel_height(_hosts: usize) -> f64 {
+    // Одна дополнительная строка — кнопка «Слои видимости»; сам список
+    // правил живёт в редакторе, как у стикера.
+    PINNED_LOCK_PANEL_HEIGHT + PINNED_SECTION_ROW_H
 }
 
 /// Минимальная ширина панели инструментов закреплённого окна, DIP.
@@ -2595,53 +2582,30 @@ pub fn build_pinned_lock_panel(
         "Блокировать клики",
     ));
 
-    // Секция «Показывать только на этих окнах» (запрос пользователя
-    // 2026-08-22): пока список пуст, окно закреплено поверх всего; как
-    // только в нём появляется окно-хозяин, закреплённое окно видно только
-    // когда этот хозяин активен.
-    let mut cy = cy_interact + PINNED_SECTION_ROW_H + PINNED_GAP;
-    panel.add_widget(Label::new(
-        PINNED_LABEL_HOSTS,
-        left,
-        cy,
-        "Показывать только на окнах:",
-    ));
-    for (i, host) in hosts.iter().take(PINNED_VISIBLE_HOSTS).enumerate() {
-        cy += PINNED_SECTION_ROW_H;
-        let remove_cx = frame.cx + frame.w / 2.0 - PINNED_PAD - theme::BUTTON_SIZE / 2.0;
-        panel.add_widget(
-            Button::new(
-                PINNED_HOST_ROW_BASE + i as WidgetId,
-                Box2D {
-                    cx: remove_cx,
-                    cy,
-                    w: theme::BUTTON_SIZE,
-                    h: theme::BUTTON_SIZE,
-                    rotation: 0.0,
-                },
-                ButtonContent::Label("×".to_string()),
-            )
-            .with_style(WidgetStyle::Settings),
-        );
-        panel.add_widget(Label::new(
-            PINNED_HOST_LABEL_BASE + i as WidgetId,
-            left,
-            cy,
-            host,
-        ));
-    }
-    cy += PINNED_SECTION_ROW_H;
+    // Кнопка «Слои видимости» — ровно тот же редактор, что у стикера
+    // (запрос пользователя 2026-08-22: «сделай редактор выбора окон точь в
+    // точь таким же, как у стикеров»): открывает панель выбора окон, где
+    // отмеченные процессы — окна, на которых это закреплённое окно
+    // показывается. Счётчик в подписи — единственное, что панель добавляет
+    // от себя: иначе пришлось бы открывать редактор, чтобы узнать, есть ли
+    // вообще правила.
+    let cy_hosts = cy_interact + PINNED_SECTION_ROW_H;
+    let hosts_label = if hosts.is_empty() {
+        "Слои видимости".to_string()
+    } else {
+        format!("Слои видимости ({})", hosts.len())
+    };
     panel.add_widget(
         Button::new(
             PINNED_BTN_ADD_HOST,
             Box2D {
                 cx: frame.cx,
-                cy,
+                cy: cy_hosts,
                 w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
                 h: theme::BUTTON_SIZE,
                 rotation: 0.0,
             },
-            ButtonContent::Label("Показывать только на…".to_string()),
+            ButtonContent::Label(hosts_label),
         )
         .with_style(WidgetStyle::Settings),
     );

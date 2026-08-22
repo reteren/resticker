@@ -264,6 +264,10 @@ pub struct HostContext<'a> {
     pub target_minimized: bool,
     /// Свернули его МЫ по этим правилам (а не пользователь руками).
     pub hidden_by_rules: bool,
+    /// Пользователь прямо сейчас переключается между окнами средствами
+    /// шелла (Alt+Tab, Win+Tab, меню Пуск, панель задач) — «активного
+    /// приложения» в этот момент фактически нет, он ещё выбирает.
+    pub shell_switching: bool,
 }
 
 /// Решение по видимости закреплённого окна с правилами
@@ -286,6 +290,14 @@ pub struct HostContext<'a> {
 pub fn host_action(ctx: &HostContext) -> HostAction {
     if ctx.rules.is_empty() {
         return HostAction::None; // обычное закрепление поверх всего
+    }
+    if ctx.shell_switching {
+        // Идёт Alt+Tab/Win+Tab/меню Пуск: активен переключатель шелла, а не
+        // приложение. Свернуть или развернуть окно сейчас — значит менять
+        // список прямо под рукой пользователя; переключатель от этого
+        // ломается целиком (критический репорт 2026-08-22). Ждём, пока
+        // выбор закончится: следующий же снимок решит по настоящему окну.
+        return HostAction::None;
     }
     let wanted_visible = ctx.foreground_is_target
         || crate::occluders::any_rule_matches(
@@ -448,7 +460,29 @@ mod tests {
             foreground_title: None,
             target_minimized: false,
             hidden_by_rules: false,
+            shell_switching: false,
         }
+    }
+
+    /// Пока пользователь переключается через Alt+Tab, окно не трогаем
+    /// вовсе: активен переключатель шелла, а не приложение (критический
+    /// репорт 2026-08-22 — иначе ломается сам Alt+Tab).
+    #[test]
+    fn host_action_freezes_while_shell_is_switching() {
+        let rules = [rule_for("chrome.exe")];
+        let mut c = ctx(&rules, Some("notepad.exe"));
+        c.shell_switching = true;
+        assert_eq!(host_action(&c), HostAction::None, "не прячем во время Alt+Tab");
+
+        // И не разворачиваем: список переключателя не должен меняться.
+        c.foreground_process = Some("chrome.exe");
+        c.target_minimized = true;
+        c.hidden_by_rules = true;
+        assert_eq!(host_action(&c), HostAction::None, "и не показываем");
+
+        // Переключение закончилось — решение принимается как обычно.
+        c.shell_switching = false;
+        assert_eq!(host_action(&c), HostAction::Show);
     }
 
     /// Без правил фича молчит: обычное закрепление ведёт себя как раньше.

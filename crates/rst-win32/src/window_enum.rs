@@ -24,6 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN,
+};
 use windows::core::{BOOL, PWSTR};
 
 use crate::window_icon;
@@ -278,6 +281,62 @@ fn window_flags(hwnd: HWND) -> WindowFlags {
 /// `pub(crate)`: переиспользуется `window_tracker` для точечного обновления
 /// rect одного окна на `EVENT_OBJECT_LOCATIONCHANGE`/`MINIMIZEEND`, не через
 /// полное `enumerate()` (M4_WINDOW_TRACKER_DESIGN.md §4).
+/// Классы окон, которые шелл показывает НА ВРЕМЯ переключения или своего
+/// меню: переключатель Alt+Tab и Win+Tab, меню Пуск, поиск, панель задач.
+///
+/// Пока такое окно на переднем плане, «активного приложения» фактически нет:
+/// пользователь ещё выбирает. Любое вмешательство в чужие окна в этот момент
+/// ломает сам переключатель — см. [`shell_switching`].
+const SHELL_TRANSIENT_CLASSES: [&str; 8] = [
+    "MultitaskingViewFrame",         // Win10 Task View / Alt+Tab
+    "XamlExplorerHostIslandWindow",  // Win11 Alt+Tab и Win+Tab
+    "TaskSwitcherWnd",               // классический Alt+Tab
+    "TaskSwitcherOverlayWnd",        // его оверлей
+    "ForegroundStaging",             // промежуточное окно переключения
+    "Windows.UI.Core.CoreWindow",    // меню Пуск, поиск
+    "Shell_TrayWnd",                 // панель задач
+    "Shell_SecondaryTrayWnd",        // панель задач на втором мониторе
+];
+
+/// Пользователь ПРЯМО СЕЙЧАС переключается между окнами средствами шелла
+/// (Alt+Tab, Win+Tab, меню Пуск, клик по панели задач).
+///
+/// Зачем: правила «показывать только на этих окнах» решают судьбу
+/// закреплённого окна по активному окну и при неподходящем активном окне
+/// сворачивают его. Во время Alt+Tab активным становится сам переключатель,
+/// и наивная логика немедленно сворачивала/разворачивала окно прямо под
+/// рукой пользователя — переключатель ломался, Alt+Tab переставал работать
+/// до перехода в другое приложение через панель задач (критический репорт
+/// пользователя 2026-08-22).
+///
+/// Два независимых признака, любой достаточен:
+/// * зажат Alt или Win — то есть комбинация переключения ещё удерживается;
+/// * переднее окно принадлежит шеллу ([`SHELL_TRANSIENT_CLASSES`]).
+///
+/// Пока это верно, координатор обязан НИЧЕГО не делать с чужими окнами:
+/// решение примется само, когда пользователь отпустит клавиши и шелл отдаст
+/// передний план настоящему окну.
+pub fn shell_switching() -> bool {
+    // SAFETY: GetAsyncKeyState — потокобезопасное чтение состояния ввода.
+    let keys_held = unsafe {
+        GetAsyncKeyState(VK_MENU.0 as i32) < 0
+            || GetAsyncKeyState(VK_LWIN.0 as i32) < 0
+            || GetAsyncKeyState(VK_RWIN.0 as i32) < 0
+    };
+    if keys_held {
+        return true;
+    }
+    // SAFETY: GetForegroundWindow — чтение состояния десктопа.
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return false;
+    }
+    let class = window_class(fg);
+    SHELL_TRANSIENT_CLASSES
+        .iter()
+        .any(|known| class.eq_ignore_ascii_case(known))
+}
+
 /// Прямоугольник окна ПРЯМО СЕЙЧАС, мимо кэша трекера (те же
 /// DWM-координаты `DWMWA_EXTENDED_FRAME_BOUNDS`, что у [`WindowInfo::rect`]).
 ///

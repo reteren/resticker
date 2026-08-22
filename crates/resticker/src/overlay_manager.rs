@@ -38,7 +38,7 @@ use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{
     Config, Hotkeys, MediaType, MonitorId, OverlapRule, Placement, Rect, Settings, Sticker,
-    StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode,
+    StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode, VisibilityRule,
 };
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
@@ -1065,12 +1065,12 @@ struct EditState {
     /// нуждается в `window_snapshot`, которого нет в `handle_toolbar_up`
     /// (дизайн §5.2); фактическое открытие происходит в цикле `run()`,
     /// где снимок под рукой, сразу после обработки текущего сообщения.
-    pending_open_picker: Option<Uuid>,
+    pending_open_picker: Option<PickerTarget>,
     /// Установлен кликом по `BTN_ADD_WINDOW` (`handle_cursor_panel_up`) — тот
     /// же повод, что у `pending_open_picker`: открытие списка нуждается в
     /// `window_snapshot`, которого нет в `handle_cursor_panel_up`; несёт
     /// монитор, на котором открывать панель (кнопка нажата на нём же).
-    pending_open_pick_list: Option<(MonitorId, PickListPurpose)>,
+    pending_open_pick_list: Option<MonitorId>,
     /// Открытый список окон для закрепления как стикер (M6, SPEC.md §5.1;
     /// `window_pick_list.rs`) — установлен кликом по `BTN_ADD_WINDOW`, снят
     /// кликом по строке (закрепляет выбранное окно), кликом мимо панели или
@@ -1247,8 +1247,21 @@ struct ConfirmState {
 /// `cursor_panel`/`ConfirmState.panel` — чтобы `Panel` могла держать
 /// hover/armed-состояние своих чекбоксов между кадрами; `rebuild_window_picker`
 /// перестраивает её заново при мутации `cfg` или новом снимке окон.
+/// Чьи правила правит панель выбора окон. Панель одна и та же (запрос
+/// пользователя 2026-08-22: «сделай редактор выбора окон точь в точь как у
+/// стикеров»), но набор правил живёт в разных местах и означает разное:
+/// у стикера — «поверх каких окон он остаётся видимым», у закреплённого
+/// окна — «на каких окнах его показывать».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerTarget {
+    Sticker(Uuid),
+    /// Закреплённое окно (`PinnedWindow::host_rules`), правила рантайм —
+    /// ни `config.json`, ни undo, ни маски окклюдеров они не трогают.
+    PinnedHost(isize),
+}
+
 struct WindowPickerState {
-    sticker_id: Uuid,
+    target: PickerTarget,
     panel: Panel,
     /// Сколько строк списка пропущено сверху (виртуализация, дизайн §7.4).
     scroll: usize,
@@ -1282,20 +1295,6 @@ struct WindowPickListState {
     panel: Panel,
     monitor_id: MonitorId,
     scroll: usize,
-    /// Зачем список открыт — см. [`PickListPurpose`].
-    purpose: PickListPurpose,
-}
-
-/// Зачем открыт список окон: он обслуживает два разных сценария, и клик по
-/// строке значит в них разное.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PickListPurpose {
-    /// Закрепить выбранное окно (исходный сценарий, кнопка «Добавить окно»).
-    PinWindow,
-    /// Выбрать окно-ХОЗЯИНА для уже закреплённого окна `target`: клик
-    /// добавляет правило «показывать только на нём» (запрос пользователя
-    /// 2026-08-22).
-    ChooseHost { target: isize },
 }
 
 /// Открытая панель свойств закреплённого окна (минимальная версия по
@@ -3171,14 +3170,20 @@ fn run(
                 // 2026-08-18) — пока хоть один жив, редрав нужен: прозрачность
                 // меняется каждый кадр. Истёкшие (старше 1 с) вычищаем здесь
                 // же — иначе копились бы вечно.
-                if edit
-                    .pin_flashes
-                    .iter()
-                    .any(|f| !f.expired(now))
-                {
+                if edit.pin_flashes.iter().any(|f| !f.expired(now)) {
                     need_redraw = true;
                 }
+                // Кадр нужен и на такте, когда пульс ТОЛЬКО ЧТО истёк: без
+                // него на экране навсегда остаётся последний нарисованный
+                // кадр рамки — с той прозрачностью, до которой она успела
+                // угаснуть (репорт пользователя 2026-08-22: «обводка не
+                // пропадает полностью и остаётся на 5-10%»). Тот же
+                // принцип, что у баннера ниже.
+                let before = edit.pin_flashes.len();
                 edit.pin_flashes.retain(|f| !f.expired(now));
+                if edit.pin_flashes.len() != before {
+                    need_redraw = true;
+                }
                 // Закреплённое окно сейчас тащат/ресайзят силами ОС: кадр
                 // обязан идти вровень с ним, а панель инструментов — ехать
                 // вместе с окном (она рисуется ВНУТРИ него).
@@ -3209,6 +3214,9 @@ fn run(
                 }
                 if edit.banner.as_ref().is_some_and(|b| b.expired(now)) {
                     edit.banner = None;
+                    // Тот же случай, что у пульса: истёкший баннер обязан
+                    // исчезнуть с экрана, а для этого нужен ещё один кадр.
+                    need_redraw = true;
                 }
                 // Тултип ещё анимируется (задержка показа или плавное
                 // появление, фидбэк пользователя 2026-08-10) — редрав нужен,
@@ -3482,13 +3490,13 @@ fn run(
         // Открытие панели выбора окон отложено до этой точки — кликом по
         // `TB_LAYERS` в `handle_toolbar_up`, у которого нет `window_snapshot`
         // (дизайн §5.2); здесь, в цикле `run()`, снимок уже под рукой.
-        if let Some(sticker_id) = edit.pending_open_picker.take() {
+        if let Some(picker_target) = edit.pending_open_picker.take() {
             open_window_picker(
                 &mut edit,
                 &cfg,
                 &window_snapshot,
                 &monitor_geometry,
-                sticker_id,
+                picker_target,
             );
             need_redraw = true;
         }
@@ -3508,10 +3516,9 @@ fn run(
         // десятках). `rebuild_window_pick_list` ниже по `Windows(Changed)`
         // и дальше продолжает читать живой кэш как обычно — разовое
         // перечисление нужно только для первого кадра.
-        if let Some((monitor_id, purpose)) = edit.pending_open_pick_list.take() {
+        if let Some(monitor_id) = edit.pending_open_pick_list.take() {
             let fresh_snapshot = rst_win32::window_enum::enumerate();
             open_window_pick_list(
-                purpose,
                 &mut edit,
                 &cfg,
                 &fresh_snapshot,
@@ -5599,7 +5606,8 @@ fn rebuild_ui_panels(
     // выбрано, и должна закрыться (M4_WINDOW_PICKER_DESIGN.md §1). Снимок
     // окон здесь не нужен — закрытие, а не пересборка содержимого.
     if let Some(state) = &edit.window_picker {
-        if single_selected_id(&edit.selection) != Some(state.sticker_id) {
+        if !matches!(state.target, PickerTarget::Sticker(id) if single_selected_id(&edit.selection) == Some(id))
+        {
             edit.window_picker = None;
         }
     }
@@ -5616,13 +5624,23 @@ fn open_window_picker(
     cfg: &Config,
     window_snapshot: &[WindowInfo],
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
-    sticker_id: Uuid,
+    target: PickerTarget,
 ) {
-    let Some(monitor_id) = toolbar_monitor(&edit.selection, cfg).cloned() else {
+    // Монитор панели: у стикера — тот же, где стоит его тулбар; у
+    // закреплённого окна — монитор его панели инструментов (окно может
+    // лежать где угодно, а панель уже привязана).
+    let Some(monitor_id) = (match target {
+        PickerTarget::Sticker(_) => toolbar_monitor(&edit.selection, cfg).cloned(),
+        PickerTarget::PinnedHost(_) => edit
+            .pinned_panel
+            .as_ref()
+            .map(|s| s.monitor_id.clone())
+            .or_else(|| Some(edit.cursor_monitor.clone())),
+    }) else {
         return;
     };
     edit.window_picker = Some(WindowPickerState {
-        sticker_id,
+        target,
         // Плейсхолдер — `rebuild_window_picker` ниже строит настоящую
         // панель немедленно, до первой отрисовки.
         panel: Panel::new(
@@ -5657,16 +5675,37 @@ fn rebuild_window_picker(
     let Some(state) = &mut edit.window_picker else {
         return;
     };
-    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == state.sticker_id) else {
-        // Стикер удалён/пропал, пока панель была открыта.
-        edit.window_picker = None;
-        return;
-    };
+    let target = state.target;
     let Some(&(w, h, scale)) = monitor_geometry.get(&state.monitor_id) else {
         edit.window_picker = None;
         return;
     };
-    let visibility = sticker.visibility.clone();
+    // Состояние чекбоксов панель читает из правил (дизайн §2.1). У
+    // закреплённого окна те же правила лежат в `host_rules`, поэтому
+    // синтезируем из них ту же структуру: панель остаётся ровно той же.
+    let visibility = match target {
+        PickerTarget::Sticker(id) => match cfg.stickers.iter().find(|s| s.id == id) {
+            Some(sticker) => sticker.visibility.clone(),
+            None => {
+                // Стикер удалён/пропал, пока панель была открыта.
+                edit.window_picker = None;
+                return;
+            }
+        },
+        PickerTarget::PinnedHost(hwnd) => {
+            match edit.pinned_windows.iter().find(|p| p.hwnd == hwnd) {
+                Some(pinned) => host_rules_as_visibility(&pinned.host_rules),
+                None => {
+                    edit.window_picker = None;
+                    return;
+                }
+            }
+        }
+    };
+    let desktop_preset = matches!(target, PickerTarget::Sticker(_));
+    let Some(state) = &mut edit.window_picker else {
+        return;
+    };
     let screen = screen_dip_rect((w, h), scale);
     let frame = Box2D {
         cx: screen.w / 2.0,
@@ -5675,8 +5714,13 @@ fn rebuild_window_picker(
         h: window_picker::PICKER_HEIGHT,
         rotation: 0.0,
     };
-    let mut result =
-        window_picker::build_picker_panel(&visibility, window_snapshot, state.scroll, frame);
+    let mut result = window_picker::build_picker_panel(
+        &visibility,
+        window_snapshot,
+        state.scroll,
+        frame,
+        desktop_preset,
+    );
     // Снимок окон мог сжаться (окна закрылись) — скролл, валидный раньше,
     // теперь может указывать за конец списка и строить пустую страницу;
     // кламп и один повторный билд чинят это без падения (`build_picker_panel`
@@ -5684,8 +5728,13 @@ fn rebuild_window_picker(
     // не строит ни одной строки).
     if result.total_rows > 0 && state.scroll >= result.total_rows {
         state.scroll = result.total_rows - 1;
-        result =
-            window_picker::build_picker_panel(&visibility, window_snapshot, state.scroll, frame);
+        result = window_picker::build_picker_panel(
+            &visibility,
+            window_snapshot,
+            state.scroll,
+            frame,
+            desktop_preset,
+        );
     } else if result.total_rows == 0 {
         state.scroll = 0;
     }
@@ -5699,7 +5748,6 @@ fn rebuild_window_picker(
 /// докком у объявления поля) — `handle_cursor_panel_up` не имеет
 /// `window_snapshot`, которым список наполняется.
 fn open_window_pick_list(
-    purpose: PickListPurpose,
     edit: &mut EditState,
     cfg: &Config,
     window_snapshot: &[WindowInfo],
@@ -5710,7 +5758,6 @@ fn open_window_pick_list(
         return;
     }
     edit.window_pick_list = Some(WindowPickListState {
-        purpose,
         // Плейсхолдер — `rebuild_window_pick_list` ниже строит настоящую
         // панель немедленно, до первой отрисовки.
         panel: Panel::new(
@@ -6083,12 +6130,27 @@ fn handle_window_picker_up(
         return true;
     };
     state.panel.pointer_event(PointerEvent::Up { pos });
-    let sticker_id = state.sticker_id;
-    if !cfg.stickers.iter().any(|s| s.id == sticker_id) {
-        // Стикер удалён, пока панель была открыта, — закрыть её.
-        edit.window_picker = None;
-        return true;
-    }
+    let target = state.target;
+    let sticker_id = match target {
+        PickerTarget::Sticker(id) => {
+            if !cfg.stickers.iter().any(|s| s.id == id) {
+                // Стикер удалён, пока панель была открыта, — закрыть её.
+                edit.window_picker = None;
+                return true;
+            }
+            id
+        }
+        PickerTarget::PinnedHost(hwnd) => {
+            if !edit.pinned_windows.iter().any(|p| p.hwnd == hwnd) {
+                // Окно откреплено/уничтожено, пока панель была открыта.
+                edit.window_picker = None;
+                return true;
+            }
+            // Ниже ветки стикера защищены `matches!(target, Sticker)`;
+            // это значение в них не попадает.
+            Uuid::nil()
+        }
+    };
 
     let select_all_clicked = edit
         .window_picker
@@ -6099,6 +6161,22 @@ fn handle_window_picker_up(
         })
         .is_some_and(Button::take_click);
     if select_all_clicked {
+        if let PickerTarget::PinnedHost(hwnd) = target {
+            // Рантайм-правила закреплённого окна: без undo, без записи в
+            // config.json и без пересчёта масок — всё это про стикеры.
+            let updated = {
+                let current = edit
+                    .pinned_windows
+                    .iter()
+                    .find(|p| p.hwnd == hwnd)
+                    .map(|p| host_rules_as_visibility(&p.host_rules))
+                    .unwrap_or_else(|| host_rules_as_visibility(&[]));
+                window_picker::toggle_select_all(&current, window_snapshot)
+            };
+            apply_host_rules(edit, hwnd, updated, window_snapshot, monitor_bounds);
+            rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+            return true;
+        }
         commit_undo_snapshot(edit, cfg.clone());
         let sticker = cfg
             .stickers
@@ -6128,7 +6206,7 @@ fn handle_window_picker_up(
                 .widget_mut::<Button>(window_picker::PICKER_BTN_DESKTOP_ONLY)
         })
         .is_some_and(Button::take_click);
-    if desktop_only_clicked {
+    if desktop_only_clicked && matches!(target, PickerTarget::Sticker(_)) {
         commit_undo_snapshot(edit, cfg.clone());
         let sticker = cfg
             .stickers
@@ -6161,13 +6239,29 @@ fn handle_window_picker_up(
         if !toggled {
             continue;
         }
+        if let PickerTarget::PinnedHost(hwnd) = target {
+            let updated = {
+                let current = edit
+                    .pinned_windows
+                    .iter()
+                    .find(|p| p.hwnd == hwnd)
+                    .map(|p| host_rules_as_visibility(&p.host_rules))
+                    .unwrap_or_else(|| host_rules_as_visibility(&[]));
+                window_picker::toggle_process_group(&current, group, window_snapshot)
+            };
+            if let Some(updated) = updated {
+                apply_host_rules(edit, hwnd, updated, window_snapshot, monitor_bounds);
+            }
+            rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+            return true;
+        }
         commit_undo_snapshot(edit, cfg.clone());
         let sticker = cfg
             .stickers
             .iter_mut()
             .find(|s| s.id == sticker_id)
             .expect("наличие стикера проверено выше");
-        if let Some(new_rule) = window_picker::toggle_process_group(&sticker.visibility, group) {
+        if let Some(new_rule) = window_picker::toggle_process_group(&sticker.visibility, group, window_snapshot) {
             sticker.visibility = new_rule;
         }
         if let Err(e) = config::save(cfg, config_path) {
@@ -6482,6 +6576,9 @@ fn maintain_pinned_windows(
     // «показывать ли окно с правилами». Берём из того же снимка трекера,
     // которым живёт весь координатор; переднего окна может не быть вовсе
     // (рабочий стол) — тогда правила заведомо не выполнены.
+    // Идёт Alt+Tab/Win+Tab/меню Пуск — на время переключения чужие окна не
+    // трогаем вовсе (см. `rst_win32::window_enum::shell_switching`).
+    let shell_switching = rst_win32::window_enum::shell_switching();
     let foreground_info = foreground.and_then(|hwnd| {
         window_snapshot
             .iter()
@@ -6504,6 +6601,7 @@ fn maintain_pinned_windows(
                 foreground_title: foreground_info.as_ref().map(|(_, title)| title.as_str()),
                 target_minimized: rst_win32::window_pin::is_window_minimized(hwnd),
                 hidden_by_rules: pinned.hidden_by_rules,
+                shell_switching,
             });
             match action {
                 pinned_window::HostAction::Hide => {
@@ -6600,7 +6698,24 @@ fn resume_pin_enforcement(edit: &EditState, window_pins: &mut WindowPins) {
 /// z-order Windows после снятия topmost (SPEC: «no forced refocus»).
 /// Пульс рамки — по подтверждению пользователя (2026-08-18) на ОБА
 /// направления: пин и анпин.
+/// Вернуть окну штатные анимации переходов (см.
+/// [`WindowPins::set_transitions_disabled`]) — обязательная часть
+/// открепления: чужому окну мы не вправе оставлять изменённое поведение.
+fn restore_window_transitions(window_pins: &WindowPins, hwnd: usize) {
+    window_pins.set_transitions_disabled(HWND(hwnd as *mut core::ffi::c_void), false);
+}
+
 fn unpin_window(edit: &mut EditState, window_pins: &mut WindowPins, hwnd: usize) {
+    // Свёрнутое правилами окно обязано вернуться пользователю: после
+    // открепления никто больше не покажет его за нас.
+    if edit
+        .pinned_windows
+        .iter()
+        .any(|p| p.hwnd == hwnd as isize && p.hidden_by_rules)
+    {
+        window_pins.show_for_host(HWND(hwnd as *mut core::ffi::c_void));
+    }
+    restore_window_transitions(window_pins, hwnd);
     if let Err(e) = window_pins.unpin(hwnd) {
         tracing::warn!(hwnd, error = %e, "не удалось открепить окно");
     }
@@ -6731,67 +6846,77 @@ fn handle_window_pick_list_up(
             .is_some_and(Button::take_click)
             .then_some(window.hwnd)
     });
-    let purpose = edit
-        .window_pick_list
-        .as_ref()
-        .map_or(PickListPurpose::PinWindow, |s| s.purpose);
     edit.window_pick_list = None;
     let Some(hwnd) = clicked_hwnd else {
         return true;
     };
-    match purpose {
-        PickListPurpose::PinWindow => {
-            pin_window(edit, window_snapshot, monitor_bounds, window_pins, hwnd);
-        }
-        PickListPurpose::ChooseHost { target } => {
-            add_host_rule(edit, window_snapshot, monitor_bounds, target, hwnd);
-        }
-    }
+    pin_window(edit, window_snapshot, monitor_bounds, window_pins, hwnd);
     true
 }
 
-/// Добавить окно `host` в список «показывать только на этих окнах» у
-/// закреплённого окна `target` (клик по строке списка окон, запрос
-/// пользователя 2026-08-22).
-///
-/// Правило создаётся ПО ПРОЦЕССУ, а не по заголовку: заголовок у браузера
-/// меняется на каждой вкладке, а пользователь показал пальцем на
-/// приложение. Имя короткое (`chrome.exe`) — так правило переживает и
-/// перезапуск приложения, и его переустановку в другой каталог
-/// (`occluders::any_rule_matches` сравнивает короткое имя с полным путём
-/// снимка тем же способом, что денй-лист).
-///
-/// Повторный выбор того же приложения — no-op: одинаковые правила ничего не
-/// добавляют, а список замусоривают.
-fn add_host_rule(
+/// Правила «показывать только на этих окнах» в виде правила видимости —
+/// формы, которую понимает панель выбора окон
+/// ([`window_picker::build_picker_panel`]). Никакой семантики стикера тут
+/// нет: панель читает из этой структуры ровно «какие процессы отмечены».
+fn host_rules_as_visibility(rules: &[OverlapRule]) -> VisibilityRule {
+    if rules.is_empty() {
+        // Правил нет — окно закреплено поверх ВСЕГО, то есть показывается
+        // на любом окне. В панели это и должно читаться как «выбраны все»
+        // (запрос пользователя 2026-08-22), а такое состояние в модели
+        // выражает именно `Always`.
+        return VisibilityRule {
+            mode: VisibilityMode::Always,
+            rules: Vec::new(),
+        };
+    }
+    VisibilityRule {
+        mode: VisibilityMode::OverlapAllowlist,
+        rules: rules.to_vec(),
+    }
+}
+
+/// Записать новый список окон-хозяев закреплённому окну и привести его
+/// состояние в порядок: список опустел — окно снова обычный пин, и если мы
+/// его прятали, вернуть обязаны мы же.
+fn apply_host_rules(
     edit: &mut EditState,
+    hwnd: isize,
+    updated: VisibilityRule,
     window_snapshot: &[WindowInfo],
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
-    target: isize,
-    host: usize,
 ) {
-    let Some(process) = window_snapshot
-        .iter()
-        .find(|w| w.hwnd == host)
-        .and_then(|w| w.exe_path.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
-    else {
-        tracing::warn!(host, "не удалось определить процесс окна-хозяина — правило не добавлено");
-        return;
+    // Обратный перевод из формы панели: «выбраны все» (`Always`) и пустой
+    // список — одно и то же «ограничений нет». Состояния «не показывать
+    // нигде» у закреплённого окна нет намеренно: окно, которое не видно
+    // никогда, бесполезно, а вернуть его пользователю было бы нечем.
+    let rules = match updated.mode {
+        VisibilityMode::Always => Vec::new(),
+        _ => updated.rules,
     };
-    if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == target) {
-        let already = pinned.host_rules.iter().any(|rule| {
-            rule.process_name
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case(&process))
-        });
-        if !already {
-            pinned.host_rules.push(OverlapRule {
-                process_name: Some(process),
-                title_pattern: None,
-            });
+    let mut restore = false;
+    if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == hwnd) {
+        pinned.host_rules = rules;
+        if pinned.host_rules.is_empty() && pinned.hidden_by_rules {
+            restore = true;
+            pinned.hidden_by_rules = false;
         }
     }
+    let win_hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    let pins = WindowPins::new();
+    if restore {
+        // Показ свёрнутого окна — тот же примитив, что у `HostAction::Show`.
+        pins.show_for_host(win_hwnd);
+    }
+    // Пока у окна есть правила, оно будет сворачиваться и возвращаться по
+    // смене активного окна — со штатной анимацией это выглядит как задержка
+    // в четверть секунды (репорт 2026-08-22). Выключаем переходы ровно на
+    // время действия правил и возвращаем их, когда правил не осталось.
+    let has_rules = edit
+        .pinned_windows
+        .iter()
+        .find(|p| p.hwnd == hwnd)
+        .is_some_and(|p| !p.host_rules.is_empty());
+    pins.set_transitions_disabled(win_hwnd, has_rules);
     rebuild_pinned_panel(edit, window_snapshot, monitor_bounds);
 }
 
@@ -6869,7 +6994,7 @@ fn handle_pinned_panel_up(
         return true;
     }
 
-    // «Показывать только на…» — открыть список окон в режиме выбора хозяина.
+    // «Слои видимости» — тот же редактор выбора окон, что у стикера.
     if edit
         .pinned_panel
         .as_mut()
@@ -6881,41 +7006,9 @@ fn handle_pinned_panel_up(
             .as_ref()
             .map(|s| s.monitor_id.clone())
             .unwrap_or_else(|| edit.cursor_monitor.clone());
-        edit.pending_open_pick_list =
-            Some((monitor_id, PickListPurpose::ChooseHost { target: hwnd }));
+        let _ = monitor_id;
+        edit.pending_open_picker = Some(PickerTarget::PinnedHost(hwnd));
         return true;
-    }
-
-    // «×» в строке правила — убрать это окно-хозяина.
-    let host_count = edit
-        .pinned_windows
-        .iter()
-        .find(|p| p.hwnd == hwnd)
-        .map_or(0, |p| p.host_rules.len());
-    for index in 0..host_count.min(rst_render::PINNED_VISIBLE_HOSTS) {
-        let clicked = edit
-            .pinned_panel
-            .as_mut()
-            .and_then(|s| {
-                s.panel
-                    .widget_mut::<Button>(rst_render::PINNED_HOST_ROW_BASE + index as WidgetId)
-            })
-            .is_some_and(Button::take_click);
-        if clicked {
-            if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == hwnd) {
-                if index < pinned.host_rules.len() {
-                    pinned.host_rules.remove(index);
-                }
-                // Список опустел — окно снова обычный пин поверх всего; если
-                // мы его прятали, вернуть обязаны мы же.
-                if pinned.host_rules.is_empty() && pinned.hidden_by_rules {
-                    window_pins.show_for_host(HWND(hwnd as *mut core::ffi::c_void));
-                    pinned.hidden_by_rules = false;
-                }
-            }
-            rebuild_pinned_panel(edit, window_snapshot, monitor_bounds);
-            return true;
-        }
     }
 
     let move_toggled = edit
@@ -7122,7 +7215,7 @@ fn handle_toolbar_up(
         // если панель уже открыта (для любого стикера — в т.ч. этого же),
         // закрыть её сразу же, без похода в `run()`.
         if edit.window_picker.take().is_none() {
-            edit.pending_open_picker = Some(id);
+            edit.pending_open_picker = Some(PickerTarget::Sticker(id));
         }
         return true;
     }
@@ -7322,7 +7415,7 @@ fn handle_cursor_panel_up(
         // отложено до цикла `run()` (`pending_open_pick_list`), у
         // `handle_cursor_panel_up` нет `window_snapshot`, которым список
         // наполняется (тот же повод, что у `pending_open_picker`/`TB_LAYERS`).
-        edit.pending_open_pick_list = Some((monitor_id.clone(), PickListPurpose::PinWindow));
+        edit.pending_open_pick_list = Some(monitor_id.clone());
         return true;
     }
     if clicked(edit, cursor_panel::BTN_PRESETS) {
@@ -10069,7 +10162,6 @@ mod tests {
         let cfg = Config::default();
         let mut edit = mask_gate_edit_state();
         edit.window_pick_list = Some(WindowPickListState {
-            purpose: PickListPurpose::PinWindow,
             panel: Panel::new(
                 window_pick_list::PANEL_ID,
                 Box2D {
@@ -10097,9 +10189,8 @@ mod tests {
         // не сделать»). Полный «путь выхода» `toggle_edit_mode` — это
         // `reset_edit_mode_panels(edit, exiting: true)`.
         let mut edit = mask_gate_edit_state();
-        edit.pending_open_pick_list = Some((monitor_id("main"), PickListPurpose::PinWindow));
+        edit.pending_open_pick_list = Some(monitor_id("main"));
         edit.window_pick_list = Some(WindowPickListState {
-            purpose: PickListPurpose::PinWindow,
             panel: Panel::new(
                 window_pick_list::PANEL_ID,
                 Box2D {
@@ -10174,7 +10265,6 @@ mod tests {
         // исчезать чаще, чем раньше.
         let mut edit = mask_gate_edit_state();
         edit.window_pick_list = Some(WindowPickListState {
-            purpose: PickListPurpose::PinWindow,
             panel: Panel::new(
                 window_pick_list::PANEL_ID,
                 Box2D {
@@ -10240,7 +10330,7 @@ mod tests {
         let cfg = Config::default();
         let mut edit = mask_gate_edit_state();
         edit.window_picker = Some(WindowPickerState {
-            sticker_id: Uuid::new_v4(),
+            target: PickerTarget::Sticker(Uuid::new_v4()),
             panel: Panel::new(
                 window_picker::PICKER_PANEL_ID,
                 Box2D {
@@ -10733,23 +10823,47 @@ mod tests {
         );
     }
 
-    /// Клик по окну в списке «Показывать только на…» добавляет правило по
-    /// ПРОЦЕССУ этого окна (запрос пользователя 2026-08-22), повторный
-    /// выбор того же приложения ничего не дублирует, а «×» правило убирает.
+    /// Редактор окон-хозяев — тот же самый, что у стикера (запрос
+    /// пользователя 2026-08-22). Проверяем сквозной путь: кнопка на панели
+    /// закреплённого окна открывает панель выбора окон для ЭТОГО окна,
+    /// отметка процесса становится правилом «показывать только на нём», а
+    /// снятие последней отметки возвращает окно в обычное закрепление.
     #[test]
-    fn host_rules_add_dedupe_and_remove() {
-        let (_cfg, _config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
+    fn host_rules_edited_through_the_sticker_style_picker() {
+        let (mut cfg, config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
         let hwnd = wnd.0.0 as usize;
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
+        let monitor_geometry: HashMap<MonitorId, (u32, u32, f32)> =
+            HashMap::from([(monitor_id("main"), (1920u32, 1080u32, 1.0f32))]);
         assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
         edit.pinned_selection = Some(hwnd as isize);
+        rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
 
-        // «Хозяин» — окно другого процесса в том же снимке.
-        let host_hwnd = hwnd + 1;
+        // Кнопка редактора на панели закреплённого окна.
+        let pos = edit
+            .pinned_panel
+            .as_ref()
+            .and_then(|s| s.panel.widget::<Button>(rst_render::PINNED_BTN_ADD_HOST))
+            .map(|b| {
+                let r = b.bounds();
+                (r.cx, r.cy)
+            })
+            .expect("кнопка «Слои видимости» на панели");
+        if let Some(state) = edit.pinned_panel.as_mut() {
+            state.panel.pointer_event(PointerEvent::Down { pos });
+        }
+        handle_pinned_panel_up(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, pos);
+        assert_eq!(
+            edit.pending_open_picker,
+            Some(PickerTarget::PinnedHost(hwnd as isize)),
+            "клик просит открыть редактор именно для этого окна"
+        );
+
+        // Окно-хозяин в снимке — другой процесс.
         let mut snapshot = snapshot.clone();
         snapshot.push(WindowInfo {
-            hwnd: host_hwnd,
+            hwnd: hwnd + 1,
             rect: WindowRect { x: 0, y: 0, w: 800, h: 600 },
             pid: std::process::id() + 2,
             exe_path: PathBuf::from(r"C:\Program Files\Google\chrome.exe"),
@@ -10758,62 +10872,105 @@ mod tests {
             ..Default::default()
         });
 
-        add_host_rule(&mut edit, &snapshot, &monitor_bounds, hwnd as isize, host_hwnd);
-        let rules = &edit.pinned_windows[0].host_rules;
-        assert_eq!(rules.len(), 1, "правило добавлено");
-        assert_eq!(
-            rules[0].process_name.as_deref(),
-            Some("chrome.exe"),
-            "правило по короткому имени процесса — переживает перезапуск приложения"
-        );
-        assert!(rules[0].title_pattern.is_none(), "заголовок не фиксируем");
+        let target = edit.pending_open_picker.take().expect("цель редактора");
+        open_window_picker(&mut edit, &cfg, &snapshot, &monitor_geometry, target);
+        rebuild_window_picker(&mut edit, &cfg, &snapshot, &monitor_geometry);
+        assert!(edit.window_picker.is_some(), "редактор открыт");
 
-        add_host_rule(&mut edit, &snapshot, &monitor_bounds, hwnd as isize, host_hwnd);
-        assert_eq!(
-            edit.pinned_windows[0].host_rules.len(),
-            1,
-            "повторный выбор того же приложения ничего не добавляет"
-        );
-
-        // Панель показывает строку правила и кнопку её удаления.
-        rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
-        let state = edit.pinned_panel.as_ref().expect("панель собрана");
-        assert!(
-            state
-                .panel
-                .widget::<Button>(rst_render::PINNED_BTN_ADD_HOST)
-                .is_some(),
-            "кнопка «Показывать только на…» на месте"
-        );
-        assert!(
-            state
-                .panel
-                .widget::<Button>(rst_render::PINNED_HOST_ROW_BASE)
-                .is_some(),
-            "строка правила с кнопкой удаления на месте"
-        );
-
-        // Клик по «×» убирает правило.
-        let pos = edit
-            .pinned_panel
+        // Отмечаем процесс-хозяина: тот же чекбокс, что у стикера.
+        let groups = window_picker::group_by_process(&snapshot);
+        let chrome = groups
+            .iter()
+            .position(|g| g.process_name.as_deref() == Some("chrome.exe"))
+            .expect("группа chrome.exe в списке");
+        let cb_pos = edit
+            .window_picker
             .as_ref()
-            .and_then(|s| s.panel.widget::<Button>(rst_render::PINNED_HOST_ROW_BASE))
-            .map(|b| {
-                let r = b.bounds();
+            .and_then(|s| {
+                s.panel.widget::<Checkbox>(
+                    window_picker::PICKER_ROW_PROCESS_BASE + chrome as WidgetId,
+                )
+            })
+            .map(|cb| {
+                let r = cb.bounds();
                 (r.cx, r.cy)
             })
-            .expect("кнопка удаления");
-        if let Some(state) = edit.pinned_panel.as_mut() {
-            state.panel.pointer_event(PointerEvent::Down { pos });
+            .expect("чекбокс процесса");
+        if let Some(state) = edit.window_picker.as_mut() {
+            state.panel.pointer_event(PointerEvent::Down { pos: cb_pos });
         }
-        handle_pinned_panel_up(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, pos);
+        let mut occluder_cache: HashMap<MonitorId, Vec<OccluderSet>> = HashMap::new();
+        handle_window_picker_up(
+            &mut edit,
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_geometry,
+            &monitor_bounds,
+            &mut occluder_cache,
+            cb_pos,
+        );
+        // По умолчанию у закреплённого окна выбраны ВСЕ окна (запрос
+        // пользователя 2026-08-22): правил нет — окно видно везде, и панель
+        // обязана показывать это всеми галочками, а не ни одной.
+        let hosts = &edit.pinned_windows[0].host_rules;
         assert!(
-            edit.pinned_windows[0].host_rules.is_empty(),
-            "«×» убирает правило"
+            hosts.iter().all(|r| r.process_name.as_deref() != Some("chrome.exe")),
+            "снятая галочка убирает именно chrome.exe: {hosts:?}"
+        );
+        assert!(
+            !hosts.is_empty(),
+            "остальные процессы остаются выбранными — иначе окно исчезло бы совсем"
+        );
+
+        // Возвращаем галочку: процесс снова становится окном-хозяином.
+        if let Some(state) = edit.window_picker.as_mut() {
+            state.panel.pointer_event(PointerEvent::Down { pos: cb_pos });
+        }
+        handle_window_picker_up(
+            &mut edit,
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_geometry,
+            &monitor_bounds,
+            &mut occluder_cache,
+            cb_pos,
+        );
+        assert!(
+            edit.pinned_windows[0]
+                .host_rules
+                .iter()
+                .any(|r| r.process_name.as_deref() == Some("chrome.exe")),
+            "повторный клик возвращает процесс в список хозяев"
         );
     }
 
-    /// Панель инструментов должна лежать ВНУТРИ прямоугольника окна
+    /// Свежезакреплённое окно показывается в редакторе как «выбраны все»
+    /// (запрос пользователя 2026-08-22) — правил нет, значит ограничений
+    /// нет, и все галочки обязаны стоять.
+    #[test]
+    fn fresh_pin_shows_every_window_checked() {
+        let (_cfg, _config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        let mut edit = mask_gate_edit_state();
+        let mut window_pins = WindowPins::new();
+        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+
+        let visibility = host_rules_as_visibility(&edit.pinned_windows[0].host_rules);
+        for group in window_picker::group_by_process(&snapshot) {
+            if group.process_name.is_none() {
+                continue;
+            }
+            assert!(
+                window_picker::process_is_checked(&visibility, &group),
+                "процесс {:?} должен быть отмечен по умолчанию",
+                group.process_name
+            );
+        }
+    }
+
+    /// Панель инструментов должна лежать ВНУТРИ прямоугольника окна    /// Панель инструментов должна лежать ВНУТРИ прямоугольника окна
     /// (решение пользователя 2026-08-21) — раньше она висела под окном
     /// снаружи.
     #[test]

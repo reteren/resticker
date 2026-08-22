@@ -82,7 +82,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetPropW, SetWindowPlacement, SetWindowPos,
     WINDOWPLACEMENT, WS_EX_TOPMOST,
 };
-use windows::core::{HRESULT, PCWSTR, w};
+use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
+use windows::core::{BOOL, HRESULT, PCWSTR, w};
 
 use crate::error::Win32Error;
 use crate::window_enum::{extended_frame_bounds, WindowInfo};
@@ -210,6 +211,36 @@ impl WindowPins {
         let shown = unsafe { ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE) }.as_bool();
         self.reassert_topmost_if_needed(hwnd);
         shown
+    }
+
+    /// Выключить/включить обратно анимации сворачивания и разворачивания
+    /// окна (`DWMWA_TRANSITIONS_FORCEDISABLED`).
+    ///
+    /// Зачем: окно с правилами «показывать только на этих окнах» мы
+    /// сворачиваем в тот момент, когда пользователь уходит с хозяина. Штатная
+    /// анимация сворачивания длится порядка четверти секунды, и всё это
+    /// время закреплённое окно ещё видно — пользователь читает это как
+    /// «оно пропадает не сразу, а с задержкой» (репорт 2026-08-22: «очень
+    /// важно»). С выключенными переходами окно исчезает и возвращается
+    /// мгновенно.
+    ///
+    /// Атрибут ставится ТОЛЬКО пока у окна есть правила, и снимается вместе
+    /// с ними и при откреплении: чужому окну мы не вправе навсегда менять
+    /// поведение. Запрос идёт в DWM, а не в процесс окна, поэтому не зависит
+    /// от его отзывчивости; ошибку игнорируем — окно могло умереть.
+    pub fn set_transitions_disabled(&self, hwnd: HWND, disabled: bool) {
+        let value: BOOL = disabled.into();
+        // SAFETY: значение живёт до конца вызова, размер соответствует
+        // типу атрибута (BOOL); DwmSetWindowAttribute безопасен для чужих
+        // и мёртвых окон.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TRANSITIONS_FORCEDISABLED,
+                (&raw const value).cast(),
+                size_of::<BOOL>() as u32,
+            )
+        };
     }
 
     /// Снять НАШ маркер с окон, которых нет в книжке закреплений, — уборка

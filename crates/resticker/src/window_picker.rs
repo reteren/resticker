@@ -48,7 +48,18 @@ pub fn window_can_express_rule(window: &WindowInfo) -> bool {
 /// `NeverOverlap`) чекбоксы сняты (дизайн §2.3: `Always` показывает всё
 /// снятым).
 pub fn window_is_checked(visibility: &VisibilityRule, window: &WindowInfo) -> bool {
-    if !window_can_express_rule(window) || visibility.mode != VisibilityMode::OverlapAllowlist {
+    if !window_can_express_rule(window) {
+        return false;
+    }
+    if visibility.mode == VisibilityMode::Always {
+        // «Всегда поверх всего» — это и есть «выбраны все окна»: элемент
+        // остаётся видимым над любым из них. Раньше панель в этом режиме
+        // показывала ВСЕ галочки снятыми, хотя элемент виден везде — прямо
+        // противоположную картину (репорт пользователя 2026-08-22: «сделай
+        // так, чтобы по умолчанию были выбраны все окна»).
+        return true;
+    }
+    if visibility.mode != VisibilityMode::OverlapAllowlist {
         return false;
     }
     visibility
@@ -62,7 +73,13 @@ pub fn window_is_checked(visibility: &VisibilityRule, window: &WindowInfo) -> bo
 /// конкретного окна процесс не отмечает). У группы «процесс неизвестен»
 /// чекбокса нет — всегда `false`.
 pub fn process_is_checked(visibility: &VisibilityRule, group: &ProcessGroup) -> bool {
-    if group.process_name.is_none() || visibility.mode != VisibilityMode::OverlapAllowlist {
+    if group.process_name.is_none() {
+        return false;
+    }
+    if visibility.mode == VisibilityMode::Always {
+        return true; // см. `window_is_checked`
+    }
+    if visibility.mode != VisibilityMode::OverlapAllowlist {
         return false;
     }
     let Some(exe_path) = group
@@ -127,8 +144,31 @@ pub fn group_by_process(snapshot: &[WindowInfo]) -> Vec<ProcessGroup> {
 pub fn toggle_process_group(
     visibility: &VisibilityRule,
     group: &ProcessGroup,
+    snapshot: &[WindowInfo],
 ) -> Option<VisibilityRule> {
     let name = group.process_name.as_deref()?;
+    if visibility.mode == VisibilityMode::Always {
+        // Снятие галочки из состояния «выбраны все»: материализуем список
+        // из всех остальных процессов снимка. Без этого шага снятие было бы
+        //но-опом — в режиме `Always` списка правил ещё не существует.
+        let mut rules = Vec::new();
+        for other in group_by_process(snapshot) {
+            let Some(other_name) = other.process_name else {
+                continue;
+            };
+            if other_name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            rules.push(OverlapRule {
+                process_name: Some(other_name),
+                title_pattern: None,
+            });
+        }
+        return Some(VisibilityRule {
+            mode: VisibilityMode::OverlapAllowlist,
+            rules,
+        });
+    }
     if process_is_checked(visibility, group) {
         let mut rules = visibility.rules.clone();
         rules.retain(|r| {
@@ -178,8 +218,12 @@ pub fn toggle_select_all(visibility: &VisibilityRule, snapshot: &[WindowInfo]) -
         .iter()
         .all(|w| !window_can_express_rule(w) || window_is_checked(visibility, w));
     if all_checked {
+        // «Снять все» — пустой allow-list. Режим обязательно
+        // `OverlapAllowlist`: в `Always` пустой список правил означал бы
+        // «выбраны все» (см. `window_is_checked`), то есть кнопка не делала
+        // бы ничего.
         return VisibilityRule {
-            mode: visibility.mode,
+            mode: VisibilityMode::OverlapAllowlist,
             rules: Vec::new(),
         };
     }
@@ -342,6 +386,7 @@ pub fn build_picker_panel(
     snapshot: &[WindowInfo],
     scroll: usize,
     frame: Box2D,
+    desktop_preset: bool,
 ) -> PickerPanel {
     let mut panel = Panel::new(PICKER_PANEL_ID, frame);
     let left = frame.cx - frame.w / 2.0 + PICKER_PAD;
@@ -360,10 +405,20 @@ pub fn build_picker_panel(
     };
     let header_y = top + PICKER_PAD + PICKER_HEADER_H / 2.0;
     let mut btn_cx = left;
-    for (id, text) in [
-        (PICKER_BTN_SELECT_ALL, toggle_label),
-        (PICKER_BTN_DESKTOP_ONLY, DESKTOP_ONLY_LABEL),
-    ] {
+    // Пресет «только рабочий стол» осмыслен лишь для стикера: у панели,
+    // открытой для ЗАКРЕПЛЁННОГО окна, тот же набор правил читается наоборот
+    // («показывать только на этих окнах»), и кнопка с таким названием врала
+    // бы. Остальная панель — та же самая, как и просил пользователь
+    // (2026-08-22: «сделай редактор выбора окон точь в точь как у стикеров»).
+    let header_buttons: &[(WidgetId, &str)] = if desktop_preset {
+        &[
+            (PICKER_BTN_SELECT_ALL, toggle_label),
+            (PICKER_BTN_DESKTOP_ONLY, DESKTOP_ONLY_LABEL),
+        ]
+    } else {
+        &[(PICKER_BTN_SELECT_ALL, toggle_label)]
+    };
+    for &(id, text) in header_buttons {
         let (tw, _) = text_size(text);
         let btn_w = tw + 2.0 * theme::BUTTON_PAD + 8.0;
         panel.add_widget(Button::new(
@@ -832,14 +887,25 @@ mod tests {
         ));
     }
 
+    /// `Always` — это «выбраны все окна» (запрос пользователя 2026-08-22:
+    /// по умолчанию должны стоять все галочки, а не ни одной, — элемент в
+    /// этом режиме и правда виден над любым окном). Остальные
+    /// не-allowlist режимы по-прежнему показывают всё снятым.
     #[test]
-    fn non_allowlist_modes_show_nothing_checked() {
+    fn always_is_everything_checked_other_modes_nothing() {
         let w = window(1, r"C:\Apps\app.exe", "t", 1, 1);
-        for mode in [
-            VisibilityMode::Always,
-            VisibilityMode::Desktop,
-            VisibilityMode::NeverOverlap,
-        ] {
+        let group = ProcessGroup {
+            process_name: Some("app.exe".to_string()),
+            windows: vec![w.clone()],
+        };
+        let always = VisibilityRule {
+            mode: VisibilityMode::Always,
+            rules: vec![],
+        };
+        assert!(window_is_checked(&always, &w), "Always — все окна выбраны");
+        assert!(process_is_checked(&always, &group), "и все процессы");
+
+        for mode in [VisibilityMode::Desktop, VisibilityMode::NeverOverlap] {
             let v = VisibilityRule {
                 mode,
                 rules: vec![rule(Some("app.exe"), None)],
@@ -897,7 +963,7 @@ mod tests {
             ],
         };
         let v = allowlist(vec![]);
-        let on = toggle_process_group(&v, &group).unwrap();
+        let on = toggle_process_group(&v, &group, &group.windows).unwrap();
         assert_eq!(on.mode, VisibilityMode::OverlapAllowlist);
         assert_eq!(on.rules, vec![rule(Some("chrome.exe"), None)]);
         for w in &group.windows {
@@ -905,26 +971,38 @@ mod tests {
         }
         assert!(process_is_checked(&on, &group));
 
-        let off = toggle_process_group(&on, &group).unwrap();
+        let off = toggle_process_group(&on, &group, &group.windows).unwrap();
         assert!(off.rules.is_empty(), "round-trip снял правило");
         for w in &group.windows {
             assert!(!window_is_checked(&off, w));
         }
     }
 
+    /// Снятие галочки из состояния «выбраны все» (`Always`) материализует
+    /// список из ВСЕХ ОСТАЛЬНЫХ процессов снимка — иначе клик был бы
+    /// но-опом: в `Always` списка правил ещё не существует.
     #[test]
-    fn toggle_process_switches_always_to_allowlist_on_first_check() {
+    fn toggle_process_from_always_materializes_the_rest() {
+        let snapshot = [
+            window(1, r"C:\Apps\app.exe", "t", 1, 1),
+            window(2, r"C:\Apps\other.exe", "t2", 2, 2),
+        ];
         let group = ProcessGroup {
             process_name: Some("app.exe".to_string()),
-            windows: vec![window(1, r"C:\Apps\app.exe", "t", 1, 1)],
+            windows: vec![snapshot[0].clone()],
         };
         let v = VisibilityRule {
             mode: VisibilityMode::Always,
             rules: vec![],
         };
-        let on = toggle_process_group(&v, &group).unwrap();
-        assert_eq!(on.mode, VisibilityMode::OverlapAllowlist);
-        assert_eq!(on.rules, vec![rule(Some("app.exe"), None)]);
+        let off = toggle_process_group(&v, &group, &snapshot).unwrap();
+        assert_eq!(off.mode, VisibilityMode::OverlapAllowlist);
+        assert_eq!(
+            off.rules,
+            vec![rule(Some("other.exe"), None)],
+            "снятый процесс выпадает, остальные остаются выбранными"
+        );
+        assert!(!process_is_checked(&off, &group), "галочка снята");
     }
 
     #[test]
@@ -937,7 +1015,7 @@ mod tests {
             mode: VisibilityMode::Desktop,
             rules: vec![],
         };
-        let on = toggle_process_group(&v, &group).unwrap();
+        let on = toggle_process_group(&v, &group, &group.windows).unwrap();
         assert_eq!(on.mode, VisibilityMode::OverlapAllowlist);
     }
 
@@ -952,7 +1030,7 @@ mod tests {
             mode: VisibilityMode::Desktop,
             rules: vec![rule(Some("app.exe"), None)],
         };
-        let on = toggle_process_group(&v, &group).unwrap();
+        let on = toggle_process_group(&v, &group, &group.windows).unwrap();
         assert_eq!(on.rules, vec![rule(Some("app.exe"), None)], "без дубля");
         assert_eq!(on.mode, VisibilityMode::OverlapAllowlist);
     }
@@ -964,7 +1042,7 @@ mod tests {
             windows: vec![window(1, r"C:\Apps\app.exe", "t", 1, 1)],
         };
         let v = allowlist(vec![rule(Some("app.exe"), None)]);
-        let off = toggle_process_group(&v, &group).unwrap();
+        let off = toggle_process_group(&v, &group, &group.windows).unwrap();
         assert_eq!(
             off.mode,
             VisibilityMode::OverlapAllowlist,
@@ -983,7 +1061,7 @@ mod tests {
             rule(None, Some("Settings")),
             rule(None, Some("*Notepad")),
         ]);
-        let off = toggle_process_group(&v, &group).unwrap();
+        let off = toggle_process_group(&v, &group, &group.windows).unwrap();
         assert_eq!(
             off.rules,
             vec![rule(None, Some("Settings")), rule(None, Some("*Notepad"))],
@@ -998,7 +1076,7 @@ mod tests {
             windows: vec![window(1, r"C:\Apps\chrome.exe", "t", 1, 1)],
         };
         let v = allowlist(vec![rule(Some("CHROME.EXE"), None)]);
-        let off = toggle_process_group(&v, &group).unwrap();
+        let off = toggle_process_group(&v, &group, &group.windows).unwrap();
         assert!(off.rules.is_empty(), "регистронезависимо");
     }
 
@@ -1014,7 +1092,7 @@ mod tests {
             title_pattern: Some("*".to_string()),
         };
         let v = allowlist(vec![combined.clone()]);
-        let off = toggle_process_group(&v, &group).unwrap();
+        let off = toggle_process_group(&v, &group, &group.windows).unwrap();
         assert_eq!(off.rules, vec![combined]);
     }
 
@@ -1026,7 +1104,7 @@ mod tests {
         };
         let v = allowlist(vec![]);
         assert_eq!(
-            toggle_process_group(&v, &group),
+            toggle_process_group(&v, &group, &group.windows),
             None,
             "no-op без имени процесса"
         );
@@ -1080,16 +1158,19 @@ mod tests {
         );
     }
 
+    /// В `Always` уже выбрано всё, поэтому переключатель работает как
+    /// «Снять все» и обязан сменить режим: пустой список правил в `Always`
+    /// снова означал бы «выбраны все», то есть кнопка ничего не делала бы.
     #[test]
-    fn select_all_from_always_sets_allowlist_mode() {
+    fn select_all_from_always_clears_to_allowlist() {
         let snapshot = [window(1, r"C:\Apps\app.exe", "t", 1, 1)];
         let v = VisibilityRule {
             mode: VisibilityMode::Always,
             rules: vec![],
         };
-        let all = toggle_select_all(&v, &snapshot);
-        assert_eq!(all.mode, VisibilityMode::OverlapAllowlist);
-        assert_eq!(all.rules, vec![rule(Some("app.exe"), None)]);
+        let cleared = toggle_select_all(&v, &snapshot);
+        assert_eq!(cleared.mode, VisibilityMode::OverlapAllowlist);
+        assert!(cleared.rules.is_empty());
     }
 
     #[test]
@@ -1254,7 +1335,7 @@ mod tests {
 
     #[test]
     fn empty_snapshot_builds_header_only() {
-        let p = build_picker_panel(&allowlist(vec![]), &[], 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &[], 0, picker_frame(), true);
         assert_eq!(p.total_rows, 0);
         assert!(p.panel.widget::<Button>(PICKER_BTN_SELECT_ALL).is_some());
         assert!(p.panel.widget::<Button>(PICKER_BTN_DESKTOP_ONLY).is_some());
@@ -1278,7 +1359,7 @@ mod tests {
             window(1, r"C:\Apps\chrome.exe", "Chrome", 100, 1),
             window(2, "", "Настройки", 200, 2),
         ];
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         // Строки: chrome-процесс, chrome-окно, неизвестный-процесс, окно.
         assert_eq!(p.total_rows, 4);
 
@@ -1333,12 +1414,10 @@ mod tests {
     #[test]
     fn process_checkbox_reflects_rules() {
         let snapshot = [window(1, r"C:\Apps\chrome.exe", "Chrome", 100, 1)];
-        let on = build_picker_panel(
-            &allowlist(vec![rule(Some("chrome.exe"), None)]),
+        let on = build_picker_panel(&allowlist(vec![rule(Some("chrome.exe"), None)]),
             &snapshot,
             0,
-            picker_frame(),
-        );
+            picker_frame(), true);
         let proc = on
             .panel
             .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE)
@@ -1351,7 +1430,7 @@ mod tests {
                 .checked(),
             "окно отмечено правилом процесса"
         );
-        let off = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let off = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         assert!(
             !off.panel
                 .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE)
@@ -1372,7 +1451,7 @@ mod tests {
             window(1, r"C:\Apps\app.exe", "t", 1, 1),
             window(2, "", "t2", 2, 2),
         ];
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         for g in 0..2u32 {
             let cb = p
                 .panel
@@ -1389,7 +1468,7 @@ mod tests {
     #[test]
     fn protected_window_checkbox_disabled_regardless() {
         let snapshot = [window(1, "", "", 1, 1)];
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         assert_eq!(
             p.total_rows, 2,
             "строка «неизвестный процесс» + строка окна"
@@ -1402,12 +1481,10 @@ mod tests {
             "protected process: disabled всегда"
         );
         // Даже тотальное правило «*» не отмечает protected-окно (дизайн §2.3).
-        let p2 = build_picker_panel(
-            &allowlist(vec![rule(None, Some("*"))]),
+        let p2 = build_picker_panel(&allowlist(vec![rule(None, Some("*"))]),
             &snapshot,
             0,
-            picker_frame(),
-        );
+            picker_frame(), true);
         assert!(
             !p2.panel
                 .widget::<Checkbox>(PICKER_ROW_WINDOW_BASE)
@@ -1424,7 +1501,7 @@ mod tests {
             window(3, r"C:\Apps\c.exe", "C", 3, 3),
         ];
         // Строки: 0 a, 1 окно a, 2 b, 3 окно b, 4 c, 5 окно c.
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 2, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 2, picker_frame(), true);
         assert_eq!(p.total_rows, 6);
         assert!(
             p.panel
@@ -1450,7 +1527,7 @@ mod tests {
         );
         assert_eq!(icon_slot_count(&p.panel), 4, "видны b, окно b, c, окно c");
         // Скролл за пределы списка: строк нет, шапка на месте.
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 6, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 6, picker_frame(), true);
         assert!(
             p.panel
                 .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE)
@@ -1458,7 +1535,7 @@ mod tests {
         );
         assert!(p.panel.widget::<Button>(PICKER_BTN_SELECT_ALL).is_some());
         // Скролл в хвост: видна только строка c.
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 4, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 4, picker_frame(), true);
         assert!(
             p.panel
                 .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE + 2)
@@ -1480,7 +1557,7 @@ mod tests {
             window(3, r"C:\Apps\b.exe", "B", 2, 3),
             window(4, "", "Неизвестное", 3, 4),
         ];
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         // a: процесс + 2 окна, b: процесс + 1 окно, неизвестный: процесс + 1 окно.
         assert_eq!(p.total_rows, 3 + 2 + 2);
         let texts = picker_texts(&p.panel);
@@ -1503,7 +1580,7 @@ mod tests {
             ));
         }
         // Один процесс + 12 окон = 13 строк списка.
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         assert_eq!(p.total_rows, 13);
         assert_eq!(
             icon_slot_count(&p.panel),
@@ -1527,7 +1604,7 @@ mod tests {
         let short: Vec<WindowInfo> = (0..3u32)
             .map(|i| window(i as usize, r"C:\Apps\app.exe", &format!("t{i}"), 1, i))
             .collect();
-        let short_panel = build_picker_panel(&allowlist(vec![]), &short, 0, picker_frame());
+        let short_panel = build_picker_panel(&allowlist(vec![]), &short, 0, picker_frame(), true);
         assert!(
             short_panel.total_rows <= PICKER_VISIBLE_ROWS,
             "фикстура должна умещаться без скролла"
@@ -1550,7 +1627,7 @@ mod tests {
                 i,
             ));
         }
-        let long_panel = build_picker_panel(&allowlist(vec![]), &long, 0, picker_frame());
+        let long_panel = build_picker_panel(&allowlist(vec![]), &long, 0, picker_frame(), true);
         assert!(long_panel.total_rows > PICKER_VISIBLE_ROWS);
         assert!(
             long_panel
@@ -1564,21 +1641,19 @@ mod tests {
     #[test]
     fn select_all_button_label_reflects_state() {
         let snapshot = [window(1, r"C:\Apps\app.exe", "t", 1, 1)];
-        let partial = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let partial = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         assert!(picker_texts(&partial.panel).contains(&"Выбрать все".to_string()));
-        let all = build_picker_panel(
-            &allowlist(vec![rule(Some("app.exe"), None)]),
+        let all = build_picker_panel(&allowlist(vec![rule(Some("app.exe"), None)]),
             &snapshot,
             0,
-            picker_frame(),
-        );
+            picker_frame(), true);
         assert!(picker_texts(&all.panel).contains(&"Снять все".to_string()));
     }
 
     #[test]
     fn desktop_only_button_present_in_both_toggle_states() {
         let snapshot = [window(1, r"C:\Apps\app.exe", "t", 1, 1)];
-        let partial = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let partial = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         assert!(
             partial
                 .panel
@@ -1589,12 +1664,10 @@ mod tests {
         assert!(texts.contains(&"Выбрать все".to_string()));
         assert!(texts.contains(&DESKTOP_ONLY_LABEL.to_string()));
 
-        let all = build_picker_panel(
-            &allowlist(vec![rule(Some("app.exe"), None)]),
+        let all = build_picker_panel(&allowlist(vec![rule(Some("app.exe"), None)]),
             &snapshot,
             0,
-            picker_frame(),
-        );
+            picker_frame(), true);
         assert!(
             all.panel
                 .widget::<Button>(PICKER_BTN_DESKTOP_ONLY)
@@ -1607,7 +1680,7 @@ mod tests {
 
     #[test]
     fn desktop_only_button_sits_next_to_toggle_all_within_panel() {
-        let p = build_picker_panel(&allowlist(vec![]), &[], 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &[], 0, picker_frame(), true);
         let frame = p.panel.frame();
         let toggle = p
             .panel
@@ -1667,7 +1740,7 @@ mod tests {
     fn build_picker_panel_truncates_long_window_title() {
         let long_title = "Ж".repeat(200);
         let snapshot = [window(1, r"C:\Apps\app.exe", &long_title, 1, 1)];
-        let picker = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let picker = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         let texts = picker_texts(&picker.panel);
         assert!(
             texts
@@ -1689,7 +1762,7 @@ mod tests {
             1,
             16,
         )];
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         // Строки: chrome-процесс + chrome-окно — обе с иконками: два Rgba,
         // плейсхолдеров (Fill) в колонке иконок нет вовсе.
         let icons = rgba_icons(&p.panel);
@@ -1704,7 +1777,7 @@ mod tests {
             window_with_icon(1, r"C:\Apps\chrome.exe", "Chrome A", 100, 1, 16),
             window_with_icon(2, r"C:\Apps\chrome.exe", "Chrome B", 200, 2, 16),
         ];
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         let icons = rgba_icons(&p.panel);
         // Процесс + два окна: три Rgba с одним ключом — одна GPU-текстура
         // на весь процесс (дедупликация кэша текстур).
@@ -1722,7 +1795,7 @@ mod tests {
             window_with_icon(1, r"C:\Apps\chrome.exe", "Chrome", 100, 1, 16),
             window_with_icon(2, r"C:\Apps\firefox.exe", "Firefox", 200, 2, 16),
         ];
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         let icons = rgba_icons(&p.panel);
         let keys: Vec<u64> = icons.iter().map(|&(k, _, _)| k).collect();
         assert_eq!(keys[0], keys[1], "chrome: процесс и окно");
@@ -1733,7 +1806,7 @@ mod tests {
     #[test]
     fn window_without_icon_keeps_fill_placeholder() {
         let snapshot = [window(1, r"C:\Apps\app.exe", "No icon", 1, 1)];
-        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame());
+        let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         assert_eq!(icon_slot_count(&p.panel), 2, "процесс и окно: плейсхолдеры");
         assert!(rgba_icons(&p.panel).is_empty());
     }
