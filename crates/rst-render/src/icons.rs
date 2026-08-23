@@ -38,6 +38,7 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
         Icon::Exit => draw_exit(&mut canvas, s),
         Icon::Play => draw_play(&mut canvas, s),
         Icon::Pause => draw_pause(&mut canvas, s),
+        Icon::Timeline | Icon::TimelineOff => draw_timeline(&mut canvas, s),
         Icon::ResetScale => draw_reset_scale(&mut canvas, s),
         Icon::Lock => draw_lock(&mut canvas, s),
         Icon::LockOpen => draw_lock_open(&mut canvas, s),
@@ -120,6 +121,11 @@ fn color_of(icon: Icon) -> [u8; 3] {
         Icon::Exit => [0xf2, 0x9a, 0x6a],
         Icon::Play => [0x8a, 0xd0, 0x9c],
         Icon::Pause => [0xf0, 0xf0, 0xf0],
+        // Включённая полоса — акцент программы (cyan, тот же тон, что у
+        // рамки закрепления); выключенная — приглушённый серый, как
+        // LockOpen/EyeOff у остальных пар «состояние вкл/выкл».
+        Icon::Timeline => [0x3c, 0x98, 0x98],
+        Icon::TimelineOff => [0xa8, 0xa8, 0xb2],
         Icon::ResetScale => [0xe8, 0xc8, 0x6a],
         Icon::Lock => [0xf0, 0xd0, 0x60],
         // Открытый замок — приглушённый серый: то же «выключено», что
@@ -404,6 +410,17 @@ fn draw_play(cv: &mut Canvas, s: f64) {
 fn draw_pause(cv: &mut Canvas, s: f64) {
     fill_rect(cv, 0.30 * s, 0.26 * s, 0.44 * s, 0.74 * s);
     fill_rect(cv, 0.56 * s, 0.26 * s, 0.70 * s, 0.74 * s);
+}
+
+/// «Полоса перемотки» (запрос пользователя 2026-08-22): горизонтальная
+/// дорожка с круглой ручкой — узнаваемый скраббер плеера. Форма у
+/// включённого и выключенного состояния одна: их различает цвет (см.
+/// `icon_color`), как у пары `Lock`/`LockOpen`.
+fn draw_timeline(cv: &mut Canvas, s: f64) {
+    // Дорожка чуть ниже центра, ручка на ней — так пиктограмма читается
+    // как полоса с бегунком, а не как знак «минус».
+    fill_rect(cv, 0.16 * s, 0.47 * s, 0.84 * s, 0.53 * s);
+    fill_circle(cv, 0.38 * s, 0.50 * s, 0.13 * s);
 }
 
 /// «Сбросить масштаб» (тулбар выделения, фидбэк пользователя 2026-08-09):

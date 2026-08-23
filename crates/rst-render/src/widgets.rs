@@ -80,6 +80,15 @@ pub enum Icon {
     Play,
     /// «Пауза» — видео-стикер играет (M5b).
     Pause,
+    /// «Полоса перемотки показывается вне режима редактирования» —
+    /// включённое состояние переключателя (запрос пользователя
+    /// 2026-08-22). Пара `Timeline`/`TimelineOff` отражает СОСТОЯНИЕ, как
+    /// `Eye`/`EyeOff`, а не действие (в отличие от `Play`/`Pause`):
+    /// переключатель, а не кнопка-действие.
+    Timeline,
+    /// «Полоса перемотки вне режима редактирования выключена» — приглушённый
+    /// вариант той же пиктограммы.
+    TimelineOff,
     /// «Сбросить масштаб» — тулбар выделения, возвращает размер/поворот/
     /// отражения к натуральным (фидбэк пользователя 2026-08-09).
     ResetScale,
@@ -2539,10 +2548,15 @@ pub fn build_pinned_panel(
 /// `PINNED_BTN_ADD_RULE`, `PINNED_SCROLLBAR_ID`) в результате нет, их ветки
 /// просто не сработают. `frame` — рамка панели (типовой размер —
 /// [`PINNED_PANEL_WIDTH`]×[`PINNED_LOCK_PANEL_HEIGHT`]).
+/// `hosts` — окна, на которых закреплённое окно показывается: `None` —
+/// ограничений нет (видно везде), `Some(&[])` — ни на одном (окно ждёт,
+/// пока пользователь вызовет его сам). Два этих состояния обязаны читаться
+/// с панели по-разному: слив их в одно и ломал кнопку «Снять все» (репорт
+/// пользователя 2026-08-22).
 pub fn build_pinned_lock_panel(
     move_locked: bool,
     interact_locked: bool,
-    hosts: &[String],
+    hosts: Option<&[String]>,
     frame: Box2D,
 ) -> Panel {
     let mut panel = Panel::new(PINNED_PANEL_ID, frame).with_style(WidgetStyle::Settings);
@@ -2590,10 +2604,10 @@ pub fn build_pinned_lock_panel(
     // от себя: иначе пришлось бы открывать редактор, чтобы узнать, есть ли
     // вообще правила.
     let cy_hosts = cy_interact + PINNED_SECTION_ROW_H;
-    let hosts_label = if hosts.is_empty() {
-        "Слои видимости".to_string()
-    } else {
-        format!("Слои видимости ({})", hosts.len())
+    let hosts_label = match hosts {
+        None => "Слои видимости: везде".to_string(),
+        Some([]) => "Слои видимости: нигде".to_string(),
+        Some(list) => format!("Слои видимости ({})", list.len()),
     };
     panel.add_widget(
         Button::new(
@@ -3787,7 +3801,7 @@ mod tests {
             (PINNED_CHECK_INTERACT_LOCK, true, Icon::Lock),
             (PINNED_CHECK_INTERACT_LOCK, false, Icon::LockOpen),
         ] {
-            let p = build_pinned_lock_panel(checked, checked, &[], pinned_lock_frame());
+            let p = build_pinned_lock_panel(checked, checked, None, pinned_lock_frame());
             let mut prims = Vec::new();
             p.widget::<Checkbox>(id).unwrap().draw(&mut prims);
             let mut seen_icon = false;
@@ -3805,7 +3819,7 @@ mod tests {
     /// `Checkbox` (тот же контракт, что `pinned_panel_lock_toggle_clicks_like_checkbox`).
     #[test]
     fn pinned_lock_panel_toggle_clicks_like_checkbox() {
-        let mut p = build_pinned_lock_panel(false, false, &[], pinned_lock_frame());
+        let mut p = build_pinned_lock_panel(false, false, None, pinned_lock_frame());
         let b = p.widget::<Checkbox>(PINNED_CHECK_MOVE_LOCK).unwrap().bounds();
         assert_eq!(b.w, theme::BUTTON_SIZE, "иконка-кнопка размера тулбара");
         p.pointer_event(PointerEvent::Down { pos: (b.cx, b.cy) });
@@ -3824,7 +3838,7 @@ mod tests {
     #[test]
     fn pinned_lock_panel_has_unpin_button() {
         let frame = pinned_lock_frame();
-        let p = build_pinned_lock_panel(false, false, &[], frame);
+        let p = build_pinned_lock_panel(false, false, None, frame);
         let b = p.widget::<Button>(PINNED_BTN_UNPIN).unwrap().bounds();
         assert_eq!(
             b.w,
@@ -3842,7 +3856,7 @@ mod tests {
     /// (с разделом) остаётся нетронутым для будущего возврата.
     #[test]
     fn pinned_lock_panel_omits_neighbor_rule_widgets() {
-        let p = build_pinned_lock_panel(false, false, &[], pinned_lock_frame());
+        let p = build_pinned_lock_panel(false, false, None, pinned_lock_frame());
         assert!(
             p.widget::<Label>(PINNED_LABEL_RULES).is_none(),
             "заголовок «Соседние окна» не должен строиться"

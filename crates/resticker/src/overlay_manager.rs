@@ -44,7 +44,7 @@ use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
 use rst_core::occluders::{self, OccluderCandidate, OccluderSet};
 use rst_core::ops;
-use rst_core::pinned_window::{self, PinnedWindow};
+use rst_core::pinned_window::{self, HostFilter, PinnedWindow};
 use rst_core::presets;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
@@ -55,7 +55,8 @@ use rst_render::{
     PresentSync,
     Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon,
     Key, Label, NumericField, Panel, PinnedRowField, PointerEvent, Primitive, RenderError,
-    SelectionBox, Slider, Sprite, Texture, TextField, TextureAtlas, VideoTextures, WidgetId,
+    SelectionBox, Slider, Sprite, Texture, TextField, TextureAtlas, VideoTextures, Widget,
+    WidgetId,
     WindowHighlight, WindowTarget, edit_overlay, lock_indicator, marquee_visuals, pin_indicator,
     pinned_row_id,
     rasterize, solid_sprite, theme,
@@ -436,6 +437,14 @@ const VK_D: u32 = 0x44;
 const VK_V: u32 = 0x56;
 const VK_Y: u32 = 0x59;
 const VK_Z: u32 = 0x5A;
+const VK_SPACE: u32 = 0x20;
+const VK_PRIOR: u32 = 0x21;
+const VK_NEXT: u32 = 0x22;
+
+/// Шаг громкости на нажатие PgUp/PgDn (запрос пользователя 2026-08-22).
+/// Десять шагов на всю шкалу: достаточно крупно, чтобы менять громкость
+/// парой нажатий, и достаточно мелко, чтобы попасть в нужную.
+const VOLUME_KEY_STEP: f64 = 0.1;
 
 /// Глубина истории undo/redo — снимков `Config` (см. заметку о снимках выше).
 const UNDO_CAPACITY: usize = 100;
@@ -852,6 +861,14 @@ enum OverlayMessage {
     /// не раз в секунду: планировщик спит ровно до дедлайна, который ему
     /// последним прислал координатор.
     AnimationTick,
+    /// Декодер положил в очередь готовый видеокадр
+    /// ([`rst_video::VideoSource::set_frame_notifier`]).
+    ///
+    /// Показ по сигналу, а не по опросу: опрос добавлял к каждому
+    /// третьему-четвёртому кадру до периода опроса задержки, и это
+    /// читалось как рывок (замер в приложении 2026-08-22: период кадров
+    /// 17 мс, интервалы показа — 17 мс, но раз в секунду 25 мс).
+    VideoFrameReady,
 }
 
 /// Период тика автомата потери монитора (M3_HOTPLUG_DESIGN.md §1):
@@ -875,10 +892,107 @@ const LOSS_TICK_PERIOD: Duration = Duration::from_secs(1);
 /// хотя бы одном играющем видео (M5b, docs/M5B_VIDEO_DESIGN.md §6) —
 /// переиспользует планировщик анимации (`anim_deadline_tx`/`AnimationTick`,
 /// M5a §5), просто как ещё один источник ближайшего дедлайна, а не отдельный
-/// поток: декодер сам держит темп по PTS (`rst_video::decoder::Pacing`),
-/// координатору не нужна точность лучше «часто достаточно, чтобы не
-/// заметить» — 60 Гц с запасом покрывает типичную частоту кадров видео.
-const VIDEO_POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// поток: декодер сам держит темп по PTS (`rst_video::decoder::Pacing`).
+///
+/// Это СТРАХОВКА, а не такт показа: кадры приходят по сигналу декодера
+/// ([`OverlayMessage::VideoFrameReady`]), и опрос нужен лишь на случай,
+/// если сигнал почему-то потерян (канал переполнен, источник подключён не
+/// через `run`). Раньше опрос и был тактом — и добавлял к показу до своего
+/// периода задержки: кадр, пришедший сразу после пробуждения, ждал
+/// следующего, отчего раз в секунду интервал показа вырастал с 17 до 25 мс
+/// (замер 2026-08-22). Уменьшать период бессмысленно — это лечило
+/// симптом ценой лишних пробуждений.
+const VIDEO_POLL_INTERVAL: Duration = Duration::from_millis(32);
+
+/// Счётчики плавности видео: интервалы между ПОКАЗАННЫМИ кадрами и время
+/// отрисовки. Сводка раз в секунду в журнал уровня DEBUG.
+///
+/// Без чисел спор о рывках беспредметен: «декодер успевает» и «на экране
+/// плавно» — разные утверждения, между ними лежат пробуждение
+/// координатора, сборка кадра и показ. Замер включается переменной
+/// окружения (`RUST_LOG=resticker=debug`) и в обычной работе молчит.
+#[derive(Debug)]
+struct VideoSmoothness {
+    window_start: Instant,
+    last_frame: Option<Instant>,
+    /// Интервалы между показанными кадрами, мс.
+    gaps: Vec<f64>,
+    /// Длительности `redraw_all`, мс.
+    draws: Vec<f64>,
+    /// Пробуждения, на которых кадра не было.
+    empty_ticks: u32,
+    /// Сколько раз декодер сказал «кадр готов».
+    notifies: u32,
+}
+
+impl VideoSmoothness {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            last_frame: None,
+            gaps: Vec::new(),
+            draws: Vec::new(),
+            empty_ticks: 0,
+            notifies: 0,
+        }
+    }
+
+    /// Показан кадр.
+    fn frame_shown(&mut self, now: Instant) {
+        if let Some(prev) = self.last_frame {
+            self.gaps.push((now - prev).as_secs_f64() * 1000.0);
+        }
+        self.last_frame = Some(now);
+    }
+
+    /// Пробуждение без кадра (декодер ещё не отдал следующий).
+    fn empty_tick(&mut self) {
+        self.empty_ticks += 1;
+    }
+
+    /// Кадр отрисован за `dur`.
+    fn drawn(&mut self, dur: Duration) {
+        self.draws.push(dur.as_secs_f64() * 1000.0);
+    }
+
+    /// Выдать сводку, если прошла секунда.
+    fn maybe_report(&mut self, now: Instant) {
+        if now - self.window_start < Duration::from_secs(1) {
+            return;
+        }
+        if !self.gaps.is_empty() {
+            let mut gaps = std::mem::take(&mut self.gaps);
+            gaps.sort_by(|a, b| a.total_cmp(b));
+            let p = |q: f64| gaps[((gaps.len() - 1) as f64 * q) as usize];
+            let mut draws = std::mem::take(&mut self.draws);
+            draws.sort_by(|a, b| a.total_cmp(b));
+            let dp = |q: f64| {
+                if draws.is_empty() {
+                    0.0
+                } else {
+                    draws[((draws.len() - 1) as f64 * q) as usize]
+                }
+            };
+            tracing::debug!(
+                кадров = gaps.len() + 1,
+                сигналов = self.notifies,
+                пустых_тиков = self.empty_ticks,
+                интервал_p50 = format!("{:.1}", p(0.5)),
+                интервал_p95 = format!("{:.1}", p(0.95)),
+                интервал_макс = format!("{:.1}", p(1.0)),
+                отрисовка_p50 = format!("{:.1}", dp(0.5)),
+                отрисовка_p95 = format!("{:.1}", dp(0.95)),
+                отрисовка_макс = format!("{:.1}", dp(1.0)),
+                "плавность видео, мс"
+            );
+        }
+        self.gaps.clear();
+        self.draws.clear();
+        self.empty_ticks = 0;
+        self.notifies = 0;
+        self.window_start = now;
+    }
+}
 
 /// Ручка для отправки команд оверлей-потоку; `Drop` останавливает поток.
 pub struct OverlayHandle {
@@ -1187,6 +1301,28 @@ struct EditState {
     /// пользователя 2026-08-10) — `None`, если курсор не над кнопкой с
     /// текстом подсказки.
     tooltip: Option<TooltipState>,
+    /// Полоса перемотки видео (см. [`VideoTimelineState`]); `None` — сейчас
+    /// её показывать некому.
+    video_timeline: Option<VideoTimelineState>,
+    /// Хотя бы одно видео сейчас играет: кадр показывается без ожидания
+    /// вертикальной синхронизации внутри `Present` (см. выбор
+    /// [`PresentSync`] в `redraw`).
+    video_playing: bool,
+    /// Ручку полосы перемотки сейчас тащат вне режима редактирования.
+    /// Пока это так, оверлей обязан оставаться кликабельным, даже если
+    /// курсор ушёл за пределы самой полосы: иначе протяжка оборвётся, стоит
+    /// увести мышь на пару пикселей вверх.
+    timeline_dragging: bool,
+    /// Монитор, на оверлее которого сейчас зарегистрированы медиа-хоткеи
+    /// (пробел/PgUp/PgDn для видео под курсором). Хранится по той же
+    /// причине, что `timeline_click_target`: снимать регистрацию обязан тот
+    /// же оверлей, который её ставил.
+    media_hotkeys_on: Option<MonitorId>,
+    /// Монитор, чей оверлей сейчас переведён в режим «ловим клики» ради
+    /// полосы перемотки вне режима редактирования. Хранится, чтобы вернуть
+    /// клик-прозрачность ИМЕННО тому окну, которому её сняли: курсор мог
+    /// уже уехать на другой монитор.
+    timeline_click_target: Option<MonitorId>,
     /// Кто держит текущий указательный жест начиная с `MouseDown` (раздел 5).
     /// Модал сюда не входит — он перехватывается раньше отдельной веткой.
     pointer_owner: PointerOwner,
@@ -1223,7 +1359,40 @@ enum PointerOwner {
     /// Панель свойств закреплённого окна (SPEC «Закрепление окна», пункт 9)
     /// — тот же паттерн, что `WindowPicker`.
     PinnedPanel,
+    /// Полоса перемотки видео ([`VideoTimelineState`]): захват на всё время
+    /// протяжки, как у ползунка тулбара.
+    VideoTimeline,
     Scene,
+}
+
+/// Полоса перемотки видео-стикера (запрос пользователя 2026-08-22).
+///
+/// Живёт ровно для ОДНОГО стикера за раз: в режиме редактирования — для
+/// выделенного видео, вне его — для того, над которым сейчас курсор (и
+/// только если у стикера включён `playback.show_timeline`). Две полосы
+/// одновременно не нужны — перематывать можно только то видео, на которое
+/// смотришь.
+struct VideoTimelineState {
+    sticker_id: Uuid,
+    /// Монитор стикера: панель рисуется только в его кадре (как тулбар).
+    monitor_id: MonitorId,
+    panel: Panel,
+    /// Полоса показана ВНЕ режима редактирования, по наведению. В этом
+    /// режиме оверлей приходится временно делать кликабельным
+    /// (`set_hover_click_target`), поэтому состояние надо различать.
+    hover_mode: bool,
+    /// Прямоугольник стикера, под который собрана панель (DIP): стикер
+    /// могли подвинуть/растянуть — тогда полосу надо пересобрать, а не
+    /// оставить висеть на старом месте.
+    anchor: (f64, f64, f64, f64),
+    /// Длительность, под которую собран виджет: у файла она не меняется, но
+    /// становится известна не сразу (потоковый контейнер), и тогда полосу
+    /// надо пересобрать.
+    duration: Duration,
+    /// Курсор прямо сейчас над самой полосой (а не просто над стикером).
+    /// Ровно на это время вне режима редактирования снимается
+    /// клик-прозрачность оверлея — см. `OverlayWindow::set_hover_click_target`.
+    over_strip: bool,
 }
 
 /// Открытый модал подтверждения удаления (docs/M2_WIRING_PLAN.md, раздел 6/7).
@@ -1596,6 +1765,35 @@ enum PendingAnimation {
 struct VideoPlayback {
     source: VideoSource,
     audio: Option<AudioSource>,
+    /// Момент последнего ПОКАЗАННОГО кадра (его `pts`) — позиция
+    /// воспроизведения для таймлайна перемотки (запрос пользователя
+    /// 2026-08-22). Именно показанного, а не декодированного: полоса
+    /// обязана показывать то, что человек видит на экране, иначе она
+    /// убегает вперёд на глубину очереди декодера.
+    ///
+    /// `VideoSource` своей позиции не отдаёт (её знает только поток
+    /// декодера, и спрашивать его на каждый кадр — лишняя синхронизация),
+    /// поэтому координатор ведёт её сам из `DecodedVideoFrame::pts`.
+    position: Duration,
+    /// Длительность файла; `None` — неизвестна (поток без длительности).
+    /// Без неё полоса перемотки бессмысленна и не показывается.
+    duration: Option<Duration>,
+    /// Кадры приходят аппаратным путём (D3D11VA, M5c): NV12-текстура на
+    /// общем с рендером устройстве, без копирования через процессор.
+    /// Определяется при открытии файла: декодер сам откатывается на
+    /// программный путь, когда аппаратный невозможен.
+    hw: bool,
+    /// Сигнал «кадр готов» уже подключён к этому источнику.
+    notifier_wired: bool,
+    /// ПОКАЗЫВАЕМЫЙ сейчас аппаратный кадр — держим его живым всё время,
+    /// пока он на экране.
+    ///
+    /// Кадр владеет ссылкой на элемент пула декодера: пока ссылка жива,
+    /// декодер не пишет в эту поверхность. Если отпустить кадр сразу после
+    /// создания вида, декодер вправе тут же занять слой под следующий кадр
+    /// — и на экране окажется каша из двух кадров. Предыдущий кадр
+    /// освобождается ровно в тот момент, когда его сменяет новый.
+    hw_frame: Option<rst_video::HwDecodedVideoFrame>,
 }
 
 /// Схлопнуть подряд идущие `MouseMove` одного монитора в очереди `rx`,
@@ -1723,6 +1921,19 @@ fn run(
             return;
         }
     };
+    // Список мониторов в журнал: их идентификаторы — device interface path
+    // (ADR-010) — попадают в `config.json` как привязка стикера, и без них
+    // разбор жалоб вида «стикер не на том экране» превращается в гадание.
+    for m in &monitor_infos {
+        tracing::info!(
+            id = %m.id.0,
+            name = %m.friendly_name,
+            bounds = ?m.bounds_px,
+            dpi = m.dpi,
+            primary = m.is_primary,
+            "монитор"
+        );
+    }
     // `mut`: пересоздаётся веткой `MonitorsChanged`, если основной монитор
     // сменился (M3_HOTPLUG_DESIGN.md §2).
     let mut primary_id = monitor_infos
@@ -1816,6 +2027,10 @@ fn run(
             tracing::info!(cleared, "снял осиротевшие маркеры закрепления прошлого запуска");
         }
     }
+
+    // Счётчики плавности видео (сводка раз в секунду при
+    // `RUST_LOG=resticker=debug`).
+    let mut smoothness = VideoSmoothness::new();
 
     let mut sprites: Vec<(Uuid, Sprite)> = Vec::new();
     let mut animations: HashMap<Uuid, StickerAnimation> = HashMap::new();
@@ -2064,6 +2279,11 @@ fn run(
         tooltip: None,
         pointer_owner: PointerOwner::None,
         ui_pending_snapshot: None,
+        video_timeline: None,
+        video_playing: false,
+        media_hotkeys_on: None,
+        timeline_dragging: false,
+        timeline_click_target: None,
         cursor_pos: (0.0, 0.0),
         cursor_monitor: primary_id.clone(),
         coordinator_tx,
@@ -2163,6 +2383,9 @@ fn run(
         let (msg, leftover) = coalesce_mouse_move(&rx, msg);
         pending = leftover;
         let mut need_redraw = false;
+        // Тип сообщения нужен внутри веток (счётчик сигналов декодера), а
+        // сам `msg` в них уже перемещён — фиксируем до разбора.
+        let is_frame_ready = matches!(msg, OverlayMessage::VideoFrameReady);
         match msg {
             OverlayMessage::Command(OverlayCommand::AddSticker(path)) => {
                 // Команда от Tauri не несёт «текущий монитор» — добавляем на
@@ -2592,6 +2815,43 @@ fn run(
                 audio_muted = !audio_muted;
                 if let Some(mixer) = audio_mixer.as_ref() {
                     mixer.set_muted(audio_muted);
+                }
+            }
+            OverlayMessage::Event(_, OverlayEvent::MediaPlayPause)
+            | OverlayMessage::Event(_, OverlayEvent::MediaVolumeUp)
+            | OverlayMessage::Event(_, OverlayEvent::MediaVolumeDown) => {
+                // Пробел/PgUp/PgDn на видео-стикере ПОД КУРСОРОМ вне режима
+                // редактирования (запрос пользователя 2026-08-22). Цель —
+                // тот же стикер, которому сейчас показана полоса перемотки:
+                // хоткеи и включены ровно на это время (см.
+                // `OverlayWindow::set_media_hotkeys`), другого понятия
+                // «выбранного» стикера вне режима редактирования нет.
+                let target = edit
+                    .video_timeline
+                    .as_ref()
+                    .filter(|t| t.hover_mode)
+                    .map(|t| t.sticker_id);
+                if let Some(id) = target {
+                    let delta = match msg {
+                        OverlayMessage::Event(_, OverlayEvent::MediaVolumeUp) => {
+                            Some(VOLUME_KEY_STEP)
+                        }
+                        OverlayMessage::Event(_, OverlayEvent::MediaVolumeDown) => {
+                            Some(-VOLUME_KEY_STEP)
+                        }
+                        _ => None,
+                    };
+                    let changed = match delta {
+                        Some(delta) => adjust_video_volume(&mut cfg, &[id], delta),
+                        None => toggle_video_playback(&mut cfg, &[id]),
+                    };
+                    if changed {
+                        if let Err(e) = config::save(&cfg, &config_path) {
+                            tracing::warn!(error = %e, "не удалось сохранить config.json после управления видео с клавиатуры");
+                        }
+                        rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
+                        need_redraw = true;
+                    }
                 }
             }
             OverlayMessage::Event(_, OverlayEvent::PinFocusedWindow) => {
@@ -3067,6 +3327,25 @@ fn run(
                     sync_other_monitors_edit_mode(&monitors_map, &monitor_id, edit.active);
                 }
             }
+            OverlayMessage::Event(monitor_id, OverlayEvent::Input(event)) if !edit.active => {
+                // Вне режима редактирования оверлей кликопрозрачен, и сюда
+                // события приходят ТОЛЬКО когда мы сами сняли прозрачность
+                // ради полосы перемотки (см. `set_hover_click_target`). В
+                // сцену они не уходят: вне режима редактирования стикеры не
+                // двигают и не выделяют.
+                let scale = monitors_map.get(&monitor_id).map(|ms| ms.scale);
+                if let Some(scale) = scale {
+                    if handle_timeline_hover_input(
+                        &mut edit,
+                        &mut videos,
+                        event,
+                        scale,
+                        &monitor_id,
+                    ) {
+                        need_redraw = true;
+                    }
+                }
+            }
             OverlayMessage::Event(_, OverlayEvent::Key { .. }) => {}
             OverlayMessage::Event(monitor_id, OverlayEvent::Input(event)) if edit.active => {
                 let Some(ms) = monitors_map.get_mut(&monitor_id) else {
@@ -3157,7 +3436,14 @@ fn run(
                 rebuild_pinned_panel(&mut edit, &window_snapshot, &monitor_bounds);
                 need_redraw = true;
             }
-            OverlayMessage::AnimationTick => {
+            // `VideoFrameReady` разбирается ЗДЕСЬ ЖЕ: разбор очереди кадров
+            // живёт в этой ветке, и отдельная ветка «просто проснуться» его
+            // бы не выполнила — кадры ждали бы ближайшего тика анимации
+            // (замер 2026-08-22: показ падал до 15 кадров в секунду).
+            OverlayMessage::AnimationTick | OverlayMessage::VideoFrameReady => {
+                if is_frame_ready {
+                    smoothness.notifies += 1;
+                }
                 // Планировщик разбудил нас на ближайший известный ему
                 // дедлайн (M5a §5) — продвигаем часы всех анимаций, которым
                 // сейчас положено тикать (видимых и не полностью
@@ -3301,13 +3587,65 @@ fn run(
                         .is_some_and(|sticker| {
                             sticker_should_tick(sticker, edit.active, &occluder_cache, &monitor_bounds)
                         });
-                    let mut latest = None;
-                    if should_tick {
-                        while let Some(frame) = playback.source.try_recv_frame() {
-                            latest = Some(frame);
+                    // Забираем ВСЕ готовые кадры, показываем последний.
+                    //
+                    // В норме кадр ровно один: декодер будит нас на каждый
+                    // (`VideoFrameReady`). Несколько означает, что мы
+                    // отстали — например, координатор был занят другим
+                    // сообщением; тогда показать надо самый свежий, а не
+                    // доигрывать историю с опозданием. Пробовалось «ровно
+                    // один за пробуждение» — и на живом замере давало вдвое
+                    // меньше кадров: пока идёт итерация, сигналы копятся, и
+                    // очередь росла быстрее, чем вычерпывалась.
+                    if !should_tick {
+                        // Скрытое/перекрытое видео кадры не забирает вовсе.
+                    } else if !need_redraw && playback.source.is_paused() {
+                        // На паузе тиков не ждём.
+                    } else if playback.hw {
+                        // Аппаратный кадр: текстура декодера уже в
+                        // видеопамяти, обновляется только индекс элемента
+                        // массива — ни копирования, ни загрузки.
+                        let mut newest = None;
+                        while let Some(f) = playback.source.try_recv_hw_frame() {
+                            newest = Some(f);
                         }
-                    }
-                    if let Some(frame) = latest {
+                        if let Some(frame) = newest {
+                            if let Some((_, sprite)) =
+                                sprites.iter_mut().find(|(sid, _)| sid == id)
+                            {
+                                if let Some(video) = &mut sprite.video {
+                                    match device.update_video_textures_nv12(
+                                        video,
+                                        &frame.texture,
+                                        frame.array_index,
+                                        frame.width,
+                                        frame.height,
+                                    ) {
+                                        Ok(()) => {
+                                            playback.position = frame.pts;
+                                            // Держим кадр живым, пока он на
+                                            // экране (см. `hw_frame`);
+                                            // прошлый освобождается здесь же.
+                                            playback.hw_frame = Some(frame);
+                                            smoothness.frame_shown(Instant::now());
+                                            need_redraw = true;
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            sticker = %id,
+                                            "не удалось показать аппаратный видеокадр"
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(frame) = {
+                        let mut newest = None;
+                        while let Some(f) = playback.source.try_recv_frame() {
+                            newest = Some(f);
+                        }
+                        newest
+                    } {
                         if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| sid == id) {
                             if let Some(video) = &mut sprite.video {
                                 if let Err(e) = device
@@ -3315,6 +3653,8 @@ fn run(
                                 {
                                     tracing::warn!(error = %e, sticker = %id, "не удалось обновить видеотекстуры");
                                 } else {
+                                    playback.position = frame.pts;
+                                    smoothness.frame_shown(Instant::now());
                                     need_redraw = true;
                                 }
                             }
@@ -3377,6 +3717,7 @@ fn run(
         // перекрытый/скрытый стикер продолжал бы декодировать, играть звук
         // и держать координатор на `VIDEO_POLL_INTERVAL`-пробуждениях
         // впустую (то же ревью, находка 2).
+        edit.video_playing = videos.values().any(|v| !v.source.is_paused());
         for (id, playback) in videos.iter_mut() {
             let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) else {
                 continue;
@@ -3472,8 +3813,99 @@ fn run(
         if next_pin_follow_deadline.is_none() {
             edit.pinned_follow_until = None;
         }
+        // Новые источники видео получают сигнал «кадр готов» — с ним показ
+        // идёт по факту готовности кадра, а не по ближайшему пробуждению
+        // (см. `OverlayMessage::VideoFrameReady`). Разово на источник.
+        for playback in videos.values_mut() {
+            if !playback.notifier_wired {
+                let notify_tx = tx.clone();
+                playback.source.set_frame_notifier(move || {
+                    let _ = notify_tx.send(OverlayMessage::VideoFrameReady);
+                });
+                playback.notifier_wired = true;
+            }
+        }
+
+        // Полоса перемотки (запрос пользователя 2026-08-22): показать её
+        // тому стикеру, которому сейчас положено, обновить позицию
+        // проигрывания и снять, когда показывать некому.
+        if sync_video_timeline(&mut edit, &cfg, &videos, &monitor_bounds) {
+            need_redraw = true;
+        }
+        // Вне режима редактирования оверлей кликопрозрачен — полоса не
+        // получила бы ни одного клика. Снимаем прозрачность РОВНО на то
+        // время, пока курсор над самой полосой (или пока ручку тащат):
+        // клик-прозрачность — свойство окна на весь монитор, и держать её
+        // снятой дольше значит перехватывать чужие клики.
+        //
+        // В САМОМ режиме редактирования этот механизм не работает вовсе:
+        // там окно уже интерактивно целиком (`set_click_through(false)`), и
+        // вернуть ему `WS_EX_TRANSPARENT` отсюда значило бы обрушить весь
+        // ввод режима. Достаточно забыть отметку — при выходе из режима
+        // `set_click_through(true)` и так вернёт окно в исходное состояние.
+        if edit.active {
+            edit.timeline_click_target = None;
+        } else {
+            let want_click_target = edit
+                .video_timeline
+                .as_ref()
+                .filter(|t| t.hover_mode && (t.over_strip || edit.timeline_dragging))
+                .map(|t| t.monitor_id.clone());
+            if want_click_target != edit.timeline_click_target {
+                if let Some(old) = edit.timeline_click_target.take() {
+                    if let Some(ms) = monitors_map.get(&old) {
+                        ms.overlay.set_hover_click_target(false);
+                    }
+                }
+                if let Some(new_id) = &want_click_target {
+                    if let Some(ms) = monitors_map.get(new_id) {
+                        ms.overlay.set_hover_click_target(true);
+                    }
+                }
+                edit.timeline_click_target = want_click_target;
+            }
+            // Медиа-хоткеи (пробел/PgUp/PgDn) включены, пока курсор на
+            // стикере с полосой, — по НАВЕДЕНИЮ, а не по попаданию в саму
+            // полосу: клавиши логично работают со всего стикера, на который
+            // смотришь. Хоткей забирает клавишу у всей системы, поэтому
+            // условие узкое и снимается сразу, как курсор ушёл.
+            let want_media = edit
+                .video_timeline
+                .as_ref()
+                .filter(|t| t.hover_mode)
+                .map(|t| t.monitor_id.clone());
+            if want_media != edit.media_hotkeys_on {
+                if let Some(old) = edit.media_hotkeys_on.take() {
+                    if let Some(ms) = monitors_map.get(&old) {
+                        ms.overlay.set_media_hotkeys(false);
+                    }
+                }
+                if let Some(new_id) = &want_media {
+                    if let Some(ms) = monitors_map.get(new_id) {
+                        ms.overlay.set_media_hotkeys(true);
+                    }
+                }
+                edit.media_hotkeys_on = want_media;
+            }
+        }
+
+        // Полоса перемотки вне режима редактирования всплывает по
+        // наведению, а наведение на кликопрозрачном окне видно только
+        // опросом курсора — значит, пока в конфиге есть хоть одно видео с
+        // включённой полосой, координатору нужен свой редкий дедлайн. В
+        // самом режиме редактирования опрос не нужен: там есть настоящие
+        // `MouseMove`.
+        let next_timeline_deadline = if session_locked || edit.active {
+            None
+        } else {
+            cfg.stickers
+                .iter()
+                .any(|s| s.playback.show_timeline && sticker_is_video(s))
+                .then(|| Instant::now() + TIMELINE_HOVER_POLL)
+        };
         let next_tick_deadline = [
             next_anim_deadline,
+            next_timeline_deadline,
             next_video_deadline,
             next_tooltip_deadline,
             next_flash_deadline,
@@ -3540,6 +3972,11 @@ fn run(
                 tracker.set_mask_needed(last_mask_needed);
             }
         }
+        if !need_redraw && edit.video_playing {
+            smoothness.empty_tick();
+        }
+        smoothness.maybe_report(Instant::now());
+        let draw_started = Instant::now();
         if need_redraw
             && redraw_all(
                 &device,
@@ -3584,6 +4021,9 @@ fn run(
             } else {
                 device_needs_recovery = true;
             }
+        }
+        if need_redraw {
+            smoothness.drawn(draw_started.elapsed());
         }
     }
     // Гарантированное открепление стикеров-окон при выходе (ROADMAP.md M6,
@@ -3978,6 +4418,88 @@ fn open_streaming_animation(
     Some((texture, source, first.delay))
 }
 
+/// Переключить паузу у видео-стикеров из списка. Возвращает `true`, если
+/// хоть один действительно переключился (в списке могут быть картинки —
+/// им пауза не применима).
+///
+/// Живой `VideoSource` тут НЕ трогается: единственный источник истины —
+/// `sticker.playback`, а синхронизацию с декодером делает общий проход в
+/// `run()` (тот же принцип, что у кнопки паузы в тулбаре).
+fn toggle_video_playback(cfg: &mut Config, ids: &[Uuid]) -> bool {
+    let mut changed = false;
+    for id in ids {
+        if let Some(sticker) = cfg
+            .stickers
+            .iter_mut()
+            .find(|s| s.id == *id && sticker_is_video(s))
+        {
+            sticker.playback.paused = !sticker.playback.paused;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Изменить громкость видео-стикеров из списка на `delta` (доля 0..=1).
+fn adjust_video_volume(cfg: &mut Config, ids: &[Uuid], delta: f64) -> bool {
+    let mut changed = false;
+    for id in ids {
+        if let Some(sticker) = cfg
+            .stickers
+            .iter_mut()
+            .find(|s| s.id == *id && sticker_is_video(s))
+        {
+            let next = (sticker.playback.volume + delta).clamp(0.0, 1.0);
+            if (next - sticker.playback.volume).abs() > f64::EPSILON {
+                sticker.playback.volume = next;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Открыть видеофайл: аппаратный декод (D3D11VA) на ОБЩЕМ с рендером
+/// D3D11-устройстве, звук — под формат реального устройства вывода.
+///
+/// Аппаратный путь просят всегда, а `rst_video` сам откатывается на
+/// программный, когда он невозможен (нет железа, кодек без d3d11va, видео с
+/// альфой). Для тяжёлых файлов разница принципиальна: 1440p60 H.264 на
+/// процессоре — это и полный декод, и построчное копирование плоскостей, и
+/// загрузка ~5 МБ на кадр в видеопамять; аппаратный путь не делает ничего из
+/// этого — кадр остаётся текстурой на GPU (репорт пользователя 2026-08-22:
+/// «видео в хорошем качестве иногда пролагивает»). Механика M5c существовала
+/// в крейтах с самого начала, но координатор её не включал.
+fn open_video(
+    path: &Path,
+    device: &Device,
+    mixer: Option<&AudioMixer>,
+) -> Result<VideoSource, rst_video::VideoError> {
+    let d3d = device.d3d_device();
+    match mixer {
+        Some(m) => {
+            VideoSource::open_with_audio_target_hw(path, m.sample_rate(), m.channels(), d3d)
+        }
+        None => VideoSource::open_with_hw_device(path, d3d),
+    }
+}
+
+/// Каркас видеотекстур под РЕЖИМ декодирования этого источника: аппаратный
+/// кадр — это готовая NV12-текстура декодера (свой шейдер, SRV появится с
+/// первым кадром), программный — три плоскости Y/U/V.
+fn video_textures_for(
+    device: &Device,
+    source: &VideoSource,
+    width: u32,
+    height: u32,
+) -> Result<VideoTextures, RenderError> {
+    if source.hw_accel() {
+        device.create_video_textures_nv12(width, height)
+    } else {
+        blank_video_textures(device, width, height)
+    }
+}
+
 /// Пустые (чёрные) видеотекстуры нужного размера — до первого декодированного
 /// кадра (декодер работает в своём потоке и не гарантирует кадр сразу же,
 /// как `VideoSource::open*` вернулся, docs/M5B_VIDEO_DESIGN.md §6): спрайт
@@ -4018,11 +4540,7 @@ fn load_sticker_video(
     if !is_video {
         return None;
     }
-    let opened = match mixer {
-        Some(m) => VideoSource::open_with_audio_target(path, m.sample_rate(), m.channels()),
-        None => VideoSource::open(path),
-    };
-    let source = match opened {
+    let source = match open_video(path, device, mixer) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "не удалось открыть видео");
@@ -4030,7 +4548,7 @@ fn load_sticker_video(
         }
     };
     let (width, height) = source.dimensions();
-    let textures = match blank_video_textures(device, width, height) {
+    let textures = match video_textures_for(device, &source, width, height) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "не удалось создать видеотекстуры");
@@ -4053,7 +4571,20 @@ fn load_sticker_video(
         sticker.transform,
     )
     .with_video(textures);
-    Some((sprite, VideoPlayback { source, audio }))
+    let duration = source.duration();
+    let hw = source.hw_accel();
+    Some((
+        sprite,
+        VideoPlayback {
+            source,
+            audio,
+            position: Duration::ZERO,
+            duration,
+            hw,
+            notifier_wired: false,
+            hw_frame: None,
+        },
+    ))
 }
 
 /// Загрузить статичную текстуру стикера (без анимации) — общий хвост между
@@ -4338,7 +4869,7 @@ fn handle_key(
                         .pinned_windows
                         .iter()
                         .find(|p| p.hwnd == hwnd)
-                        .map_or(0, |p| p.host_rules.len());
+                        .map_or(0, |p| p.hosts.rules().len());
                     if sync_pinned_rule_text_fields(edit, hwnd, rule_count) {
                         rebuild_pinned_panel(edit, window_snapshot, monitor_bounds);
                     }
@@ -4394,6 +4925,26 @@ fn handle_key(
             }
             return result.redraw;
         }
+    }
+    // Пробел и PgUp/PgDn управляют ВЫДЕЛЕННЫМИ видео-стикерами (запрос
+    // пользователя 2026-08-22). Клавиши обычные, без модификаторов, поэтому
+    // проверяются здесь — ПОСЛЕ маршрутизации в сфокусированные текстовые
+    // поля выше: в поле ввода пробел обязан оставаться пробелом.
+    if matches!(vk, VK_SPACE | VK_PRIOR | VK_NEXT) && !modifiers.ctrl && !modifiers.alt {
+        let ids: Vec<Uuid> = edit.selection.ids().to_vec();
+        let changed = match vk {
+            VK_SPACE => toggle_video_playback(cfg, &ids),
+            VK_PRIOR => adjust_video_volume(cfg, &ids, VOLUME_KEY_STEP),
+            _ => adjust_video_volume(cfg, &ids, -VOLUME_KEY_STEP),
+        };
+        if changed {
+            commit_undo_snapshot(edit, cfg.clone());
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после управления видео с клавиатуры");
+            }
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
+        }
+        return changed;
     }
     match vk {
         VK_ESCAPE => {
@@ -4898,6 +5449,7 @@ fn toolbar_tooltip_text(id: WidgetId) -> Option<&'static str> {
         toolbar::TB_RESET_SCALE => Some("Сбросить масштаб"),
         toolbar::TB_DELETE => Some("Удалить"),
         toolbar::TB_PLAY_PAUSE => Some("Играть/пауза"),
+        toolbar::TB_TIMELINE => Some("Полоса перемотки вне режима редактирования"),
         _ => None,
     }
 }
@@ -5541,9 +6093,360 @@ fn rebuild_toolbar(edit: &mut EditState, cfg: &Config, screen_h: f64) {
     let video = is_video.then(|| toolbar::VideoToolbarState {
         paused: sticker.playback.paused,
         volume_pct: (sticker.playback.volume.clamp(0.0, 1.0) * 100.0).round() as u32,
+        show_timeline: sticker.playback.show_timeline,
     });
     let opacity = Some(sticker.transform.opacity);
     edit.toolbar = Some(toolbar::build_toolbar(&bounds, opacity, video, screen_h));
+}
+
+/// Идентификатор панели полосы перемотки: собственная панель, ни с чьими
+/// идентификаторами не пересекается (тулбар и панель закреплённого окна
+/// живут в своих панелях).
+const TIMELINE_PANEL_ID: rst_render::WidgetId = 400;
+
+/// Идентификатор виджета полосы внутри её собственной панели: панель
+/// содержит ровно один виджет, номер значения не имеет.
+const TIMELINE_WIDGET_ID: rst_render::WidgetId = 1;
+
+/// Как часто опрашивается позиция курсора ради «полоса всплывает при
+/// наведении» вне режима редактирования. Оверлей там кликопрозрачен и
+/// `WM_MOUSEMOVE` не получает вовсе, так что узнать о наведении можно
+/// только опросом. 60 мс — незаметно для руки и в разы дешевле кадра.
+const TIMELINE_HOVER_POLL: Duration = Duration::from_millis(60);
+
+/// Стикер, которому сейчас положена полоса перемотки, и режим показа.
+///
+/// В режиме редактирования — выделенное видео (полоса часть редактирования,
+/// показывается всегда). Вне его — видео под курсором с включённым
+/// `playback.show_timeline`: там стикер обычно должен оставаться просто
+/// картинкой, поэтому полоса всплывает по наведению, как в плеерах.
+/// `playable` — «у этого стикера есть живое видео с известной
+/// длительностью»: предикат, а не карта `videos`, чтобы правило выбора
+/// проверялось тестами без живого декодера и файлов на диске.
+fn video_timeline_target(
+    edit: &EditState,
+    cfg: &Config,
+    playable: &dyn Fn(&Uuid) -> bool,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    cursor: Option<(i32, i32)>,
+) -> Option<(Uuid, MonitorId, bool)> {
+    let has_duration = |id: &Uuid| playable(id);
+    if edit.active {
+        let ids = edit.selection.ids();
+        // Мульти-выделение: перематывать «их все» нечего.
+        let [id] = ids else {
+            return None;
+        };
+        let id = *id;
+        let sticker = cfg.stickers.iter().find(|s| s.id == id)?;
+        if !sticker_is_video(sticker) || !has_duration(&id) {
+            return None;
+        }
+        return Some((id, sticker.placement.monitor_id.clone(), false));
+    }
+    // Вне режима редактирования — по курсору. Позиция берётся опросом:
+    // кликопрозрачное окно событий мыши не получает.
+    let (cx, cy) = cursor?;
+    let (monitor_id, dip) = monitor_dip_at(cx, cy, monitor_bounds)?;
+    cfg.stickers
+        .iter()
+        .filter(|s| s.enabled && s.visible && s.playback.show_timeline)
+        .filter(|s| sticker_is_video(s) && has_duration(&s.id))
+        .filter(|s| s.placement.monitor_id == *monitor_id)
+        .filter(|s| {
+            let r = hittest::aabb(&s.placement, s.transform.rotation);
+            dip.0 >= r.x && dip.0 <= r.x + r.w && dip.1 >= r.y && dip.1 <= r.y + r.h
+        })
+        // Стикеры перекрываются — полоса принадлежит верхнему, тому же,
+        // который человек и видит под курсором.
+        .max_by_key(|s| s.order)
+        .map(|s| (s.id, monitor_id.clone(), true))
+}
+
+/// Стикер — видеофайл.
+fn sticker_is_video(sticker: &Sticker) -> bool {
+    matches!(
+        &sticker.source,
+        StickerSource::File {
+            media_type: MediaType::Video,
+            ..
+        }
+    )
+}
+
+/// Монитор под точкой виртуального десктопа (физические пиксели) и та же
+/// точка в DIP этого монитора — координатах, в которых живут стикеры.
+fn monitor_dip_at(
+    x: i32,
+    y: i32,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> Option<(&MonitorId, (f64, f64))> {
+    monitor_bounds.iter().find_map(|(id, b)| {
+        let r = b.bounds_px;
+        let inside = x >= r.x && y >= r.y && x < r.x + r.w as i32 && y < r.y + r.h as i32;
+        inside.then(|| {
+            (
+                id,
+                (
+                    (x - r.x) as f64 / b.scale,
+                    (y - r.y) as f64 / b.scale,
+                ),
+            )
+        })
+    })
+}
+
+/// Привести полосу перемотки в соответствие с текущим состоянием: показать
+/// нужному стикеру, обновить позицию проигрывания, убрать, когда её больше
+/// некому показывать. Возвращает `true`, если кадр надо перерисовать.
+///
+/// Позиция ВО ВРЕМЯ протяжки не навязывается виджету: пока пользователь
+/// держит ручку, положение задаёт его палец, а не продолжающее играть видео
+/// (иначе полоса дёргалась бы под рукой) — виджет это и обеспечивает,
+/// игнорируя `set_position` в перетаскивании.
+fn sync_video_timeline(
+    edit: &mut EditState,
+    cfg: &Config,
+    videos: &HashMap<Uuid, VideoPlayback>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> bool {
+    if videos.is_empty() {
+        // Ни одного живого видео — ни полосы, ни опроса курсора: в обычном
+        // режиме программа не должна просыпаться и дёргать систему впустую
+        // (ADR-006, «ноль пробуждений в покое»).
+        return edit.video_timeline.take().is_some();
+    }
+    let cursor = (!edit.active)
+        .then(|| rst_win32::window_pick::cursor_position().ok())
+        .flatten()
+        .map(|c| (c.x, c.y));
+    let playable = |id: &Uuid| videos.get(id).is_some_and(|v| v.duration.is_some());
+    let target = video_timeline_target(edit, cfg, &playable, monitor_bounds, cursor);
+    let Some((id, monitor_id, hover_mode)) = target else {
+        return edit.video_timeline.take().is_some();
+    };
+    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) else {
+        return edit.video_timeline.take().is_some();
+    };
+    let Some(playback) = videos.get(&id) else {
+        return edit.video_timeline.take().is_some();
+    };
+    let Some(duration) = playback.duration else {
+        return edit.video_timeline.take().is_some();
+    };
+    let r = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+    let anchor = (r.x, r.y, r.w, r.h);
+    let same = edit.video_timeline.as_ref().is_some_and(|t| {
+        t.sticker_id == id
+            && t.hover_mode == hover_mode
+            && t.anchor == anchor
+            && t.duration == duration
+    });
+    if !same {
+        let Some(frame) = rst_render::timeline_bounds(rect_to_box(&r)) else {
+            // Стикер слишком мал: полоса заняла бы его целиком и перемотка
+            // всё равно была бы неуправляемой.
+            return edit.video_timeline.take().is_some();
+        };
+        let mut panel = Panel::new(TIMELINE_PANEL_ID, frame);
+        panel.add_widget(rst_render::VideoTimeline::new(
+            TIMELINE_WIDGET_ID,
+            frame,
+            duration.as_secs_f64(),
+            playback.position.as_secs_f64(),
+        ));
+        edit.video_timeline = Some(VideoTimelineState {
+            sticker_id: id,
+            monitor_id,
+            panel,
+            hover_mode,
+            anchor,
+            duration,
+            over_strip: false,
+        });
+        update_timeline_over_strip(edit, monitor_bounds);
+        return true;
+    }
+    update_timeline_over_strip(edit, monitor_bounds);
+    // Полоса «в полный голос» ровно тогда, когда курсор на стикере: вне
+    // режима редактирования она в этот момент и появляется, а в самом
+    // режиме — подсвечивается, когда до неё дотянулись.
+    let hovered = hover_mode || cursor_over_rect(edit, &r);
+    let position = playback.position.as_secs_f64();
+    let Some(state) = edit.video_timeline.as_mut() else {
+        return false;
+    };
+    let Some(w) = state
+        .panel
+        .widget_mut::<rst_render::VideoTimeline>(TIMELINE_WIDGET_ID)
+    else {
+        return false;
+    };
+    let before = w.position();
+    w.set_position(position);
+    let redraw = w.set_hovered(hovered);
+    redraw || (w.position() - before).abs() > f64::EPSILON
+}
+
+/// Курсор внутри прямоугольника (DIP своего монитора) по данным режима
+/// редактирования — там `MouseMove` приходят и опрашивать курсор незачем.
+fn cursor_over_rect(edit: &EditState, r: &DipRect) -> bool {
+    let (x, y) = edit.cursor_pos;
+    x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
+}
+
+/// Обновить признак «курсор над самой полосой» — вне режима
+/// редактирования по нему включается кликабельность оверлея. В режиме
+/// редактирования оверлей кликабелен и так, признак не нужен.
+fn update_timeline_over_strip(
+    edit: &mut EditState,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) {
+    let Some(state) = edit.video_timeline.as_mut() else {
+        return;
+    };
+    if !state.hover_mode {
+        state.over_strip = false;
+        return;
+    }
+    let over = rst_win32::window_pick::cursor_position()
+        .ok()
+        .and_then(|c| monitor_dip_at(c.x, c.y, monitor_bounds))
+        .is_some_and(|(id, dip)| *id == state.monitor_id && state.panel.hit_test(dip));
+    state.over_strip = over;
+}
+
+/// `DipRect` → `Box2D` (виджеты живут в центрированных прямоугольниках).
+fn rect_to_box(r: &DipRect) -> Box2D {
+    Box2D {
+        cx: r.x + r.w / 2.0,
+        cy: r.y + r.h / 2.0,
+        w: r.w,
+        h: r.h,
+        rotation: 0.0,
+    }
+}
+
+/// Выполнить перемотку, которую запросила полоса: синхронный `seek` в
+/// декодер + сброс уже накопленного звука (он относится к старой позиции).
+fn apply_timeline_seek(videos: &mut HashMap<Uuid, VideoPlayback>, id: Uuid, to_secs: f64) {
+    let Some(playback) = videos.get_mut(&id) else {
+        return;
+    };
+    let to = Duration::from_secs_f64(to_secs.max(0.0));
+    match playback.source.seek(to) {
+        Ok(()) => {
+            playback.source.clear_audio_queue();
+            // До первого нового кадра позиция должна показывать то, куда
+            // пользователь отпустил ручку, иначе полоса прыгнет назад.
+            playback.position = to;
+        }
+        Err(e) => tracing::warn!(error = %e, "не удалось перемотать видео"),
+    }
+}
+
+/// Клик по полосе перемотки: `true` — полоса его забрала.
+fn timeline_pointer_down(edit: &mut EditState, monitor_id: &MonitorId, pos: (f64, f64)) -> bool {
+    let Some(state) = edit.video_timeline.as_mut() else {
+        return false;
+    };
+    if state.monitor_id != *monitor_id {
+        return false;
+    }
+    state.panel.pointer_event(PointerEvent::Down { pos }).consumed
+}
+
+/// Протяжка по полосе: отдать событие виджету и выполнить перемотку, если
+/// он её запросил.
+fn timeline_pointer_move(
+    edit: &mut EditState,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    pos: (f64, f64),
+) {
+    let Some(state) = edit.video_timeline.as_mut() else {
+        return;
+    };
+    state.panel.pointer_event(PointerEvent::Move { pos });
+    let id = state.sticker_id;
+    if let Some(secs) = timeline_take_seek(state) {
+        apply_timeline_seek(videos, id, secs);
+    }
+}
+
+/// Отпускание ручки: последняя перемотка (положение могло измениться уже
+/// самим `Up`) и конец жеста.
+fn timeline_pointer_up(
+    edit: &mut EditState,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    pos: (f64, f64),
+) {
+    let Some(state) = edit.video_timeline.as_mut() else {
+        return;
+    };
+    state.panel.pointer_event(PointerEvent::Up { pos });
+    let id = state.sticker_id;
+    if let Some(secs) = timeline_take_seek(state) {
+        apply_timeline_seek(videos, id, secs);
+    }
+}
+
+/// Забрать у виджета запрошенную позицию перемотки (одноразово, как
+/// `take_click` у кнопок).
+fn timeline_take_seek(state: &mut VideoTimelineState) -> Option<f64> {
+    state
+        .panel
+        .widget_mut::<rst_render::VideoTimeline>(TIMELINE_WIDGET_ID)?
+        .take_seek()
+}
+
+/// Указатель для полосы, показанной ВНЕ режима редактирования: там оверлей
+/// кликопрозрачен для всего, кроме самой полосы (см.
+/// `OverlayWindow::set_hover_click_target`), поэтому события приходят
+/// отдельным путём и НИКОГДА не уходят в сцену — вне режима редактирования
+/// стикеры не двигают и не выделяют.
+fn handle_timeline_hover_input(
+    edit: &mut EditState,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    event: InputEvent,
+    scale: f32,
+    monitor_id: &MonitorId,
+) -> bool {
+    if !edit
+        .video_timeline
+        .as_ref()
+        .is_some_and(|t| t.hover_mode && t.monitor_id == *monitor_id)
+    {
+        return false;
+    }
+    match event {
+        InputEvent::MouseDown { pos, .. } => {
+            let consumed = timeline_pointer_down(edit, monitor_id, to_dip(pos, scale));
+            if consumed {
+                edit.timeline_dragging = true;
+            }
+            consumed
+        }
+        InputEvent::MouseMove { pos, .. } => {
+            timeline_pointer_move(edit, videos, to_dip(pos, scale));
+            true
+        }
+        InputEvent::MouseUp { pos, .. } => {
+            timeline_pointer_up(edit, videos, to_dip(pos, scale));
+            edit.timeline_dragging = false;
+            true
+        }
+        InputEvent::CaptureLost => {
+            // Захват отобрали (Alt+Tab, чужой модал) — бросаем протяжку.
+            // Панель снимаем целиком: `Panel`/виджет держат внутри
+            // `capture`/`dragging`, и штатный способ их сбросить в этом коде
+            // — построить панель заново, а не синтезировать `Up`, который
+            // засчитался бы как перемотка (тот же приём, что у тулбара).
+            edit.video_timeline = None;
+            edit.timeline_dragging = false;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Пересобрать панель у курсора (раздел 4): есть, пока режим активен, на
@@ -5694,7 +6597,7 @@ fn rebuild_window_picker(
         },
         PickerTarget::PinnedHost(hwnd) => {
             match edit.pinned_windows.iter().find(|p| p.hwnd == hwnd) {
-                Some(pinned) => host_rules_as_visibility(&pinned.host_rules),
+                Some(pinned) => host_rules_as_visibility(&pinned.hosts),
                 None => {
                     edit.window_picker = None;
                     return;
@@ -5906,31 +6809,34 @@ fn rebuild_pinned_panel(
         return;
     };
     let bounds = &monitor_bounds[&monitor_id];
-    let frame = pinned_panel_frame(&placement, bounds, pinned.host_rules.len());
+    let frame = pinned_panel_frame(&placement, bounds, pinned.hosts.rules().len());
     // Урезанная панель: замки + «Открепить», без раздела правил соседства
     // (см. доккомент `rst_render::build_pinned_lock_panel`).
     // Подписи строк «показывать только на этих окнах» — имена процессов
     // (правило создаётся по процессу, см. `add_host_rule`); правило по
     // заголовку, если оно когда-нибудь появится, показывается своим
     // шаблоном.
-    let hosts: Vec<String> = pinned
-        .host_rules
-        .iter()
-        .map(|rule| {
-            rule.process_name
-                .clone()
-                .or_else(|| rule.title_pattern.clone())
-                .unwrap_or_else(|| "—".to_string())
-        })
-        .collect();
+    let hosts: Option<Vec<String>> = pinned.hosts.is_restricted().then(|| {
+        pinned
+            .hosts
+            .rules()
+            .iter()
+            .map(|rule| {
+                rule.process_name
+                    .clone()
+                    .or_else(|| rule.title_pattern.clone())
+                    .unwrap_or_else(|| "—".to_string())
+            })
+            .collect()
+    });
     let panel = rst_render::build_pinned_lock_panel(
         pinned.lock_move,
         pinned.lock_interact,
-        &hosts,
+        hosts.as_deref(),
         frame,
     );
     edit.pinned_panel = Some(PinnedPanelState {
-        host_rules: hosts.len(),
+        host_rules: hosts.map_or(0, |h| h.len()),
         hwnd,
         panel,
         monitor_id,
@@ -6169,8 +7075,8 @@ fn handle_window_picker_up(
                     .pinned_windows
                     .iter()
                     .find(|p| p.hwnd == hwnd)
-                    .map(|p| host_rules_as_visibility(&p.host_rules))
-                    .unwrap_or_else(|| host_rules_as_visibility(&[]));
+                    .map(|p| host_rules_as_visibility(&p.hosts))
+                    .unwrap_or_else(|| host_rules_as_visibility(&HostFilter::Anywhere));
                 window_picker::toggle_select_all(&current, window_snapshot)
             };
             apply_host_rules(edit, hwnd, updated, window_snapshot, monitor_bounds);
@@ -6245,8 +7151,8 @@ fn handle_window_picker_up(
                     .pinned_windows
                     .iter()
                     .find(|p| p.hwnd == hwnd)
-                    .map(|p| host_rules_as_visibility(&p.host_rules))
-                    .unwrap_or_else(|| host_rules_as_visibility(&[]));
+                    .map(|p| host_rules_as_visibility(&p.hosts))
+                    .unwrap_or_else(|| host_rules_as_visibility(&HostFilter::Anywhere));
                 window_picker::toggle_process_group(&current, group, window_snapshot)
             };
             if let Some(updated) = updated {
@@ -6579,6 +7485,9 @@ fn maintain_pinned_windows(
     // Идёт Alt+Tab/Win+Tab/меню Пуск — на время переключения чужие окна не
     // трогаем вовсе (см. `rst_win32::window_enum::shell_switching`).
     let shell_switching = rst_win32::window_enum::shell_switching();
+    // Монитор переднего окна: переключение на соседнем экране не должно
+    // гасить закреплённое окно на этом (запрос пользователя 2026-08-22).
+    let foreground_monitor = foreground.and_then(rst_win32::window_enum::monitor_of);
     let foreground_info = foreground.and_then(|hwnd| {
         window_snapshot
             .iter()
@@ -6589,20 +7498,45 @@ fn maintain_pinned_windows(
     for pinned in &mut edit.pinned_windows {
         let hwnd = pinned.hwnd as usize;
         let win_hwnd = HWND(hwnd as *mut core::ffi::c_void);
-        if !pinned.host_rules.is_empty() {
+        if pinned.hosts.is_restricted() {
             // «Показывать только на этих окнах» (запрос пользователя
             // 2026-08-22): видимость определяется ИДЕНТИЧНОСТЬЮ активного
             // окна, а не геометрией — перекрывает ли хозяин ту область, где
             // лежит закреплённое окно, значения не имеет.
-            let action = pinned_window::host_action(&pinned_window::HostContext {
-                rules: &pinned.host_rules,
+            let minimized = rst_win32::window_pin::is_window_minimized(hwnd);
+            let ctx = pinned_window::HostContext {
+                hosts: &pinned.hosts,
                 foreground_is_target: foreground == Some(hwnd),
                 foreground_process: foreground_info.as_ref().map(|(exe, _)| exe.as_str()),
                 foreground_title: foreground_info.as_ref().map(|(_, title)| title.as_str()),
-                target_minimized: rst_win32::window_pin::is_window_minimized(hwnd),
+                target_minimized: minimized,
                 hidden_by_rules: pinned.hidden_by_rules,
+                away_from_hosts: pinned.away_from_hosts,
+                foreground_elsewhere: match (
+                    foreground_monitor,
+                    rst_win32::window_enum::monitor_of(hwnd),
+                ) {
+                    (Some(fg), Some(target)) => fg != target,
+                    // Монитор неизвестен (нет переднего окна — рабочий
+                    // стол; закреплённое окно свёрнуто) — правило работает
+                    // как раньше.
+                    _ => false,
+                },
                 shell_switching,
-            });
+            };
+            let action = pinned_window::host_action(&ctx);
+            // Ведём «успел уйти с хозяев» ДО применения решения: окно
+            // видно — счётчик сброшен; окно свёрнуто и активно что-то
+            // постороннее — пользователь ушёл, и его возвращение на
+            // хозяина обязано вернуть окно (репорт пользователя
+            // 2026-08-22). Во время переключения шелла (Alt+Tab, панель
+            // задач) состояние не трогаем вовсе: «активен переключатель» —
+            // это не «пользователь ушёл на другое приложение».
+            if !minimized {
+                pinned.away_from_hosts = false;
+            } else if !shell_switching && !pinned_window::host_is_active(&ctx) {
+                pinned.away_from_hosts = true;
+            }
             match action {
                 pinned_window::HostAction::Hide => {
                     if window_pins.hide_until_host(win_hwnd) {
@@ -6612,6 +7546,9 @@ fn maintain_pinned_windows(
                 pinned_window::HostAction::Show => {
                     window_pins.show_for_host(win_hwnd);
                     pinned.hidden_by_rules = false;
+                    // Окно снова на экране — следующий возврат потребует
+                    // нового ухода.
+                    pinned.away_from_hosts = false;
                 }
                 pinned_window::HostAction::None => {
                     // Окно видно и должно быть видно — держим его наверху
@@ -6659,11 +7596,11 @@ fn suspend_pin_enforcement(
         let hwnd = HWND(pinned.hwnd as usize as *mut core::ffi::c_void);
         window_pins.set_move_lock(hwnd, false);
         window_pins.set_interact_lock(hwnd, false);
-        if edit.surfaced_pins.remove(&pinned.hwnd) && !pinned.host_rules.is_empty() {
+        if edit.surfaced_pins.remove(&pinned.hwnd) && pinned.hosts.is_restricted() {
             let above = resolve_topmost_neighbor(
                 window_snapshot,
                 pinned.hwnd as usize,
-                &pinned.host_rules,
+                pinned.hosts.rules(),
             )
             .map(|n| HWND(n as *mut core::ffi::c_void));
             window_pins.restore_slot(hwnd, above);
@@ -6858,20 +7795,22 @@ fn handle_window_pick_list_up(
 /// формы, которую понимает панель выбора окон
 /// ([`window_picker::build_picker_panel`]). Никакой семантики стикера тут
 /// нет: панель читает из этой структуры ровно «какие процессы отмечены».
-fn host_rules_as_visibility(rules: &[OverlapRule]) -> VisibilityRule {
-    if rules.is_empty() {
-        // Правил нет — окно закреплено поверх ВСЕГО, то есть показывается
-        // на любом окне. В панели это и должно читаться как «выбраны все»
-        // (запрос пользователя 2026-08-22), а такое состояние в модели
-        // выражает именно `Always`.
-        return VisibilityRule {
+fn host_rules_as_visibility(hosts: &HostFilter) -> VisibilityRule {
+    match hosts {
+        // Ограничений нет — окно видно на любом окне, и панель обязана
+        // показывать это всеми галочками (запрос пользователя 2026-08-22);
+        // такое состояние в модели видимости выражает именно `Always`.
+        HostFilter::Anywhere => VisibilityRule {
             mode: VisibilityMode::Always,
             rules: Vec::new(),
-        };
-    }
-    VisibilityRule {
-        mode: VisibilityMode::OverlapAllowlist,
-        rules: rules.to_vec(),
+        },
+        // Список хозяев — allow-list, в том числе ПУСТОЙ: снятые все
+        // галочки должны остаться снятыми, иначе кнопка «Снять все»
+        // выглядит неработающей (репорт 2026-08-22).
+        HostFilter::Only(rules) => VisibilityRule {
+            mode: VisibilityMode::OverlapAllowlist,
+            rules: rules.clone(),
+        },
     }
 }
 
@@ -6885,18 +7824,19 @@ fn apply_host_rules(
     window_snapshot: &[WindowInfo],
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
 ) {
-    // Обратный перевод из формы панели: «выбраны все» (`Always`) и пустой
-    // список — одно и то же «ограничений нет». Состояния «не показывать
-    // нигде» у закреплённого окна нет намеренно: окно, которое не видно
-    // никогда, бесполезно, а вернуть его пользователю было бы нечем.
-    let rules = match updated.mode {
-        VisibilityMode::Always => Vec::new(),
-        _ => updated.rules,
+    // Обратный перевод из формы панели. `Always` — «выбраны все», то есть
+    // ограничений нет; любой allow-list (включая пустой — «ни на одном
+    // окне») ограничение включает. Пустой список запереть окно не может:
+    // [`pinned_window::host_action`] всегда уступает явному вызову
+    // пользователем, так что окно возвращается с панели задач.
+    let hosts = match updated.mode {
+        VisibilityMode::Always => HostFilter::Anywhere,
+        _ => HostFilter::Only(updated.rules),
     };
     let mut restore = false;
     if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == hwnd) {
-        pinned.host_rules = rules;
-        if pinned.host_rules.is_empty() && pinned.hidden_by_rules {
+        pinned.hosts = hosts;
+        if !pinned.hosts.is_restricted() && pinned.hidden_by_rules {
             restore = true;
             pinned.hidden_by_rules = false;
         }
@@ -6915,7 +7855,7 @@ fn apply_host_rules(
         .pinned_windows
         .iter()
         .find(|p| p.hwnd == hwnd)
-        .is_some_and(|p| !p.host_rules.is_empty());
+        .is_some_and(|p| p.hosts.is_restricted());
     pins.set_transitions_disabled(win_hwnd, has_rules);
     rebuild_pinned_panel(edit, window_snapshot, monitor_bounds);
 }
@@ -6939,7 +7879,7 @@ fn sync_pinned_rule_text_fields(edit: &mut EditState, hwnd: isize, rule_count: u
             let Some(text) = submitted else { continue };
             let value = (!text.is_empty()).then_some(text);
             if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == hwnd) {
-                if let Some(rule) = pinned.host_rules.get_mut(rule_index) {
+                if let Some(rule) = pinned.hosts.rules_mut().get_mut(rule_index) {
                     match field {
                         PinnedRowField::ProcessName => rule.process_name = value,
                         PinnedRowField::TitlePattern => rule.title_pattern = value,
@@ -7044,7 +7984,7 @@ fn handle_pinned_panel_up(
         .is_some_and(Button::take_click)
     {
         if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == hwnd) {
-            pinned.host_rules.push(OverlapRule::default());
+            pinned.hosts.rules_mut().push(OverlapRule::default());
         }
         rebuild_pinned_panel(edit, window_snapshot, monitor_bounds);
         return true;
@@ -7054,7 +7994,7 @@ fn handle_pinned_panel_up(
         .pinned_windows
         .iter()
         .find(|p| p.hwnd == hwnd)
-        .map_or(0, |p| p.host_rules.len());
+        .map_or(0, |p| p.hosts.rules().len());
     for rule_index in 0..rule_count {
         let removed = edit
             .pinned_panel
@@ -7068,8 +8008,8 @@ fn handle_pinned_panel_up(
             continue;
         }
         if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == hwnd) {
-            if rule_index < pinned.host_rules.len() {
-                pinned.host_rules.remove(rule_index);
+            if rule_index < pinned.hosts.rules().len() {
+                pinned.hosts.rules_mut().remove(rule_index);
             }
         }
         rebuild_pinned_panel(edit, window_snapshot, monitor_bounds);
@@ -7312,6 +8252,20 @@ fn handle_toolbar_up(
         }
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после паузы/воспроизведения видео");
+        }
+        rebuild_ui_panels(edit, cfg, monitor_geometry);
+        return true;
+    }
+    // Полоса перемотки вне режима редактирования (запрос пользователя
+    // 2026-08-22) — настройка стикера, как пауза и громкость: сохраняется в
+    // config.json и переживает перезапуск.
+    if clicked(edit, toolbar::TB_TIMELINE) {
+        commit_undo_snapshot(edit, cfg.clone());
+        if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
+            sticker.playback.show_timeline = !sticker.playback.show_timeline;
+        }
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после переключения полосы перемотки");
         }
         rebuild_ui_panels(edit, cfg, monitor_geometry);
         return true;
@@ -7697,6 +8651,20 @@ fn handle_input(
                     }
                 }
             }
+            // Полоса перемотки лежит ВНУТРИ прямоугольника стикера, поэтому
+            // проверяется до сцены: иначе клик по ней начал бы тащить сам
+            // стикер, а перемотать видео стало бы нельзя. Но ручки ресайза
+            // и поворота приоритетнее полосы: полоса прижата к нижнему краю
+            // и накрыла бы нижнюю ручку, а без неё стикер стало бы не
+            // растянуть — перемотать же можно и на пару пикселей выше.
+            let over_handle = matches!(
+                resolve_zone(cfg, &edit.selection, monitor_id, dip_x, dip_y),
+                Zone::ResizeHandle(..) | Zone::Rotate(..)
+            );
+            if !over_handle && timeline_pointer_down(edit, monitor_id, (dip_x, dip_y)) {
+                edit.pointer_owner = PointerOwner::VideoTimeline;
+                return true;
+            }
             edit.pointer_owner = PointerOwner::Scene;
             // Ручки ресайза выделенного закреплённого окна — приоритетнее
             // сцены стикеров (тот же приоритет «ручки прежде всего», что у
@@ -7938,6 +8906,15 @@ fn handle_input(
                             pos: (dip_x, dip_y),
                         });
                     }
+                    return true;
+                }
+                PointerOwner::VideoTimeline => {
+                    // Перемотка идёт ПРЯМО ВО ВРЕМЯ протяжки, а не по
+                    // отпусканию: человек ищет нужный момент глазами, и без
+                    // живой картинки полоса превращается в угадайку.
+                    // Троттлинг не нужен — виджет отдаёт запрос только при
+                    // реальной смене позиции.
+                    timeline_pointer_move(edit, videos, (dip_x, dip_y));
                     return true;
                 }
                 PointerOwner::Scene if dragging && edit.pinned_gesture.is_some() => {
@@ -8271,6 +9248,11 @@ fn handle_input(
                         (dip_x, dip_y),
                     );
                 }
+                PointerOwner::VideoTimeline => {
+                    edit.pointer_owner = PointerOwner::None;
+                    timeline_pointer_up(edit, videos, (dip_x, dip_y));
+                    return true;
+                }
                 PointerOwner::PinnedPanel => {
                     edit.pointer_owner = PointerOwner::None;
                     return handle_pinned_panel_up(
@@ -8484,6 +9466,14 @@ fn handle_input(
             if edit.pointer_owner == PointerOwner::PinnedPanel {
                 edit.pointer_owner = PointerOwner::None;
                 rebuild_pinned_panel(edit, window_snapshot, monitor_bounds);
+                return true;
+            }
+            if edit.pointer_owner == PointerOwner::VideoTimeline {
+                // Полоса перемотки: откатывать в `cfg` нечего (перемотка —
+                // рантайм-состояние декодера), достаточно снять зависшую
+                // протяжку — панель соберётся заново следующим тиком.
+                edit.pointer_owner = PointerOwner::None;
+                edit.video_timeline = None;
                 return true;
             }
             if let Some(gesture) = edit.pinned_gesture.take() {
@@ -9085,6 +10075,20 @@ fn redraw(
         primitives_to_sprites(&prims, ui_cache, renderer, monitor_id, text_scale, &mut frame);
     }
 
+    // Полоса перемотки видео — ПОД тулбаром и панелью у курсора: она
+    // прижата к самому стикеру и не должна перекрывать элементы
+    // редактирования, если они наложились. Рисуется и вне режима
+    // редактирования (в этом её смысл — см. `VideoTimelineState`).
+    if let Some(timeline) = &edit.video_timeline {
+        if timeline.monitor_id == *monitor_id {
+            let mut prims = Vec::new();
+            timeline.panel.draw(&mut prims);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
+    }
+
     // Тулбар и панель у курсора — над рамками выделения, под модалом
     // (раздел 11). Тулбар следует за монитором выделенного стикера; панель
     // у курсора и марка — за `edit.cursor_monitor` (M3, см. выше).
@@ -9246,7 +10250,14 @@ fn redraw(
     // `Present`: иначе геометрия, прочитанная до ожидания, показывается на
     // кадр позже и графика поверх окна отстаёт (замер 2026-08-21: около
     // 16.5 мс на 60 Гц). В остальное время такт задаёт сам `Present(1)`.
-    let sync = if pin_follow_active(edit) {
+    // Играющее видео — тот же случай, что слежение за чужим окном:
+    // `Present(1)` блокирует поток координатора до следующей развёртки
+    // (до 16.7 мс на 60 Гц), и это ожидание складывается с ожиданием
+    // следующего кадра — эффективный такт падает вдвое, кадры пропускаются
+    // (репорт 2026-08-22 про рывки). Композитор всё равно показывает наш
+    // DirectComposition-слой на своей развёртке, так что ждать внутри
+    // `Present` нечего.
+    let sync = if pin_follow_active(edit) || edit.video_playing {
         PresentSync::Immediate
     } else {
         PresentSync::VSync
@@ -9758,11 +10769,7 @@ fn add_video_sticker(
     monitor_id: &MonitorId,
     audio_mixer: Option<&AudioMixer>,
 ) -> bool {
-    let opened = match audio_mixer {
-        Some(m) => VideoSource::open_with_audio_target(&path, m.sample_rate(), m.channels()),
-        None => VideoSource::open(&path),
-    };
-    let source = match opened {
+    let source = match open_video(&path, renderer.device, audio_mixer) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "не удалось открыть видео");
@@ -9770,7 +10777,7 @@ fn add_video_sticker(
         }
     };
     let (w, h) = source.dimensions();
-    let textures = match blank_video_textures(renderer.device, w, h) {
+    let textures = match video_textures_for(renderer.device, &source, w, h) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "не удалось создать видеотекстуры");
@@ -9819,7 +10826,20 @@ fn add_video_sticker(
         tracing::warn!(error = %e, "не удалось сохранить config.json после добавления стикера");
     }
     sprites.push((id, sprite));
-    edit.pending_video = Some((id, VideoPlayback { source, audio }));
+    let duration = source.duration();
+    let hw = source.hw_accel();
+    edit.pending_video = Some((
+        id,
+        VideoPlayback {
+            source,
+            audio,
+            position: Duration::ZERO,
+            duration,
+            hw,
+            notifier_wired: false,
+            hw_frame: None,
+        },
+    ));
     true
 }
 
@@ -9838,7 +10858,6 @@ fn load_static(renderer: &Renderer, path: &Path) -> Option<Texture> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rst_render::Widget as _;
 
     fn bounds(x: i32, y: i32, w: u32, h: u32) -> Rect {
         Rect { x, y, w, h }
@@ -10139,7 +11158,12 @@ mod tests {
             tooltip: None,
             pointer_owner: PointerOwner::None,
             ui_pending_snapshot: None,
-            cursor_pos: (0.0, 0.0),
+            video_timeline: None,
+        video_playing: false,
+        media_hotkeys_on: None,
+        timeline_dragging: false,
+        timeline_click_target: None,
+        cursor_pos: (0.0, 0.0),
             cursor_monitor: monitor_id("main"),
             coordinator_tx,
         }
@@ -10913,7 +11937,7 @@ mod tests {
         // По умолчанию у закреплённого окна выбраны ВСЕ окна (запрос
         // пользователя 2026-08-22): правил нет — окно видно везде, и панель
         // обязана показывать это всеми галочками, а не ни одной.
-        let hosts = &edit.pinned_windows[0].host_rules;
+        let hosts = edit.pinned_windows[0].hosts.rules();
         assert!(
             hosts.iter().all(|r| r.process_name.as_deref() != Some("chrome.exe")),
             "снятая галочка убирает именно chrome.exe: {hosts:?}"
@@ -10939,7 +11963,8 @@ mod tests {
         );
         assert!(
             edit.pinned_windows[0]
-                .host_rules
+                .hosts
+                .rules()
                 .iter()
                 .any(|r| r.process_name.as_deref() == Some("chrome.exe")),
             "повторный клик возвращает процесс в список хозяев"
@@ -10957,7 +11982,7 @@ mod tests {
         let mut window_pins = WindowPins::new();
         assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
 
-        let visibility = host_rules_as_visibility(&edit.pinned_windows[0].host_rules);
+        let visibility = host_rules_as_visibility(&edit.pinned_windows[0].hosts);
         for group in window_picker::group_by_process(&snapshot) {
             if group.process_name.is_none() {
                 continue;
@@ -10970,7 +11995,96 @@ mod tests {
         }
     }
 
-    /// Панель инструментов должна лежать ВНУТРИ прямоугольника окна    /// Панель инструментов должна лежать ВНУТРИ прямоугольника окна
+    /// «Снять все» в выборе окон-хозяев обязана реально снимать галочки
+    /// (репорт пользователя 2026-08-22: кнопка не работала). Раньше пустой
+    /// список читался как «ограничений нет», панель перерисовывалась со
+    /// всеми галочками, и клик выглядел как ничего не делающий.
+    #[test]
+    fn select_all_button_clears_host_checkboxes() {
+        let (mut cfg, config_path, snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        let mut edit = mask_gate_edit_state();
+        let mut window_pins = WindowPins::new();
+        let monitor_geometry: HashMap<MonitorId, (u32, u32, f32)> =
+            HashMap::from([(monitor_id("main"), (1920u32, 1080u32, 1.0f32))]);
+        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        edit.pinned_selection = Some(hwnd as isize);
+        open_window_picker(
+            &mut edit,
+            &cfg,
+            &snapshot,
+            &monitor_geometry,
+            PickerTarget::PinnedHost(hwnd as isize),
+        );
+        rebuild_window_picker(&mut edit, &cfg, &snapshot, &monitor_geometry);
+
+        let btn_pos = edit
+            .window_picker
+            .as_ref()
+            .and_then(|s| s.panel.widget::<Button>(window_picker::PICKER_BTN_SELECT_ALL))
+            .map(|b| {
+                let r = b.bounds();
+                (r.cx, r.cy)
+            })
+            .expect("кнопка «Выбрать/Снять все»");
+        if let Some(state) = edit.window_picker.as_mut() {
+            state.panel.pointer_event(PointerEvent::Down { pos: btn_pos });
+        }
+        let mut occluder_cache: HashMap<MonitorId, Vec<OccluderSet>> = HashMap::new();
+        handle_window_picker_up(
+            &mut edit,
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_geometry,
+            &monitor_bounds,
+            &mut occluder_cache,
+            btn_pos,
+        );
+
+        assert_eq!(
+            edit.pinned_windows[0].hosts,
+            HostFilter::Only(Vec::new()),
+            "снятые все галочки — это «ни на одном окне», а не «ограничений нет»"
+        );
+        let visibility = host_rules_as_visibility(&edit.pinned_windows[0].hosts);
+        for group in window_picker::group_by_process(&snapshot) {
+            assert!(
+                !window_picker::process_is_checked(&visibility, &group),
+                "галочка {:?} обязана быть снятой",
+                group.process_name
+            );
+        }
+
+        // Повторный клик возвращает все галочки — кнопка работает в обе
+        // стороны, как у стикера.
+        if let Some(state) = edit.window_picker.as_mut() {
+            state.panel.pointer_event(PointerEvent::Down { pos: btn_pos });
+        }
+        handle_window_picker_up(
+            &mut edit,
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_geometry,
+            &monitor_bounds,
+            &mut occluder_cache,
+            btn_pos,
+        );
+        let visibility = host_rules_as_visibility(&edit.pinned_windows[0].hosts);
+        for group in window_picker::group_by_process(&snapshot) {
+            if group.process_name.is_none() {
+                continue;
+            }
+            assert!(
+                window_picker::process_is_checked(&visibility, &group),
+                "галочка {:?} обязана вернуться",
+                group.process_name
+            );
+        }
+    }
+
+    /// Панель инструментов должна лежать ВНУТРИ прямоугольника окна
     /// (решение пользователя 2026-08-21) — раньше она висела под окном
     /// снаружи.
     #[test]
@@ -11825,6 +12939,187 @@ mod tests {
         assert_close(cursor_100.1, start_dip.1, "y после полного круга");
     }
 
+    // --- Полоса перемотки видео (запрос пользователя 2026-08-22) ---
+
+    /// Видео-стикер `w`×`h` с центром в `(cx, cy)` на мониторе `monitor`.
+    fn video_sticker(monitor: &str, cx: f64, cy: f64, w: f64, h: f64) -> Sticker {
+        Sticker {
+            id: Uuid::new_v4(),
+            source: StickerSource::File {
+                path: PathBuf::from(r"C:\video.mp4"),
+                media_type: MediaType::Video,
+            },
+            placement: Placement {
+                monitor_id: monitor_id(monitor),
+                cx,
+                cy,
+                w,
+                h,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn one_monitor() -> HashMap<MonitorId, MonitorBounds> {
+        HashMap::from([(
+            monitor_id("main"),
+            MonitorBounds {
+                id: monitor_id("main"),
+                bounds_px: bounds(0, 0, 1920, 1080),
+                scale: 1.0,
+            },
+        )])
+    }
+
+    /// В режиме редактирования полоса принадлежит выделенному видео —
+    /// независимо от того, где курсор: там она часть редактирования.
+    #[test]
+    fn timeline_target_in_edit_mode_follows_selection() {
+        let mut cfg = Config::default();
+        let sticker = video_sticker("main", 500.0, 500.0, 400.0, 300.0);
+        let id = sticker.id;
+        cfg.stickers.push(sticker);
+        let mut edit = mask_gate_edit_state();
+        edit.selection.select(id);
+
+        let target = video_timeline_target(&edit, &cfg, &|_| true, &one_monitor(), None);
+        assert_eq!(
+            target.map(|(id, _, hover)| (id, hover)),
+            Some((id, false)),
+            "выделенное видео получает полосу, режим — не hover"
+        );
+    }
+
+    /// Пока длительность неизвестна, перематывать нечего — полосы нет.
+    #[test]
+    fn timeline_target_needs_known_duration() {
+        let mut cfg = Config::default();
+        let sticker = video_sticker("main", 500.0, 500.0, 400.0, 300.0);
+        let id = sticker.id;
+        cfg.stickers.push(sticker);
+        let mut edit = mask_gate_edit_state();
+        edit.selection.select(id);
+
+        assert!(video_timeline_target(&edit, &cfg, &|_| false, &one_monitor(), None).is_none());
+    }
+
+    /// Мульти-выделение: «перемотать их все» — бессмысленная операция.
+    #[test]
+    fn timeline_target_absent_for_multiselection() {
+        let mut cfg = Config::default();
+        let a = video_sticker("main", 300.0, 300.0, 200.0, 200.0);
+        let b = video_sticker("main", 800.0, 300.0, 200.0, 200.0);
+        let (ida, idb) = (a.id, b.id);
+        cfg.stickers.push(a);
+        cfg.stickers.push(b);
+        let mut edit = mask_gate_edit_state();
+        edit.selection.select(ida);
+        edit.selection.select(idb);
+
+        assert!(video_timeline_target(&edit, &cfg, &|_| true, &one_monitor(), None).is_none());
+    }
+
+    /// Вне режима редактирования полоса появляется только у видео с
+    /// включённой настройкой и только под курсором.
+    #[test]
+    fn timeline_target_outside_edit_mode_needs_setting_and_hover() {
+        let mut cfg = Config::default();
+        let mut sticker = video_sticker("main", 500.0, 500.0, 400.0, 300.0);
+        let id = sticker.id;
+        sticker.playback.show_timeline = false;
+        cfg.stickers.push(sticker);
+        let mut edit = mask_gate_edit_state();
+        edit.active = false;
+        let mon = one_monitor();
+
+        // Настройка выключена — полосы нет даже под курсором.
+        assert!(
+            video_timeline_target(&edit, &cfg, &|_| true, &mon, Some((500, 500))).is_none(),
+            "без настройки полоса вне режима редактирования не показывается"
+        );
+
+        cfg.stickers[0].playback.show_timeline = true;
+        assert_eq!(
+            video_timeline_target(&edit, &cfg, &|_| true, &mon, Some((500, 500)))
+                .map(|(id, _, hover)| (id, hover)),
+            Some((id, true)),
+            "курсор на стикере — полоса всплывает"
+        );
+        assert!(
+            video_timeline_target(&edit, &cfg, &|_| true, &mon, Some((50, 50))).is_none(),
+            "курсор мимо стикера — полосы нет"
+        );
+        assert!(
+            video_timeline_target(&edit, &cfg, &|_| true, &mon, None).is_none(),
+            "позиция курсора неизвестна — полосы нет"
+        );
+    }
+
+    /// Стикеры перекрываются — полоса у верхнего: именно его человек видит
+    /// под курсором.
+    #[test]
+    fn timeline_target_picks_topmost_under_cursor() {
+        let mut cfg = Config::default();
+        let mut low = video_sticker("main", 500.0, 500.0, 400.0, 300.0);
+        low.order = 1;
+        low.playback.show_timeline = true;
+        let mut high = video_sticker("main", 500.0, 500.0, 400.0, 300.0);
+        high.order = 5;
+        high.playback.show_timeline = true;
+        let top = high.id;
+        cfg.stickers.push(low);
+        cfg.stickers.push(high);
+        let mut edit = mask_gate_edit_state();
+        edit.active = false;
+
+        assert_eq!(
+            video_timeline_target(&edit, &cfg, &|_| true, &one_monitor(), Some((500, 500)))
+                .map(|(id, _, _)| id),
+            Some(top)
+        );
+    }
+
+    /// Скрытый стикер (кнопка «глаз») полосу не получает: перематывать то,
+    /// чего не видно, некуда.
+    #[test]
+    fn timeline_target_skips_hidden_sticker() {
+        let mut cfg = Config::default();
+        let mut sticker = video_sticker("main", 500.0, 500.0, 400.0, 300.0);
+        sticker.playback.show_timeline = true;
+        sticker.visible = false;
+        cfg.stickers.push(sticker);
+        let mut edit = mask_gate_edit_state();
+        edit.active = false;
+
+        assert!(
+            video_timeline_target(&edit, &cfg, &|_| true, &one_monitor(), Some((500, 500)))
+                .is_none()
+        );
+    }
+
+    /// Курсор на втором мониторе переводится в его собственные DIP —
+    /// с учётом и смещения, и масштаба.
+    #[test]
+    fn monitor_dip_at_maps_secondary_monitor_with_scale() {
+        let mut mon = one_monitor();
+        mon.insert(
+            monitor_id("second"),
+            MonitorBounds {
+                id: monitor_id("second"),
+                bounds_px: bounds(1920, 0, 2560, 1440),
+                scale: 2.0,
+            },
+        );
+        let (id, dip) = monitor_dip_at(1920 + 400, 200, &mon).expect("точка на втором мониторе");
+        assert_eq!(*id, monitor_id("second"));
+        assert_eq!(dip, (200.0, 100.0), "физические пиксели делятся на масштаб");
+
+        assert!(
+            monitor_dip_at(-5, 0, &mon).is_none(),
+            "точка вне всех мониторов"
+        );
+    }
+
     // --- Геометрия закреплённых окон (SPEC.md «Закрепление окна»):
     // физический rect окна <-> DIP-`Placement`, для хит-теста/ручек ресайза
     // и обратно для `WindowPins::move_resize`.
@@ -12220,7 +13515,12 @@ mod tests {
             tooltip: None,
             pointer_owner: PointerOwner::None,
             ui_pending_snapshot: None,
-            cursor_pos: (0.0, 0.0),
+            video_timeline: None,
+        video_playing: false,
+        media_hotkeys_on: None,
+        timeline_dragging: false,
+        timeline_click_target: None,
+        cursor_pos: (0.0, 0.0),
             cursor_monitor: monitor_id("main"),
             coordinator_tx,
         };

@@ -16,6 +16,20 @@ use std::path::{Path, PathBuf};
 /// swscale/avdevice/avfilter отключены и не линкуются вовсе).
 const FFMPEG_LIBS: &[&str] = &["avformat", "avcodec", "avutil", "swresample"];
 
+/// Мажорная версия libavcodec, под которую сгенерированы биндинги
+/// (`ffmpeg-sys-next` 7.1.x = FFmpeg 7.1 = libavcodec 61).
+///
+/// Проверять её обязательно: FFmpeg меняет РАСКЛАДКУ публичных структур
+/// между мажорными версиями, а `bindgen` разбирает те заголовки, что нашёл.
+/// Собрав биндинги под одну версию и подложив рядом с exe библиотеки другой,
+/// получаешь программу, которая запускается и почти работает: поля в начале
+/// структур совпадают, а те, что дальше, читаются по чужим смещениям.
+/// Именно так выглядел репорт 2026-08-22 — «видео стоит картинкой и половина
+/// файлов не добавляется»: `AVFrame::ch_layout` читался мимо, ресемплер
+/// звука отвечал EINVAL, и декодер бесконечно перезапускал файл. Час на
+/// диагностику вместо одной понятной ошибки сборки.
+const EXPECTED_AVCODEC_MAJOR: u32 = 61;
+
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     println!("cargo:rerun-if-changed=build.rs");
@@ -42,12 +56,41 @@ fn main() {
         }
     }
 
+    check_version(&dir);
+
     // Дублируем директивы `ffmpeg-sys-next` — безвредно при совпадении путей,
     // защищает от изменения его логики поиска.
     println!("cargo:rustc-link-search=native={}", lib.display());
     for name in FFMPEG_LIBS {
         println!("cargo:rustc-link-lib=dylib={name}");
     }
+}
+
+/// Проверить, что заголовки в `FFMPEG_DIR` — той же мажорной версии, под
+/// которую написан вендоренный `ffmpeg-sys-next` (см.
+/// [`EXPECTED_AVCODEC_MAJOR`]). Несовпадение — ошибка сборки, а не
+/// предупреждение: собранная программа была бы внешне рабочей и неверной.
+///
+/// Заголовок читается текстом, без запуска компилятора: `version_major.h`
+/// содержит ровно одну строку `#define LIBAVCODEC_VERSION_MAJOR <n>`.
+/// Прочитать не удалось — не мешаем сборке: у чужой раскладки установки
+/// файл может лежать иначе, а ложный отказ хуже пропущенной проверки.
+fn check_version(dir: &Path) {
+    let path = dir.join("include").join("libavcodec").join("version_major.h");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Some(major) = text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("#define LIBAVCODEC_VERSION_MAJOR")?;
+        rest.trim().parse::<u32>().ok()
+    }) else {
+        return;
+    };
+    assert!(
+        major == EXPECTED_AVCODEC_MAJOR,
+        "FFMPEG_DIR={dir:?} — это FFmpeg с libavcodec {major}, а биндинги (vendor/ffmpeg-sys-next 7.1.x) написаны под libavcodec {EXPECTED_AVCODEC_MAJOR} (FFmpeg 7.1). Смешивать нельзя: раскладка структур между мажорными версиями разная — программа собралась бы и молча читала поля по чужим смещениям (репорт 2026-08-22: видео переставало играть). Укажите установку FFmpeg 7.1 или обновите vendor/ffmpeg-sys-next под новую версию."
+    );
 }
 
 /// Папка установки FFmpeg: `FFMPEG_DIR` обязателен (его же читает build.rs

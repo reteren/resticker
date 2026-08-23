@@ -51,6 +51,17 @@ pub(crate) enum VideoPixelFormat {
     /// При распаковке понижается до 8 бит на CPU (полноценный 10-бит
     /// рендер вне скоупа M5e — задокументированное упрощение).
     Yuva444p10le,
+    /// YUVA444P12LE — то же самое, но 12 бит в том же 16-бит контейнере
+    /// (встречается у роликов, сделанных редакторами вроде Adobe Express;
+    /// найден в библиотеке пользователя 2026-08-22). Отличается от 10-бит
+    /// только сдвигом при понижении до 8 бит.
+    Yuva444p12le,
+    /// YUVJ420P — та же раскладка, что [`Self::Yuv420p`], но полный диапазон
+    /// (0–255 вместо 16–235/240): так пишут записи экрана Android-эмуляторов
+    /// и старые кодировщики (в библиотеке пользователя это было 4 файла из
+    /// 559, и все они не добавлялись вовсе). Диапазон приводится к
+    /// «телевизионному» при распаковке — шейдер рендера умеет только его.
+    Yuvj420p,
     /// Packed RGB(A) с qtrle-декодера (QuickTime Animation, SPEC §7.2):
     /// конкретный порядок каналов — в [`RgbPacked`]. Конвертируется в
     /// YUVA420P на CPU при распаковке (swscale в этой сборке FFmpeg
@@ -111,7 +122,16 @@ impl VideoPixelFormat {
                     alpha: Some(w * h),
                 }
             }
-            Self::Yuva444p10le => PlaneSizes {
+            Self::Yuvj420p => {
+                let (y, u, v) = yuv420p_plane_sizes(w as u32, h as u32);
+                PlaneSizes {
+                    y,
+                    u,
+                    v,
+                    alpha: None,
+                }
+            }
+            Self::Yuva444p10le | Self::Yuva444p12le => PlaneSizes {
                 y: w * h,
                 u: w * h,
                 v: w * h,
@@ -125,7 +145,7 @@ impl VideoPixelFormat {
     /// для создания текстур в rst-render.
     pub(crate) fn chroma_dims(&self, w: u32, h: u32) -> (u32, u32) {
         match self {
-            Self::Yuva444p10le => (w, h),
+            Self::Yuva444p10le | Self::Yuva444p12le => (w, h),
             _ => (w.div_ceil(2), h.div_ceil(2)),
         }
     }
@@ -133,7 +153,7 @@ impl VideoPixelFormat {
     /// Несёт ли формат альфа-канал (тогда выходной кадр содержит 4-ю
     /// плоскость, и рендер обязан умножать цвет на альфу).
     pub(crate) fn has_alpha(&self) -> bool {
-        !matches!(self, Self::Yuv420p)
+        !matches!(self, Self::Yuv420p | Self::Yuvj420p)
     }
 
     /// Может ли формат декодироваться аппаратно (d3d11va, M5c). Аппаратные
@@ -144,16 +164,27 @@ impl VideoPixelFormat {
     /// видео с альфой»). Предикат — единое место, где будущий hwaccel-путь
     /// отсекает эти форматы.
     pub(crate) fn hwaccel_compatible(&self) -> bool {
+        // YUVJ420P аппаратный путь тоже не отдаёт: там пришлось бы приводить
+        // диапазон на GPU, а этого шейдер не умеет.
         matches!(self, Self::Yuv420p)
     }
 
     /// Байт на сэмпл плоскости В ИСХОДНИКЕ декодера: 1 — 8-бит, 2 — 10-бит
     /// в 16-бит LE контейнере (строки таких плоскостей вдвое шире).
     pub(crate) fn source_bytes_per_sample(&self) -> usize {
-        if matches!(self, Self::Yuva444p10le) {
+        if matches!(self, Self::Yuva444p10le | Self::Yuva444p12le) {
             2
         } else {
             1
+        }
+    }
+
+    /// На сколько бит сдвигать сэмпл 16-бит LE контейнера, чтобы получить 8
+    /// бит: 10-бит — на 2, 12-бит — на 4.
+    pub(crate) fn high_bit_shift(&self) -> u32 {
+        match self {
+            Self::Yuva444p12le => 4,
+            _ => 2,
         }
     }
 }
@@ -172,6 +203,12 @@ pub(crate) fn classify_pixel_format(fmt: i32) -> Option<(VideoPixelFormat, Optio
         }
         x if x == AVPixelFormat::AV_PIX_FMT_YUVA444P10LE as u32 => {
             Some((VideoPixelFormat::Yuva444p10le, None))
+        }
+        x if x == AVPixelFormat::AV_PIX_FMT_YUVA444P12LE as u32 => {
+            Some((VideoPixelFormat::Yuva444p12le, None))
+        }
+        x if x == AVPixelFormat::AV_PIX_FMT_YUVJ420P as u32 => {
+            Some((VideoPixelFormat::Yuvj420p, None))
         }
         x if x == AVPixelFormat::AV_PIX_FMT_ARGB as u32 => {
             Some((VideoPixelFormat::Rgb32, Some(RgbPacked::Argb)))
@@ -192,11 +229,31 @@ pub(crate) fn classify_pixel_format(fmt: i32) -> Option<(VideoPixelFormat, Optio
 /// не перечитывается (нечётные байты контейнера не читаются) — сжатие
 /// in-place безопасно. Полноценный 10-бит рендер вне скоупа M5e (упрощение,
 /// задокументировано в ROADMAP.md).
-pub(crate) fn downconvert_10bit_le(plane: &mut [u8]) {
+pub(crate) fn downconvert_high_bit_le(plane: &mut [u8], shift: u32) {
     debug_assert!(plane.len() % 2 == 0, "16-бит контейнер: чётное число байт");
     for i in 0..plane.len() / 2 {
         let sample = u16::from_le_bytes([plane[2 * i], plane[2 * i + 1]]);
-        plane[i] = (sample >> 2) as u8;
+        plane[i] = (sample >> shift) as u8;
+    }
+}
+
+/// Привести плоскость яркости из полного диапазона (0–255, `yuvj*`) к
+/// телевизионному (16–235) — и хрому к 16–240.
+///
+/// Зачем на CPU: шейдер рендера считает по BT.709 limited range, другого
+/// режима у него нет. Показать full-range данные как limited — значит
+/// получить срезанные тени и пересвеченные света; привести диапазон здесь
+/// дешевле, чем заводить второй путь в шейдере ради четырёх файлов из
+/// пятисот. Таблица на 256 значений считается один раз на плоскость,
+/// проход линейный.
+pub(crate) fn full_range_to_limited(y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
+    let luma: [u8; 256] = std::array::from_fn(|i| (16 + (i * 219 + 127) / 255) as u8);
+    let chroma: [u8; 256] = std::array::from_fn(|i| (16 + (i * 224 + 127) / 255) as u8);
+    for s in y.iter_mut() {
+        *s = luma[*s as usize];
+    }
+    for s in u.iter_mut().chain(v.iter_mut()) {
+        *s = chroma[*s as usize];
     }
 }
 
@@ -478,7 +535,7 @@ mod tests {
         ];
         for (input, want) in cases {
             let mut plane = input.to_vec();
-            downconvert_10bit_le(&mut plane);
+            downconvert_high_bit_le(&mut plane, 2);
             // Сжатие in-place: значащие байты — первая половина буфера.
             assert_eq!(&plane[..plane.len() / 2], [want], "вход {input:?}");
         }
@@ -491,10 +548,66 @@ mod tests {
         if cfg!(debug_assertions) {
             let mut plane = vec![0u8; 3];
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                downconvert_10bit_le(&mut plane)
+                downconvert_high_bit_le(&mut plane, 2)
             }));
             assert!(result.is_err(), "нечётная длина — panic в debug");
         }
+    }
+
+    /// 12-бит понижается сдвигом на 4 — иначе кадр выходит вчетверо ярче
+    /// и пересвеченным (файл из библиотеки пользователя 2026-08-22).
+    #[test]
+    fn downconvert_12bit_uses_shift_four() {
+        assert_eq!(VideoPixelFormat::Yuva444p12le.high_bit_shift(), 4);
+        assert_eq!(VideoPixelFormat::Yuva444p10le.high_bit_shift(), 2);
+        // 0x0FFF = 4095 (максимум 12 бит) → 255.
+        let mut plane = vec![0xFFu8, 0x0F];
+        downconvert_high_bit_le(&mut plane, 4);
+        assert_eq!(plane[0], 255);
+        // Тот же буфер сдвигом для 10 бит дал бы переполнение до 255 из
+        // меньшего значения — проверяем, что шаг действительно разный.
+        let mut plane = vec![0x00u8, 0x04]; // 1024
+        downconvert_high_bit_le(&mut plane, 4);
+        assert_eq!(plane[0], 64);
+    }
+
+    /// `yuvj*` — полный диапазон; шейдер умеет только телевизионный, поэтому
+    /// диапазон приводится на CPU. Без этого 4 файла из библиотеки
+    /// пользователя не открывались вовсе (репорт 2026-08-22).
+    #[test]
+    fn full_range_maps_to_tv_range_endpoints() {
+        assert_eq!(
+            classify_pixel_format(AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32),
+            Some((VideoPixelFormat::Yuvj420p, None))
+        );
+        assert_eq!(
+            classify_pixel_format(AVPixelFormat::AV_PIX_FMT_YUVA444P12LE as i32),
+            Some((VideoPixelFormat::Yuva444p12le, None))
+        );
+
+        let mut y = vec![0u8, 255, 128];
+        let mut u = vec![0u8, 255];
+        let mut v = vec![128u8];
+        full_range_to_limited(&mut y, &mut u, &mut v);
+        assert_eq!(y[0], 16, "чёрный полного диапазона → 16");
+        assert_eq!(y[1], 235, "белый полного диапазона → 235");
+        assert_eq!(u[0], 16);
+        assert_eq!(u[1], 240, "хрома → 16..240");
+        assert!((124..=132).contains(&v[0]), "середина остаётся серединой");
+    }
+
+    /// Раскладка `yuvj420p` — ровно та же, что у `yuv420p`: плоскости и
+    /// хрома считаются одинаково, альфы нет.
+    #[test]
+    fn yuvj420p_has_same_geometry_as_yuv420p() {
+        let j = VideoPixelFormat::Yuvj420p;
+        let n = VideoPixelFormat::Yuv420p;
+        assert_eq!(j.plane_sizes(64, 48), n.plane_sizes(64, 48));
+        assert_eq!(j.chroma_dims(64, 48), n.chroma_dims(64, 48));
+        assert!(!j.has_alpha());
+        assert_eq!(j.source_bytes_per_sample(), 1);
+        // Аппаратный путь для него закрыт: приведение диапазона живёт на CPU.
+        assert!(!j.hwaccel_compatible());
     }
 
     #[test]

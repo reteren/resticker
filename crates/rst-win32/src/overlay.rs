@@ -79,6 +79,24 @@ const MUTE_ALL_HOTKEY_ID: i32 = 3;
 /// подключает.
 const PIN_FOCUSED_HOTKEY_ID: i32 = 4;
 
+/// Идентификаторы временных хоткеев управления видео-стикером под курсором
+/// (запрос пользователя 2026-08-22: пробел — пауза, PgUp/PgDn — громкость).
+///
+/// Регистрируются НЕ на всё время работы программы, а ровно пока курсор
+/// стоит на видео-стикере с показанной полосой перемотки: `RegisterHotKey`
+/// забирает клавишу у всей системы, и постоянно занятый пробел сломал бы
+/// набор текста везде. Включает/выключает их координатор
+/// ([`OverlayWindow::set_media_hotkeys`]) тем же условием, по которому
+/// показывает полосу.
+const MEDIA_PLAY_PAUSE_HOTKEY_ID: i32 = 5;
+const MEDIA_VOLUME_UP_HOTKEY_ID: i32 = 6;
+const MEDIA_VOLUME_DOWN_HOTKEY_ID: i32 = 7;
+
+/// Виртуальные коды клавиш медиа-хоткеев (docs.microsoft.com/Virtual-Key-Codes).
+const VK_SPACE: u32 = 0x20;
+const VK_PRIOR: u32 = 0x21;
+const VK_NEXT: u32 = 0x22;
+
 /// Координатор → поток оверлея: сменить форму курсора (зона под курсором
 /// меняется на его стороне, хит-тест — не Win32, ARCHITECTURE.md 5.3);
 /// `wParam` — форма, закодированная [`cursor_shape_to_wparam`].
@@ -89,6 +107,11 @@ const WM_APP_EDIT_CURSOR: u32 = WM_APP + 1;
 /// потоке окна (`SetCapture`/`ReleaseCapture` — thread-affine Win32 API),
 /// поэтому не прямой вызов, а сообщение, как и `WM_APP_EDIT_CURSOR`.
 const WM_APP_RELEASE_CAPTURE: u32 = WM_APP + 2;
+
+/// Включить/выключить медиа-хоткеи (`wparam != 0` — включить). Сообщением, а
+/// не прямым вызовом: `RegisterHotKey` привязан к ПОТОКУ, снять его может
+/// только тот же поток, а просит координатор со своего.
+const WM_APP_MEDIA_HOTKEYS: u32 = WM_APP + 3;
 
 /// Смещение кода угла поворота в кодировке `WPARAM` — коды `0..ROTATE_BASE`
 /// заняты фиксированными формами, `ROTATE_BASE + N` (`N` — 0..359) кодирует
@@ -159,6 +182,14 @@ pub enum OverlayEvent {
     /// (редизайн пинов). Что делать с событием (какое окно в фокусе,
     /// денайлист, pin/unpin) — задача координатора.
     PinFocusedWindow,
+    /// Пробел на видео-стикере под курсором: пауза/воспроизведение
+    /// (запрос пользователя 2026-08-22). Приходит только пока
+    /// медиа-хоткеи включены — см. [`OverlayWindow::set_media_hotkeys`].
+    MediaPlayPause,
+    /// PgUp на видео-стикере под курсором: громче.
+    MediaVolumeUp,
+    /// PgDn на видео-стикере под курсором: тише.
+    MediaVolumeDown,
     /// Глобальный хоткей не удалось зарегистрировать: комбинация уже занята
     /// другим приложением. Строка — каноничный вид комбинации из конфига
     /// (ARCHITECTURE.md, раздел 5.1). Окно продолжает работать — недоступны
@@ -370,6 +401,43 @@ impl OverlayWindow {
         self.set_exstyle_bits(!interactive);
     }
 
+    /// Принимать клики, НЕ забирая фокус и НЕ активируясь: снимается только
+    /// `WS_EX_TRANSPARENT`, `WS_EX_NOACTIVATE` остаётся.
+    ///
+    /// Для таймлайна видео-стикера вне режима редактирования (запрос
+    /// пользователя 2026-08-22): полоса перемотки обязана ловить клик, но
+    /// оверлей при этом остаётся фоновым — пользователь мотает ролик, не
+    /// теряя фокус в приложении, где работает.
+    ///
+    /// Клик-прозрачность — свойство ОКНА, а не области, поэтому вызывающий
+    /// снимает её ровно на то время, пока курсор физически над полосой, и
+    /// возвращает сразу же, как он ушёл: иначе оверлей на весь монитор
+    /// начнёт перехватывать чужие клики.
+    pub fn set_hover_click_target(&self, target: bool) {
+        self.toggle_exstyle(WS_EX_TRANSPARENT.0, !target);
+    }
+
+    /// Включить/выключить временные хоткеи управления видео-стикером под
+    /// курсором: пробел — пауза/воспроизведение, PgUp/PgDn — громкость
+    /// (запрос пользователя 2026-08-22).
+    ///
+    /// Пока они включены, клавиши забраны у ВСЕЙ системы, поэтому включать
+    /// их можно только на время наведения на конкретный стикер — иначе
+    /// пробел перестанет работать во всех программах. Вне режима
+    /// редактирования иначе никак: оверлей не получает фокус (и не должен),
+    /// а низкоуровневый клавиатурный хук в этом проекте запрещён (ADR-009).
+    pub fn set_media_hotkeys(&self, enabled: bool) {
+        // SAFETY: hwnd — наше живое окно; PostMessageW потокобезопасен.
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                WM_APP_MEDIA_HOTKEYS,
+                WPARAM(usize::from(enabled)),
+                LPARAM(0),
+            );
+        }
+    }
+
     /// Скрыть/показать окно для захвата экрана (SPEC.md, раздел 8):
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`/`WDA_NONE`.
     /// Возвращает `Ok(true)`, если проверка (`GetWindowDisplayAffinity`)
@@ -396,12 +464,18 @@ impl OverlayWindow {
     /// Общая часть `set_click_through`/`set_interactive`: переключить
     /// `WS_EX_TRANSPARENT|WS_EX_NOACTIVATE` без побочных эффектов на фокус.
     fn set_exstyle_bits(&self, click_through: bool) {
+        self.toggle_exstyle(WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0, click_through);
+    }
+
+    /// Выставить/снять произвольные биты `GWL_EXSTYLE` с обязательным
+    /// `SWP_FRAMECHANGED` (см. ниже, почему без него смена не вступает в
+    /// силу).
+    fn toggle_exstyle(&self, bits: u32, set: bool) {
         // SAFETY: hwnd — наше живое окно; смена GWL_EXSTYLE безопасна с
         // любого потока (в отличие от владения самим HWND).
         unsafe {
             let mut ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32;
-            let bits = WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0;
-            if click_through {
+            if set {
                 ex |= bits;
             } else {
                 ex &= !bits;
@@ -564,6 +638,10 @@ struct WndState {
     capture: MouseCapture,
     cursor: CursorManager,
     tx: Sender<OverlayEvent>,
+    /// Временные хоткеи управления видео (см. [`MEDIA_PLAY_PAUSE_HOTKEY_ID`]).
+    /// Живут здесь, потому что `RegisteredHotkey` привязан к потоку окна —
+    /// а `WndState` живёт ровно на нём.
+    media_hotkeys: Vec<crate::hotkey::RegisteredHotkey>,
 }
 
 /// Смаппить ошибку регистрации хоткея на событие оверлея. Наружу уходит
@@ -680,6 +758,7 @@ fn run_message_loop(
         capture: MouseCapture::new(hwnd),
         cursor: CursorManager::new(),
         tx: event_tx,
+        media_hotkeys: Vec::new(),
     });
     // SAFETY: hwnd — наше окно этого потока; указатель освобождается в
     // WM_NCDESTROY ниже (единственное место, где он читается и дропается).
@@ -718,6 +797,12 @@ fn run_message_loop(
                 let _ = hotkey_tx.send(OverlayEvent::ToggleMuteAll);
             } else if id == PIN_FOCUSED_HOTKEY_ID {
                 let _ = hotkey_tx.send(OverlayEvent::PinFocusedWindow);
+            } else if id == MEDIA_PLAY_PAUSE_HOTKEY_ID {
+                let _ = hotkey_tx.send(OverlayEvent::MediaPlayPause);
+            } else if id == MEDIA_VOLUME_UP_HOTKEY_ID {
+                let _ = hotkey_tx.send(OverlayEvent::MediaVolumeUp);
+            } else if id == MEDIA_VOLUME_DOWN_HOTKEY_ID {
+                let _ = hotkey_tx.send(OverlayEvent::MediaVolumeDown);
             }
             continue;
         }
@@ -1035,6 +1120,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_RELEASE_CAPTURE => {
             if let Some(state) = unsafe { state_ptr.as_mut() } {
                 state.capture.force_release();
+            }
+            LRESULT(0)
+        }
+        WM_APP_MEDIA_HOTKEYS => {
+            if let Some(state) = unsafe { state_ptr.as_mut() } {
+                // Снятие — просто отпустить владельцев (Drop зовёт
+                // UnregisterHotKey на этом же потоке).
+                state.media_hotkeys.clear();
+                if wparam.0 != 0 {
+                    for (id, vk) in [
+                        (MEDIA_PLAY_PAUSE_HOTKEY_ID, VK_SPACE),
+                        (MEDIA_VOLUME_UP_HOTKEY_ID, VK_PRIOR),
+                        (MEDIA_VOLUME_DOWN_HOTKEY_ID, VK_NEXT),
+                    ] {
+                        let combo = crate::hotkey::HotkeyCombo {
+                            ctrl: false,
+                            alt: false,
+                            shift: false,
+                            win: false,
+                            vk,
+                        };
+                        // Клавишу уже держит другая программа — молча
+                        // остаёмся без этого сочетания: ругаться на каждое
+                        // наведение курсора нельзя, а остальные продолжают
+                        // работать.
+                        if let Ok(h) = crate::hotkey::RegisteredHotkey::register(id, combo) {
+                            state.media_hotkeys.push(h);
+                        }
+                    }
+                }
             }
             LRESULT(0)
         }

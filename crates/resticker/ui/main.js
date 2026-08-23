@@ -224,7 +224,11 @@ document.getElementById('clear-hotkey-pin').addEventListener('click', () => {
 
 // ==== Вкладка «Стикеры» ====
 
-const VIDEO_EXTENSIONS = ['mp4', 'webm', 'mkv', 'mov', 'avi'];
+// Держать в синхроне с rst_core::model::VIDEO_EXTENSIONS.
+const VIDEO_EXTENSIONS = [
+  'mp4', 'm4v', 'webm', 'mkv', 'mov', 'avi', 'wmv', 'flv',
+  'mpg', 'mpeg', 'ts', 'm2ts', 'mts', '3gp', 'ogv',
+];
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'];
 
 function mediaTypeLabel(source) {

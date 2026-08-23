@@ -7,11 +7,19 @@
 
 ## Требования к сборке
 
-1. **Пресобранный FFmpeg** (LGPL-only, MinGW-w64, `docs/M5B_VIDEO_DESIGN.md`
-   §1): заголовки и импортные библиотеки в
-   `W:/ffmpeg_build/install/{include,lib}`, DLL в `bin/`. В сборке должны
+1. **Пресобранный FFmpeg 7.1** (LGPL-only, MinGW-w64,
+   `docs/M5B_VIDEO_DESIGN.md` §1): заголовки и импортные библиотеки в
+   `<FFMPEG_DIR>/{include,lib}`, DLL в `bin/`. В сборке должны
    быть libavformat/libavcodec/libavutil/libswresample; swscale/avdevice/
    avfilter могут отсутствовать (именно так собрана эта).
+
+   Версия принципиальна: вендоренный `ffmpeg-sys-next` 7.1.x генерирует
+   биндинги под libavcodec 61/libavutil 59/libswresample 5. С библиотеками
+   другой мажорной версии программа собирается и запускается, но читает
+   поля структур по чужим смещениям — так в репорте 2026-08-22 видео
+   «стояло картинкой», а половина файлов не добавлялась. Сборку сторожит
+   `build.rs` (сверяет `version_major.h`), рантайм — `check_runtime_versions`
+   в `pipeline.rs` (сверяет `avcodec_version()` и соседей).
 2. **Переменная окружения `FFMPEG_DIR`** на время любой сборки воркспейса
    (читается `build.rs` крейта `ffmpeg-sys-next` для bindgen и линковки):
 

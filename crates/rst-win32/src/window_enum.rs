@@ -15,6 +15,7 @@ use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
+use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromWindow};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -392,6 +393,26 @@ pub fn foreground_hwnd() -> Option<usize> {
     // состояния не меняет, безопасен с любого потока.
     let hwnd = unsafe { GetForegroundWindow() };
     (!hwnd.0.is_null()).then_some(hwnd.0 as usize)
+}
+
+/// Монитор, на котором лежит окно (`MonitorFromWindow`), как числовой
+/// ключ — сравнивать мониторы двух окон можно, ничего не зная о геометрии.
+///
+/// `None` — окно ни на одном мониторе: свёрнутое окно живёт в координатах
+/// вроде (-32000, -32000), и `MONITOR_DEFAULTTONULL` честно отвечает
+/// «нигде» вместо того, чтобы приписать его ближайшему экрану. Вызывающему
+/// это и нужно: «монитор неизвестен» — не то же самое, что «монитор тот
+/// же».
+pub fn monitor_of(hwnd: usize) -> Option<isize> {
+    // SAFETY: чистый запрос состояния десктопа для чужого HWND; невалидный
+    // или свёрнутый дескриптор даёт нулевой HMONITOR, а не UB.
+    let monitor = unsafe {
+        MonitorFromWindow(
+            HWND(hwnd as *mut core::ffi::c_void),
+            MONITOR_DEFAULTTONULL,
+        )
+    };
+    (!monitor.0.is_null()).then_some(monitor.0 as isize)
 }
 
 /// Заголовок окна. Пустая строка — нет заголовка, сбой API или таймаут

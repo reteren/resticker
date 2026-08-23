@@ -31,7 +31,8 @@ use windows::core::Interface;
 
 use crate::error::VideoError;
 use crate::format::{
-    VideoPixelFormat, classify_pixel_format, downconvert_10bit_le, pts_to_duration,
+    VideoPixelFormat, classify_pixel_format, downconvert_high_bit_le, full_range_to_limited,
+    pts_to_duration,
     rgb_packed_to_yuva420p, swr_out_count,
 };
 use crate::hwaccel::{self, HwDecode};
@@ -342,6 +343,7 @@ impl Pipeline {
     /// вывода — `AudioTarget::default()`, если вызывающему коду он
     /// неизвестен).
     pub(crate) fn open(path: &Path, audio_target: AudioTarget) -> Result<Self, VideoError> {
+        check_runtime_versions();
         Self::open_inner(path, audio_target, None)
     }
 
@@ -616,6 +618,36 @@ impl Pipeline {
         })
     }
 
+    /// Готовая порция звука; сбой ЗВУКА не убивает ВИДЕО.
+    ///
+    /// Так было не всегда, и это стоило пользователю всей фичи (репорт
+    /// 2026-08-22): ошибка инициализации ресемплера поднималась наверх как
+    /// ошибка шага конвейера, декодер-поток лечил её перезапуском цикла — и
+    /// файл вечно крутился на первом кадре, «как картинка». Файлы, у
+    /// которых звуковой пакет попадался раньше первого видеокадра, вообще
+    /// не открывались.
+    ///
+    /// Звук — не обязательная часть стикера (`VideoPlayback::audio` и так
+    /// `None`, когда устройство вывода не открылось), поэтому при ошибке
+    /// поток звука выключается насовсем ДЛЯ ЭТОГО ФАЙЛА: дальше пакеты
+    /// звука просто не декодируются (`codec_ctx_for` перестаёт их узнавать),
+    /// видео продолжает играть. Лог — один раз на файл, а не на каждый
+    /// пакет: прошлая версия успевала написать в журнал тысячи одинаковых
+    /// строк за минуту.
+    fn pull_audio_chunk_soft(&mut self) -> Option<AudioChunkOut> {
+        match self.pull_audio_chunk() {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "звук отключён для этого файла, видео продолжает играть"
+                );
+                self.audio = None;
+                None
+            }
+        }
+    }
+
     /// Один шаг конвейера: выкачать готовые кадры декодеров; если их нет —
     /// читать и декодировать пакеты, пока что-то не выйдет (или EOF).
     pub(crate) fn next(&mut self) -> Result<Event, VideoError> {
@@ -625,7 +657,7 @@ impl Pipeline {
         if let Some(frame) = self.pull_video()? {
             return Ok(frame);
         }
-        if let Some(chunk) = self.pull_audio_chunk()? {
+        if let Some(chunk) = self.pull_audio_chunk_soft() {
             return Ok(Event::Audio(chunk));
         }
         if self.eof_seen {
@@ -670,7 +702,7 @@ impl Pipeline {
                 if let Some(frame) = self.pull_video()? {
                     return Ok(frame);
                 }
-                if let Some(chunk) = self.pull_audio_chunk()? {
+                if let Some(chunk) = self.pull_audio_chunk_soft() {
                     return Ok(Event::Audio(chunk));
                 }
                 return Ok(Event::Eof);
@@ -695,7 +727,7 @@ impl Pipeline {
             if let Some(frame) = self.pull_video()? {
                 return Ok(frame);
             }
-            if let Some(chunk) = self.pull_audio_chunk()? {
+            if let Some(chunk) = self.pull_audio_chunk_soft() {
                 return Ok(Event::Audio(chunk));
             }
             // Пакет без выхода — читаем следующий.
@@ -859,6 +891,15 @@ impl Pipeline {
                     copy_plane_rows_8(src[1], ls[1], u_width as usize, u_height as i32, &mut u);
                     copy_plane_rows_8(src[2], ls[2], u_width as usize, u_height as i32, &mut v);
                 }
+                (VideoPixelFormat::Yuvj420p, _) => {
+                    // Раскладка та же, что у YUV420P, — отличается только
+                    // диапазон значений (полный вместо телевизионного);
+                    // приводим его здесь, шейдер знает лишь один режим.
+                    copy_plane_rows_8(src[0], ls[0], width as usize, height, &mut y);
+                    copy_plane_rows_8(src[1], ls[1], u_width as usize, u_height as i32, &mut u);
+                    copy_plane_rows_8(src[2], ls[2], u_width as usize, u_height as i32, &mut v);
+                    full_range_to_limited(&mut y, &mut u, &mut v);
+                }
                 (VideoPixelFormat::Yuva420p, _) => {
                     copy_plane_rows_8(src[0], ls[0], width as usize, height, &mut y);
                     copy_plane_rows_8(src[1], ls[1], u_width as usize, u_height as i32, &mut u);
@@ -872,7 +913,7 @@ impl Pipeline {
                         alpha.as_mut().expect("YUVA420P несёт альфу"),
                     );
                 }
-                (VideoPixelFormat::Yuva444p10le, _) => {
+                (VideoPixelFormat::Yuva444p10le | VideoPixelFormat::Yuva444p12le, _) => {
                     // 10-бит в 16-бит LE контейнере: строки вдвое шире,
                     // затем понижение до 8 бит на CPU (упрощение M5e).
                     let sample_bytes = pix_fmt.source_bytes_per_sample();
@@ -881,7 +922,7 @@ impl Pipeline {
                         (0usize, &mut y),
                         (1, &mut u),
                         (2, &mut v),
-                        (3, alpha.as_mut().expect("YUVA444P10LE несёт альфу")),
+                        (3, alpha.as_mut().expect("YUVA444P1xLE несёт альфу")),
                     ] {
                         copy_plane_rows_16_le(
                             src[plane],
@@ -891,7 +932,7 @@ impl Pipeline {
                             sample_bytes,
                             &mut staged,
                         );
-                        downconvert_10bit_le(&mut staged);
+                        downconvert_high_bit_le(&mut staged, pix_fmt.high_bit_shift());
                         let out_len = out.len();
                         out.copy_from_slice(&staged[..out_len]);
                     }
@@ -1017,9 +1058,16 @@ impl Pipeline {
 
     /// Программная копия аппаратного кадра (readback, M5c): NV12-текстура →
     /// YUV420P-плоскости на CPU (`av_hwframe_transfer_data` + разделение
-    /// interleaved UV). Нужен только для совместимости старого
-    /// `VideoSource::try_recv_frame` в hw-режиме; zero-copy потребители
-    /// (`try_recv_hw_frame`) этот вызов не делают.
+    /// interleaved UV).
+    ///
+    /// Сейчас не вызывается никем: в аппаратном режиме кадр отдаётся как
+    /// текстура (`try_recv_hw_frame`), а копировать его в системную память
+    /// «на всякий случай» — 5.5 МБ через шину на каждый кадр 1440p и
+    /// ожидание готовности GPU, то есть ровно та работа, ради отказа от
+    /// которой аппаратный декод и включают (замер 2026-08-22). Код оставлен:
+    /// он понадобится, когда кадр реально потребуется на процессоре — снимок
+    /// кадра, экспорт, фильтр.
+    #[allow(dead_code, reason = "нужен для будущего доступа к кадру на CPU")]
     pub(crate) fn hw_to_yuv(
         &mut self,
         hw_frame: &HwVideoFrameOut,
@@ -1308,6 +1356,51 @@ fn new_codec_ctx(
     Ok(ctx)
 }
 
+/// Сверить версии ЗАГРУЖЕННЫХ библиотек FFmpeg с теми, под которые
+/// сгенерированы биндинги, — один раз за процесс.
+///
+/// Смешать версии на удивление легко: DLL кладутся рядом с exe отдельным
+/// шагом сборки, и достаточно, чтобы папка установки FFmpeg разъехалась с
+/// той, по которой bindgen читал заголовки. Программа при этом запускается
+/// и почти работает — поля в начале структур совпадают, дальние читаются по
+/// чужим смещениям. Так выглядел репорт 2026-08-22: видео стояло картинкой,
+/// потому что `AVFrame::ch_layout` читался мимо и ресемплер звука отвечал
+/// EINVAL. Сборку от этого страхует `build.rs`, но проверить стоит и то, что
+/// реально загрузилось: подменить DLL можно и после сборки.
+fn check_runtime_versions() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: функции запроса версии не трогают состояние и безопасны с
+        // любого потока.
+        let (codec, util, swr) = unsafe {
+            (
+                avcodec_version(),
+                avutil_version(),
+                swresample_version(),
+            )
+        };
+        let major = |v: u32| v >> 16;
+        let expected = (
+            LIBAVCODEC_VERSION_MAJOR as u32,
+            LIBAVUTIL_VERSION_MAJOR as u32,
+            LIBSWRESAMPLE_VERSION_MAJOR as u32,
+        );
+        let actual = (major(codec), major(util), major(swr));
+        if actual == expected {
+            tracing::debug!(?actual, "версии FFmpeg совпадают с биндингами");
+        } else {
+            tracing::error!(
+                ?actual,
+                ?expected,
+                "ЗАГРУЖЕНЫ DLL FFmpeg ДРУГОЙ МАЖОРНОЙ ВЕРСИИ, чем биндинги: \\
+                 раскладка структур не совпадает, поведение декодера \\
+                 непредсказуемо (видео может стоять картинкой). Проверьте, \\
+                 какие *.dll лежат рядом с exe."
+            );
+        }
+    });
+}
+
 /// Создать ресемплер из входного формата в f32 stereo 48 кГц.
 fn create_swr(
     in_rate: u32,
@@ -1315,6 +1408,20 @@ fn create_swr(
     in_layout: &AVChannelLayout,
     target: AudioTarget,
 ) -> Result<SwrCtx, VideoError> {
+    // Целевой формат приходит от реального устройства вывода. Ноль каналов
+    // или нулевая частота — заведомо невалидная раскладка, и ресемплер
+    // отказал бы с EINVAL; документированный дефолт лучше молчаливой
+    // потери звука.
+    let target = if target.rate == 0 || target.channels == 0 {
+        tracing::warn!(
+            rate = target.rate,
+            channels = target.channels,
+            "устройство вывода отдало невалидный формат — берём дефолт"
+        );
+        AudioTarget::default()
+    } else {
+        target
+    };
     let mut swr: *mut SwrContext = null_mut();
     // Стандартная раскладка на N каналов (моно/стерео/5.1/…) — не хардкодим
     // стерео-маску: целевой формат теперь приходит от реального устройства
@@ -1344,9 +1451,19 @@ fn create_swr(
         )
     };
     if ret < 0 {
+        // В сообщение идут ВСЕ входные величины: по одному коду -22 в
+        // журнале причину не найти, а воспроизводится это только на файле
+        // пользователя (репорт 2026-08-22).
         return Err(VideoError::Decode(format!(
-            "swr_alloc_set_opts2: {}",
-            ff_err(ret)
+            "swr_alloc_set_opts2: {} (вход: {} Гц, формат {:?}, порядок {:?}, каналов {}; \
+             выход: {} Гц, каналов {})",
+            ff_err(ret),
+            in_rate,
+            in_fmt,
+            in_layout.order,
+            in_layout.nb_channels,
+            target.rate,
+            target.channels,
         )));
     }
     // SAFETY: swr инициализирован set_opts2; см. swr_init.

@@ -599,12 +599,12 @@ impl Device {
                 display_width,
                 display_height,
             )?;
-            nv12.set_index(array_index);
+            nv12.set_index(array_index)?;
             textures.nv12 = Some(nv12);
             return Ok(());
         }
         let nv12 = textures.nv12.as_ref().expect("same_texture => Some");
-        nv12.set_index(array_index);
+        nv12.set_index(array_index)?;
         Ok(())
     }
 
@@ -848,7 +848,7 @@ impl Device {
                             self.context.PSSetShader(&self.video_nv12_ps, None);
                             self.context.PSSetShaderResources(
                                 5,
-                                Some(&[Some(nv12.srv_y().clone()), Some(nv12.srv_uv().clone())]),
+                                Some(&[Some(nv12.srv_y()), Some(nv12.srv_uv())]),
                             );
                         } else {
                             self.context.PSSetShader(&self.video_ps, None);
@@ -1164,6 +1164,85 @@ mod gpu_tests {
             context.Unmap(Some(&staging_res), 0);
         }
         out
+    }
+
+    /// Массив NV12-поверхностей, как его создаёт пул d3d11va: несколько
+    /// слоёв, `BIND_DECODER | BIND_SHADER_RESOURCE`.
+    fn decoder_like_nv12_array(
+        device: &Device,
+        width: u32,
+        height: u32,
+        slices: u32,
+    ) -> windows::Win32::Graphics::Direct3D11::ID3D11Texture2D {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+            D3D11_USAGE_DEFAULT, ID3D11Texture2D,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC,
+        };
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: slices,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_DECODER.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        // SAFETY: описание валидно, out-параметр жив до конца вызова.
+        unsafe { device.d3d_device().CreateTexture2D(&desc, None, Some(&mut tex)) }
+            .expect("массив NV12 создаётся");
+        tex.expect("CreateTexture2D без ошибки возвращает текстуру")
+    }
+
+    /// Кадр аппаратного декодера показывается через вид на ОДИН слой
+    /// массива: пул d3d11va создаётся с `D3D11_BIND_DECODER`, и вид на
+    /// несколько слоёв драйвер отвергает (E_INVALIDARG). Первая версия
+    /// M5c-пути делала именно такой вид — SRV не создавался, спрайт
+    /// оставался с нулевыми плоскостями, и всё видео было ЗЕЛЁНЫМ
+    /// (нули в BT.709 — зелёный; репорт пользователя 2026-08-22).
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn nv12_views_are_created_per_array_slice() {
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let texture = decoder_like_nv12_array(&device, 640, 480, 8);
+        let mut textures = device
+            .create_video_textures_nv12(640, 480)
+            .expect("каркас NV12 создаётся");
+        assert!(
+            textures.nv12.is_none(),
+            "до первого кадра аппаратного вида ещё нет"
+        );
+
+        // Первый кадр: вид создаётся, ошибки быть не должно.
+        device
+            .update_video_textures_nv12(&mut textures, &texture, 0, 640, 480)
+            .expect("вид на слой 0");
+        assert!(textures.is_nv12(), "спрайт перешёл на аппаратный путь");
+
+        // Кадры приходят с РАЗНЫХ слоёв пула — каждый должен приниматься,
+        // включая повторное обращение к уже виденному слою (кэш видов).
+        for slice in [3u32, 7, 3, 0] {
+            device
+                .update_video_textures_nv12(&mut textures, &texture, slice, 640, 480)
+                .unwrap_or_else(|e| panic!("вид на слой {slice}: {e}"));
+        }
+
+        // Шейдер всегда семплирует нулевой элемент: вид однослойный.
+        let nv12 = textures.nv12.as_ref().expect("аппаратный путь активен");
+        assert_eq!(nv12.index(), 0, "индекс в шейдере — всегда 0");
+        // Выход за границы массива не должен ронять: слой поджимается.
+        device
+            .update_video_textures_nv12(&mut textures, &texture, 99, 640, 480)
+            .expect("слой за пределами массива поджимается, а не падает");
     }
 
     #[test]

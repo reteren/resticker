@@ -262,6 +262,17 @@ impl AudioMixer {
                 None,
             )?;
         stream.play()?;
+        // Формат устройства уходит в декодер видео как цель ресемплинга
+        // (`VideoSource::open_with_audio_target`), и неправдоподобные
+        // значения там превращаются в отказ инициализировать звук — а
+        // разбираться в этом по симптому «видео не играет» очень дорого
+        // (репорт 2026-08-22). Пишем в лог один раз при старте.
+        tracing::info!(
+            sample_rate = stream_config.sample_rate,
+            channels = stream_config.channels,
+            ?sample_format,
+            "аудиоустройство открыто"
+        );
         Ok(Self {
             sample_rate: stream_config.sample_rate,
             channels: stream_config.channels,

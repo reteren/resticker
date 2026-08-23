@@ -16,6 +16,59 @@ use crate::model::OverlapRule;
 /// самого topmost остаётся, кламп — только про размер).
 const MONITOR_MAX_FRACTION: f64 = 0.9;
 
+/// Где закреплённому окну разрешено показываться.
+///
+/// Двух состояний мало: «правил нет» и «список пуст» — разные вещи, и
+/// именно их слияние ломало кнопку «Снять все» в выборе окон-хозяев (репорт
+/// пользователя 2026-08-22). Снятие всех галочек давало пустой список,
+/// пустой список читался как «ограничений нет», и панель тут же
+/// перерисовывалась со всеми галочками на месте — кнопка выглядела
+/// сломанной.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum HostFilter {
+    /// Ограничений нет: обычное закрепление поверх всего
+    /// ([`is_full_topmost`]) — состояние свежего пина.
+    #[default]
+    Anywhere,
+    /// Показывать ТОЛЬКО поверх окон, подходящих под эти правила.
+    ///
+    /// Пустой список — валидное состояние «ни на одном окне»: окно остаётся
+    /// свёрнутым, пока пользователь не вызовет его сам (Alt+Tab, панель
+    /// задач) — [`host_action`] всегда уступает явному выбору человека,
+    /// поэтому запереть окно этим состоянием нельзя.
+    Only(Vec<OverlapRule>),
+}
+
+impl HostFilter {
+    /// Правила для сопоставления; у [`HostFilter::Anywhere`] их нет —
+    /// пустой срез тут значит «сопоставлять нечего», а не «нигде»: ветки
+    /// различает [`Self::is_restricted`].
+    pub fn rules(&self) -> &[OverlapRule] {
+        match self {
+            Self::Anywhere => &[],
+            Self::Only(rules) => rules,
+        }
+    }
+
+    /// Видимость окна ограничена списком хозяев.
+    pub fn is_restricted(&self) -> bool {
+        matches!(self, Self::Only(_))
+    }
+
+    /// Правила на изменение; правка списка сама по себе означает, что
+    /// ограничение включено, поэтому [`HostFilter::Anywhere`] переходит в
+    /// пустой [`HostFilter::Only`].
+    pub fn rules_mut(&mut self) -> &mut Vec<OverlapRule> {
+        if let Self::Anywhere = self {
+            *self = Self::Only(Vec::new());
+        }
+        match self {
+            Self::Only(rules) => rules,
+            Self::Anywhere => unreachable!("переведено в Only строкой выше"),
+        }
+    }
+}
+
 /// Закреплённое окно другого приложения: рантайм-состояние, не конфиг.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PinnedWindow {
@@ -30,18 +83,22 @@ pub struct PinnedWindow {
     /// (`EnableWindow(hwnd, FALSE)` + визуальный индикатор в координаторе).
     pub lock_interact: bool,
     /// Окна-хозяева: «показывать это окно ТОЛЬКО поверх них» (запрос
-    /// пользователя 2026-08-22). Пока список пуст — обычное закрепление
-    /// поверх всего ([`is_full_topmost`]). Как только в списке появляется
-    /// правило, окно живёт по [`host_action`]: активен хозяин — окно видно
-    /// и лежит поверх него; активно что угодно другое (включая рабочий
-    /// стол) — окно свёрнуто.
+    /// пользователя 2026-08-22). [`HostFilter::Anywhere`] — обычное
+    /// закрепление поверх всего ([`is_full_topmost`]). В режиме
+    /// [`HostFilter::Only`] окно живёт по [`host_action`]: активен хозяин —
+    /// окно видно и лежит поверх него; активно что угодно другое (включая
+    /// рабочий стол) — окно свёрнуто.
     ///
     /// Правило то же по форме, что у денй-листа и окклюдеров
     /// ([`OverlapRule`]): процесс ИЛИ шаблон заголовка. По клику в списке
     /// окон создаётся правило ПО ПРОЦЕССУ — оно переживает перезапуск
     /// приложения и смену заголовка (браузер меняет заголовок на каждой
     /// вкладке).
-    pub host_rules: Vec<OverlapRule>,
+    pub hosts: HostFilter,
+    /// С тех пор как окно свёрнуто, пользователь успел побывать не на
+    /// хозяине — см. [`HostContext::away_from_hosts`]. Рантайм-состояние,
+    /// ведёт его координатор на каждом снимке.
+    pub away_from_hosts: bool,
     /// Окно сейчас свёрнуто НАМИ, потому что ни один хозяин не активен
     /// ([`host_action`]). Отличает наше сокрытие от «пользователь свернул
     /// окно сам» — второе мы не оспариваем. Рантайм-флаг, как и всё
@@ -56,7 +113,8 @@ impl PinnedWindow {
             hwnd,
             lock_move: false,
             lock_interact: false,
-            host_rules: Vec::new(),
+            hosts: HostFilter::Anywhere,
+            away_from_hosts: false,
             hidden_by_rules: false,
         }
     }
@@ -66,7 +124,7 @@ impl PinnedWindow {
 /// `WS_EX_TOPMOST`; непустой список — z-order-слот над соседями вместо
 /// него. Вопрос «какой из двух режимов» решается одним этим предикатом.
 pub fn is_full_topmost(pinned: &PinnedWindow) -> bool {
-    pinned.host_rules.is_empty()
+    !pinned.hosts.is_restricted()
 }
 
 /// Кламп размера закрепляемого окна до 90% монитора ПО КАЖДОЙ ОСИ
@@ -250,8 +308,8 @@ pub enum HostAction {
 /// Всё, что нужно знать о моменте, чтобы решить судьбу окна с правилами.
 #[derive(Debug, Clone, Copy)]
 pub struct HostContext<'a> {
-    /// Правила «показывать только на этих окнах» ([`PinnedWindow::host_rules`]).
-    pub rules: &'a [OverlapRule],
+    /// Где окну разрешено показываться ([`PinnedWindow::hosts`]).
+    pub hosts: &'a HostFilter,
     /// Переднее окно — это САМО закреплённое окно (пользователь вызвал его
     /// через Alt+Tab или панель задач).
     pub foreground_is_target: bool,
@@ -264,10 +322,58 @@ pub struct HostContext<'a> {
     pub target_minimized: bool,
     /// Свернули его МЫ по этим правилам (а не пользователь руками).
     pub hidden_by_rules: bool,
+    /// С тех пор как окно оказалось свёрнутым, пользователь успел побывать
+    /// НЕ на хозяине (другое приложение, рабочий стол).
+    ///
+    /// По этому признаку возвращается окно, свёрнутое пользователем вручную
+    /// (запрос 2026-08-22: «свернул окно, потом снова переключился на
+    /// программу, где оно закреплено, — оно появляется»). Простого «хозяин
+    /// активен» тут мало: после нажатия «Свернуть» фокус падает как раз на
+    /// хозяина, и окно всплывало бы обратно в ту же долю секунды — кнопку
+    /// «Свернуть» стало бы невозможно нажать.
+    ///
+    /// Раньше здесь стоял фронт «фокус только что перешёл на хозяина», и он
+    /// терялся: между сворачиванием и возвратом приходит несколько снимков
+    /// (переключатель Alt+Tab, панель задач), любой из них съедал фронт, и
+    /// окно не возвращалось (репорт пользователя). Состояние «успел уйти»
+    /// от порядка и числа снимков не зависит.
+    pub away_from_hosts: bool,
+    /// Переднее окно лежит на ДРУГОМ мониторе, чем закреплённое.
+    ///
+    /// Переключение на соседнем экране не должно гасить окно на этом
+    /// (запрос пользователя 2026-08-22: браузер с закреплённым Проводником
+    /// на первом мониторе, Discord — на втором). Формально пользователь
+    /// ушёл на постороннее окно, но на мониторе закреплённого окна ничего
+    /// не изменилось: хозяин там как лежал, так и лежит, и убирать окно с
+    /// экрана, на который человек даже не смотрел, — потеря информации без
+    /// причины.
+    ///
+    /// `false`, когда монитор неизвестен (переднего окна нет — рабочий
+    /// стол): неизвестность не повод отменять правило.
+    pub foreground_elsewhere: bool,
     /// Пользователь прямо сейчас переключается между окнами средствами
     /// шелла (Alt+Tab, Win+Tab, меню Пуск, панель задач) — «активного
     /// приложения» в этот момент фактически нет, он ещё выбирает.
     pub shell_switching: bool,
+}
+
+/// Должно ли окно быть видно прямо сейчас: активен хозяин или само окно.
+///
+/// Отдельная функция, потому что этот же вопрос задаёт координатор, чтобы
+/// вести [`HostContext::away_from_hosts`] — иначе признак «успел уйти»
+/// считался бы по своей копии правил и разошёлся бы с решением.
+pub fn host_is_active(ctx: &HostContext) -> bool {
+    match ctx.hosts {
+        HostFilter::Anywhere => true,
+        HostFilter::Only(rules) => wants_visible(ctx, rules),
+    }
+}
+
+/// Внутренняя часть: пустой список хозяев не совпадает ни с чем — окно
+/// показывается только по явному вызову пользователем.
+fn wants_visible(ctx: &HostContext, rules: &[OverlapRule]) -> bool {
+    ctx.foreground_is_target
+        || crate::occluders::any_rule_matches(ctx.foreground_process, ctx.foreground_title, rules)
 }
 
 /// Решение по видимости закреплённого окна с правилами
@@ -280,17 +386,17 @@ pub struct HostContext<'a> {
 /// окно сейчас активно.
 ///
 /// Два правила, которые делают поведение предсказуемым:
-/// * **Возвращаем только то, что прятали сами.** Если пользователь свернул
-///   окно руками, оно останется свёрнутым, даже когда хозяин активен, —
-///   иначе приложение спорило бы с человеком, а он бы не понимал, почему
-///   окно всё время всплывает.
+/// * **Возвращаем и то, что свернул пользователь, — но только если он
+///   успел уйти с хозяев и вернуться** (`away_from_hosts`, запрос
+///   2026-08-22). Пока пользователь не уходил, свёрнутое руками окно не
+///   трогаем: иначе свернуть его при активном хозяине было бы невозможно.
 /// * **Пользователь всегда главнее правил.** Как только он сам вызвал окно
 ///   (`foreground_is_target`), оно показывается, даже если по правилам
 ///   должно быть скрыто; спрячется снова, когда он уйдёт на другое окно.
 pub fn host_action(ctx: &HostContext) -> HostAction {
-    if ctx.rules.is_empty() {
+    let HostFilter::Only(rules) = ctx.hosts else {
         return HostAction::None; // обычное закрепление поверх всего
-    }
+    };
     if ctx.shell_switching {
         // Идёт Alt+Tab/Win+Tab/меню Пуск: активен переключатель шелла, а не
         // приложение. Свернуть или развернуть окно сейчас — значит менять
@@ -299,20 +405,19 @@ pub fn host_action(ctx: &HostContext) -> HostAction {
         // выбор закончится: следующий же снимок решит по настоящему окну.
         return HostAction::None;
     }
-    let wanted_visible = ctx.foreground_is_target
-        || crate::occluders::any_rule_matches(
-            ctx.foreground_process,
-            ctx.foreground_title,
-            ctx.rules,
-        );
+    let wanted_visible = wants_visible(ctx, rules);
     if wanted_visible {
-        // Разворачиваем ТОЛЬКО своё сокрытие: свёрнутое пользователем окно
-        // не трогаем.
-        if ctx.hidden_by_rules && ctx.target_minimized {
+        // Своё сокрытие разворачиваем всегда; сворачивание пользователем —
+        // когда он успел уйти с хозяев и вернуться (см. `away_from_hosts`).
+        if ctx.target_minimized && (ctx.hidden_by_rules || ctx.away_from_hosts) {
             HostAction::Show
         } else {
             HostAction::None
         }
+    } else if ctx.foreground_elsewhere {
+        // Ушли на другой монитор — этого экрана переключение не касается
+        // (см. `HostContext::foreground_elsewhere`).
+        HostAction::None
     } else if ctx.target_minimized {
         HostAction::None // уже убрано — неважно, кем
     } else {
@@ -452,14 +557,20 @@ mod tests {
         }
     }
 
-    fn ctx<'a>(rules: &'a [OverlapRule], fg: Option<&'a str>) -> HostContext<'a> {
+    fn only(processes: &[&str]) -> HostFilter {
+        HostFilter::Only(processes.iter().map(|p| rule_for(p)).collect())
+    }
+
+    fn ctx<'a>(hosts: &'a HostFilter, fg: Option<&'a str>) -> HostContext<'a> {
         HostContext {
-            rules,
+            hosts,
             foreground_is_target: false,
             foreground_process: fg,
             foreground_title: None,
             target_minimized: false,
             hidden_by_rules: false,
+            away_from_hosts: false,
+            foreground_elsewhere: false,
             shell_switching: false,
         }
     }
@@ -469,7 +580,7 @@ mod tests {
     /// репорт 2026-08-22 — иначе ломается сам Alt+Tab).
     #[test]
     fn host_action_freezes_while_shell_is_switching() {
-        let rules = [rule_for("chrome.exe")];
+        let rules = only(&["chrome.exe"]);
         let mut c = ctx(&rules, Some("notepad.exe"));
         c.shell_switching = true;
         assert_eq!(host_action(&c), HostAction::None, "не прячем во время Alt+Tab");
@@ -488,15 +599,32 @@ mod tests {
     /// Без правил фича молчит: обычное закрепление ведёт себя как раньше.
     #[test]
     fn host_action_is_silent_without_rules() {
-        let empty: [OverlapRule; 0] = [];
-        assert_eq!(host_action(&ctx(&empty, Some("chrome.exe"))), HostAction::None);
+        let anywhere = HostFilter::Anywhere;
+        assert_eq!(host_action(&ctx(&anywhere, Some("chrome.exe"))), HostAction::None);
+    }
+
+    /// Снятые ВСЕ галочки — это «ни на одном окне», а не «ограничений нет»
+    /// (репорт 2026-08-22: кнопка «Снять все» выглядела неработающей именно
+    /// потому, что пустой список читался как отсутствие правил). Окно при
+    /// этом не заперто: пользователь вызывает его сам и видит.
+    #[test]
+    fn empty_host_list_hides_everywhere_but_yields_to_the_user() {
+        let nowhere = HostFilter::Only(Vec::new());
+        assert_eq!(host_action(&ctx(&nowhere, Some("chrome.exe"))), HostAction::Hide);
+        assert_eq!(host_action(&ctx(&nowhere, None)), HostAction::Hide);
+
+        let mut c = ctx(&nowhere, Some("chrome.exe"));
+        c.foreground_is_target = true;
+        c.target_minimized = true;
+        c.hidden_by_rules = true;
+        assert_eq!(host_action(&c), HostAction::Show, "вызванное вручную — показываем");
     }
 
     /// Активен хозяин — окно должно быть видно; активно что-то другое —
     /// свёрнуто. Ровно пример пользователя: Проводник на браузере.
     #[test]
     fn host_action_follows_foreground_window() {
-        let rules = [rule_for("chrome.exe")];
+        let rules = only(&["chrome.exe"]);
         // Хозяин активен, окно уже видно — трогать нечего.
         assert_eq!(host_action(&ctx(&rules, Some("chrome.exe"))), HostAction::None);
         // Активен чужой процесс — прячем.
@@ -508,22 +636,62 @@ mod tests {
     /// Хозяин снова активен — возвращаем окно, которое прятали сами.
     #[test]
     fn host_action_restores_only_what_it_hid() {
-        let rules = [rule_for("chrome.exe")];
+        let rules = only(&["chrome.exe"]);
         let mut c = ctx(&rules, Some("chrome.exe"));
         c.target_minimized = true;
         c.hidden_by_rules = true;
         assert_eq!(host_action(&c), HostAction::Show);
 
-        // То же окно, но свёрнутое ПОЛЬЗОВАТЕЛЕМ: не спорим с ним.
+        // То же окно, свёрнутое ПОЛЬЗОВАТЕЛЕМ, при уже активном хозяине:
+        // не спорим с ним, иначе кнопку «Свернуть» было бы не нажать.
         c.hidden_by_rules = false;
         assert_eq!(host_action(&c), HostAction::None);
+    }
+
+    /// Свернул окно руками, ушёл на другое приложение, вернулся на
+    /// хозяина — окно возвращается (запрос пользователя 2026-08-22).
+    #[test]
+    fn host_action_restores_user_minimized_window_after_leaving_hosts() {
+        let rules = only(&["chrome.exe"]);
+        let mut c = ctx(&rules, Some("chrome.exe"));
+        c.target_minimized = true;
+        c.hidden_by_rules = false;
+
+        // Сразу после сворачивания фокус падает на того же хозяина —
+        // возвращать нельзя, иначе кнопка «Свернуть» не работает.
+        c.away_from_hosts = false;
+        assert_eq!(host_action(&c), HostAction::None);
+
+        // Пользователь успел уйти на постороннее окно и вернулся.
+        c.away_from_hosts = true;
+        assert_eq!(host_action(&c), HostAction::Show);
+    }
+
+    /// Признак «активен хозяин» — тот же, по которому принимается решение:
+    /// координатор ведёт им состояние ухода.
+    #[test]
+    fn host_is_active_matches_decision() {
+        let rules = only(&["chrome.exe"]);
+        assert!(host_is_active(&ctx(&rules, Some("chrome.exe"))));
+        assert!(!host_is_active(&ctx(&rules, Some("notepad.exe"))));
+        assert!(!host_is_active(&ctx(&rules, None)));
+
+        // Само окно на переднем плане — тоже «активен хозяин»: пользователь
+        // вызвал его сам.
+        let mut c = ctx(&rules, Some("notepad.exe"));
+        c.foreground_is_target = true;
+        assert!(host_is_active(&c));
+
+        // Без ограничений вопрос не стоит.
+        let anywhere = HostFilter::Anywhere;
+        assert!(host_is_active(&ctx(&anywhere, Some("vlc.exe"))));
     }
 
     /// Пользователь сам вызвал окно (Alt+Tab, панель задач) — показываем,
     /// даже если по правилам его быть не должно.
     #[test]
     fn host_action_yields_to_explicit_user_choice() {
-        let rules = [rule_for("chrome.exe")];
+        let rules = only(&["chrome.exe"]);
         let mut c = ctx(&rules, Some("explorer.exe"));
         c.foreground_is_target = true;
         c.target_minimized = true;
@@ -538,16 +706,43 @@ mod tests {
     /// Ушёл с окна на постороннее — прячем снова.
     #[test]
     fn host_action_hides_again_after_user_leaves() {
-        let rules = [rule_for("chrome.exe")];
+        let rules = only(&["chrome.exe"]);
         let c = ctx(&rules, Some("notepad.exe"));
         assert_eq!(host_action(&c), HostAction::Hide);
+    }
+
+    /// Постороннее окно на ДРУГОМ мониторе окно не гасит (запрос
+    /// пользователя 2026-08-22): на экране закреплённого окна ничего не
+    /// изменилось.
+    #[test]
+    fn host_action_ignores_switches_on_another_monitor() {
+        let rules = only(&["chrome.exe"]);
+        let mut c = ctx(&rules, Some("discord.exe"));
+        c.foreground_elsewhere = true;
+        assert_eq!(host_action(&c), HostAction::None, "не гасим соседний экран");
+
+        // Тот же Discord, но на мониторе закреплённого окна — прячем.
+        c.foreground_elsewhere = false;
+        assert_eq!(host_action(&c), HostAction::Hide);
+    }
+
+    /// Хозяин на другом мониторе — окно всё равно показываем: ограничение
+    /// касается только сокрытия, иначе окно нельзя было бы вернуть.
+    #[test]
+    fn host_action_shows_for_a_host_on_another_monitor() {
+        let rules = only(&["chrome.exe"]);
+        let mut c = ctx(&rules, Some("chrome.exe"));
+        c.foreground_elsewhere = true;
+        c.target_minimized = true;
+        c.hidden_by_rules = true;
+        assert_eq!(host_action(&c), HostAction::Show);
     }
 
     /// Уже свёрнутое окно повторно не сворачиваем — иначе на каждый снимок
     /// летела бы лишняя команда чужому окну.
     #[test]
     fn host_action_does_not_hide_twice() {
-        let rules = [rule_for("chrome.exe")];
+        let rules = only(&["chrome.exe"]);
         let mut c = ctx(&rules, Some("notepad.exe"));
         c.target_minimized = true;
         c.hidden_by_rules = true;
@@ -557,7 +752,7 @@ mod tests {
     /// Несколько правил: достаточно совпадения с любым.
     #[test]
     fn host_action_accepts_any_of_several_rules() {
-        let rules = [rule_for("chrome.exe"), rule_for("firefox.exe")];
+        let rules = only(&["chrome.exe", "firefox.exe"]);
         assert_eq!(host_action(&ctx(&rules, Some("firefox.exe"))), HostAction::None);
         assert_eq!(host_action(&ctx(&rules, Some("vlc.exe"))), HostAction::Hide);
     }
@@ -565,10 +760,10 @@ mod tests {
     /// Правило по заголовку с маской работает так же, как в денй-листе.
     #[test]
     fn host_action_matches_title_pattern() {
-        let rules = [OverlapRule {
+        let rules = HostFilter::Only(vec![OverlapRule {
             process_name: None,
             title_pattern: Some("*YouTube*".to_string()),
-        }];
+        }]);
         let mut c = ctx(&rules, Some("chrome.exe"));
         c.foreground_title = Some("Видео — YouTube — Chrome");
         assert_eq!(host_action(&c), HostAction::None);
@@ -581,7 +776,7 @@ mod tests {
     /// кликом по списку окон, не срабатывало бы вовсе).
     #[test]
     fn host_action_matches_full_exe_path() {
-        let rules = [rule_for("chrome.exe")];
+        let rules = only(&["chrome.exe"]);
         assert_eq!(
             host_action(&ctx(&rules, Some(r"C:\Program Files\Google\chrome.exe"))),
             HostAction::None
@@ -594,16 +789,21 @@ mod tests {
         assert_eq!(pinned.hwnd, 42);
         assert!(!pinned.lock_move);
         assert!(!pinned.lock_interact);
-        assert!(pinned.host_rules.is_empty());
+        assert!(!pinned.away_from_hosts);
+        assert!(!pinned.hosts.is_restricted());
         assert!(is_full_topmost(&pinned));
     }
 
     #[test]
     fn host_rules_switch_off_full_topmost() {
         let mut pinned = PinnedWindow::new(1);
-        pinned.host_rules.push(OverlapRule::default());
+        pinned.hosts.rules_mut().push(OverlapRule::default());
         assert!(!is_full_topmost(&pinned));
-        pinned.host_rules.clear();
+        // Пустой список — всё ещё ограничение («ни на одном окне»), а не его
+        // отсутствие: обратно в full-topmost возвращает только `Anywhere`.
+        pinned.hosts.rules_mut().clear();
+        assert!(!is_full_topmost(&pinned));
+        pinned.hosts = HostFilter::Anywhere;
         assert!(is_full_topmost(&pinned));
     }
 

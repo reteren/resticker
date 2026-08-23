@@ -113,7 +113,9 @@ pnpm install
 
 # FFmpeg-линкуемые крейты (rst-video, resticker) требуют эти переменные —
 # путь подставьте свой, см. CONTRIBUTING.md за инструкцией по сборке FFmpeg.
-$env:FFMPEG_DIR = "путь\к\ffmpeg\install"
+# Версия FFmpeg обязана быть 7.1 (libavcodec 61): под неё написаны биндинги,
+# сборка с другой версией отклоняется build.rs.
+$env:FFMPEG_DIR = "путь\к\ffmpeg-7.1\install"
 $env:LIBCLANG_PATH = "путь\к\llvm\bin"
 
 # Запуск без сборки инсталлятора:

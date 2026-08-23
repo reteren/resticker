@@ -24,6 +24,22 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D10",
     "Win32_Graphics_Direct3D11",
+    # timeBeginPeriod/timeEndPeriod — точность пауз декодера (см. timer_res.rs)
+    "Win32_Media",
+] }
+
+[dev-dependencies]
+# Только для примера-пробника `examples/probe.rs`: он печатает журнал
+# декодера в терминал, иначе диагностика не видна.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Пробнику нужен свой D3D11-девайс, чтобы проверить аппаратный декод так же,
+# как это делает приложение (в приложении устройство приходит от рендера).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 
 [lints]

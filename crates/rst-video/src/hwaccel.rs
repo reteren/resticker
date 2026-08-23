@@ -340,6 +340,12 @@ unsafe extern "C" fn pick_d3d11_format(
 /// `codec_ctx->hw_frames_ctx`. Значения пула повторяют
 /// `ff_dxva2_common_frame_params` (libavcodec/dxva2.c); ручное построение —
 /// см. док модуля.
+/// Сколько поверхностей пула может одновременно удерживать потребитель:
+/// очередь готовых кадров ([`crate::decoder::FRAME_QUEUE_CAPACITY`] = 3),
+/// показываемый сейчас кадр и запас на перекрытие показа со следующим
+/// кадром.
+const CONSUMER_HELD_SURFACES: i32 = 6;
+
 fn create_frames_ctx(codec_ctx: *mut AVCodecContext) -> Result<(), String> {
     // SAFETY: codec_ctx жив; hw_device_ctx выставлен в enable.
     let device_ctx_raw = unsafe { (*codec_ctx).hw_device_ctx };
@@ -363,6 +369,16 @@ fn create_frames_ctx(codec_ctx: *mut AVCodecContext) -> Result<(), String> {
             _ => (16, 3),
         }
     };
+    // Запас поверхностей для ПОТРЕБИТЕЛЯ. Размеры выше — из
+    // `ff_dxva2_common_frame_params`, и считают они только нужды самого
+    // декодера (опорные кадры плюс рабочая). Всё, что потребитель держит у
+    // себя, вычитается из этого запаса: очередь готовых кадров (3) плюс
+    // кадр, который прямо сейчас на экране (его нельзя отпускать — декодер
+    // тут же перезапишет поверхность). Без запаса пул кончается, декодер
+    // ждёт свободную поверхность, и вместо 60 кадров в секунду выходит 40,
+    // из которых до экрана доживает 15 — замерено в приложении 2026-08-22,
+    // ровно тот «лагающий» показ, на который жаловался пользователь.
+    let pool_size = pool_size + CONSUMER_HELD_SURFACES;
     let align = |v: i32| (v + alignment - 1) / alignment * alignment;
     // К моменту get_format размеры уже кодовые (coded) — из битстрима.
     let tex_width = unsafe { align((*codec_ctx).width) };

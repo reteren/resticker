@@ -27,6 +27,7 @@ mod text;
 mod texture;
 mod ui_textures;
 mod video;
+mod video_timeline;
 mod widgets;
 mod window_highlight;
 mod window_target;
@@ -49,6 +50,11 @@ pub use text::{Glyph, LINE_HEIGHT, glyph_for, rasterize, text_size, width_up_to}
 pub use texture::Texture;
 pub use ui_textures::{TextureFactory, UiTextures};
 pub use video::VideoTextures;
+pub use video_timeline::{
+    TIMELINE_BG_OPACITY, TIMELINE_BG_OPACITY_HOVER, TIMELINE_HEIGHT, TIMELINE_KNOB,
+    TIMELINE_MARGIN, TIMELINE_MIN_WIDTH, TIMELINE_TEXT_OPACITY, TIMELINE_TEXT_OPACITY_HOVER,
+    TIMELINE_TRACK_H, TIMELINE_TRACK_H_HOVER, VideoTimeline, timeline_bounds,
+};
 pub use widgets::{
     Button, ButtonContent, Checkbox, EventResult, Icon, Key, Label, NumericField, Panel,
     PINNED_BTN_ADD_RULE, PINNED_BTN_UNPIN, PINNED_CHECK_INTERACT_LOCK, PINNED_CHECK_MOVE_LOCK,

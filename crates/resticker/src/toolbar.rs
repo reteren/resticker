@@ -27,6 +27,9 @@ pub const TB_DELETE: WidgetId = 7;
 /// `MediaType::Video` выделен один; иконка отражает текущее состояние
 /// (`Icon::Play` на паузе, `Icon::Pause` во время игры).
 pub const TB_PLAY_PAUSE: WidgetId = 9;
+/// Переключатель «показывать полосу перемотки вне режима редактирования»
+/// (запрос пользователя 2026-08-22).
+pub const TB_TIMELINE: WidgetId = 12;
 /// Громкость видео-стикера (M5b) — тот же виджет-класс, что ползунок
 /// прозрачности, диапазон 0..=100 процентов.
 pub const TB_VOLUME: WidgetId = 10;
@@ -64,8 +67,12 @@ pub const TOOLBAR_WIDTH_MULTI: f64 =
 /// Добавочная ширина видео-виджетов (M5b) — кнопка играть/пауза + ползунок
 /// громкости, каждый со своим зазором слева; добавляется к ширине
 /// одиночного режима, когда выделен один видео-стикер.
-pub const TOOLBAR_VIDEO_EXTRA_W: f64 =
-    TOOLBAR_WIDGET_GAP + theme::BUTTON_SIZE + TOOLBAR_WIDGET_GAP + TOOLBAR_SLIDER_W;
+pub const TOOLBAR_VIDEO_EXTRA_W: f64 = TOOLBAR_WIDGET_GAP
+    + theme::BUTTON_SIZE
+    + TOOLBAR_WIDGET_GAP
+    + theme::BUTTON_SIZE
+    + TOOLBAR_WIDGET_GAP
+    + TOOLBAR_SLIDER_W;
 
 /// Состояние воспроизведения видео-стикера для тулбара (M5b): показывает
 /// кнопку играть/пауза и ползунок громкости справа от обычных 6 кнопок,
@@ -77,6 +84,9 @@ pub const TOOLBAR_VIDEO_EXTRA_W: f64 =
 pub struct VideoToolbarState {
     /// `true` — воспроизведение на паузе (кнопка показывает `Icon::Play`).
     pub paused: bool,
+    /// Полоса перемотки показывается вне режима редактирования (запрос
+    /// пользователя 2026-08-22) — состояние переключателя `TB_TIMELINE`.
+    pub show_timeline: bool,
     /// Громкость в процентах, `0..=100` (то же зеркалирование, что у
     /// прозрачности: модель хранит `0.0..=1.0`, виджет — целые проценты).
     pub volume_pct: u32,
@@ -182,6 +192,22 @@ pub fn build_toolbar(
             x + theme::BUTTON_SIZE / 2.0,
             cy,
             play_icon,
+        ));
+        x += theme::BUTTON_SIZE + TOOLBAR_WIDGET_GAP;
+
+        // Переключатель полосы перемотки вне режима редактирования: иконка
+        // отражает СОСТОЯНИЕ (как Eye/EyeOff), а не действие — это тумблер
+        // настройки стикера, а не разовая команда.
+        let timeline_icon = if video.show_timeline {
+            Icon::Timeline
+        } else {
+            Icon::TimelineOff
+        };
+        panel.add_widget(Button::icon(
+            TB_TIMELINE,
+            x + theme::BUTTON_SIZE / 2.0,
+            cy,
+            timeline_icon,
         ));
         x += theme::BUTTON_SIZE + TOOLBAR_WIDGET_GAP;
 
@@ -491,6 +517,7 @@ mod tests {
         let video = VideoToolbarState {
             paused: true,
             volume_pct: 70,
+            show_timeline: false,
         };
         let p = build_toolbar(
             &aabb(960.0, 400.0, 200.0, 100.0),
@@ -518,11 +545,55 @@ mod tests {
         assert!(play_cx < volume_cx, "громкость правее играть/пауза");
     }
 
+    /// Переключатель полосы перемотки: есть только у видео, иконка
+    /// отражает состояние настройки в обе стороны, а сам он стоит между
+    /// «играть/пауза» и громкостью (запрос пользователя 2026-08-22).
+    #[test]
+    fn toolbar_timeline_toggle_reflects_state_and_order() {
+        for show in [false, true] {
+            let video = VideoToolbarState {
+                paused: false,
+                volume_pct: 50,
+                show_timeline: show,
+            };
+            let p = build_toolbar(
+                &aabb(960.0, 400.0, 200.0, 100.0),
+                Some(1.0),
+                Some(video),
+                SCREEN_H,
+            );
+            assert_eq!(
+                button_icon(&p, TB_TIMELINE),
+                if show {
+                    Icon::Timeline
+                } else {
+                    Icon::TimelineOff
+                },
+                "иконка отражает состояние настройки"
+            );
+            let play_cx = p.widget::<Button>(TB_PLAY_PAUSE).unwrap().bounds().cx;
+            let timeline_cx = p.widget::<Button>(TB_TIMELINE).unwrap().bounds().cx;
+            let volume_cx = p.widget::<Slider>(TB_VOLUME).unwrap().bounds().cx;
+            assert!(
+                play_cx < timeline_cx && timeline_cx < volume_cx,
+                "порядок: играть/пауза -> таймлайн -> громкость"
+            );
+        }
+    }
+
+    /// Без видео переключателя нет — как и остальных видео-виджетов.
+    #[test]
+    fn toolbar_without_video_has_no_timeline_toggle() {
+        let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.0), None, SCREEN_H);
+        assert!(p.widget::<Button>(TB_TIMELINE).is_none());
+    }
+
     #[test]
     fn toolbar_video_playing_shows_pause_icon() {
         let video = VideoToolbarState {
             paused: false,
             volume_pct: 100,
+            show_timeline: false,
         };
         let p = build_toolbar(
             &aabb(960.0, 400.0, 200.0, 100.0),

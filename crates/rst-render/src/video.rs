@@ -18,7 +18,9 @@
 //! рендера (ARCHITECTURE.md). Для непрозрачного видео (`alpha == None`)
 //! в t5 биндится белая 1×1-текстура — a = 1, поведение M5b без изменений.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11ShaderResourceView, ID3D11Texture2D,
@@ -77,23 +79,40 @@ impl VideoTextures {
 /// кадр, спрайт-клоны читают свежее значение).
 ///
 /// Почему плоскостные виды, а не один NV12-вид: на реальном железе
-/// (NVIDIA GTX 1070 Ti, проверено на стенде M5c) `CreateShaderResourceView`
-/// с `DXGI_FORMAT_NV12` и/или `TEXTURE2DARRAY` возвращает E_INVALIDARG —
+/// `CreateShaderResourceView` с `DXGI_FORMAT_NV12` возвращает E_INVALIDARG —
 /// принимаются только виды отдельных плоскостей (R8/R8G8). Плоскостные
 /// виды — штатный механизм D3D11 для планарных форматов (Y-плоскость как
-/// R8, UV как R8G8, `PlaneSlice` D3D11.1).
+/// R8, UV как R8G8).
+///
+/// Почему вид на ОДИН слой, а не на весь массив: пул d3d11va создаётся с
+/// `D3D11_BIND_DECODER`, и такую текстуру драйвер разрешает видеть только
+/// послойно — вид с `ArraySize` больше единицы отвергается тем же
+/// E_INVALIDARG. Замерено пробником на этой машине (пул 2560×1440, 17
+/// поверхностей, `BindFlags 0x208`): вид на весь массив — ошибка, вид на
+/// один слой — успех. Первая версия делала ровно наоборот и давала
+/// зелёный кадр: SRV не создавался, спрайт оставался с нулевыми
+/// плоскостями, а нули в BT.709 — это зелёный (репорт 2026-08-22).
+///
+/// Отсюда кэш: слоёв в пуле полтора десятка, кадр приходит то с одним, то
+/// с другим, и создавать вид заново на каждый кадр — лишний вызов
+/// драйвера 60 раз в секунду. Виды создаются лениво и переиспользуются;
+/// шейдер всегда семплирует нулевой элемент такого вида.
 ///
 /// Владение: SRV и COM-ссылка на текстуру декодера — умные указатели
 /// windows-rs; `Clone` — AddRef/Arc, дёшево.
 #[derive(Debug, Clone)]
 pub(crate) struct Nv12VideoTextures {
-    srv_y: ID3D11ShaderResourceView,
-    srv_uv: ID3D11ShaderResourceView,
-    /// Держатель текстуры декодера (явный — SRV и так держат COM-ссылку,
-    /// но объект удерживается здесь для ясности).
-    _texture: ID3D11Texture2D,
-    /// Индекс текущего кадра в массив-текстуре (общий для клонов).
-    index: std::sync::Arc<AtomicU32>,
+    /// Устройство рендера — на нём создаются виды по мере появления слоёв.
+    device: ID3D11Device,
+    /// Текстура декодера (массив NV12-поверхностей пула).
+    texture: ID3D11Texture2D,
+    /// Виды по слою массива: `слой -> (Y, UV)`. Общий для клонов спрайта.
+    slices: Arc<Mutex<HashMap<u32, (ID3D11ShaderResourceView, ID3D11ShaderResourceView)>>>,
+    /// Виды текущего показываемого слоя (общие для клонов).
+    current: Arc<Mutex<(ID3D11ShaderResourceView, ID3D11ShaderResourceView)>>,
+    /// Слой текущего кадра — для диагностики; шейдеру он не нужен, вид и
+    /// так однослойный.
+    index: Arc<AtomicU32>,
     /// Число элементов массива (валидация индекса).
     array_size: u32,
     /// Размеры текстуры (выровненные до 16/32/128 px декодером).
@@ -105,25 +124,21 @@ pub(crate) struct Nv12VideoTextures {
 }
 
 impl Nv12VideoTextures {
-    /// Создать NV12-путь из текстуры декодера (M5c): два плоскостных SRV
-    /// (R8 — Y, R8G8 — UV) на массив-текстуру d3d11va. Текстура обязана
-    /// быть NV12 с `D3D11_BIND_SHADER_RESOURCE` (так создаёт пул
-    /// `rst-video::hwaccel`). Если драйвер не принимает `TEXTURE2DARRAY`
-    /// (проверено: NVIDIA GTX 1070 Ti) — ошибка: вызывающий код пропустит
-    /// кадр, программный путь не задет.
+    /// Создать NV12-путь из текстуры декодера (M5c): плоскостные SRV
+    /// (R8 — Y, R8G8 — UV) на ОДИН слой массив-текстуры d3d11va. Текстура
+    /// обязана быть NV12 с `D3D11_BIND_SHADER_RESOURCE` (так создаёт пул
+    /// `rst-video::hwaccel`). Ошибка — вызывающий код пропустит кадр,
+    /// программный путь не задет.
     pub(crate) fn from_decoder_texture(
         device: &ID3D11Device,
         texture: &ID3D11Texture2D,
         display_width: u32,
         display_height: u32,
     ) -> Result<Self, crate::RenderError> {
-        use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2DARRAY;
         use windows::Win32::Graphics::Direct3D11::{
-            D3D11_BIND_SHADER_RESOURCE, D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_TEXTURE2D_DESC,
+            D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
         };
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_NV12, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
-        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 
         // SAFETY: GetDesc на живой текстуре (out-параметр).
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -143,40 +158,13 @@ impl Nv12VideoTextures {
                 "текстура декодера с нулевыми размерами".into(),
             ));
         }
-        // Два плоскостных вида на массив (элемент — индекс в шейдере).
-        let make = |format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT|
-         -> Result<ID3D11ShaderResourceView, crate::RenderError> {
-            let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                Format: format,
-                ViewDimension: D3D_SRV_DIMENSION_TEXTURE2DARRAY,
-                Anonymous: windows::Win32::Graphics::Direct3D11::
-                    D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2DArray: windows::Win32::Graphics::Direct3D11::
-                            D3D11_TEX2D_ARRAY_SRV {
-                                MostDetailedMip: 0,
-                                MipLevels: 1,
-                                FirstArraySlice: 0,
-                                ArraySize: desc.ArraySize,
-                            },
-                    },
-            };
-            let mut srv: Option<ID3D11ShaderResourceView> = None;
-            // SAFETY: desc валиден; текстура устройства; out-параметр валиден.
-            unsafe { device.CreateShaderResourceView(texture, Some(&srv_desc), Some(&mut srv)) }
-                .map_err(crate::RenderError::Windows)?;
-            Ok(srv.expect("CreateShaderResourceView без ошибки возвращает объект"))
-        };
-        let srv_y = make(DXGI_FORMAT_R8_UNORM)?;
-        let srv_uv = make(DXGI_FORMAT_R8G8_UNORM)?;
-
-        // Держатель текстуры декодера: SRV и так держат COM-ссылку, но
-        // объект удерживается явно для ясности владения.
-        let holder = texture.clone();
+        let pair = Self::make_slice_views(device, texture, 0)?;
         Ok(Self {
-            srv_y,
-            srv_uv,
-            _texture: holder,
-            index: std::sync::Arc::new(AtomicU32::new(0)),
+            device: device.clone(),
+            texture: texture.clone(),
+            slices: Arc::new(Mutex::new(HashMap::from([(0u32, pair.clone())]))),
+            current: Arc::new(Mutex::new(pair)),
+            index: Arc::new(AtomicU32::new(0)),
             array_size: desc.ArraySize,
             tex_width: desc.Width,
             tex_height: desc.Height,
@@ -185,17 +173,72 @@ impl Nv12VideoTextures {
         })
     }
 
-    /// Текущий индекс кадра в массив-текстуре декодера.
+    /// Индекс элемента, который семплирует шейдер: всегда 0 — вид
+    /// однослойный, слой выбран при его создании ([`Self::set_index`]).
     pub(crate) fn index(&self) -> u32 {
-        self.index.load(Ordering::Relaxed)
+        0
     }
 
-    /// Установить текущий кадр (индекс элемента массива).
-    pub(crate) fn set_index(&self, index: u32) {
-        self.index.store(
-            index.min(self.array_size.saturating_sub(1)),
-            Ordering::Relaxed,
-        );
+    /// Показывать слой `index`: берём готовые виды из кэша или создаём их
+    /// один раз на слой.
+    pub(crate) fn set_index(&self, index: u32) -> Result<(), crate::RenderError> {
+        let index = index.min(self.array_size.saturating_sub(1));
+        if self.index.load(Ordering::Relaxed) == index {
+            // Тот же слой — виды уже стоят.
+            return Ok(());
+        }
+        let pair = {
+            let mut slices = self.slices.lock().expect("мьютекс видов NV12 не отравлен");
+            match slices.get(&index) {
+                Some(pair) => pair.clone(),
+                None => {
+                    let pair = Self::make_slice_views(&self.device, &self.texture, index)?;
+                    slices.insert(index, pair.clone());
+                    pair
+                }
+            }
+        };
+        *self.current.lock().expect("мьютекс текущего вида NV12 не отравлен") = pair;
+        self.index.store(index, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Пара плоскостных видов (Y: R8, UV: R8G8) на ОДИН слой массива.
+    fn make_slice_views(
+        device: &ID3D11Device,
+        texture: &ID3D11Texture2D,
+        slice: u32,
+    ) -> Result<(ID3D11ShaderResourceView, ID3D11ShaderResourceView), crate::RenderError> {
+        use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2DARRAY;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0,
+            D3D11_TEX2D_ARRAY_SRV,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM};
+
+        let make = |format| -> Result<ID3D11ShaderResourceView, crate::RenderError> {
+            let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D_SRV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        FirstArraySlice: slice,
+                        // Ровно один слой: пул декодера с BIND_DECODER не
+                        // позволяет вид на несколько (см. док структуры).
+                        ArraySize: 1,
+                    },
+                },
+            };
+            let mut srv: Option<ID3D11ShaderResourceView> = None;
+            // SAFETY: описание валидно, текстура принадлежит устройству,
+            // out-параметр жив до конца вызова.
+            unsafe { device.CreateShaderResourceView(texture, Some(&srv_desc), Some(&mut srv)) }
+                .map_err(crate::RenderError::Windows)?;
+            Ok(srv.expect("CreateShaderResourceView без ошибки возвращает объект"))
+        };
+        Ok((make(DXGI_FORMAT_R8_UNORM)?, make(DXGI_FORMAT_R8G8_UNORM)?))
     }
 
     /// Масштаб UV видимой области: `display/tex` по каждой оси — левый
@@ -208,19 +251,27 @@ impl Nv12VideoTextures {
     }
 
     /// SRV плоскости Y для биндинга в пиксельный шейдер (t5, R8).
-    pub(crate) fn srv_y(&self) -> &ID3D11ShaderResourceView {
-        &self.srv_y
+    pub(crate) fn srv_y(&self) -> ID3D11ShaderResourceView {
+        self.current
+            .lock()
+            .expect("мьютекс текущего вида NV12 не отравлен")
+            .0
+            .clone()
     }
 
     /// SRV плоскости UV для биндинга в пиксельный шейдер (t6, R8G8).
-    pub(crate) fn srv_uv(&self) -> &ID3D11ShaderResourceView {
-        &self.srv_uv
+    pub(crate) fn srv_uv(&self) -> ID3D11ShaderResourceView {
+        self.current
+            .lock()
+            .expect("мьютекс текущего вида NV12 не отравлен")
+            .1
+            .clone()
     }
 
     /// Та же ли это текстура, что мы оборачиваем (сравнение COM-указателей).
     pub(crate) fn holds_texture(&self, texture: &ID3D11Texture2D) -> bool {
         use windows::core::Interface;
-        self._texture.as_raw() == texture.as_raw()
+        self.texture.as_raw() == texture.as_raw()
     }
 }
 

@@ -55,6 +55,28 @@ pub(crate) enum Control {
 pub(crate) struct Shared {
     pub paused: std::sync::atomic::AtomicBool,
     pub volume: std::sync::Mutex<f32>,
+    /// Кого будить, когда готов кадр (см.
+    /// [`crate::VideoSource::set_frame_notifier`]).
+    ///
+    /// Без этого потребителю остаётся опрашивать очередь по таймеру, а
+    /// опрос по определению добавляет к показу задержку до периода опроса:
+    /// кадр, пришедший сразу после пробуждения, ждёт следующего. Замер в
+    /// приложении показывал ровно это: период кадров 17 мс, а раз в
+    /// секунду интервал показа 25 мс — то есть 17 плюс период опроса
+    /// (репорт пользователя 2026-08-22 про рывки).
+    pub frame_notify: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+impl Shared {
+    /// Сообщить потребителю, что в очереди появился кадр. Вызывается на
+    /// декодер-потоке, поэтому обязано быть дешёвым: отправка в канал.
+    pub(crate) fn notify_frame(&self) {
+        if let Ok(guard) = self.frame_notify.lock() {
+            if let Some(notify) = guard.as_ref() {
+                notify();
+            }
+        }
+    }
 }
 
 /// Запрошенная перемотка: применяется к конвейеру до чтения новых пакетов.
@@ -93,6 +115,11 @@ pub(crate) fn decoder_thread(
     audio_target: crate::pipeline::AudioTarget,
     hw_device: Option<ID3D11Device>,
 ) {
+    // Пока живёт этот поток, процесс держит миллисекундное разрешение
+    // таймера: пауза до `pts` кадра иначе округляется до ~15.6 мс и видео
+    // идёт рывками (см. `crate::timer_res`).
+    let _timer = crate::timer_res::TimerResolution::acquire();
+
     // Открытие и проверка первого кадра (формат пикселя/размеры) — здесь, в
     // потоке: все FFmpeg-вызовы одного файла живут на одной нити. В hw-режиме
     // устройство передаётся в `Pipeline::open_with_hw` (hw-контексты
@@ -194,32 +221,31 @@ pub(crate) fn decoder_thread(
                 // Полная очередь — кадр отбрасывается: координатор медленнее
                 // реального времени, пропуск кадров — корректное поведение
                 // (очередь несёт самые свежие кадры, см. доку модуля).
-                let _ = frame_tx.try_send(frame);
+                if frame_tx.try_send(frame).is_ok() {
+                    shared.notify_frame();
+                }
             }
             Ok(Event::VideoHw(frame)) => {
-                // Аппаратный кадр (M5c): zero-copy путь — NV12-текстура на
-                // общем D3D11-девайсе; плюс readback-копия для совместимости
-                // старого `try_recv_frame` (координатор до перехода на
-                // hw-путь пользуется YUV-очередью). Readback дёшев (≈1.5 МБ
-                // memcpy на кадр 1080p), но zero-copy потребители его не
-                // делают.
+                // Аппаратный кадр (M5c): zero-copy — NV12-текстура на общем
+                // с рендером D3D11-девайсе.
+                //
+                // Копии в системную память (readback) здесь НЕТ намеренно.
+                // Раньше каждый аппаратный кадр дополнительно копировался с
+                // видеокарты в YUV-очередь «для совместимости» со старым
+                // `try_recv_frame`. Для 1440p это 5.5 МБ через шину на
+                // кадр, шестьдесят раз в секунду, да ещё и с ожиданием
+                // готовности GPU — то есть ровно та работа, ради отказа от
+                // которой аппаратный декод и включают. Потребитель
+                // аппаратного режима читает `try_recv_hw_frame`; программная
+                // очередь в этом режиме остаётся пустой (док
+                // `VideoSource::try_recv_frame`).
                 if let Some(cmd) = pace_to(&mut pacing, frame.pts, &ctl_rx) {
                     if apply_command(cmd, &mut paused, &mut pending_seek, &shared) {
                         break; // Shutdown
                     }
                 }
-                let pts = frame.pts;
-                let readback = pipe.hw_to_yuv(&frame);
-                let _ = hw_frame_tx.try_send(frame);
-                match readback {
-                    Ok(yuv) => {
-                        let _ = frame_tx.try_send(yuv);
-                    }
-                    Err(e) => {
-                        // Readback — совместимость, его сбой не должен ломать
-                        // zero-copy путь (кадр уже отправлен).
-                        warn!(?path, pts = ?pts, "readback hw-кадра не удался: {e}");
-                    }
+                if hw_frame_tx.try_send(frame).is_ok() {
+                    shared.notify_frame();
                 }
             }
             Ok(Event::Audio(chunk)) => {

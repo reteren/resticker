@@ -52,6 +52,7 @@ mod error;
 mod format;
 mod hwaccel;
 mod pipeline;
+mod timer_res;
 
 pub use error::VideoError;
 pub use pipeline::{AUDIO_TARGET_CHANNELS, AUDIO_TARGET_SAMPLE_RATE};
@@ -255,6 +256,7 @@ impl VideoSource {
         let shared = Arc::new(Shared {
             paused: std::sync::atomic::AtomicBool::new(false),
             volume: std::sync::Mutex::new(1.0),
+            frame_notify: std::sync::Mutex::new(None),
         });
 
         let thread_path = path.to_path_buf();
@@ -333,6 +335,19 @@ impl VideoSource {
             .send(Control::Seek { to, ack: ack_tx })
             .map_err(|_| VideoError::DecoderThreadGone)?;
         ack_rx.recv().map_err(|_| VideoError::DecoderThreadGone)?
+    }
+
+    /// Кого будить, когда декодер положил кадр в очередь.
+    ///
+    /// Замена опроса по таймеру: потребитель показывает кадр сразу, а не в
+    /// ближайшее своё пробуждение (замер в приложении 2026-08-22 — опрос
+    /// добавлял к каждому третьему-четвёртому кадру до 8 мс задержки, и это
+    /// читалось как рывок). Замыкание зовётся НА ДЕКОДЕР-ПОТОКЕ: оно обязано
+    /// быть дешёвым и не блокировать — отправка в канал, не более.
+    pub fn set_frame_notifier(&self, notify: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut guard) = self.shared.frame_notify.lock() {
+            *guard = Some(Box::new(notify));
+        }
     }
 
     /// Громкость (0.0..=1.0). Применяется микшером звука (задача C,
