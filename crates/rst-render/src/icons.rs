@@ -40,6 +40,9 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
         Icon::Pause => draw_pause(&mut canvas, s),
         Icon::Timeline | Icon::TimelineOff => draw_timeline(&mut canvas, s),
         Icon::ResetScale => draw_reset_scale(&mut canvas, s),
+        // Двухцветная (белая с обводкой) — рисуется целиком своим
+        // генератором, как и растровая булавка ниже.
+        Icon::Rotate => return rotate_arrow_rgba(size_px),
         Icon::Lock => draw_lock(&mut canvas, s),
         Icon::LockOpen => draw_lock_open(&mut canvas, s),
         Icon::Plus => draw_plus(&mut canvas, s),
@@ -100,40 +103,54 @@ fn pinned_badge_rgba(size_px: u32) -> Vec<u8> {
 /// Цвет штриха булавки поверх тёмного бейджа.
 const PINNED_BADGE_COLOR: [u8; 3] = [0xf0, 0xf0, 0xf0];
 
-/// Цвет иконки (иконки различаются и формой, и цветом — кнопки не монохромны).
+/// Цвет иконки.
+///
+/// Палитра — монохром Source VGUI (2026-08-23, перевод тулбаров на
+/// стилистику окна настроек): пиктограмма светлая, состояние «выключено» —
+/// тёмная того же силуэта, цвет остаётся только там, где он несёт смысл,
+/// который форма не передаёт (удаление). Прежние пастельные тона были
+/// рассчитаны на тёмную панель `theme::PANEL_BG`; на светло-сером
+/// `settings::BTN_BG` (#7b7b7b) мятный и голубой давали контраст около
+/// 1.5:1 и читались как грязь.
+///
+/// Иконки живут ТОЛЬКО на панелях со стилем
+/// [`crate::WidgetStyle::Settings`] (тулбар стикера, панель у курсора,
+/// панель свойств закреплённого окна) — панели выбора окон/пресетов
+/// текстовые, поэтому одной палитры достаточно.
 fn color_of(icon: Icon) -> [u8; 3] {
+    /// Обычная пиктограмма — почти белая, как текст VGUI.
+    const LIGHT: [u8; 3] = [0xf2, 0xf2, 0xf2];
+    /// Состояние «выключено» (пары Eye/EyeOff, Lock/LockOpen,
+    /// Timeline/TimelineOff) — тёмный силуэт: на сером фоне это читается
+    /// как «утоплено/неактивно», ровно как неактивная вкладка настроек.
+    const DIM: [u8; 3] = [0x3a, 0x3a, 0x3a];
     match icon {
         // Растровая иконка красится в `pinned_badge_rgba`, сюда не попадает.
         Icon::Pinned => PINNED_BADGE_COLOR,
-        Icon::Layers => [0xcf, 0xcf, 0xd6],
-        Icon::Eye => [0xf0, 0xf0, 0xf0],
-        Icon::EyeOff => [0xa8, 0xa8, 0xb2],
-        Icon::OrderUp => [0x8a, 0xd0, 0x9c],
-        Icon::OrderDown => [0x6f, 0xa8, 0xff],
-        Icon::Duplicate => [0xc2, 0xd4, 0xe6],
-        Icon::Delete => [0xe8, 0x7a, 0x7a],
-        Icon::FileOpen => [0xf2, 0xb8, 0x66],
-        Icon::ShowAll => [0xb0, 0x8a, 0xcc],
-        Icon::HideAll => [0xcf, 0x8a, 0xc8],
-        Icon::PresetSave => [0x7f, 0xcf, 0xc0],
-        Icon::PresetLoad => [0x9f, 0xc2, 0xe8],
-        Icon::Settings => [0xe8, 0xe8, 0xee],
-        Icon::Exit => [0xf2, 0x9a, 0x6a],
-        Icon::Play => [0x8a, 0xd0, 0x9c],
-        Icon::Pause => [0xf0, 0xf0, 0xf0],
-        // Включённая полоса — акцент программы (cyan, тот же тон, что у
-        // рамки закрепления); выключенная — приглушённый серый, как
-        // LockOpen/EyeOff у остальных пар «состояние вкл/выкл».
-        Icon::Timeline => [0x3c, 0x98, 0x98],
-        Icon::TimelineOff => [0xa8, 0xa8, 0xb2],
-        Icon::ResetScale => [0xe8, 0xc8, 0x6a],
-        Icon::Lock => [0xf0, 0xd0, 0x60],
-        // Открытый замок — приглушённый серый: то же «выключено», что
-        // EyeOff/Eye у пары «показать/скрыть».
-        Icon::LockOpen => [0xa8, 0xa8, 0xb2],
-        // «Добавить правило соседства» — нейтральный голубой, как
-        // PresetLoad/Plus у кнопок-действий.
-        Icon::Plus => [0x9f, 0xc2, 0xe8],
+        Icon::EyeOff | Icon::TimelineOff | Icon::LockOpen => DIM,
+        // Двухцветные иконки красятся своими генераторами.
+        Icon::Rotate => PINNED_BADGE_COLOR,
+        // Единственный цветной акцент: удаление необратимо, и форма урны
+        // сама по себе этого не сообщает.
+        Icon::Delete => [0xe0, 0x76, 0x76],
+        Icon::Layers
+        | Icon::Eye
+        | Icon::OrderUp
+        | Icon::OrderDown
+        | Icon::Duplicate
+        | Icon::FileOpen
+        | Icon::ShowAll
+        | Icon::HideAll
+        | Icon::PresetSave
+        | Icon::PresetLoad
+        | Icon::Settings
+        | Icon::Exit
+        | Icon::Play
+        | Icon::Pause
+        | Icon::Timeline
+        | Icon::ResetScale
+        | Icon::Lock
+        | Icon::Plus => LIGHT,
     }
 }
 
@@ -417,10 +434,135 @@ fn draw_pause(cv: &mut Canvas, s: f64) {
 /// включённого и выключенного состояния одна: их различает цвет (см.
 /// `icon_color`), как у пары `Lock`/`LockOpen`.
 fn draw_timeline(cv: &mut Canvas, s: f64) {
-    // Дорожка чуть ниже центра, ручка на ней — так пиктограмма читается
-    // как полоса с бегунком, а не как знак «минус».
-    fill_rect(cv, 0.16 * s, 0.47 * s, 0.84 * s, 0.53 * s);
-    fill_circle(cv, 0.38 * s, 0.50 * s, 0.13 * s);
+    // Дорожка во всю ширину и круглая ручка ПО ЦЕНТРУ. Две другие
+    // компоновки в размере кнопки (20 DIP) читались чужими знаками:
+    // ручка у левого края — стрелка «влево», прямоугольный бегунок
+    // поперёк дорожки — «плюс».
+    fill_rect(cv, 0.10 * s, 0.47 * s, 0.90 * s, 0.53 * s);
+    fill_circle(cv, 0.50 * s, 0.50 * s, 0.17 * s);
+}
+
+/// «Поворот» — ручка на углу рамки выделения (запрос пользователя
+/// 2026-08-23). Это ТА ЖЕ двусторонняя изогнутая стрелка, что показывает
+/// курсор поворота (`rst_win32::input::rotate_cursor_rgba`): пользователь
+/// уже знает эту форму — она всплывает, когда он входит в поворот, — и
+/// просил поставить на углы именно её, а не кольцо.
+///
+/// Пропорции перенесены один-в-один из курсора (радиус дуги 11/32 стороны,
+/// охват 100°, толщина 2.2/32, остриё 4.5/32 с раствором 55°), поэтому
+/// иконка и курсор совпадают по рисунку в любом размере. Дуга смотрит
+/// вдоль +X; наклон под конкретный угол делает вызывающий слой поворотом
+/// прямоугольника ([`crate::SelectionBox::rotate_handle_rects`]).
+///
+/// Заливка белая с чёрной обводкой в один пиксель — та же конвенция, что у
+/// системных курсоров: читается и на светлом, и на тёмном стикере. Поэтому
+/// генератор возвращает готовый RGBA, а не одноцветное покрытие [`Canvas`].
+fn rotate_arrow_rgba(size_px: u32) -> Vec<u8> {
+    let n = size_px as usize;
+    let s = size_px as f64;
+    // Пропорции курсора поворота (32 px в оригинале).
+    let (cx, cy) = (0.5 * s, 0.5 * s);
+    let r = 11.0 / 32.0 * s;
+    let h = (2.2 / 32.0 * s) / 2.0;
+    let span = 100.0_f64.to_radians();
+    let head_len = 4.5 / 32.0 * s;
+    let spread = head_len * (55.0_f64.to_radians() / 2.0).tan() * 2.0;
+    let start_a = -span / 2.0;
+    let end_a = span / 2.0;
+
+    let in_arc = |x: f64, y: f64| -> bool {
+        let (dx, dy) = (x - cx, y - cy);
+        let dist = (dx * dx + dy * dy).sqrt();
+        if (dist - r).abs() > h {
+            return false;
+        }
+        let mut angle = dy.atan2(dx);
+        if angle < start_a {
+            angle += 2.0 * std::f64::consts::PI;
+        }
+        (start_a..=end_a).contains(&angle)
+    };
+
+    // Остриё на конце дуги: у `start_a` развёрнуто назад, у `end_a` —
+    // вперёд по касательной (обе стрелки смотрят «по кругу»).
+    let arrowhead = |end_angle: f64, reversed: bool| {
+        let (tx, ty) = (cx + r * end_angle.cos(), cy + r * end_angle.sin());
+        let tangent = end_angle + std::f64::consts::FRAC_PI_2;
+        let tip_dir = if reversed {
+            tangent + std::f64::consts::PI
+        } else {
+            tangent
+        };
+        let tip = (tx + head_len * tip_dir.cos(), ty + head_len * tip_dir.sin());
+        let perp = tip_dir + std::f64::consts::FRAC_PI_2;
+        let b1 = (tx + spread * perp.cos(), ty + spread * perp.sin());
+        let b2 = (tx - spread * perp.cos(), ty - spread * perp.sin());
+        (tip, b1, b2)
+    };
+    let head_start = arrowhead(start_a, true);
+    let head_end = arrowhead(end_a, false);
+
+    let sign = |ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64| {
+        (ax - px) * (by - py) - (bx - px) * (ay - py)
+    };
+    let in_triangle = |x: f64, y: f64, t: ((f64, f64), (f64, f64), (f64, f64))| {
+        let (p, b1, b2) = t;
+        let d1 = sign(x, y, p.0, p.1, b1.0, b1.1);
+        let d2 = sign(x, y, b1.0, b1.1, b2.0, b2.1);
+        let d3 = sign(x, y, b2.0, b2.1, p.0, p.1);
+        !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+    };
+
+    // Покрытие с суперсемплингом 2×2 — та же техника, что у остальных
+    // иконок (`SUB_SAMPLES`).
+    let mut fill = vec![0.0f32; n * n];
+    for py in 0..n {
+        for px in 0..n {
+            let mut hits = 0u32;
+            for (ox, oy) in SUB_SAMPLES {
+                let (x, y) = (px as f64 + ox, py as f64 + oy);
+                if in_arc(x, y) || in_triangle(x, y, head_start) || in_triangle(x, y, head_end) {
+                    hits += 1;
+                }
+            }
+            fill[py * n + px] = hits as f32 / SUB_SAMPLES.len() as f32;
+        }
+    }
+
+    let mut out = vec![0u8; n * n * 4];
+    for py in 0..n {
+        for px in 0..n {
+            let f = fill[py * n + px];
+            let (color, a) = if f > 0.0 {
+                ([0xffu8, 0xff, 0xff], (f * 255.0).round() as u8)
+            } else {
+                // Обводка: дилатация заполненных пикселей на один во все
+                // стороны — контур виден на любом фоне.
+                let neighbour = (-1i32..=1).any(|dy| {
+                    (-1i32..=1).any(|dx| {
+                        if dx == 0 && dy == 0 {
+                            return false;
+                        }
+                        let (nx, ny) = (px as i32 + dx, py as i32 + dy);
+                        nx >= 0
+                            && ny >= 0
+                            && (nx as usize) < n
+                            && (ny as usize) < n
+                            && fill[ny as usize * n + nx as usize] > 0.5
+                    })
+                });
+                if neighbour {
+                    ([0u8, 0, 0], 0xff)
+                } else {
+                    ([0u8, 0, 0], 0)
+                }
+            };
+            let i = (py * n + px) * 4;
+            out[i..i + 3].copy_from_slice(&color);
+            out[i + 3] = a;
+        }
+    }
+    out
 }
 
 /// «Сбросить масштаб» (тулбар выделения, фидбэк пользователя 2026-08-09):

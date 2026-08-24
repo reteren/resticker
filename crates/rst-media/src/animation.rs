@@ -50,24 +50,24 @@ pub struct DecodedAnimation {
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
     /// Ошибка ввода-вывода при открытии/чтении файла.
-    #[error("ошибка ввода-вывода: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     /// Файл не удалось декодировать выбранным кодеком.
-    #[error("не удалось декодировать анимацию: {0}")]
+    #[error("could not decode the animation: {0}")]
     Image(#[from] image::ImageError),
     /// Кадров больше лимита атласа (300). Вызывающий код обязан показать
     /// пользователю «анимация слишком большая», а не падать.
-    #[error("слишком много кадров: {count} > {limit}")]
+    #[error("too many frames: {count} > {limit}")]
     TooManyFrames { count: usize, limit: usize },
     /// Суммарный объём RGBA-кадров больше лимита атласа (256MB).
-    #[error("суммарный размер кадров {bytes} байт > лимит {limit} байт")]
+    #[error("total frame size {bytes} bytes exceeds the {limit} byte limit")]
     TooLargeForAtlas { bytes: usize, limit: usize },
     /// 0 или 1 кадр — вызывающий код обязан трактовать файл как
     /// `MediaType::Image`, а не как ошибку пользователю.
-    #[error("файл не анимированный (0 или 1 кадр)")]
+    #[error("the file is not animated (0 or 1 frame)")]
     NotAnimated,
     /// Магические байты не соответствуют ни одному из известных форматов.
-    #[error("неизвестный формат файла (ожидались GIF, APNG или WebP)")]
+    #[error("unknown file format (expected GIF, APNG or WebP)")]
     UnsupportedFormat,
 }
 

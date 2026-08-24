@@ -65,8 +65,8 @@ fn copy_ffmpeg_dlls() {
     }
 
     let mut copied = 0;
-    for entry in fs::read_dir(&bin_dir)
-        .unwrap_or_else(|e| panic!("не удалось прочитать {bin_dir:?}: {e}"))
+    for entry in
+        fs::read_dir(&bin_dir).unwrap_or_else(|e| panic!("не удалось прочитать {bin_dir:?}: {e}"))
     {
         let entry = entry.expect("ошибка чтения записи каталога");
         let path = entry.path();
@@ -76,17 +76,19 @@ fn copy_ffmpeg_dlls() {
         copy_to_all(&path, &dests);
         copied += 1;
     }
-    assert!(copied > 0, "в {bin_dir:?} не найдено ни одной *.dll — сборка FFmpeg неполная");
+    assert!(
+        copied > 0,
+        "в {bin_dir:?} не найдено ни одной *.dll — сборка FFmpeg неполная"
+    );
 
     for name in MINGW_RUNTIME_DLLS {
-        let src = find_mingw_runtime_dll(name, &bin_dir)
-            .unwrap_or_else(|| {
-                panic!(
-                    "не найден {name} (транзитивная зависимость FFmpeg-DLL от тулчейна \
+        let src = find_mingw_runtime_dll(name, &bin_dir).unwrap_or_else(|| {
+            panic!(
+                "не найден {name} (транзитивная зависимость FFmpeg-DLL от тулчейна \
                      MinGW-w64) — искали в {bin_dir:?}, $MINGW_RUNTIME_DIR и рядом с \
                      $LIBCLANG_PATH. Задайте MINGW_RUNTIME_DIR=путь\\к\\msys64\\mingw64\\bin"
-                )
-            });
+            )
+        });
         copy_to_all(&src, &dests);
     }
 }

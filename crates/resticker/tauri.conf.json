@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "settings",
-        "title": "resticker — настройки",
+        "title": "resticker — settings",
         "width": 900,
         "height": 600,
         "visible": false,

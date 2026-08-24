@@ -32,8 +32,7 @@ use windows::core::Interface;
 use crate::error::VideoError;
 use crate::format::{
     VideoPixelFormat, classify_pixel_format, downconvert_high_bit_le, full_range_to_limited,
-    pts_to_duration,
-    rgb_packed_to_yuva420p, swr_out_count,
+    pts_to_duration, rgb_packed_to_yuva420p, swr_out_count,
 };
 use crate::hwaccel::{self, HwDecode};
 
@@ -1372,13 +1371,8 @@ fn check_runtime_versions() {
     ONCE.call_once(|| {
         // SAFETY: функции запроса версии не трогают состояние и безопасны с
         // любого потока.
-        let (codec, util, swr) = unsafe {
-            (
-                avcodec_version(),
-                avutil_version(),
-                swresample_version(),
-            )
-        };
+        let (codec, util, swr) =
+            unsafe { (avcodec_version(), avutil_version(), swresample_version()) };
         let major = |v: u32| v >> 16;
         let expected = (
             LIBAVCODEC_VERSION_MAJOR as u32,

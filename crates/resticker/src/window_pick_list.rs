@@ -99,7 +99,9 @@ pub fn sorted_snapshot(snapshot: &[WindowInfo]) -> Vec<WindowInfo> {
 pub fn eligible_snapshot(snapshot: &[WindowInfo], denylist: &[OverlapRule]) -> Vec<WindowInfo> {
     snapshot
         .iter()
-        .filter(|w| !w.iconic && !is_denylisted(window_exe_path(w).as_deref(), Some(&w.title), denylist))
+        .filter(|w| {
+            !w.iconic && !is_denylisted(window_exe_path(w).as_deref(), Some(&w.title), denylist)
+        })
         .cloned()
         .collect()
 }
@@ -125,7 +127,7 @@ fn row_label(window: &WindowInfo, max_w: f64) -> String {
     } else if let Some(name) = window.exe_path.file_name() {
         name.to_string_lossy().into_owned()
     } else {
-        "Без имени".to_string()
+        "Untitled".to_string()
     };
     truncate_to_width(&text, max_w)
 }
@@ -235,14 +237,15 @@ pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPane
     let max_text_w = (row_right - text_left).max(0.0);
 
     if sorted.is_empty() {
-        let mut label = Label::new(EMPTY_LABEL_ID, row_left, frame.cy, "Нет доступных окон");
+        let mut label = Label::new(EMPTY_LABEL_ID, row_left, frame.cy, "No windows available");
         label.set_dim(true);
         panel.add_widget(label);
     }
 
     for (i, window) in sorted.iter().enumerate().skip(scroll).take(VISIBLE_ROWS) {
         let visible_index = i - scroll;
-        let cy = top + visible_index as f64 * (theme::BUTTON_SIZE + ROW_GAP) + theme::BUTTON_SIZE / 2.0;
+        let cy =
+            top + visible_index as f64 * (theme::BUTTON_SIZE + ROW_GAP) + theme::BUTTON_SIZE / 2.0;
         let id = ROW_BASE + i as WidgetId;
         // Фон + hover/armed-подсветка + хит-тест строки — без своей надписи
         // (иначе конвейер спрайтов растянул бы текстуру текста на всю
@@ -288,8 +291,7 @@ pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPane
         // позиции скролла: панель не меняет размер (`height()` капается на
         // VISIBLE_ROWS), последняя страница просто может быть неполной
         // (тот же принцип, что у `window_picker`).
-        let list_h =
-            VISIBLE_ROWS as f64 * theme::BUTTON_SIZE + (VISIBLE_ROWS - 1) as f64 * ROW_GAP;
+        let list_h = VISIBLE_ROWS as f64 * theme::BUTTON_SIZE + (VISIBLE_ROWS - 1) as f64 * ROW_GAP;
         panel.add_widget(ScrollBar::new(
             SCROLLBAR_ID,
             Box2D {
@@ -369,7 +371,7 @@ mod tests {
     fn empty_snapshot_shows_placeholder_message() {
         let sorted = sorted_snapshot(&[]);
         let p = build(&sorted, 0, frame(height(0)));
-        assert_eq!(labels(&p.panel), vec!["Нет доступных окон"]);
+        assert_eq!(labels(&p.panel), vec!["No windows available"]);
     }
 
     /// Непустой список не показывает подсказку «нет окон».
@@ -378,7 +380,7 @@ mod tests {
         let snapshot = [window(r"C:\Apps\a.exe", "A", 0)];
         let sorted = sorted_snapshot(&snapshot);
         let p = build(&sorted, 0, frame(height(1)));
-        assert!(!labels(&p.panel).contains(&"Нет доступных окон".to_string()));
+        assert!(!labels(&p.panel).contains(&"No windows available".to_string()));
     }
 
     #[test]
@@ -409,7 +411,7 @@ mod tests {
         let snapshot = [window("", "", 0)];
         let sorted = sorted_snapshot(&snapshot);
         let p = build(&sorted, 0, frame(height(1)));
-        assert_eq!(labels(&p.panel), vec!["Без имени"]);
+        assert_eq!(labels(&p.panel), vec!["Untitled"]);
     }
 
     #[test]
@@ -465,11 +467,18 @@ mod tests {
 
     #[test]
     fn long_title_is_truncated_to_row_width() {
-        let snapshot = [window(r"C:\Apps\app.exe", &"очень-длинный-заголовок-".repeat(10), 0)];
+        let snapshot = [window(
+            r"C:\Apps\app.exe",
+            &"очень-длинный-заголовок-".repeat(10),
+            0,
+        )];
         let sorted = sorted_snapshot(&snapshot);
         let p = build(&sorted, 0, frame(height(1)));
         let text = &labels(&p.panel)[0];
-        assert!(text.ends_with("..."), "длинный заголовок усечён многоточием");
+        assert!(
+            text.ends_with("..."),
+            "длинный заголовок усечён многоточием"
+        );
         assert!(text.len() < snapshot[0].title.len());
     }
 
@@ -486,7 +495,10 @@ mod tests {
         let has_icon_placeholder = out.iter().any(|prim| {
             matches!(prim, Primitive::Fill { rect, .. } if rect.w == ICON_SIZE && rect.h == ICON_SIZE)
         });
-        assert!(has_icon_placeholder, "нет иконки — рисуется плейсхолдер-квадрат");
+        assert!(
+            has_icon_placeholder,
+            "нет иконки — рисуется плейсхолдер-квадрат"
+        );
     }
 
     /// Строка с реальной иконкой окна рисует её растром, не плейсхолдером.
@@ -502,16 +514,30 @@ mod tests {
         let p = build(&sorted, 0, frame(height(1)));
         let mut out = Vec::new();
         p.panel.draw(&mut out);
-        let has_rgba_icon = out
-            .iter()
-            .any(|prim| matches!(prim, Primitive::Rgba { width: 16, height: 16, .. }));
-        assert!(has_rgba_icon, "с иконкой — рисуется реальный растр, не плейсхолдер");
+        let has_rgba_icon = out.iter().any(|prim| {
+            matches!(
+                prim,
+                Primitive::Rgba {
+                    width: 16,
+                    height: 16,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_rgba_icon,
+            "с иконкой — рисуется реальный растр, не плейсхолдер"
+        );
     }
 
     #[test]
     fn height_grows_with_visible_count_but_caps_at_visible_rows() {
         assert!(height(3) > height(1));
-        assert_eq!(height(0), height(1), "нулевой список не даёт нулевую высоту");
+        assert_eq!(
+            height(0),
+            height(1),
+            "нулевой список не даёт нулевую высоту"
+        );
         assert_eq!(
             height(VISIBLE_ROWS),
             height(VISIBLE_ROWS + 50),
@@ -524,7 +550,11 @@ mod tests {
         let allowed = window(r"C:\Apps\good.exe", "Good", 0);
         let denied_by_name = window(r"C:\Apps\bad.exe", "Bad", 1);
         let denied_by_title = window(r"C:\Apps\other.exe", "Secret * window", 2);
-        let snapshot = [allowed.clone(), denied_by_name.clone(), denied_by_title.clone()];
+        let snapshot = [
+            allowed.clone(),
+            denied_by_name.clone(),
+            denied_by_title.clone(),
+        ];
         let denylist = vec![
             OverlapRule {
                 process_name: Some("bad.exe".to_string()),
@@ -557,9 +587,7 @@ mod tests {
             process_name: Some(r"C:\Apps\chrome.exe".to_string()),
             title_pattern: None,
         }];
-        assert!(
-            eligible_snapshot(std::slice::from_ref(&by_full_path), &denylist_full).is_empty()
-        );
+        assert!(eligible_snapshot(std::slice::from_ref(&by_full_path), &denylist_full).is_empty());
 
         let denylist_name = vec![OverlapRule {
             process_name: Some("chrome.exe".to_string()),
@@ -586,14 +614,23 @@ mod tests {
 
     #[test]
     fn rows_stack_top_to_bottom_inside_frame() {
-        let snapshot = [window(r"C:\Apps\a.exe", "A", 0), window(r"C:\Apps\b.exe", "B", 1)];
+        let snapshot = [
+            window(r"C:\Apps\a.exe", "A", 0),
+            window(r"C:\Apps\b.exe", "B", 1),
+        ];
         let sorted = sorted_snapshot(&snapshot);
         let f = frame(height(sorted.len()));
         let p = build(&sorted, 0, f);
         let b0 = p.panel.widget::<Button>(ROW_BASE).unwrap().bounds();
         let b1 = p.panel.widget::<Button>(ROW_BASE + 1).unwrap().bounds();
         assert!(b1.cy > b0.cy, "вторая строка ниже первой");
-        assert!(b0.cy - b0.h / 2.0 >= f.cy - f.h / 2.0, "первая строка в рамке");
-        assert!(b1.cy + b1.h / 2.0 <= f.cy + f.h / 2.0, "последняя строка в рамке");
+        assert!(
+            b0.cy - b0.h / 2.0 >= f.cy - f.h / 2.0,
+            "первая строка в рамке"
+        );
+        assert!(
+            b1.cy + b1.h / 2.0 <= f.cy + f.h / 2.0,
+            "последняя строка в рамке"
+        );
     }
 }

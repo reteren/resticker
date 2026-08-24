@@ -24,6 +24,9 @@ use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{
     COLORREF, ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::{
+    CombineRgn, CreateRectRgn, DeleteObject, RGN_DIFF, SetWindowRgn,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
@@ -33,18 +36,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA,
-    GetMessageW, GetSystemMetrics, GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect,
-    LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-    GW_HWNDPREV, GetWindow, HWND_TOPMOST,
-    SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA, WM_APP,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GW_HWNDPREV, GWL_EXSTYLE,
+    GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindow, GetWindowDisplayAffinity,
+    GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE,
+    WDA_NONE, WHEEL_DELTA, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK,
     WTS_SESSION_UNLOCK,
 };
@@ -209,6 +211,15 @@ pub enum OverlayEvent {
         modifiers: Modifiers,
         pressed: bool,
     },
+    /// Введён символ (`WM_CHAR`) — то, что реально набрал пользователь с
+    /// учётом раскладки, регистра и мёртвых клавиш.
+    ///
+    /// Отдельно от [`OverlayEvent::Key`]: по одному `vk` символ не
+    /// восстановить (VK-коды букв — это ФИЗИЧЕСКИЕ клавиши раскладки US, и
+    /// на русской раскладке из них получились бы латинские буквы). Пока
+    /// этого события не было, текстовые поля панелей принимали только
+    /// цифры — репорт пользователя 2026-08-24 про имя пресета.
+    Char(char),
     /// Конфигурация мониторов изменилась (`WM_DISPLAYCHANGE`): свежий снапшот
     /// [`crate::monitors::enumerate`] целиком — сравнение «старое ↔ новое» по
     /// device interface path делает координатор (docs/M3_PREP_NOTES.md,
@@ -388,6 +399,51 @@ impl OverlayWindow {
             unsafe {
                 let _ = SetForegroundWindow(self.hwnd);
             }
+        }
+    }
+
+    /// Вырезать в окне оверлея дыру под прямоугольником `hole` (экранные
+    /// физические пиксели) — или убрать вырез (`None`).
+    ///
+    /// Зачем: в режиме редактирования оверлей растянут на весь монитор и НЕ
+    /// кликопрозрачен, поэтому любое окно поверх него (окно настроек) не
+    /// получало бы ни кликов, ни колеса — даже будучи topmost, оно уходит
+    /// под оверлей, как только пользователь щёлкнет по сцене и активирует
+    /// его (запрос пользователя 2026-08-23: «хочу тыкаться в настройки, не
+    /// выходя из режима»). Регион окна решает это независимо от z-order:
+    /// система не считает вырезанную область принадлежащей окну ни при
+    /// отрисовке, ни при хит-тесте.
+    ///
+    /// Возвращает `false`, если система отказала (`SetWindowRgn`).
+    pub fn set_hole(&self, hole: Option<(i32, i32, i32, i32)>) -> bool {
+        // SAFETY: hwnd — наше живое окно; регион после SetWindowRgn
+        // принадлежит системе, поэтому удаляем только временный.
+        unsafe {
+            let mut rect = RECT::default();
+            if GetWindowRect(self.hwnd, &mut rect).is_err() {
+                return false;
+            }
+            let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+            let Some((hx, hy, hr, hb)) = hole else {
+                return SetWindowRgn(self.hwnd, None, true) != 0;
+            };
+            // Пересечение в координатах окна; пустое — выреза нет.
+            let (lx, ly) = (hx - rect.left, hy - rect.top);
+            let (rx, ry) = (hr - rect.left, hb - rect.top);
+            let (lx, ly) = (lx.max(0), ly.max(0));
+            let (rx, ry) = (rx.min(w), ry.min(h));
+            if rx <= lx || ry <= ly {
+                return SetWindowRgn(self.hwnd, None, true) != 0;
+            }
+            let full = CreateRectRgn(0, 0, w, h);
+            let cut = CreateRectRgn(lx, ly, rx, ry);
+            let _ = CombineRgn(Some(full), Some(full), Some(cut), RGN_DIFF);
+            let _ = DeleteObject(cut.into());
+            let ok = SetWindowRgn(self.hwnd, Some(full), true) != 0;
+            if !ok {
+                let _ = DeleteObject(full.into());
+            }
+            ok
         }
     }
 
@@ -607,7 +663,12 @@ impl OverlayWindow {
     pub fn force_release_capture(&self) {
         // SAFETY: hwnd — наше окно; PostMessage безопасен с любого потока.
         unsafe {
-            let _ = PostMessageW(Some(self.hwnd), WM_APP_RELEASE_CAPTURE, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                WM_APP_RELEASE_CAPTURE,
+                WPARAM(0),
+                LPARAM(0),
+            );
         }
     }
 }
@@ -642,6 +703,32 @@ struct WndState {
     /// Живут здесь, потому что `RegisteredHotkey` привязан к потоку окна —
     /// а `WndState` живёт ровно на нём.
     media_hotkeys: Vec<crate::hotkey::RegisteredHotkey>,
+    /// Верхняя половина суррогатной пары из предыдущего `WM_CHAR`: символы
+    /// вне BMP (эмодзи) Windows шлёт двумя сообщениями.
+    pending_surrogate: Option<u16>,
+}
+
+/// Собрать символ из `WM_CHAR`: обычный код возвращается сразу, суррогатная
+/// пара — по второму сообщению (первое запоминается в `pending`).
+///
+/// Чистая функция ради тестов: суррогатные пары приходят редко, а ломаются
+/// молча — проверять их на живой машине эмодзи неудобно.
+fn char_from_wm_char(unit: u16, pending: &mut Option<u16>) -> Option<char> {
+    const HIGH: std::ops::Range<u16> = 0xD800..0xDC00;
+    const LOW: std::ops::Range<u16> = 0xDC00..0xE000;
+    if let Some(high) = pending.take() {
+        if LOW.contains(&unit) {
+            let code = 0x1_0000 + ((u32::from(high) - 0xD800) << 10) + (u32::from(unit) - 0xDC00);
+            return char::from_u32(code);
+        }
+        // Пара разорвана (так быть не должно) — вторую половину разбираем
+        // как самостоятельный символ, а первую выбрасываем.
+    }
+    if HIGH.contains(&unit) {
+        *pending = Some(unit);
+        return None;
+    }
+    char::from_u32(u32::from(unit))
 }
 
 /// Смаппить ошибку регистрации хоткея на событие оверлея. Наружу уходит
@@ -759,6 +846,7 @@ fn run_message_loop(
         cursor: CursorManager::new(),
         tx: event_tx,
         media_hotkeys: Vec::new(),
+        pending_surrogate: None,
     });
     // SAFETY: hwnd — наше окно этого потока; указатель освобождается в
     // WM_NCDESTROY ниже (единственное место, где он читается и дропается).
@@ -1092,9 +1180,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let raw_delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
                     let notches = raw_delta / WHEEL_DELTA as i32;
                     if notches != 0 {
-                        let _ = state.tx.send(OverlayEvent::Input(InputEvent::MouseWheel {
-                            notches,
-                        }));
+                        let _ = state
+                            .tx
+                            .send(OverlayEvent::Input(InputEvent::MouseWheel { notches }));
                     }
                     return LRESULT(0);
                 }
@@ -1204,6 +1292,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
+        WM_CHAR => {
+            // `TranslateMessage` в цикле сообщений уже применил раскладку и
+            // мёртвые клавиши; здесь остаётся собрать суррогатную пару и
+            // отсеять управляющие коды (Backspace/Enter/Esc приходят и
+            // сюда, но их обрабатывает ветка WM_KEYDOWN выше).
+            if let Some(state) = unsafe { state_ptr.as_mut() } {
+                if let Some(ch) = char_from_wm_char(wparam.0 as u16, &mut state.pending_surrogate)
+                    && !ch.is_control()
+                {
+                    let _ = state.tx.send(OverlayEvent::Char(ch));
+                }
+            }
+            LRESULT(0)
+        }
         WM_KEYDOWN | WM_KEYUP => {
             let vk = wparam.0 as u32;
             // Автоповтор нажатия (удержание) наружу не уходит: наружу — только
@@ -1250,6 +1352,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn wm_char_returns_plain_characters() {
+        let mut pending = None;
+        assert_eq!(char_from_wm_char(b'a' as u16, &mut pending), Some('a'));
+        // Кириллическая Ж — из BMP, приходит одним сообщением.
+        assert_eq!(char_from_wm_char(0x0416, &mut pending), Some('\u{416}'));
+        assert_eq!(pending, None, "обычный символ не оставляет хвоста");
+    }
+
+    #[test]
+    fn wm_char_assembles_surrogate_pair() {
+        // U+1F600 приходит двумя сообщениями: D83D DE00.
+        let mut pending = None;
+        assert_eq!(
+            char_from_wm_char(0xD83D, &mut pending),
+            None,
+            "ждём вторую половину"
+        );
+        assert_eq!(pending, Some(0xD83D));
+        assert_eq!(char_from_wm_char(0xDE00, &mut pending), Some('\u{1F600}'));
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn wm_char_recovers_from_a_broken_pair() {
+        // За верхней половиной пришёл обычный символ — разбираем его как
+        // самостоятельный, а не молчим и не паникуем.
+        let mut pending = Some(0xD83Du16);
+        assert_eq!(char_from_wm_char(b'x' as u16, &mut pending), Some('x'));
+        assert_eq!(pending, None);
+    }
     use super::*;
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
@@ -1281,7 +1415,8 @@ mod tests {
         for angle in [0, 45, 90, 180, 270, 359, -45, -135, 400] {
             let shape = CursorShape::Rotate(angle);
             let decoded = cursor_shape_from_wparam(cursor_shape_to_wparam(shape));
-            let CursorShape::Rotate(decoded_angle) = decoded.expect("Rotate декодируется") else {
+            let CursorShape::Rotate(decoded_angle) = decoded.expect("Rotate декодируется")
+            else {
                 panic!("ожидался CursorShape::Rotate");
             };
             assert_eq!(
@@ -1342,8 +1477,9 @@ mod tests {
 
     #[test]
     fn window_uses_given_bounds() {
-        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
-            .expect("создание оверлея");
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+                .expect("создание оверлея");
 
         // Позиция и размер окна — ровно границы монитора, не (0, 0) и не
         // системный экран (docs/M3_PREP_NOTES.md, раздел 3.1).
@@ -1362,8 +1498,9 @@ mod tests {
 
     #[test]
     fn set_bounds_moves_and_resizes_window() {
-        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
-            .expect("создание оверлея");
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+                .expect("создание оверлея");
         assert_eq!(overlay.size(), (1280, 1024));
 
         let moved = Rect {
@@ -1452,8 +1589,9 @@ mod tests {
         // M3: окна других мониторов используют set_interactive, а не
         // set_click_through, чтобы не бороться за фокус — но сами биты
         // WS_EX_TRANSPARENT|WS_EX_NOACTIVATE переключаются одинаково.
-        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
-            .expect("создание оверлея");
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+                .expect("создание оверлея");
 
         overlay.set_interactive(true);
         let editing = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
@@ -1561,7 +1699,8 @@ mod tests {
             OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None, None, None)
                 .expect("первое окно");
         let (_second, second_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None).expect("второе окно");
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+                .expect("второе окно");
 
         match second_events.recv_timeout(Duration::from_millis(300)) {
             Err(RecvTimeoutError::Timeout) => {}
@@ -1652,8 +1791,9 @@ mod tests {
 
     #[test]
     fn dpi_changed_applies_recommended_rect_and_reports_event() {
-        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
-            .expect("создание оверлея");
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+                .expect("создание оверлея");
 
         // Как в настоящем WM_DPICHANGED: wParam — новый DPI (младшее слово —
         // dpiX, старшее — dpiY, тут мусор, чтобы проверить что берём LOWORD),
@@ -1695,8 +1835,9 @@ mod tests {
 
     #[test]
     fn dpi_changed_with_zero_dpi_is_ignored() {
-        let (overlay, _events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
-            .expect("создание оверлея");
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+                .expect("создание оверлея");
         let before = overlay.size();
         // Нулевой DPI в wParam быть не должен; окно не трогаем (и lParam
         // с нулевым указателем не читаем).
@@ -1769,8 +1910,9 @@ mod tests {
         // Сообщения шлём реальному окну вручную — диспетчеризация от wndproc
         // до канала событий проверяется целиком; системная регистрация
         // (WTSRegisterSessionNotification) здесь не участвует.
-        let (overlay, events) = OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
-            .expect("создание оверлея");
+        let (overlay, events) =
+            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+                .expect("создание оверлея");
         // SAFETY: hwnd — наше живое окно; порядок сообщений в очереди окна
         // гарантируется (FIFO), значит и порядок событий в канале.
         unsafe {

@@ -76,8 +76,14 @@ fn legacy_window_stickers_are_dropped_without_breaking_load() {
     config::strip_legacy_window_stickers(&mut value);
     let cfg: Config = serde_json::from_value(value).expect("конфиг без window-записей парсится");
     assert_eq!(cfg.stickers.len(), 1);
-    assert!(matches!(cfg.stickers[0].source, StickerSource::Pasted { .. }));
-    assert!(cfg.presets[0].stickers.is_empty(), "window-стикер пресета тоже отброшен");
+    assert!(matches!(
+        cfg.stickers[0].source,
+        StickerSource::Pasted { .. }
+    ));
+    assert!(
+        cfg.presets[0].stickers.is_empty(),
+        "window-стикер пресета тоже отброшен"
+    );
 }
 
 #[test]
@@ -332,4 +338,3 @@ fn zdbg_pasted_source() {
     let cfg: Result<Config, _> = serde_json::from_value(v);
     eprintln!("config parse: {cfg:?}");
 }
-

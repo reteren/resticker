@@ -20,6 +20,9 @@ mod logging;
 mod overlay_manager;
 mod preset_picker;
 mod toolbar;
+/// Оффскрин-превью панелей в PNG — инструмент разработки оформления.
+#[cfg(test)]
+mod ui_preview;
 mod window_pick_list;
 mod window_picker;
 
@@ -51,15 +54,13 @@ const MENU_PRESET_BASE: u32 = 100;
 /// Возвращает и сами пункты, и id-список пресетов в том же порядке, что и
 /// пункты подменю: `preset_ids[i]` — это пресет пункта с
 /// `id == MENU_PRESET_BASE + i` (см. `MENU_PRESET_BASE`).
-/// `lang` — `cfg.settings.language`, захваченный один раз при старте
-/// resticker (см. вызовы в `main()`): как и хоткеи, смена языка в окне
-/// настроек применяется к меню трея после перезапуска, не мгновенно
+/// Подписи пунктов — английские, единственный язык нативного слоя
 /// (`crates/resticker/src/i18n.rs`, доккомент модуля).
-fn build_tray_menu(presets: &[(Uuid, String)], lang: &str) -> (Vec<MenuItem>, Vec<Uuid>) {
+fn build_tray_menu(presets: &[(Uuid, String)]) -> (Vec<MenuItem>, Vec<Uuid>) {
     let mut items = vec![
-        MenuItem::new(MENU_OPEN_SETTINGS, i18n::tray_open_settings(lang)),
+        MenuItem::new(MENU_OPEN_SETTINGS, i18n::tray_open_settings()),
         tray::separator(),
-        MenuItem::new(MENU_TOGGLE_VISIBLE, i18n::tray_toggle_visible(lang)),
+        MenuItem::new(MENU_TOGGLE_VISIBLE, i18n::tray_toggle_visible()),
     ];
     let ids: Vec<Uuid> = presets.iter().map(|(id, _)| *id).collect();
     if !ids.is_empty() {
@@ -69,13 +70,10 @@ fn build_tray_menu(presets: &[(Uuid, String)], lang: &str) -> (Vec<MenuItem>, Ve
             .map(|(i, (_, name))| MenuItem::new(MENU_PRESET_BASE + i as u32, name.clone()))
             .collect();
         items.push(tray::separator());
-        items.push(MenuItem::submenu(
-            i18n::tray_presets_submenu(lang),
-            children,
-        ));
+        items.push(MenuItem::submenu(i18n::tray_presets_submenu(), children));
     }
     items.push(tray::separator());
-    items.push(MenuItem::new(MENU_EXIT, i18n::tray_exit(lang)));
+    items.push(MenuItem::new(MENU_EXIT, i18n::tray_exit()));
     (items, ids)
 }
 
@@ -100,6 +98,54 @@ fn get_config(config_path: tauri::State<PathBuf>) -> Result<Config, String> {
         })
 }
 
+/// Показать окно настроек: поверх всех окон и в фокусе.
+///
+/// `set_always_on_top` обязателен: оверлей-окна и закреплённые окна живут с
+/// `WS_EX_TOPMOST`, и обычное окно уходит под них — на прозрачном оверлее
+/// это выглядит как «настройки открылись, но не нажимаются» (репорт
+/// пользователя 2026-08-23).
+fn show_settings_window<R: tauri::Runtime>(app: &impl tauri::Manager<R>) {
+    let Some(w) = app.get_webview_window("settings") else {
+        return;
+    };
+    let _ = w.set_always_on_top(true);
+    let _ = w.show();
+    let _ = w.set_focus();
+    // Вебвью загружает config.json ОДИН раз при создании и живёт дальше
+    // скрытым: без этого события список стикеров в настройках показывал
+    // состояние на момент запуска (репорт пользователя 2026-08-23 —
+    // «No stickers yet» при двух живых стикерах на экране).
+    let _ = w.emit("settings-shown", ());
+    report_settings_rect(app, &w);
+}
+
+/// Сообщить координатору прямоугольник окна настроек (физические пиксели
+/// экрана) — по нему оверлей режима редактирования вырезает дыру, иначе в
+/// окно нельзя тыкнуть (репорт пользователя 2026-08-23).
+///
+/// `None` шлём при скрытии окна; при показе, перемещении и изменении
+/// размера — свежий прямоугольник.
+fn report_settings_rect<R: tauri::Runtime>(
+    app: &impl tauri::Manager<R>,
+    window: &tauri::WebviewWindow<R>,
+) {
+    let rect = match (
+        window.is_visible(),
+        window.outer_position(),
+        window.outer_size(),
+    ) {
+        (Ok(true), Ok(pos), Ok(size)) => Some((
+            pos.x,
+            pos.y,
+            pos.x + size.width as i32,
+            pos.y + size.height as i32,
+        )),
+        _ => None,
+    };
+    app.state::<OverlayHandle>()
+        .send(OverlayCommand::SettingsWindowRect(rect));
+}
+
 /// Понятный пользователю текст ошибки конфига вместо кода/сырого текста
 /// (ROADMAP.md M8, «понятные тексты ошибок вместо кодов»): `CoreError`
 /// оборачивает `std::io::Error`/`serde_json::Error`, чей `Display` — это
@@ -111,19 +157,20 @@ fn get_config(config_path: tauri::State<PathBuf>) -> Result<Config, String> {
 fn friendly_config_error(e: &rst_core::CoreError) -> String {
     match e {
         rst_core::CoreError::Io(io) => match io.kind() {
-            std::io::ErrorKind::NotFound => "Файл настроек не найден.".to_string(),
+            std::io::ErrorKind::NotFound => "Settings file not found.".to_string(),
             std::io::ErrorKind::PermissionDenied => {
-                "Нет доступа к файлу настроек — проверьте права на папку AppData.".to_string()
+                "No access to the settings file - check the permissions on the AppData folder."
+                    .to_string()
             }
-            _ => "Не удалось прочитать файл настроек.".to_string(),
+            _ => "Could not read the settings file.".to_string(),
         },
         rst_core::CoreError::Json(_) | rst_core::CoreError::Migrate(_) => {
-            "Файл настроек повреждён.".to_string()
+            "Settings file is corrupted.".to_string()
         }
         rst_core::CoreError::UnknownSchemaVersion(_) => {
-            "Файл настроек создан более новой версией resticker — обновите программу.".to_string()
+            "Settings file was written by a newer resticker - please update the app.".to_string()
         }
-        rst_core::CoreError::NotAnObject => "Файл настроек повреждён.".to_string(),
+        rst_core::CoreError::NotAnObject => "Settings file is corrupted.".to_string(),
     }
 }
 
@@ -145,7 +192,7 @@ fn update_hotkeys(hotkeys: Hotkeys, overlay: tauri::State<OverlayHandle>) {
 fn parse_id(id: &str) -> Result<Uuid, String> {
     Uuid::parse_str(id).map_err(|e| {
         tracing::warn!(error = %e, id, "parse_id: некорректный идентификатор от UI");
-        "Внутренняя ошибка: некорректный идентификатор элемента.".to_string()
+        "Internal error: malformed item identifier.".to_string()
     })
 }
 
@@ -345,7 +392,7 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
         .map(|_| ())
         .map_err(|e| {
             tracing::warn!(error = %e, path, "reveal_in_explorer: не удалось запустить проводник");
-            "Не удалось открыть проводник.".to_string()
+            "Could not open File Explorer.".to_string()
         })
 }
 
@@ -425,10 +472,13 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "не удалось синхронизировать автозапуск");
     }
 
-    let tray_lang = cfg.settings.language.clone();
     let initial_presets: Vec<(Uuid, String)> =
         cfg.presets.iter().map(|p| (p.id, p.name.clone())).collect();
-    let (initial_menu, initial_preset_ids) = build_tray_menu(&initial_presets, &tray_lang);
+    let (initial_menu, initial_preset_ids) = build_tray_menu(&initial_presets);
+    // Меню трея рисуем сами и той же гарнитурой, что оверлей (запрос
+    // пользователя 2026-08-23 — «сделай менюшку в трее в стилистику
+    // приложения»): GDI умеет только зарегистрированные шрифты.
+    rst_win32::tray::register_menu_font(rst_render::FONT_BYTES, rst_render::FONT_FAMILY);
     let (tray_icon, tray_rx) =
         TrayIcon::new("resticker", initial_menu).context("инициализация иконки трея")?;
     // Индекс пункта меню → id пресета (см. `MENU_PRESET_BASE`) — общий между
@@ -477,9 +527,7 @@ fn main() -> anyhow::Result<()> {
         ])
         .setup(move |app| {
             if !silent_start {
-                if let Some(w) = app.get_webview_window("settings") {
-                    let _ = w.show();
-                }
+                show_settings_window(app);
             }
 
             let handle = app.handle().clone();
@@ -488,10 +536,7 @@ fn main() -> anyhow::Result<()> {
                 for event in tray_rx {
                     match event {
                         TrayEvent::MenuItem(MENU_OPEN_SETTINGS) | TrayEvent::Activate => {
-                            if let Some(w) = handle.get_webview_window("settings") {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
+                            show_settings_window(&handle);
                         }
                         TrayEvent::MenuItem(MENU_TOGGLE_VISIBLE) => {
                             handle
@@ -526,15 +571,11 @@ fn main() -> anyhow::Result<()> {
             // трогать не может. Обработка — та же, что у пункта трея.
             let coordinator_handle = app.handle().clone();
             let preset_ids_for_coordinator = Arc::clone(&preset_ids);
-            let tray_lang_for_coordinator = tray_lang.clone();
             std::thread::spawn(move || {
                 for request in coordinator_rx {
                     match request {
                         CoordinatorRequest::OpenSettings => {
-                            if let Some(w) = coordinator_handle.get_webview_window("settings") {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
+                            show_settings_window(&coordinator_handle);
                         }
                         // M7: применение пресета оставило часть стикеров
                         // неприменённой (SPEC.md §11) — форвардим списком
@@ -559,7 +600,7 @@ fn main() -> anyhow::Result<()> {
                         // трея целиком (`TrayIcon::set_menu`) и обновляем
                         // общий с потоком трея id→Uuid список.
                         CoordinatorRequest::PresetsChanged(list) => {
-                            let (items, ids) = build_tray_menu(&list, &tray_lang_for_coordinator);
+                            let (items, ids) = build_tray_menu(&list);
                             *preset_ids_for_coordinator
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner()) = ids;
@@ -574,9 +615,27 @@ fn main() -> anyhow::Result<()> {
         .on_window_event(|window, event| {
             // Закрытие окна настроек прячет его, а не завершает процесс —
             // приложение живёт в трее (SPEC.md, раздел 12).
+            // Оверлей режима редактирования вырезает в себе прямоугольник
+            // окна настроек — значит, обязан знать про каждое его движение.
+            if matches!(
+                event,
+                WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::Focused(_)
+            ) {
+                if let Some(w) = window.get_webview_window("settings") {
+                    report_settings_rect(window.app_handle(), &w);
+                }
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                // Снять «поверх всех» вместе со скрытием: флаг нужен только
+                // пока окно открыто, чтобы его не заслоняли оверлей и
+                // закреплённые окна (они topmost). Оставленный включённым,
+                // он держал бы невидимое окно над чужими приложениями.
+                let _ = window.set_always_on_top(false);
                 let _ = window.hide();
+                window
+                    .state::<OverlayHandle>()
+                    .send(OverlayCommand::SettingsWindowRect(None));
             }
         })
         .run(tauri::generate_context!())
@@ -598,19 +657,19 @@ mod tests {
         let not_found = rst_core::CoreError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert_eq!(
             friendly_config_error(&not_found),
-            "Файл настроек не найден."
+            "Settings file not found."
         );
 
         let denied =
             rst_core::CoreError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert_eq!(
             friendly_config_error(&denied),
-            "Нет доступа к файлу настроек — проверьте права на папку AppData."
+            "No access to the settings file - check the permissions on the AppData folder."
         );
 
         let other_io = rst_core::CoreError::Io(std::io::Error::other("что-то сломалось на диске"));
         let msg = friendly_config_error(&other_io);
-        assert_eq!(msg, "Не удалось прочитать файл настроек.");
+        assert_eq!(msg, "Could not read the settings file.");
         assert!(
             !msg.contains("что-то сломалось"),
             "сырой текст io::Error не должен просочиться в UI-сообщение"
@@ -618,25 +677,22 @@ mod tests {
 
         let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
         let msg = friendly_config_error(&rst_core::CoreError::Json(json_err));
-        assert_eq!(msg, "Файл настроек повреждён.");
+        assert_eq!(msg, "Settings file is corrupted.");
 
         let msg = friendly_config_error(&rst_core::CoreError::UnknownSchemaVersion(99));
         assert_eq!(
             msg,
-            "Файл настроек создан более новой версией resticker — обновите программу."
+            "Settings file was written by a newer resticker - please update the app."
         );
 
         let msg = friendly_config_error(&rst_core::CoreError::NotAnObject);
-        assert_eq!(msg, "Файл настроек повреждён.");
+        assert_eq!(msg, "Settings file is corrupted.");
     }
 
     #[test]
     fn parse_id_rejects_garbage_with_friendly_text_not_raw_parse_error() {
         let err = parse_id("not-a-uuid").unwrap_err();
-        assert_eq!(
-            err,
-            "Внутренняя ошибка: некорректный идентификатор элемента."
-        );
+        assert_eq!(err, "Internal error: malformed item identifier.");
     }
 
     #[test]
@@ -647,8 +703,14 @@ mod tests {
 
     #[test]
     fn trim_non_empty_drops_empty_and_whitespace() {
-        assert_eq!(trim_non_empty("chrome.exe".to_string()).as_deref(), Some("chrome.exe"));
-        assert_eq!(trim_non_empty("  chrome.exe  ".to_string()).as_deref(), Some("chrome.exe"));
+        assert_eq!(
+            trim_non_empty("chrome.exe".to_string()).as_deref(),
+            Some("chrome.exe")
+        );
+        assert_eq!(
+            trim_non_empty("  chrome.exe  ".to_string()).as_deref(),
+            Some("chrome.exe")
+        );
         assert_eq!(trim_non_empty("".to_string()), None);
         assert_eq!(trim_non_empty("   ".to_string()), None);
     }

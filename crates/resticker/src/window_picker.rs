@@ -317,7 +317,7 @@ const PICKER_SCROLLBAR_ID: WidgetId = 203;
 /// Подпись кнопки-пресета «Только рабочий стол» — постоянна, не зависит от
 /// состояния списка правил (в отличие от подписи переключателя «Выбрать
 /// все»/«Снять все»).
-const DESKTOP_ONLY_LABEL: &str = "Только рабочий стол";
+const DESKTOP_ONLY_LABEL: &str = "Desktop only";
 
 // Схема WidgetId строк (число строк динамическое — малых констант, как у
 // фиксированного тулбара, недостаточно):
@@ -399,9 +399,9 @@ pub fn build_picker_panel(
     // постоянная подпись вместо чтения состояния списка.
     let all_checked = all_windows_checked(visibility, snapshot);
     let toggle_label = if all_checked {
-        "Снять все"
+        "Clear all"
     } else {
-        "Выбрать все"
+        "Select all"
     };
     let header_y = top + PICKER_PAD + PICKER_HEADER_H / 2.0;
     let mut btn_cx = left;
@@ -448,8 +448,7 @@ pub fn build_picker_panel(
     // за рамкой. Обрезаем по ширине с многоточием (`truncate_to_width`).
     // Полоса скролла (ниже) всегда откусывает свою колонку от правого края —
     // ширина текста не скачет в зависимости от того, нужен ли сейчас скролл.
-    let right_edge =
-        frame.cx + frame.w / 2.0 - PICKER_PAD - theme::SCROLLBAR_WIDTH - PICKER_GAP;
+    let right_edge = frame.cx + frame.w / 2.0 - PICKER_PAD - theme::SCROLLBAR_WIDTH - PICKER_GAP;
     let process_label_max_w = right_edge - process_label_left;
     let window_label_max_w = right_edge - window_label_left;
 
@@ -471,7 +470,7 @@ pub fn build_picker_panel(
             }
             let text = match &group.process_name {
                 Some(name) => format!("{name} ({})", group.windows.len()),
-                None => format!("Неизвестный процесс ({})", group.windows.len()),
+                None => format!("Unknown process ({})", group.windows.len()),
             };
             let text = truncate_to_width(&text, process_label_max_w);
             panel.add_widget(RowLabel::new(
@@ -1343,7 +1342,7 @@ mod tests {
         // предлагает снять; рядом — пресет «Только рабочий стол».
         assert_eq!(
             picker_texts(&p.panel),
-            vec!["Снять все".to_string(), DESKTOP_ONLY_LABEL.to_string()]
+            vec!["Clear all".to_string(), DESKTOP_ONLY_LABEL.to_string()]
         );
         assert!(
             p.panel
@@ -1387,7 +1386,7 @@ mod tests {
         for expected in [
             "chrome.exe (1)",
             "Chrome",
-            "Неизвестный процесс (1)",
+            "Unknown process (1)",
             "Настройки",
         ] {
             assert!(
@@ -1414,10 +1413,13 @@ mod tests {
     #[test]
     fn process_checkbox_reflects_rules() {
         let snapshot = [window(1, r"C:\Apps\chrome.exe", "Chrome", 100, 1)];
-        let on = build_picker_panel(&allowlist(vec![rule(Some("chrome.exe"), None)]),
+        let on = build_picker_panel(
+            &allowlist(vec![rule(Some("chrome.exe"), None)]),
             &snapshot,
             0,
-            picker_frame(), true);
+            picker_frame(),
+            true,
+        );
         let proc = on
             .panel
             .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE)
@@ -1481,10 +1483,13 @@ mod tests {
             "protected process: disabled всегда"
         );
         // Даже тотальное правило «*» не отмечает protected-окно (дизайн §2.3).
-        let p2 = build_picker_panel(&allowlist(vec![rule(None, Some("*"))]),
+        let p2 = build_picker_panel(
+            &allowlist(vec![rule(None, Some("*"))]),
             &snapshot,
             0,
-            picker_frame(), true);
+            picker_frame(),
+            true,
+        );
         assert!(
             !p2.panel
                 .widget::<Checkbox>(PICKER_ROW_WINDOW_BASE)
@@ -1642,12 +1647,15 @@ mod tests {
     fn select_all_button_label_reflects_state() {
         let snapshot = [window(1, r"C:\Apps\app.exe", "t", 1, 1)];
         let partial = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
-        assert!(picker_texts(&partial.panel).contains(&"Выбрать все".to_string()));
-        let all = build_picker_panel(&allowlist(vec![rule(Some("app.exe"), None)]),
+        assert!(picker_texts(&partial.panel).contains(&"Select all".to_string()));
+        let all = build_picker_panel(
+            &allowlist(vec![rule(Some("app.exe"), None)]),
             &snapshot,
             0,
-            picker_frame(), true);
-        assert!(picker_texts(&all.panel).contains(&"Снять все".to_string()));
+            picker_frame(),
+            true,
+        );
+        assert!(picker_texts(&all.panel).contains(&"Clear all".to_string()));
     }
 
     #[test]
@@ -1661,20 +1669,23 @@ mod tests {
                 .is_some()
         );
         let texts = picker_texts(&partial.panel);
-        assert!(texts.contains(&"Выбрать все".to_string()));
+        assert!(texts.contains(&"Select all".to_string()));
         assert!(texts.contains(&DESKTOP_ONLY_LABEL.to_string()));
 
-        let all = build_picker_panel(&allowlist(vec![rule(Some("app.exe"), None)]),
+        let all = build_picker_panel(
+            &allowlist(vec![rule(Some("app.exe"), None)]),
             &snapshot,
             0,
-            picker_frame(), true);
+            picker_frame(),
+            true,
+        );
         assert!(
             all.panel
                 .widget::<Button>(PICKER_BTN_DESKTOP_ONLY)
                 .is_some()
         );
         let texts = picker_texts(&all.panel);
-        assert!(texts.contains(&"Снять все".to_string()));
+        assert!(texts.contains(&"Clear all".to_string()));
         assert!(texts.contains(&DESKTOP_ONLY_LABEL.to_string()));
     }
 

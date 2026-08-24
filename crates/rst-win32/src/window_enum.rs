@@ -19,14 +19,12 @@ use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromWindow};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow,
     GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
     SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN,
 };
 use windows::core::{BOOL, PWSTR};
 
@@ -289,14 +287,14 @@ fn window_flags(hwnd: HWND) -> WindowFlags {
 /// пользователь ещё выбирает. Любое вмешательство в чужие окна в этот момент
 /// ломает сам переключатель — см. [`shell_switching`].
 const SHELL_TRANSIENT_CLASSES: [&str; 8] = [
-    "MultitaskingViewFrame",         // Win10 Task View / Alt+Tab
-    "XamlExplorerHostIslandWindow",  // Win11 Alt+Tab и Win+Tab
-    "TaskSwitcherWnd",               // классический Alt+Tab
-    "TaskSwitcherOverlayWnd",        // его оверлей
-    "ForegroundStaging",             // промежуточное окно переключения
-    "Windows.UI.Core.CoreWindow",    // меню Пуск, поиск
-    "Shell_TrayWnd",                 // панель задач
-    "Shell_SecondaryTrayWnd",        // панель задач на втором мониторе
+    "MultitaskingViewFrame",        // Win10 Task View / Alt+Tab
+    "XamlExplorerHostIslandWindow", // Win11 Alt+Tab и Win+Tab
+    "TaskSwitcherWnd",              // классический Alt+Tab
+    "TaskSwitcherOverlayWnd",       // его оверлей
+    "ForegroundStaging",            // промежуточное окно переключения
+    "Windows.UI.Core.CoreWindow",   // меню Пуск, поиск
+    "Shell_TrayWnd",                // панель задач
+    "Shell_SecondaryTrayWnd",       // панель задач на втором мониторе
 ];
 
 /// Пользователь ПРЯМО СЕЙЧАС переключается между окнами средствами шелла
@@ -406,12 +404,8 @@ pub fn foreground_hwnd() -> Option<usize> {
 pub fn monitor_of(hwnd: usize) -> Option<isize> {
     // SAFETY: чистый запрос состояния десктопа для чужого HWND; невалидный
     // или свёрнутый дескриптор даёт нулевой HMONITOR, а не UB.
-    let monitor = unsafe {
-        MonitorFromWindow(
-            HWND(hwnd as *mut core::ffi::c_void),
-            MONITOR_DEFAULTTONULL,
-        )
-    };
+    let monitor =
+        unsafe { MonitorFromWindow(HWND(hwnd as *mut core::ffi::c_void), MONITOR_DEFAULTTONULL) };
     (!monitor.0.is_null()).then_some(monitor.0 as isize)
 }
 

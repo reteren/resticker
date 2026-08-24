@@ -185,7 +185,12 @@ impl MouseCapture {
     /// ([`left_button_physically_down`]) — см. [`Self::handle_message_checked`]
     /// за самой защитной логикой и тестируемой версией с инъекцией
     /// состояния кнопки.
-    pub fn handle_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<InputEvent> {
+    pub fn handle_message(
+        &mut self,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<InputEvent> {
         self.handle_message_checked(msg, wparam, lparam, left_button_physically_down())
     }
 
@@ -237,9 +242,8 @@ impl MouseCapture {
         // самая дешёвая и безопасная защита: настоящее движение мышью
         // почти никогда не даёт бит-в-бит идентичный `lParam` два раза
         // подряд.
-        let is_duplicate_move = effective_msg == WM_MOUSEMOVE
-            && self.captured
-            && self.last_drag_pos == Some(pos);
+        let is_duplicate_move =
+            effective_msg == WM_MOUSEMOVE && self.captured && self.last_drag_pos == Some(pos);
         // ВРЕМЕННАЯ диагностика бага «стикер дрейфует сам по себе» — только
         // пока идёт захват, чтобы не шуметь на обычном hover. Снять после
         // того, как причина найдена по логу реального запуска пользователя.
@@ -307,7 +311,6 @@ pub enum Handle {
     West,
     NorthWest,
 }
-
 
 /// Зона редактора под курсором. Хит-тест с обратной аффинной трансформацией
 /// делает ядро (ARCHITECTURE.md 5.3); здесь зона лишь отображается в форму
@@ -543,9 +546,8 @@ fn create_rotate_cursor(base_angle_deg: f64) -> Option<HCURSOR> {
     // SAFETY: bmi описывает 32bpp top-down DIB n×n; bits_ptr — валидный
     // out-параметр; hdc=None — GDI использует DC экрана по умолчанию для
     // формата, нам важен только явно заданный BITMAPINFOHEADER.
-    let hbm_color = unsafe {
-        CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0).ok()?
-    };
+    let hbm_color =
+        unsafe { CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0).ok()? };
     if bits_ptr.is_null() {
         // SAFETY: hbm_color только что создан этим же вызовом.
         unsafe {
@@ -572,8 +574,7 @@ fn create_rotate_cursor(base_angle_deg: f64) -> Option<HCURSOR> {
     let mask_bits = vec![0u8; mask_row_bytes * n as usize];
     // SAFETY: mask_bits — буфер ровно нужного размера для 1bpp n×n
     // монохромного битмапа с WORD-выровненными строками (контракт CreateBitmap).
-    let hbm_mask =
-        unsafe { CreateBitmap(n, n, 1, 1, Some(mask_bits.as_ptr().cast())) };
+    let hbm_mask = unsafe { CreateBitmap(n, n, 1, 1, Some(mask_bits.as_ptr().cast())) };
     if hbm_mask.is_invalid() {
         // SAFETY: hbm_color создан этим же вызовом.
         unsafe {
@@ -786,11 +787,15 @@ mod tests {
             .map(|p| (p[0], p[1], p[2], p[3]))
             .collect();
         assert!(
-            pixels.iter().any(|&(r, g, b, a)| r == 255 && g == 255 && b == 255 && a == 255),
+            pixels
+                .iter()
+                .any(|&(r, g, b, a)| r == 255 && g == 255 && b == 255 && a == 255),
             "должна быть непрозрачная белая заливка фигуры"
         );
         assert!(
-            pixels.iter().any(|&(r, g, b, a)| r == 0 && g == 0 && b == 0 && a == 255),
+            pixels
+                .iter()
+                .any(|&(r, g, b, a)| r == 0 && g == 0 && b == 0 && a == 255),
             "должна быть непрозрачная чёрная обводка"
         );
         assert!(
@@ -843,9 +848,16 @@ mod tests {
         let a1 = set.rotate_cursor(45);
         let a2 = set.rotate_cursor(45);
         let b = set.rotate_cursor(-45);
-        assert_eq!(a1.0, a2.0, "повторный запрос того же угла возвращает тот же хендл из кэша");
+        assert_eq!(
+            a1.0, a2.0,
+            "повторный запрос того же угла возвращает тот же хендл из кэша"
+        );
         assert_ne!(a1.0, b.0, "разные углы — разные хендлы");
-        assert_eq!(set.rotate_cache.len(), 2, "в кэше ровно две записи (45 и -45)");
+        assert_eq!(
+            set.rotate_cache.len(),
+            2,
+            "в кэше ровно две записи (45 и -45)"
+        );
     }
 
     fn mk_lparam(x: i16, y: i16) -> LPARAM {
@@ -1174,7 +1186,10 @@ mod tests {
 
         let _ = cap.handle_message(WM_LBUTTONDOWN, WPARAM(0), mk_lparam(10, 10));
         let first = cap.handle_message_checked(WM_MOUSEMOVE, WPARAM(0), mk_lparam(20, 20), true);
-        assert!(first.is_some(), "первое движение на новую позицию — не дубликат");
+        assert!(
+            first.is_some(),
+            "первое движение на новую позицию — не дубликат"
+        );
 
         let duplicate =
             cap.handle_message_checked(WM_MOUSEMOVE, WPARAM(0), mk_lparam(20, 20), true);

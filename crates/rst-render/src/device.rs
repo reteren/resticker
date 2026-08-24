@@ -1178,9 +1178,7 @@ mod gpu_tests {
             D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
             D3D11_USAGE_DEFAULT, ID3D11Texture2D,
         };
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC,
-        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
@@ -1198,8 +1196,12 @@ mod gpu_tests {
         };
         let mut tex: Option<ID3D11Texture2D> = None;
         // SAFETY: описание валидно, out-параметр жив до конца вызова.
-        unsafe { device.d3d_device().CreateTexture2D(&desc, None, Some(&mut tex)) }
-            .expect("массив NV12 создаётся");
+        unsafe {
+            device
+                .d3d_device()
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+        }
+        .expect("массив NV12 создаётся");
         tex.expect("CreateTexture2D без ошибки возвращает текстуру")
     }
 

@@ -30,6 +30,11 @@ pub struct Settings {
     /// позиция панели запоминается между входами в режим редактирования).
     /// `None` — дефолтное смещение (12, 12).
     pub cursor_panel_offset: Option<(f64, f64)>,
+    /// Язык интерфейса. Не используется с 2026-08-23: программа
+    /// англоязычная целиком (`resticker/src/i18n.rs`, `ui/i18n.js`).
+    /// Поле оставлено, чтобы существующие `config.json` со значением
+    /// `"ru"` читались без миграции и чтобы возврат второго языка не
+    /// требовал менять схему.
     pub language: String,
     /// Онбординг первого запуска уже показан (ROADMAP.md M8, «первый
     /// запуск: короткий онбординг, показать хоткей») — тост с хоткеем
@@ -71,7 +76,7 @@ impl Default for Settings {
             battery_fps_limit: 30,
             mute_invisible_stickers: true,
             cursor_panel_offset: None,
-            language: "ru".to_string(),
+            language: "en".to_string(),
             onboarding_shown: false,
             denylist: Vec::new(),
             pin_sound_volume: 100,

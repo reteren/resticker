@@ -74,11 +74,35 @@ fn all_media_filter_spec() -> String {
 /// картинки и видео вместе) — «Images»/«Videos» доступны рядом в том же
 /// выпадающем списке, если нужно сузить выбор.
 pub fn pick_media_file(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> {
+    let filters = vec![
+        (ALL_MEDIA_FILTER_NAME.to_string(), all_media_filter_spec()),
+        (IMAGE_FILTER_NAME.to_string(), IMAGE_FILTER_SPEC.to_string()),
+        (VIDEO_FILTER_NAME.to_string(), video_filter_spec()),
+    ];
+    pick_file(owner_hwnd, filters)
+}
+
+/// Показать диалог выбора файла пресета (`*.json`) — импорт пресета прямо из
+/// режима редактирования (запрос пользователя 2026-08-23), тем же системным
+/// диалогом, что и добавление стикера.
+pub fn pick_preset_file(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> {
+    pick_file(
+        owner_hwnd,
+        vec![("Preset (*.json)".to_string(), "*.json".to_string())],
+    )
+}
+
+/// Общая часть: COM на время одного модального диалога и заданные фильтры
+/// (первый — открытый по умолчанию).
+fn pick_file(
+    owner_hwnd: HWND,
+    filters: Vec<(String, String)>,
+) -> Result<Option<PathBuf>, Win32Error> {
     // SAFETY: инициализация COM на вызывающем потоке для длительности одного
     // модального диалога; деинициализация — в конце этой же функции, на том
     // же потоке, независимо от исхода (см. `result` ниже).
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok()?;
-    let result = show_dialog(owner_hwnd);
+    let result = show_dialog(owner_hwnd, &filters);
     // SAFETY: парная `CoUninitialize` для успешной `CoInitializeEx` выше —
     // на том же потоке, после того как диалог и все его COM-объекты уже
     // отпущены (они локальны для `show_dialog` и падают из области видимости
@@ -87,57 +111,36 @@ pub fn pick_media_file(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> 
     result
 }
 
-fn show_dialog(owner_hwnd: HWND) -> Result<Option<PathBuf>, Win32Error> {
+fn show_dialog(
+    owner_hwnd: HWND,
+    filters: &[(String, String)],
+) -> Result<Option<PathBuf>, Win32Error> {
     // SAFETY: `CLSID_FILE_OPEN_DIALOG` — валидный CLSID общего системного
-    // диалога; COM уже инициализирован вызывающей `pick_media_file`.
+    // диалога; COM уже инициализирован вызывающей `pick_file`.
     let dialog: IFileOpenDialog =
         unsafe { CoCreateInstance(&CLSID_FILE_OPEN_DIALOG, None, CLSCTX_INPROC_SERVER) }?;
 
-    let image_filter_name: Vec<u16> = IMAGE_FILTER_NAME
-        .encode_utf16()
-        .chain(std::iter::once(0))
+    // UTF-16 строки живут в `wide` до конца функции — дольше, чем нужны
+    // указателям в `specs`.
+    let wide: Vec<(Vec<u16>, Vec<u16>)> = filters
+        .iter()
+        .map(|(name, spec)| {
+            (
+                name.encode_utf16().chain(std::iter::once(0)).collect(),
+                spec.encode_utf16().chain(std::iter::once(0)).collect(),
+            )
+        })
         .collect();
-    let image_filter_spec: Vec<u16> = IMAGE_FILTER_SPEC
-        .encode_utf16()
-        .chain(std::iter::once(0))
+    let specs: Vec<COMDLG_FILTERSPEC> = wide
+        .iter()
+        .map(|(name, spec)| COMDLG_FILTERSPEC {
+            pszName: PCWSTR(name.as_ptr()),
+            pszSpec: PCWSTR(spec.as_ptr()),
+        })
         .collect();
-    let video_filter_name: Vec<u16> = VIDEO_FILTER_NAME
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let video_filter_spec_owned = video_filter_spec();
-    let video_filter_spec: Vec<u16> = video_filter_spec_owned
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let all_media_filter_name: Vec<u16> = ALL_MEDIA_FILTER_NAME
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let all_media_filter_spec_owned = all_media_filter_spec();
-    let all_media_filter_spec: Vec<u16> = all_media_filter_spec_owned
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let filters = [
-        COMDLG_FILTERSPEC {
-            pszName: PCWSTR(all_media_filter_name.as_ptr()),
-            pszSpec: PCWSTR(all_media_filter_spec.as_ptr()),
-        },
-        COMDLG_FILTERSPEC {
-            pszName: PCWSTR(image_filter_name.as_ptr()),
-            pszSpec: PCWSTR(image_filter_spec.as_ptr()),
-        },
-        COMDLG_FILTERSPEC {
-            pszName: PCWSTR(video_filter_name.as_ptr()),
-            pszSpec: PCWSTR(video_filter_spec.as_ptr()),
-        },
-    ];
-    // SAFETY: `filters` содержит указатели в `all_media_filter_name`/
-    // `all_media_filter_spec`/`image_filter_name`/`image_filter_spec`/
-    // `video_filter_name`/`video_filter_spec`, все живут до конца этой
-    // функции — дольше, чем нужен вызов.
-    unsafe { dialog.SetFileTypes(&filters) }?;
+    // SAFETY: указатели в `specs` смотрят в `wide`, который жив до конца
+    // этой функции — дольше, чем нужен вызов.
+    unsafe { dialog.SetFileTypes(&specs) }?;
     // SAFETY: индексация фильтров у `IFileDialog` с единицы (не с нуля) —
     // 1 открывает диалог на комбинированном фильтре «All supported files»
     // по умолчанию (см. доккомент `pick_media_file`).

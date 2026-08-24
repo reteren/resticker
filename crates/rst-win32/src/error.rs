@@ -1,46 +1,50 @@
 //! Ошибки Win32-обёрток.
+//!
+//! Тексты английские: `Display` этих ошибок попадает не только в лог, но и в
+//! баллон-уведомления (`PinAccessDenied` — тост «Could not pin the window»),
+//! а программа с 2026-08-23 англоязычная целиком.
 
 use windows::core::Error as WinError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Win32Error {
-    #[error("не удалось создать окно трея")]
+    #[error("could not create the tray window")]
     TrayWindowCreateFailed,
-    #[error("поток трея завершился до инициализации")]
+    #[error("the tray thread exited before initialization")]
     TrayThreadCrashed,
-    #[error("Shell_NotifyIconW провалился")]
+    #[error("Shell_NotifyIconW failed")]
     TrayNotifyIconFailed,
-    #[error("не удалось создать оверлей-окно")]
+    #[error("could not create the overlay window")]
     OverlayWindowCreateFailed,
-    #[error("поток оверлея завершился до инициализации")]
+    #[error("the overlay thread exited before initialization")]
     OverlayThreadCrashed,
-    #[error("не удалось создать окно трекера окон")]
+    #[error("could not create the window-tracker window")]
     WindowTrackerWindowCreateFailed,
-    #[error("поток трекера окон завершился до инициализации")]
+    #[error("the window-tracker thread exited before initialization")]
     WindowTrackerThreadCrashed,
-    #[error("комбинация клавиш «{0}» уже занята другим приложением")]
+    #[error("the {0} shortcut is already taken by another application")]
     HotkeyConflict(String),
-    #[error("некорректная комбинация клавиш: {0}")]
+    #[error("malformed key combination: {0}")]
     InvalidHotkey(String),
-    #[error("буфер обмена занят другим приложением")]
+    #[error("the clipboard is locked by another application")]
     ClipboardBusy,
-    #[error("повреждённые данные в буфере обмена: {0}")]
+    #[error("corrupted clipboard data: {0}")]
     ClipboardDataCorrupt(&'static str),
-    #[error("путь из системного диалога выбора файла повреждён (не валидный UTF-16)")]
+    #[error("the path from the system file dialog is corrupted (not valid UTF-16)")]
     FileDialogPathInvalid,
-    #[error("окно закрепления не существует (закрыто до операции)")]
+    #[error("the window to pin no longer exists (closed before the operation)")]
     PinWindowGone,
-    #[error("окно уже закреплено (на нём уже стоит маркер resticker)")]
+    #[error("the window is already pinned (it already carries the resticker marker)")]
     AlreadyPinned,
     #[error(
-        "закрепление отклонено системой: у процесса нет доступа к целевому окну (UIPI). Перезапустите resticker от имени администратора, чтобы закреплять стикеры за окнами с повышенными правами"
+        "pinning was rejected by the system: this process has no access to the target window (UIPI). Restart resticker as administrator to pin stickers to windows running with elevated rights"
     )]
     PinAccessDenied,
     #[error(
-        "менеджер виртуальных рабочих столов недоступен (нужна Windows 10 1607+; на системах без виртуальных столов проверка стола недоступна): {0}"
+        "the virtual desktop manager is unavailable (needs Windows 10 1607+; on systems without virtual desktops the desktop check is not available): {0}"
     )]
     VirtualDesktopManagerUnavailable(String),
-    #[error("реестр: {0}")]
+    #[error("registry: {0}")]
     Registry(#[from] std::io::Error),
     #[error("Win32: {0}")]
     Win32(#[from] WinError),

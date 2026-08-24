@@ -6,6 +6,7 @@
 
 pub mod autostart;
 pub mod clipboard;
+pub mod dwm;
 mod error;
 pub mod file_dialog;
 pub mod hotkey;
@@ -16,7 +17,6 @@ pub mod single_instance;
 pub mod sound;
 pub mod tray;
 pub mod virtual_desktops;
-pub mod dwm;
 pub mod window_enum;
 mod window_icon;
 pub mod window_pick;

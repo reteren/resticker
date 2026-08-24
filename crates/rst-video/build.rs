@@ -76,13 +76,18 @@ fn main() {
 /// Прочитать не удалось — не мешаем сборке: у чужой раскладки установки
 /// файл может лежать иначе, а ложный отказ хуже пропущенной проверки.
 fn check_version(dir: &Path) {
-    let path = dir.join("include").join("libavcodec").join("version_major.h");
+    let path = dir
+        .join("include")
+        .join("libavcodec")
+        .join("version_major.h");
     println!("cargo:rerun-if-changed={}", path.display());
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
     let Some(major) = text.lines().find_map(|line| {
-        let rest = line.trim().strip_prefix("#define LIBAVCODEC_VERSION_MAJOR")?;
+        let rest = line
+            .trim()
+            .strip_prefix("#define LIBAVCODEC_VERSION_MAJOR")?;
         rest.trim().parse::<u32>().ok()
     }) else {
         return;

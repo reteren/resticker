@@ -10,7 +10,7 @@
 //! и состояние живут в [`crate::window_picker`] (docs/M4_WINDOW_PICKER_DESIGN.md).
 
 use rst_core::hittest::DipRect;
-use rst_render::{Box2D, Button, Icon, NumericField, Panel, Slider, WidgetId, theme};
+use rst_render::{Box2D, Button, Icon, NumericField, Panel, Slider, WidgetId, WidgetStyle, theme};
 
 /// Идентификаторы виджетов тулбара — для опроса состояния ядром через
 /// [`Panel::widget`]/[`Panel::widget_mut`].
@@ -135,6 +135,9 @@ pub fn build_toolbar(
     let left = bounds.x + bounds.w / 2.0 - width / 2.0;
     let cy = top + TOOLBAR_HEIGHT / 2.0;
 
+    // Оформление — стилистика окна настроек (Source VGUI), тот же стиль,
+    // что у панели свойств закреплённого окна: оверлей и окно настроек
+    // должны читаться как один продукт (запрос пользователя 2026-08-23).
     let mut panel = Panel::new(
         TB_PANEL,
         Box2D {
@@ -144,7 +147,8 @@ pub fn build_toolbar(
             h: TOOLBAR_HEIGHT,
             rotation: 0.0,
         },
-    );
+    )
+    .with_style(WidgetStyle::Settings);
 
     let mut x = left + TOOLBAR_PAD;
     if let Some(opacity) = opacity {
@@ -152,13 +156,15 @@ pub fn build_toolbar(
         let value = (opacity.clamp(0.0, 1.0) * 100.0).round() as u32;
 
         let mut slider =
-            Slider::opacity(TB_SLIDER, x + TOOLBAR_SLIDER_W / 2.0, cy, TOOLBAR_SLIDER_W);
+            Slider::opacity(TB_SLIDER, x + TOOLBAR_SLIDER_W / 2.0, cy, TOOLBAR_SLIDER_W)
+                .with_style(WidgetStyle::Settings);
         slider.set_value(value);
         panel.add_widget(slider);
         x += TOOLBAR_SLIDER_W + TOOLBAR_WIDGET_GAP;
 
         let mut field =
-            NumericField::opacity(TB_FIELD, x + TOOLBAR_FIELD_W / 2.0, cy, TOOLBAR_FIELD_W);
+            NumericField::opacity(TB_FIELD, x + TOOLBAR_FIELD_W / 2.0, cy, TOOLBAR_FIELD_W)
+                .with_style(WidgetStyle::Settings);
         field.set_value(value);
         panel.add_widget(field);
         x += TOOLBAR_FIELD_W + TOOLBAR_WIDGET_GAP;
@@ -174,7 +180,10 @@ pub fn build_toolbar(
         (TB_DELETE, Icon::Delete),
     ];
     for (id, icon) in buttons {
-        panel.add_widget(Button::icon(id, x + theme::BUTTON_SIZE / 2.0, cy, icon));
+        panel.add_widget(
+            Button::icon(id, x + theme::BUTTON_SIZE / 2.0, cy, icon)
+                .with_style(WidgetStyle::Settings),
+        );
         x += theme::BUTTON_SIZE + TOOLBAR_WIDGET_GAP;
     }
 
@@ -187,12 +196,10 @@ pub fn build_toolbar(
         } else {
             Icon::Pause
         };
-        panel.add_widget(Button::icon(
-            TB_PLAY_PAUSE,
-            x + theme::BUTTON_SIZE / 2.0,
-            cy,
-            play_icon,
-        ));
+        panel.add_widget(
+            Button::icon(TB_PLAY_PAUSE, x + theme::BUTTON_SIZE / 2.0, cy, play_icon)
+                .with_style(WidgetStyle::Settings),
+        );
         x += theme::BUTTON_SIZE + TOOLBAR_WIDGET_GAP;
 
         // Переключатель полосы перемотки вне режима редактирования: иконка
@@ -203,12 +210,10 @@ pub fn build_toolbar(
         } else {
             Icon::TimelineOff
         };
-        panel.add_widget(Button::icon(
-            TB_TIMELINE,
-            x + theme::BUTTON_SIZE / 2.0,
-            cy,
-            timeline_icon,
-        ));
+        panel.add_widget(
+            Button::icon(TB_TIMELINE, x + theme::BUTTON_SIZE / 2.0, cy, timeline_icon)
+                .with_style(WidgetStyle::Settings),
+        );
         x += theme::BUTTON_SIZE + TOOLBAR_WIDGET_GAP;
 
         let volume = Slider::new(
@@ -223,7 +228,8 @@ pub fn build_toolbar(
             0,
             100,
             video.volume_pct,
-        );
+        )
+        .with_style(WidgetStyle::Settings);
         panel.add_widget(volume);
     }
 
@@ -251,12 +257,7 @@ mod tests {
     #[test]
     fn toolbar_below_selection_when_space() {
         // Рамка y ∈ [350, 450]; снизу места достаточно — тулбар под ней.
-        let p = build_toolbar(
-            &aabb(960.0, 400.0, 200.0, 100.0),
-            Some(1.0),
-            None,
-            SCREEN_H,
-        );
+        let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.0), None, SCREEN_H);
         assert_eq!(toolbar_cy(&p), 450.0 + TOOLBAR_GAP_Y + TOOLBAR_HEIGHT / 2.0);
         assert!(p.hit_test((960.0, 476.0)));
         assert!(!p.hit_test((960.0, 457.0)), "зазор между рамкой и тулбаром");
@@ -267,12 +268,7 @@ mod tests {
         // Рамка x ∈ [860, 1060] → центр 960; рамка тулбара x ∈ [774, 1146]
         // (7 кнопок, TOOLBAR_WIDTH = 372, фидбэк 2026-08-09: «сбросить
         // масштаб» добавил седьмую кнопку).
-        let p = build_toolbar(
-            &aabb(960.0, 400.0, 200.0, 100.0),
-            Some(1.0),
-            None,
-            SCREEN_H,
-        );
+        let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.0), None, SCREEN_H);
         assert!(p.hit_test((775.0, 476.0)), "левый край тулбара");
         assert!(!p.hit_test((773.0, 476.0)));
     }
@@ -280,12 +276,7 @@ mod tests {
     #[test]
     fn toolbar_above_when_no_space_below() {
         // Рамка y ∈ [1010, 1070]; снизу всего 10 DIP — тулбар над рамкой.
-        let p = build_toolbar(
-            &aabb(960.0, 1040.0, 200.0, 60.0),
-            Some(1.0),
-            None,
-            SCREEN_H,
-        );
+        let p = build_toolbar(&aabb(960.0, 1040.0, 200.0, 60.0), Some(1.0), None, SCREEN_H);
         assert_eq!(
             toolbar_cy(&p),
             1010.0 - TOOLBAR_GAP_Y - TOOLBAR_HEIGHT / 2.0
@@ -297,12 +288,7 @@ mod tests {
     fn toolbar_below_boundary_is_inclusive() {
         // Высота экрана ровно «низ рамки + зазор + высота тулбара» — ещё снизу.
         let screen_h = 450.0 + TOOLBAR_GAP_Y + TOOLBAR_HEIGHT;
-        let p = build_toolbar(
-            &aabb(960.0, 400.0, 200.0, 100.0),
-            Some(1.0),
-            None,
-            screen_h,
-        );
+        let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.0), None, screen_h);
         assert_eq!(toolbar_cy(&p), 450.0 + TOOLBAR_GAP_Y + TOOLBAR_HEIGHT / 2.0);
         // Один DIP меньше — уже сверху.
         let p = build_toolbar(
@@ -320,12 +306,7 @@ mod tests {
         // y ∈ [850, 950]) вычисляет вызывающий код — билдер позиционируется
         // под переданным прямоугольником. Без учёта поворота низ был бы 920
         // и тулбар встал бы на 928+18.
-        let p = build_toolbar(
-            &aabb(960.0, 900.0, 40.0, 100.0),
-            Some(1.0),
-            None,
-            SCREEN_H,
-        );
+        let p = build_toolbar(&aabb(960.0, 900.0, 40.0, 100.0), Some(1.0), None, SCREEN_H);
         assert_eq!(toolbar_cy(&p), 950.0 + TOOLBAR_GAP_Y + TOOLBAR_HEIGHT / 2.0);
     }
 
@@ -343,12 +324,7 @@ mod tests {
 
     #[test]
     fn toolbar_opacity_clamped_to_percent_range() {
-        let p = build_toolbar(
-            &aabb(960.0, 400.0, 200.0, 100.0),
-            Some(1.5),
-            None,
-            SCREEN_H,
-        );
+        let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.5), None, SCREEN_H);
         assert_eq!(p.widget::<Slider>(TB_SLIDER).unwrap().value(), 100);
         let p = build_toolbar(
             &aabb(960.0, 400.0, 200.0, 100.0),
@@ -363,12 +339,7 @@ mod tests {
 
     #[test]
     fn toolbar_multi_hides_slider_and_field() {
-        let p = build_toolbar(
-            &aabb(960.0, 400.0, 400.0, 200.0),
-            None,
-            None,
-            SCREEN_H,
-        );
+        let p = build_toolbar(&aabb(960.0, 400.0, 400.0, 200.0), None, None, SCREEN_H);
         assert!(
             p.widget::<Slider>(TB_SLIDER).is_none(),
             "в мульти-режиме слайдера нет (SPEC 3.6)"
@@ -399,33 +370,29 @@ mod tests {
             TOOLBAR_WIDTH - TOOLBAR_WIDTH_MULTI,
             TOOLBAR_SLIDER_W + TOOLBAR_WIDGET_GAP + TOOLBAR_FIELD_W + TOOLBAR_WIDGET_GAP
         );
-        let p = build_toolbar(
-            &aabb(960.0, 400.0, 400.0, 200.0),
-            None,
-            None,
-            SCREEN_H,
-        );
+        let p = build_toolbar(&aabb(960.0, 400.0, 400.0, 200.0), None, None, SCREEN_H);
         assert_eq!(p.frame().w, TOOLBAR_WIDTH_MULTI);
     }
 
+    /// Иконка кнопки: ищем примитив по типу, а не по индексу — в
+    /// стилистике настроек между фоном и иконкой лежат ещё четыре грани
+    /// объёмной рамки (`settings_bevel`).
     fn button_icon(p: &Panel, id: WidgetId) -> Icon {
         let b = p.widget::<Button>(id).unwrap();
         let mut out = Vec::new();
         b.draw(&mut out);
-        let Some(Primitive::Icon { icon, .. }) = out.into_iter().nth(1) else {
-            panic!("второй примитив кнопки — иконка")
+        let Some(Primitive::Icon { icon, .. }) = out
+            .into_iter()
+            .find(|prim| matches!(prim, Primitive::Icon { .. }))
+        else {
+            panic!("у кнопки тулбара нет примитива-иконки")
         };
         icon
     }
 
     #[test]
     fn toolbar_six_buttons_in_spec_order() {
-        let p = build_toolbar(
-            &aabb(960.0, 400.0, 200.0, 100.0),
-            Some(1.0),
-            None,
-            SCREEN_H,
-        );
+        let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.0), None, SCREEN_H);
         let expected = [
             (TB_LAYERS, Icon::Layers),
             (TB_EYE, Icon::Eye),
@@ -501,12 +468,7 @@ mod tests {
 
     #[test]
     fn toolbar_without_video_has_no_play_pause_or_volume() {
-        let p = build_toolbar(
-            &aabb(960.0, 400.0, 200.0, 100.0),
-            Some(1.0),
-            None,
-            SCREEN_H,
-        );
+        let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.0), None, SCREEN_H);
         assert!(p.widget::<Button>(TB_PLAY_PAUSE).is_none());
         assert!(p.widget::<Slider>(TB_VOLUME).is_none());
         assert_eq!(p.frame().w, TOOLBAR_WIDTH, "без видео — обычная ширина");

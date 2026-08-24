@@ -61,7 +61,7 @@ async function loadConfig() {
   }
   draftSettings = { ...config.settings };
   draftHotkeys = { ...config.hotkeys };
-  applyStaticTranslations(draftSettings.language ?? 'ru');
+  applyStaticTranslations();
   renderGeneral();
   renderControl();
   renderStickers();
@@ -86,7 +86,6 @@ function renderGeneral() {
   const fps = draftSettings.battery_fps_limit ?? 30;
   document.getElementById('battery-fps-limit').value = fps;
   document.getElementById('battery-fps-limit-value').textContent = String(fps);
-  document.getElementById('language').value = draftSettings.language ?? 'ru';
 }
 
 const GENERAL_CHECKBOXES = [
@@ -110,19 +109,6 @@ const fpsValue = document.getElementById('battery-fps-limit-value');
 fpsSlider.addEventListener('input', () => {
   fpsValue.textContent = fpsSlider.value;
   draftSettings.battery_fps_limit = Number(fpsSlider.value);
-});
-
-// Смена языка применяется сразу, без перезапуска окна (перерисовываем и
-// статический, и динамический текст — вкладки «Стикеры»/«Пресеты» строят
-// разметку через t() на каждый рендер) — сохраняется в draftSettings и
-// уходит в конфиг обычным путём, вместе с остальными настройками, по
-// «Применить»/«ОК».
-document.getElementById('language').addEventListener('change', (e) => {
-  draftSettings.language = e.target.value;
-  applyStaticTranslations(draftSettings.language);
-  renderStickers();
-  renderPresets();
-  renderDenylist();
 });
 
 // ==== Вкладка «Управление» (хоткеи) ====
@@ -515,6 +501,13 @@ document.getElementById('import-preset').addEventListener('click', async () => {
   } catch (err) {
     presetStatusEl.textContent = t('error.generic', { err });
   }
+});
+
+// Окно не пересоздаётся между показами — оно просто прячется. Бэкенд шлёт
+// это событие на каждый показ, чтобы список стикеров и пресетов был живым, а
+// не таким, каким был при запуске программы.
+listen('settings-shown', () => {
+  loadConfig();
 });
 
 // Диалог недостающих элементов (SPEC §11): бэкенд применяет пресет без

@@ -6,8 +6,17 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    AddFontMemResourceEx, BACKGROUND_MODE, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW,
+    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DeleteObject, DrawTextW, FF_DONTCARE, FW_LIGHT, FillRect, GetDC,
+    GetTextExtentPoint32W, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, TRANSPARENT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::Shell::{
     ExtractIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -15,10 +24,11 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, HICON, HMENU,
-    IDI_APPLICATION, LoadIconW, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
-    WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPED,
+    IDI_APPLICATION, LoadIconW, MENUINFO, MF_DISABLED, MF_OWNERDRAW, MF_POPUP, MIM_APPLYTOSUBMENUS,
+    MIM_BACKGROUND, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
+    SetMenuInfo, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu,
+    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DRAWITEM,
+    WM_LBUTTONUP, WM_MEASUREITEM, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -414,32 +424,317 @@ fn remove_notify_icon(hwnd: HWND) -> Result<(), Win32Error> {
     }
 }
 
+/// Палитра и метрики контекстного меню трея — те же значения, что у
+/// панелей оверлея и окна настроек (Source VGUI): системное меню Windows
+/// выбивалось из продукта (репорт пользователя 2026-08-23).
+///
+/// Здесь цвета заданы числами, а не взяты из `rst-render`: этот крейт —
+/// платформенный слой и о рендерере ничего не знает (CONTRIBUTING.md,
+/// «правило зависимостей»). Значения обязаны совпадать с
+/// `rst_render::theme::settings`, поэтому рядом стоят имена оттуда.
+mod menu_style {
+    /// `settings::BG` — фон меню (поля вокруг кнопок).
+    pub const BG: u32 = 0x0076_7676;
+    /// `settings::BTN_BG` — фон кнопки-пункта.
+    pub const BTN_BG: u32 = 0x007B_7B7B;
+    /// `settings::BTN_BG_HOVER` — кнопка под курсором.
+    pub const BTN_HOVER: u32 = 0x008C_8C8C;
+    /// `settings::BORDER_DARK` / `BORDER_LIGHT` — грани.
+    pub const BORDER_DARK: u32 = 0x0043_4343;
+    pub const BORDER_LIGHT: u32 = 0x00BA_BABB;
+    /// `settings::TEXT` — белый текст пункта.
+    pub const TEXT: u32 = 0x00FF_FFFF;
+    /// Отступ подписи от края кнопки, px.
+    pub const PAD_X: i32 = 18;
+    /// Поле вокруг кнопки внутри пункта, px: между соседними кнопками
+    /// получается двойное — они не слипаются в сплошную стену.
+    pub const BTN_MARGIN: i32 = 3;
+    /// Высота пункта, px (кнопка плюс поля).
+    pub const ITEM_H: i32 = 32;
+    /// Высота разделителя, px.
+    pub const SEPARATOR_H: i32 = 9;
+    /// Кегль подписи, px (тот же 12 DIP, что у панелей, на 100% DPI).
+    pub const FONT_PX: i32 = 15;
+}
+
+/// Данные пункта для owner-draw: Win32 хранит только `dwItemData`, поэтому
+/// подпись и признак разделителя живут здесь, а меню держит указатели.
+struct OwnerDrawItem {
+    label: Vec<u16>,
+    separator: bool,
+}
+
+/// Ресурсы, которые обязаны пережить показ меню: подписи пунктов, кисть
+/// фона и шрифт. Уничтожаются вместе с `HMENU` после `TrackPopupMenu`.
+struct MenuResources {
+    /// Подписи пунктов: Win32 держит на них сырые указатели в `dwItemData`,
+    /// поэтому боксы обязаны дожить до `DestroyMenu` — читать их отсюда не
+    /// нужно, важно только владение. Именно боксы, а не `Vec<OwnerDrawItem>`:
+    /// вектор переезжает при росте и утащил бы за собой адреса, на которые
+    /// уже смотрит меню.
+    #[allow(
+        dead_code,
+        clippy::vec_box,
+        reason = "владение данными по стабильным адресам, на которые смотрит Win32"
+    )]
+    items: Vec<Box<OwnerDrawItem>>,
+    background: HBRUSH,
+    font: HFONT,
+}
+
+impl Drop for MenuResources {
+    fn drop(&mut self) {
+        // SAFETY: оба объекта созданы этим же кодом и больше не выбраны ни
+        // в один DC (меню уже закрыто).
+        unsafe {
+            let _ = DeleteObject(self.background.into());
+            let _ = DeleteObject(self.font.into());
+        }
+    }
+}
+
+/// Семейство шрифта меню, зарегистрированное [`register_menu_font`].
+static MENU_FONT_FAMILY: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+
+/// Зарегистрировать шрифт меню из байтов TTF (вызывающий слой передаёт ту же
+/// гарнитуру, которой набран оверлей — `rst_render::FONT_BYTES`). Без вызова
+/// меню рисуется системным шрифтом: не ошибка, просто не так красиво.
+///
+/// `family` — имя семейства внутри файла («Roboto Light»); GDI ищет шрифт по
+/// имени, а не по хендлу ресурса.
+pub fn register_menu_font(bytes: &'static [u8], family: &str) {
+    // SAFETY: bytes живёт всю программу ('static), длина берётся из среза.
+    let handle = unsafe {
+        AddFontMemResourceEx(
+            bytes.as_ptr().cast(),
+            bytes.len() as u32,
+            None,
+            &mut 0u32 as *mut u32,
+        )
+    };
+    if handle.is_invalid() {
+        tracing::warn!("не удалось зарегистрировать шрифт меню трея");
+        return;
+    }
+    // Ресурс намеренно не освобождается: он нужен до конца жизни процесса,
+    // как и сам трей.
+    let wide: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = MENU_FONT_FAMILY.set(wide);
+}
+
+/// Шрифт для отрисовки пунктов: зарегистрированное семейство, если оно есть.
+fn create_menu_font() -> HFONT {
+    let family = MENU_FONT_FAMILY.get();
+    let name = family.map_or(PCWSTR::null(), |f| PCWSTR(f.as_ptr()));
+    // SAFETY: name — либо null (системный шрифт по умолчанию), либо
+    // nul-terminated строка, живущая в статике.
+    unsafe {
+        CreateFontW(
+            menu_style::FONT_PX,
+            0,
+            0,
+            0,
+            FW_LIGHT.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            name,
+        )
+    }
+}
+
+/// Обработчик `WM_MEASUREITEM`: размер пункта меню.
+fn on_measure_item(hwnd: HWND, lparam: LPARAM, font: HFONT) {
+    let Some(mis) = (unsafe { (lparam.0 as *mut MEASUREITEMSTRUCT).as_mut() }) else {
+        return;
+    };
+    // SAFETY: dwItemData — указатель, который положил `build_hmenu`; он жив,
+    // пока меню на экране (`MenuResources`).
+    let Some(item) = (unsafe { (mis.itemData as *const OwnerDrawItem).as_ref() }) else {
+        return;
+    };
+    if item.separator {
+        mis.itemWidth = 0;
+        mis.itemHeight = menu_style::SEPARATOR_H as u32;
+        return;
+    }
+    // Ширина — по реальной ширине подписи выбранным шрифтом.
+    // SAFETY: hwnd валиден; DC освобождается ниже, шрифт возвращается на место.
+    let width = unsafe {
+        let hdc = GetDC(Some(hwnd));
+        let old = SelectObject(hdc, font.into());
+        let mut size = SIZE::default();
+        let text = &item.label[..item.label.len().saturating_sub(1)];
+        let _ = GetTextExtentPoint32W(hdc, text, &mut size);
+        SelectObject(hdc, old);
+        ReleaseDC(Some(hwnd), hdc);
+        size.cx
+    };
+    mis.itemWidth = (width + 2 * (menu_style::PAD_X + menu_style::BTN_MARGIN)) as u32;
+    mis.itemHeight = menu_style::ITEM_H as u32;
+}
+
+/// Обработчик `WM_DRAWITEM`: фон, подсветка, подпись, разделитель.
+fn on_draw_item(lparam: LPARAM, font: HFONT) {
+    let Some(dis) = (unsafe { (lparam.0 as *const DRAWITEMSTRUCT).as_ref() }) else {
+        return;
+    };
+    // SAFETY: как и в on_measure_item — указатель на живой OwnerDrawItem.
+    let Some(item) = (unsafe { (dis.itemData as *const OwnerDrawItem).as_ref() }) else {
+        return;
+    };
+    let hdc = dis.hDC;
+    let rect = dis.rcItem;
+    let selected = dis.itemState.0 & ODS_SELECTED.0 != 0;
+
+    // SAFETY: hdc принадлежит системе на время обработки сообщения; все
+    // созданные объекты удаляются здесь же, выбранные — возвращаются.
+    unsafe {
+        // Поле пункта — фоном меню; сама кнопка рисуется внутри с отступом.
+        let bg = CreateSolidBrush(COLORREF(menu_style::BG));
+        FillRect(hdc, &rect, bg);
+        let _ = DeleteObject(bg.into());
+
+        if item.separator {
+            // Канавка VGUI: тёмная линия и светлая под ней.
+            let mid = (rect.top + rect.bottom) / 2;
+            for (y, color) in [
+                (mid, menu_style::BORDER_DARK),
+                (mid + 1, menu_style::BORDER_LIGHT),
+            ] {
+                let line = RECT {
+                    left: rect.left + menu_style::PAD_X / 2,
+                    top: y,
+                    right: rect.right - menu_style::PAD_X / 2,
+                    bottom: y + 1,
+                };
+                let brush = CreateSolidBrush(COLORREF(color));
+                FillRect(hdc, &line, brush);
+                let _ = DeleteObject(brush.into());
+            }
+            return;
+        }
+
+        // Кнопка VGUI: фон с гранями — светлая сверху слева, тёмная снизу
+        // справа (запрос пользователя 2026-08-23 — «сделай полноценные
+        // красивые кнопки»). Пункт под курсором светлее, как в панелях.
+        let button = RECT {
+            left: rect.left + menu_style::BTN_MARGIN,
+            top: rect.top + menu_style::BTN_MARGIN,
+            right: rect.right - menu_style::BTN_MARGIN,
+            bottom: rect.bottom - menu_style::BTN_MARGIN,
+        };
+        let face = CreateSolidBrush(COLORREF(if selected {
+            menu_style::BTN_HOVER
+        } else {
+            menu_style::BTN_BG
+        }));
+        FillRect(hdc, &button, face);
+        let _ = DeleteObject(face.into());
+        for (edge, color) in [
+            (
+                RECT {
+                    bottom: button.top + 1,
+                    ..button
+                },
+                menu_style::BORDER_LIGHT,
+            ),
+            (
+                RECT {
+                    right: button.left + 1,
+                    ..button
+                },
+                menu_style::BORDER_LIGHT,
+            ),
+            (
+                RECT {
+                    top: button.bottom - 1,
+                    ..button
+                },
+                menu_style::BORDER_DARK,
+            ),
+            (
+                RECT {
+                    left: button.right - 1,
+                    ..button
+                },
+                menu_style::BORDER_DARK,
+            ),
+        ] {
+            let brush = CreateSolidBrush(COLORREF(color));
+            FillRect(hdc, &edge, brush);
+            let _ = DeleteObject(brush.into());
+        }
+
+        let old_font = SelectObject(hdc, font.into());
+        let old_mode = SetBkMode(hdc, TRANSPARENT);
+        let old_color = SetTextColor(hdc, COLORREF(menu_style::TEXT));
+        let mut text_rect = RECT {
+            left: button.left + menu_style::PAD_X,
+            top: button.top,
+            right: button.right - menu_style::PAD_X,
+            bottom: button.bottom,
+        };
+        let mut text: Vec<u16> = item.label.clone();
+        text.pop(); // без завершающего нуля — DrawTextW считает по длине
+        DrawTextW(
+            hdc,
+            &mut text,
+            &mut text_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SetTextColor(hdc, old_color);
+        SetBkMode(hdc, BACKGROUND_MODE(old_mode as u32));
+        SelectObject(hdc, old_font);
+    }
+}
+
 /// Собрать `HMENU` из списка пунктов, рекурсивно (вложенные `children` →
 /// `MF_POPUP`-подпункты, [`MenuItem::submenu`]). `DestroyMenu` на корневом
 /// `HMENU` уничтожает и все вложенные подменю — Win32 делает это сам
 /// (MSDN: `DestroyMenu` "also destroys any submenus"), поэтому вызывающий
 /// код освобождает только корень.
-fn build_hmenu(items: &[MenuItem]) -> Option<HMENU> {
+#[allow(
+    clippy::vec_box,
+    reason = "адреса боксов уезжают в dwItemData — вектор значений их сломает"
+)]
+fn build_hmenu(items: &[MenuItem], keep: &mut Vec<Box<OwnerDrawItem>>) -> Option<HMENU> {
     // SAFETY: CreatePopupMenu без аргументов; ошибка (пустой HMENU) обрабатывается ниже.
     let hmenu = unsafe { CreatePopupMenu() }.ok()?;
     for item in items {
-        let wide: Vec<u16> = item
-            .label
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: hmenu только что создано; wide — валидная nul-terminated строка,
-        // живущая до конца вызова AppendMenuW.
+        // Пункты рисуем сами (`MF_OWNERDRAW`): системное меню не умеет ни
+        // нашей палитры, ни шрифта. Подпись Win32 при этом не хранит — она
+        // едет в `dwItemData` (последний аргумент `AppendMenuW`), поэтому
+        // обязана пережить показ меню: владеет ею `keep`.
+        let data = Box::new(OwnerDrawItem {
+            label: item
+                .label
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect(),
+            separator: item.children.is_empty() && item.id == 0,
+        });
+        let data_ptr = PCWSTR((&raw const *data).cast());
+        keep.push(data);
+        // SAFETY: hmenu только что создано; data_ptr указывает на бокс,
+        // который живёт в `keep` до конца показа меню.
         unsafe {
             if !item.children.is_empty() {
-                let Some(submenu) = build_hmenu(&item.children) else {
+                let Some(submenu) = build_hmenu(&item.children, keep) else {
                     continue;
                 };
-                let _ = AppendMenuW(hmenu, MF_POPUP, submenu.0 as usize, PCWSTR(wide.as_ptr()));
+                let _ = AppendMenuW(hmenu, MF_POPUP | MF_OWNERDRAW, submenu.0 as usize, data_ptr);
             } else if item.id == 0 {
-                let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+                // Разделитель тоже owner-draw, но недоступен для выбора —
+                // иначе он подсвечивался бы под курсором.
+                let _ = AppendMenuW(hmenu, MF_OWNERDRAW | MF_DISABLED, 0, data_ptr);
             } else {
-                let _ = AppendMenuW(hmenu, MF_STRING, item.id as usize, PCWSTR(wide.as_ptr()));
+                let _ = AppendMenuW(hmenu, MF_OWNERDRAW, item.id as usize, data_ptr);
             }
         }
     }
@@ -461,9 +756,32 @@ fn show_context_menu(hwnd: HWND) {
     }
 
     let items = state.menu.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let Some(hmenu) = build_hmenu(&items) else {
+    let mut keep: Vec<Box<OwnerDrawItem>> = Vec::new();
+    let Some(hmenu) = build_hmenu(&items, &mut keep) else {
         return;
     };
+    // Фон самого окна меню (поля вокруг пунктов) — системный по умолчанию,
+    // его задаёт только `MENUINFO`; сами пункты закрасит `WM_DRAWITEM`.
+    // SAFETY: кисть живёт в `resources` до конца показа меню.
+    let background = unsafe { CreateSolidBrush(COLORREF(menu_style::BG)) };
+    let resources = MenuResources {
+        items: keep,
+        background,
+        font: create_menu_font(),
+    };
+    // SAFETY: hmenu только что создано, mi заполнен целиком.
+    unsafe {
+        let mi = MENUINFO {
+            cbSize: size_of::<MENUINFO>() as u32,
+            fMask: MIM_BACKGROUND | MIM_APPLYTOSUBMENUS,
+            hbrBack: resources.background,
+            ..Default::default()
+        };
+        let _ = SetMenuInfo(hmenu, &mi);
+    }
+    // Пока меню на экране, окно-владелец должно знать, каким шрифтом
+    // рисовать пункты: WM_MEASUREITEM/WM_DRAWITEM приходят именно ему.
+    set_menu_font(hwnd, resources.font);
 
     let mut pt = Default::default();
     // SAFETY: pt — валидный указатель на стековую POINT.
@@ -488,6 +806,21 @@ fn show_context_menu(hwnd: HWND) {
         );
         let _ = DestroyMenu(hmenu);
     }
+    set_menu_font(hwnd, HFONT::default());
+    drop(resources);
+}
+
+/// Шрифт текущего показываемого меню — окно-владелец берёт его в
+/// `WM_MEASUREITEM`/`WM_DRAWITEM`. Не `WndState`: меню живёт короче окна и
+/// пересоздаётся на каждый показ.
+static MENU_FONT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+fn set_menu_font(_hwnd: HWND, font: HFONT) {
+    MENU_FONT.store(font.0 as isize, std::sync::atomic::Ordering::Release);
+}
+
+fn menu_font() -> HFONT {
+    HFONT(MENU_FONT.load(std::sync::atomic::Ordering::Acquire) as *mut core::ffi::c_void)
 }
 
 fn with_state<F: FnOnce(&WndState)>(hwnd: HWND, f: F) {
@@ -515,6 +848,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 _ => {}
             }
             LRESULT(0)
+        }
+        WM_MEASUREITEM => {
+            on_measure_item(hwnd, lparam, menu_font());
+            LRESULT(1)
+        }
+        WM_DRAWITEM => {
+            on_draw_item(lparam, menu_font());
+            LRESULT(1)
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xffff) as u32;
@@ -645,7 +986,8 @@ mod tests {
                 vec![MenuItem::new(10, "A"), MenuItem::new(11, "B")],
             ),
         ];
-        let hmenu = build_hmenu(&items).expect("меню с подменю строится");
+        let mut keep = Vec::new();
+        let hmenu = build_hmenu(&items, &mut keep).expect("меню с подменю строится");
         // SAFETY: hmenu только что построено выше, ещё не показано/уничтожено.
         unsafe {
             let _ = DestroyMenu(hmenu);

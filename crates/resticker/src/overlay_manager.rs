@@ -52,14 +52,11 @@ use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::animation as media_animation;
 use rst_media::paste;
 use rst_render::{
-    PresentSync,
-    Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon,
-    Key, Label, NumericField, Panel, PinnedRowField, PointerEvent, Primitive, RenderError,
-    SelectionBox, Slider, Sprite, Texture, TextField, TextureAtlas, VideoTextures, Widget,
-    WidgetId,
-    WindowHighlight, WindowTarget, edit_overlay, lock_indicator, marquee_visuals, pin_indicator,
-    pinned_row_id,
-    rasterize, solid_sprite, theme,
+    Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon, Key, Label,
+    NumericField, Panel, PinnedRowField, PointerEvent, PresentSync, Primitive, RenderError,
+    SelectionBox, Slider, Sprite, TextField, Texture, TextureAtlas, VideoTextures, Widget,
+    WidgetId, WindowHighlight, WindowTarget, edit_overlay, lock_indicator, marquee_visuals,
+    pin_indicator, pinned_row_id, rasterize, solid_sprite, theme,
 };
 use rst_video::VideoSource;
 use rst_win32::Win32Error;
@@ -74,7 +71,9 @@ use rst_win32::window_pin::{self as window_pin, WindowPins};
 use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker};
 use uuid::Uuid;
 
-use crate::{confirm_dialog, cursor_panel, preset_picker, toolbar, window_pick_list, window_picker};
+use crate::{
+    confirm_dialog, cursor_panel, preset_picker, toolbar, window_pick_list, window_picker,
+};
 
 /// Мост к `Device`/`WindowTarget` (M3 step 2 разделил `rst_render::Renderer`
 /// на процесс-wide устройство и цель на монитор, M3_PREP_NOTES.md §4.2).
@@ -128,7 +127,8 @@ impl Renderer<'_> {
         masks: &[Option<&Texture>],
         sync: PresentSync,
     ) -> Result<(), RenderError> {
-        self.device.draw_masked_with_sync(&*self.target, sprites, masks, sync)
+        self.device
+            .draw_masked_with_sync(&*self.target, sprites, masks, sync)
     }
 }
 
@@ -417,10 +417,7 @@ fn onboarding_notification(cfg: &Config) -> Option<(String, String)> {
         .edit_mode
         .as_deref()
         .unwrap_or(DEFAULT_EDIT_HOTKEY);
-    Some(crate::i18n::onboarding_notification(
-        &cfg.settings.language,
-        hotkey_text,
-    ))
+    Some(crate::i18n::onboarding_notification(hotkey_text))
 }
 
 /// Виртуальный код `VK_ESCAPE` (docs.microsoft.com/Virtual-Key-Codes) — выход
@@ -449,14 +446,59 @@ const VOLUME_KEY_STEP: f64 = 0.1;
 /// Глубина истории undo/redo — снимков `Config` (см. заметку о снимках выше).
 const UNDO_CAPACITY: usize = 100;
 
-/// Минимальный отступ от угла рамки выделения (DIP), с которого начинается
-/// зона поворота (фидбэк пользователя 2026-08-09, третий раунд): раньше
-/// зона поворота была кольцом вокруг угла (`ROTATE_RING_MAX_DIP=24`,
-/// срабатывало и ВНУТРИ рамки) — теперь поворот работает только СНАРУЖИ
-/// рамки, начиная с этого отступа от ближайшего угла, и тянется на
-/// бесконечную дистанцию (как в Photoshop — весь внешний периметр после
-/// выделения объекта отдан повороту, ресайз — только на самих ручках).
-const ROTATE_MIN_CORNER_GAP_DIP: f64 = 35.0;
+/// Длительность выезда/уезда панели редактирования (запрос пользователя
+/// 2026-08-23 — «чтобы менюшка плавно закрывалась и открывалась»). Короче
+/// стандартных 200 мс: панель ловят курсором и сразу тянутся к кнопке, а
+/// долгая анимация в таком месте читается как тормоз.
+const CURSOR_PANEL_SLIDE: Duration = Duration::from_millis(150);
+
+/// Шаг перерисовки во время выезда панели (~60 кадров в секунду).
+const CURSOR_PANEL_SLIDE_STEP: Duration = Duration::from_millis(16);
+
+/// Выезд панели редактирования: откуда, куда и когда начали. Значение —
+/// степень раскрытия `0..=1` (см. `cursor_panel::panel_center`).
+#[derive(Debug, Clone, Copy)]
+struct PanelSlide {
+    from: f64,
+    to: f64,
+    started: Instant,
+}
+
+impl PanelSlide {
+    /// Мгновенное значение без анимации.
+    fn fixed(value: f64) -> Self {
+        Self {
+            from: value,
+            to: value,
+            started: Instant::now(),
+        }
+    }
+
+    /// Доля пройденного времени, `0..=1`.
+    fn phase(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.started).as_secs_f64();
+        (elapsed / CURSOR_PANEL_SLIDE.as_secs_f64()).clamp(0.0, 1.0)
+    }
+
+    /// Текущая степень раскрытия. Замедление к концу (ease-out кубический):
+    /// панель выпрыгивает сразу и мягко останавливается — линейное движение
+    /// на таком коротком пути выглядит механическим.
+    fn value(&self, now: Instant) -> f64 {
+        let t = self.phase(now);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        self.from + (self.to - self.from) * eased
+    }
+
+    /// Анимация ещё идёт.
+    fn running(&self, now: Instant) -> bool {
+        self.from != self.to && self.phase(now) < 1.0
+    }
+
+    /// Когда нужен следующий кадр (пока анимация идёт).
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        self.running(now).then(|| now + CURSOR_PANEL_SLIDE_STEP)
+    }
+}
 
 /// Задержка перед показом тултипа кнопки — с момента, когда курсор навёлся
 /// (фидбэк пользователя 2026-08-10: «через 0.2 секунды после того как
@@ -740,7 +782,8 @@ struct BannerState {
 
 impl BannerState {
     fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        (now.saturating_duration_since(self.shown_at) < BANNER_DURATION).then(|| now + PIN_FLASH_STEP)
+        (now.saturating_duration_since(self.shown_at) < BANNER_DURATION)
+            .then(|| now + PIN_FLASH_STEP)
     }
 
     fn expired(&self, now: Instant) -> bool {
@@ -785,6 +828,12 @@ pub enum OverlayCommand {
     /// курсора, просто с другого источника (меню трея живёт вне оверлей-
     /// потока, `OverlayEvent` ему недоступен).
     ToggleAllStickers,
+    /// Прямоугольник видимого окна настроек в физических пикселях экрана
+    /// (`None` — окно скрыто). Оверлей режима редактирования вырезает его в
+    /// своём окне, иначе в настройки нельзя тыкнуть: оверлей растянут на
+    /// весь монитор и в режиме не кликопрозрачен (запрос пользователя
+    /// 2026-08-23).
+    SettingsWindowRect(Option<(i32, i32, i32, i32)>),
     /// Сохранить текущую расстановку стикеров как новый пресет (M7,
     /// SPEC.md §11) — снимок `cfg.stickers`, имя из настроек.
     SavePreset(String),
@@ -1339,6 +1388,15 @@ struct EditState {
     /// на этом мониторе — оба гарантированно принадлежат ровно одному окну
     /// на время жеста (мышь захвачена этим окном, M3_PREP_NOTES.md §3.4/3.5).
     cursor_monitor: MonitorId,
+    /// Курсор навёлся на свёрнутую панель редактирования (или всё ещё
+    /// держится на развёрнутой ею) — панель показана целиком, несмотря на
+    /// выделенный стикер. См. [`update_cursor_panel_hover`].
+    cursor_panel_hovered: bool,
+    /// Текущий выезд панели редактирования (см. [`PanelSlide`]).
+    cursor_panel_slide: PanelSlide,
+    /// Прямоугольник открытого окна настроек, физические пиксели экрана
+    /// (`None` — окно скрыто). См. [`apply_settings_hole`].
+    settings_rect: Option<(i32, i32, i32, i32)>,
     /// Канал запросов координатора к главному потоку Tauri (`BTN_SETTINGS`,
     /// docs/M2_WIRING_PLAN.md, раздел 12). Здесь, а не отдельным параметром
     /// `handle_cursor_panel_up`, — чтобы обработчики UI могли слать запрос
@@ -1447,6 +1505,10 @@ struct WindowPickerState {
 /// модальная панель открыта (единственный способ её закрыть — клик по
 /// строке или `Esc`, оба сразу же убирают `Some`).
 struct PresetPickerState {
+    /// Набранное имя нового пресета: панель пересобирается после каждого
+    /// действия (сохранил/удалил/импортировал), и без этого поле каждый раз
+    /// обнулялось бы.
+    name_draft: String,
     panel: Panel,
     /// Монитор, на котором рисуется панель (тот же, что у панели у
     /// курсора, — открыта её кнопкой), как у `ConfirmState`/`WindowPickerState`.
@@ -2024,7 +2086,10 @@ fn run(
         let startup_windows = rst_win32::window_enum::enumerate();
         let cleared = window_pins.clear_orphan_markers(&startup_windows);
         if cleared > 0 {
-            tracing::info!(cleared, "снял осиротевшие маркеры закрепления прошлого запуска");
+            tracing::info!(
+                cleared,
+                "снял осиротевшие маркеры закрепления прошлого запуска"
+            );
         }
     }
 
@@ -2205,6 +2270,9 @@ fn run(
     // Последний дедлайн, отправленный планировщику — чтобы не слать
     // одинаковое значение на каждой итерации цикла впустую.
     let mut last_anim_deadline: Option<Instant> = None;
+    // Вырез под окном настроек, применённый к окнам оверлея (см.
+    // `apply_settings_hole`) — чтобы не звать систему без изменений.
+    let mut applied_settings_hole: Option<(i32, i32, i32, i32)> = None;
     // Сессия Windows заблокирована (SPEC.md §9) — пока `true`, часы анимации
     // не тикают и планировщику не шлётся новый дедлайн: экран блокировки не
     // виден пользователю, анимировать нечего (тот же принцип, что «не
@@ -2276,6 +2344,9 @@ fn run(
         marquee_started: false,
         toolbar: None,
         cursor_panel: None,
+        cursor_panel_hovered: false,
+        cursor_panel_slide: PanelSlide::fixed(1.0),
+        settings_rect: None,
         tooltip: None,
         pointer_owner: PointerOwner::None,
         ui_pending_snapshot: None,
@@ -2754,6 +2825,11 @@ fn run(
                 }
             }
             OverlayMessage::Command(OverlayCommand::Shutdown) => break,
+            OverlayMessage::Command(OverlayCommand::SettingsWindowRect(rect)) => {
+                // Применяет вырез общий гейт ниже по циклу: он же ловит вход
+                // и выход из режима редактирования.
+                edit.settings_rect = rect;
+            }
             OverlayMessage::Event(monitor_id, OverlayEvent::ToggleEditMode) => {
                 let Some(ms) = monitors_map.get_mut(&monitor_id) else {
                     continue;
@@ -2936,8 +3012,7 @@ fn run(
                 // «режим редактирования», даже когда на самом деле не
                 // регистрировался toggle_all/mute_all).
                 tracing::warn!(?name, combo = %combo, "хоткей уже занят другим приложением");
-                let (title, body) =
-                    crate::i18n::hotkey_conflict_notification(&cfg.settings.language, name, &combo);
+                let (title, body) = crate::i18n::hotkey_conflict_notification(name, &combo);
                 let _ = edit
                     .coordinator_tx
                     .send(CoordinatorRequest::ShowNotification {
@@ -3347,6 +3422,15 @@ fn run(
                 }
             }
             OverlayMessage::Event(_, OverlayEvent::Key { .. }) => {}
+            OverlayMessage::Event(_, OverlayEvent::Char(ch)) if edit.active => {
+                // Набор текста в поля панелей (имя пресета, правила
+                // соседства): символ уже с раскладкой и регистром — см.
+                // `OverlayEvent::Char`.
+                if handle_char(&mut edit, ch) {
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::Event(_, OverlayEvent::Char(_)) => {}
             OverlayMessage::Event(monitor_id, OverlayEvent::Input(event)) if edit.active => {
                 let Some(ms) = monitors_map.get_mut(&monitor_id) else {
                     continue;
@@ -3414,8 +3498,11 @@ fn run(
                     // безусловный подъём означал бы z-order-войну с чужими
                     // topmost-приложениями.
                     if !edit.pinned_windows.is_empty() {
-                        let pinned: Vec<usize> =
-                            edit.pinned_windows.iter().map(|p| p.hwnd as usize).collect();
+                        let pinned: Vec<usize> = edit
+                            .pinned_windows
+                            .iter()
+                            .map(|p| p.hwnd as usize)
+                            .collect();
                         for state in monitors_map.values() {
                             state.overlay.raise_above_pinned(&pinned);
                         }
@@ -3491,11 +3578,7 @@ fn run(
                 }
                 // Баннер предупреждений (конфликт хоткея и т.п.) — тот же
                 // паттерн: жив — редрав нужен, истёк — вычищаем.
-                if edit
-                    .banner
-                    .as_ref()
-                    .is_some_and(|b| !b.expired(now))
-                {
+                if edit.banner.as_ref().is_some_and(|b| !b.expired(now)) {
                     need_redraw = true;
                 }
                 if edit.banner.as_ref().is_some_and(|b| b.expired(now)) {
@@ -3580,13 +3663,18 @@ fn run(
                     // декодера ограничена (2-3 кадра), декодер сам применит
                     // бэкпрешер по PTS. Звук эта пауза не трогает — его
                     // включение/выключение отдельная логика (mute_invisible).
-                    let should_tick = cfg
-                        .stickers
-                        .iter()
-                        .find(|s| s.id == *id)
-                        .is_some_and(|sticker| {
-                            sticker_should_tick(sticker, edit.active, &occluder_cache, &monitor_bounds)
-                        });
+                    let should_tick =
+                        cfg.stickers
+                            .iter()
+                            .find(|s| s.id == *id)
+                            .is_some_and(|sticker| {
+                                sticker_should_tick(
+                                    sticker,
+                                    edit.active,
+                                    &occluder_cache,
+                                    &monitor_bounds,
+                                )
+                            });
                     // Забираем ВСЕ готовые кадры, показываем последний.
                     //
                     // В норме кадр ровно один: декодер будит нас на каждый
@@ -3610,8 +3698,7 @@ fn run(
                             newest = Some(f);
                         }
                         if let Some(frame) = newest {
-                            if let Some((_, sprite)) =
-                                sprites.iter_mut().find(|(sid, _)| sid == id)
+                            if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| sid == id)
                             {
                                 if let Some(video) = &mut sprite.video {
                                     match device.update_video_textures_nv12(
@@ -3832,6 +3919,19 @@ fn run(
         if sync_video_timeline(&mut edit, &cfg, &videos, &monitor_bounds) {
             need_redraw = true;
         }
+        // Кадр выезда панели редактирования.
+        if sync_cursor_panel_slide(&mut edit, &cfg, &monitor_geometry) {
+            need_redraw = true;
+        }
+        // Вырез под окном настроек: пересчитываем по изменению состояния, а
+        // не каждый кадр — `SetWindowRgn` дёргает систему и заставляет её
+        // перерисовать окно.
+        let want_hole = edit.active.then_some(edit.settings_rect).flatten();
+        if want_hole != applied_settings_hole {
+            applied_settings_hole = want_hole;
+            apply_settings_hole(&monitors_map, &edit);
+        }
+        let next_cursor_panel_deadline = edit.cursor_panel_slide.next_deadline(Instant::now());
         // Вне режима редактирования оверлей кликопрозрачен — полоса не
         // получила бы ни одного клика. Снимаем прозрачность РОВНО на то
         // время, пока курсор над самой полосой (или пока ручку тащат):
@@ -3911,10 +4011,11 @@ fn run(
             next_flash_deadline,
             next_banner_deadline,
             next_pin_follow_deadline,
+            next_cursor_panel_deadline,
         ]
-            .into_iter()
-            .flatten()
-            .min();
+        .into_iter()
+        .flatten()
+        .min();
         if next_tick_deadline != last_anim_deadline {
             last_anim_deadline = next_tick_deadline;
             let _ = anim_deadline_tx.send(next_tick_deadline);
@@ -4116,6 +4217,15 @@ fn toggle_edit_mode(
     edit.active = !edit.active;
     overlay.set_click_through(!edit.active);
     if edit.active {
+        // Панель инструментов выезжает снизу, а не появляется рывком —
+        // тот же плавный вход, что и при возврате из свёрнутого состояния
+        // (запрос пользователя 2026-08-23).
+        edit.cursor_panel_hovered = false;
+        edit.cursor_panel_slide = PanelSlide {
+            from: 0.0,
+            to: 1.0,
+            started: Instant::now(),
+        };
         // Вход в режим редактирования: ВСЁ пиновое принуждение встаёт
         // (SPEC «Закрепление окна», пункт 5) — замки снимаются реально, но
         // флаги конфигурации не трогаются; поднятые z-order-окна
@@ -4477,9 +4587,7 @@ fn open_video(
 ) -> Result<VideoSource, rst_video::VideoError> {
     let d3d = device.d3d_device();
     match mixer {
-        Some(m) => {
-            VideoSource::open_with_audio_target_hw(path, m.sample_rate(), m.channels(), d3d)
-        }
+        Some(m) => VideoSource::open_with_audio_target_hw(path, m.sample_rate(), m.channels(), d3d),
         None => VideoSource::open_with_hw_device(path, d3d),
     }
 }
@@ -4812,10 +4920,32 @@ fn handle_key(
             false
         };
     }
-    // Панель быстрого переключения пресетов (M7) модальна для клавиатуры,
-    // как и модал подтверждения выше, — тем же паттерном (единственный
-    // выход — Esc, ничего не применяя).
+    // Панель пресетов модальна для клавиатуры, но сама несёт поле имени
+    // нового пресета — тот же приём, что у панели свойств закреплённого
+    // окна ниже: сперва отдаём клавишу панели (наберётся, если поле в
+    // фокусе), и только если она её не взяла, `Esc` закрывает панель.
     if edit.preset_picker.is_some() {
+        if let Some(key) = widget_text_key(vk, modifiers) {
+            let consumed = edit
+                .preset_picker
+                .as_mut()
+                .map(|s| s.panel.key_event(key).consumed)
+                .unwrap_or(false);
+            if consumed {
+                // Черновик имени живёт в состоянии панели: она
+                // пересобирается после каждого действия со списком.
+                if let Some(state) = &mut edit.preset_picker {
+                    if let Some(text) = state
+                        .panel
+                        .widget::<TextField>(preset_picker::FIELD_NAME)
+                        .map(|f| f.text().to_string())
+                    {
+                        state.name_draft = text;
+                    }
+                }
+                return true;
+            }
+        }
         return if vk == VK_ESCAPE {
             edit.preset_picker = None;
             true
@@ -4854,7 +4984,7 @@ fn handle_key(
     // саму панель (наберётся, если в фокусе поле), и только если она его не
     // взяла — `Esc` закрывает панель и снимает выделение окна.
     if edit.pinned_panel.is_some() {
-        if let Some(key) = widget_key(vk, modifiers) {
+        if let Some(key) = widget_text_key(vk, modifiers) {
             let consumed = edit
                 .pinned_panel
                 .as_mut()
@@ -5077,6 +5207,19 @@ fn handle_key(
 /// Перевод кода `WM_KEYDOWN` в клавишу для виджетов (числовое поле тулбара).
 /// `Ctrl`-комбинации сюда не доходят: `Ctrl+что-угодно` — хоткей ядра, а не
 /// ввод в поле (M2_UI_NOTES §9), поэтому при `modifiers.ctrl` всегда `None`.
+/// Клавиша для ТЕКСТОВОГО поля: только управляющие.
+///
+/// Символы (в том числе цифры) приходят отдельно, из `WM_CHAR`
+/// ([`OverlayEvent::Char`]) — они уже с раскладкой и регистром. Если отдать
+/// сюда ещё и `Key::Digit`, цифра попадёт в поле ДВАЖДЫ: один раз отсюда,
+/// второй — символом (репорт пользователя 2026-08-24 про дублирование).
+fn widget_text_key(vk: u32, modifiers: Modifiers) -> Option<Key> {
+    match widget_key(vk, modifiers) {
+        Some(Key::Digit(_)) | Some(Key::Char(_)) => None,
+        other => other,
+    }
+}
+
 fn widget_key(vk: u32, modifiers: Modifiers) -> Option<Key> {
     if modifiers.ctrl {
         return None;
@@ -5090,6 +5233,43 @@ fn widget_key(vk: u32, modifiers: Modifiers) -> Option<Key> {
         VK_RIGHT => Some(Key::ArrowRight),
         _ => None,
     }
+}
+
+/// Отдать введённый символ сфокусированному текстовому полю открытой
+/// панели. Порядок — тот же, что у клавиш в [`handle_key`]: панель пресетов,
+/// затем панель свойств закреплённого окна. Возвращает `true`, если символ
+/// кто-то принял (нужна перерисовка).
+///
+/// Числовое поле тулбара сюда не входит: оно принимает только цифры, а те
+/// приходят отдельным путём (`Key::Digit`) — символ ему не нужен.
+fn handle_char(edit: &mut EditState, ch: char) -> bool {
+    if edit.preset_picker.is_some() {
+        let consumed = edit
+            .preset_picker
+            .as_mut()
+            .map(|s| s.panel.key_event(Key::Char(ch)).consumed)
+            .unwrap_or(false);
+        if consumed {
+            if let Some(state) = &mut edit.preset_picker {
+                if let Some(text) = state
+                    .panel
+                    .widget::<TextField>(preset_picker::FIELD_NAME)
+                    .map(|f| f.text().to_string())
+                {
+                    state.name_draft = text;
+                }
+            }
+        }
+        return consumed;
+    }
+    if edit.pinned_panel.is_some() {
+        return edit
+            .pinned_panel
+            .as_mut()
+            .map(|s| s.panel.key_event(Key::Char(ch)).consumed)
+            .unwrap_or(false);
+    }
+    false
 }
 
 /// `Ctrl+V`: вставить изображение из буфера обмена как новый стикер
@@ -5240,38 +5420,34 @@ fn corner_local_angle_deg(corner: CoreCorner) -> f64 {
 }
 
 /// Угол курсора поворота (градусы, целые — кэшируется по этому значению в
-/// `rst-win32`): направление к БЛИЖАЙШЕМУ (по расстоянию до ручки) углу
-/// рамки, повёрнутое вместе со стикером (фидбэк пользователя 2026-08-09,
-/// третий раунд — «бери положение угла картинки в пространстве», а не
-/// фиксированную константу на 4 угла: если стикер уже повёрнут, его углы
-/// физически не там, где были бы у неповёрнутого прямоугольника). Изгиб
-/// дуги курсора при этом смотрит туда же, куда «выпирает» реальный угол.
-fn nearest_corner_cursor_angle_deg(sbox: &SelectionBox, rotation: f64, dip_x: f64, dip_y: f64) -> i32 {
-    let nearest = CoreCorner::ALL
-        .into_iter()
-        .min_by(|a, b| {
-            let da = {
-                let (hx, hy) = sbox.handle_center(a.handle());
-                (dip_x - hx).hypot(dip_y - hy)
-            };
-            let db = {
-                let (hx, hy) = sbox.handle_center(b.handle());
-                (dip_x - hx).hypot(dip_y - hy)
-            };
-            da.total_cmp(&db)
-        })
-        .expect("CoreCorner::ALL непусто");
-    (corner_local_angle_deg(nearest) + rotation.to_degrees()).round() as i32
+/// `rst-win32`) для ручки на углу `corner`: направление от центра к этому
+/// углу, повёрнутое вместе со стикером. Изгиб дуги курсора смотрит туда же,
+/// куда «выпирает» реальный угол (фидбэк пользователя 2026-08-09, третий
+/// раунд — «бери положение угла картинки в пространстве»).
+fn rotate_cursor_angle_deg(corner: CoreCorner, rotation: f64) -> i32 {
+    (corner_local_angle_deg(corner) + rotation.to_degrees()).round() as i32
+}
+
+/// Угол рамки, за который отвечает ручка `kind`; `None` — не угловая ручка.
+fn corner_of_handle(kind: HandleKind) -> Option<CoreCorner> {
+    match kind {
+        HandleKind::NorthWest => Some(CoreCorner::NorthWest),
+        HandleKind::NorthEast => Some(CoreCorner::NorthEast),
+        HandleKind::SouthEast => Some(CoreCorner::SouthEast),
+        HandleKind::SouthWest => Some(CoreCorner::SouthWest),
+        _ => None,
+    }
 }
 
 /// Разрешить зону под курсором (docs/M2_INTEGRATION_PLAN.md, раздел 7):
-/// порядок проверки — обратный порядку отрисовки. Ручки — на самих себе;
-/// поворот — СНАРУЖИ рамки на расстоянии от ближайшего угла не меньше
-/// `ROTATE_MIN_CORNER_GAP_DIP`, без верхнего предела (весь внешний
-/// периметр, как в Photoshop — фидбэк пользователя 2026-08-09, третий
-/// раунд: старое кольцо вокруг угла срабатывало и ВНУТРИ рамки, и было
-/// ограничено дистанцией). Ручки/поворот доступны только для одиночного
-/// выделения (мультивыделение — следующий срез).
+/// порядок проверки — обратный порядку отрисовки. Ресайз — на квадратных
+/// ручках рамки; поворот — на четырёх ручках-стрелках за углами рамки
+/// ([`SelectionBox::rotate_handle_rects`], запрос пользователя 2026-08-23).
+/// Всё остальное снаружи рамки — обычный фон: клик там снимает выделение,
+/// как и просил пользователь. До 2026-08-23 повороту был отдан ВЕСЬ внешний
+/// периметр без верхнего предела расстояния, и снять выделение кликом по
+/// пустому месту было невозможно вовсе. Ручки/поворот доступны только для
+/// одиночного выделения (мультивыделение — следующий срез).
 fn resolve_zone(
     cfg: &Config,
     selection: &SelectionSet,
@@ -5293,36 +5469,36 @@ fn resolve_zone(
                     return Zone::ResizeHandle(*id, kind);
                 }
             }
+            // Ручки поворота — за углами рамки, снаружи; проверяются после
+            // ручек ресайза (те лежат на самой рамке и не пересекаются с
+            // ними), но раньше тела: тело до них не достаёт.
+            for (kind, rect) in sbox.rotate_handle_rects(
+                rst_render::ROTATE_HANDLE_SIZE_DIP,
+                rst_render::ROTATE_HANDLE_GAP_DIP,
+            ) {
+                // Квадрат ручки повёрнут вместе с рамкой — хит-тест
+                // обратной аффинной математикой, не осевым сравнением.
+                if rst_render::box_contains(&rect, (dip_x, dip_y)) {
+                    if let Some(corner) = corner_of_handle(kind) {
+                        let angle = rotate_cursor_angle_deg(corner, sticker.transform.rotation);
+                        return Zone::Rotate(*id, angle);
+                    }
+                }
+            }
             let inside = hittest::contains(&sticker.placement, &sticker.transform, dip_x, dip_y);
             if inside {
                 return Zone::StickerBody(*id);
             }
-            // Клик снаружи рамки выделенного стикера может лежать на ДРУГОМ
-            // стикере — переключение выделения важнее зоны поворота: она
-            // безгранична наружу (см. ниже), поэтому без этой проверки ни
-            // один другой стикер на экране вообще не кликабелен, пока
-            // текущий выделен (баг из репорта пользователя: «выбрал стикер —
-            // не могу выбрать другой», 2026-08-10).
+            // Клик снаружи рамки может лежать на ДРУГОМ стикере —
+            // переключение выделения (баг из репорта пользователя: «выбрал
+            // стикер — не могу выбрать другой», 2026-08-10).
             if let Some(other_id) = hit_sticker_at(cfg, monitor_id, dip_x, dip_y) {
                 if other_id != *id {
                     return Zone::StickerBody(other_id);
                 }
             }
-            let nearest_corner_dist = CoreCorner::ALL
-                .into_iter()
-                .map(|corner| {
-                    let (hx, hy) = sbox.handle_center(corner.handle());
-                    (dip_x - hx).hypot(dip_y - hy)
-                })
-                .fold(f64::INFINITY, f64::min);
-            if nearest_corner_dist >= ROTATE_MIN_CORNER_GAP_DIP {
-                let angle =
-                    nearest_corner_cursor_angle_deg(&sbox, sticker.transform.rotation, dip_x, dip_y);
-                return Zone::Rotate(*id, angle);
-            }
-            // Снаружи, но ближе ROTATE_MIN_CORNER_GAP_DIP к углу и не на
-            // самой ручке — узкий буфер вокруг ручки, ни ресайз, ни поворот
-            // (та же логика, что «дырка» между зонами в Photoshop).
+            // Пустое место — фон: клик по нему снимает выделение
+            // (`Gesture::Marquee` без протяжки, см. `MouseUp`).
             return Zone::Background;
         }
     }
@@ -5441,15 +5617,15 @@ fn cursor_shape_for_zone(zone: &Zone) -> CursorShape {
 /// не кнопки).
 fn toolbar_tooltip_text(id: WidgetId) -> Option<&'static str> {
     match id {
-        toolbar::TB_LAYERS => Some("Слои видимости"),
-        toolbar::TB_EYE => Some("Показать/скрыть"),
-        toolbar::TB_ORDER_UP => Some("Переместить выше"),
-        toolbar::TB_ORDER_DOWN => Some("Переместить ниже"),
-        toolbar::TB_DUPLICATE => Some("Дублировать"),
-        toolbar::TB_RESET_SCALE => Some("Сбросить масштаб"),
-        toolbar::TB_DELETE => Some("Удалить"),
-        toolbar::TB_PLAY_PAUSE => Some("Играть/пауза"),
-        toolbar::TB_TIMELINE => Some("Полоса перемотки вне режима редактирования"),
+        toolbar::TB_LAYERS => Some("Visibility layers"),
+        toolbar::TB_EYE => Some("Show/hide"),
+        toolbar::TB_ORDER_UP => Some("Bring forward"),
+        toolbar::TB_ORDER_DOWN => Some("Send backward"),
+        toolbar::TB_DUPLICATE => Some("Duplicate"),
+        toolbar::TB_RESET_SCALE => Some("Reset scale"),
+        toolbar::TB_DELETE => Some("Delete"),
+        toolbar::TB_PLAY_PAUSE => Some("Play/pause"),
+        toolbar::TB_TIMELINE => Some("Timeline outside edit mode"),
         _ => None,
     }
 }
@@ -5457,12 +5633,12 @@ fn toolbar_tooltip_text(id: WidgetId) -> Option<&'static str> {
 /// Текст тултипа кнопки панели у курсора (фидбэк пользователя 2026-08-10).
 fn cursor_panel_tooltip_text(id: WidgetId) -> Option<&'static str> {
     match id {
-        cursor_panel::BTN_LOAD_FILE => Some("Загрузить файл"),
-        cursor_panel::BTN_ADD_WINDOW => Some("Закрепить окно"),
-        cursor_panel::BTN_PRESETS => Some("Пресеты"),
-        cursor_panel::BTN_TOGGLE_ALL => Some("Показать/скрыть все стикеры"),
-        cursor_panel::BTN_SETTINGS => Some("Настройки"),
-        cursor_panel::BTN_EXIT => Some("Выйти из режима редактирования"),
+        cursor_panel::BTN_LOAD_FILE => Some("Load file"),
+        cursor_panel::BTN_ADD_WINDOW => Some("Pin a window"),
+        cursor_panel::BTN_PRESETS => Some("Presets"),
+        cursor_panel::BTN_TOGGLE_ALL => Some("Show/hide all stickers"),
+        cursor_panel::BTN_SETTINGS => Some("Settings"),
+        cursor_panel::BTN_EXIT => Some("Leave edit mode"),
         _ => None,
     }
 }
@@ -5475,14 +5651,14 @@ fn cursor_panel_tooltip_text(id: WidgetId) -> Option<&'static str> {
 /// плейсхолдеров в `build_pinned_panel`).
 fn pinned_panel_tooltip_text(id: WidgetId) -> Option<&'static str> {
     match id {
-        rst_render::PINNED_CHECK_MOVE_LOCK => Some("Заблокировать перемещение окна"),
-        rst_render::PINNED_CHECK_INTERACT_LOCK => Some("Заблокировать ввод в окно"),
-        rst_render::PINNED_BTN_UNPIN => Some("Открепить окно"),
-        rst_render::PINNED_BTN_ADD_RULE => Some("Добавить правило соседства"),
+        rst_render::PINNED_CHECK_MOVE_LOCK => Some("Lock the window in place"),
+        rst_render::PINNED_CHECK_INTERACT_LOCK => Some("Block input to the window"),
+        rst_render::PINNED_BTN_UNPIN => Some("Unpin the window"),
+        rst_render::PINNED_BTN_ADD_RULE => Some("Add a neighbour rule"),
         _ => match rst_render::decode_pinned_row_id(id) {
-            Some((_, PinnedRowField::Remove)) => Some("Удалить правило"),
-            Some((_, PinnedRowField::ProcessName)) => Some("Имя процесса окна-соседа"),
-            Some((_, PinnedRowField::TitlePattern)) => Some("Маска заголовка окна-соседа"),
+            Some((_, PinnedRowField::Remove)) => Some("Remove the rule"),
+            Some((_, PinnedRowField::ProcessName)) => Some("Neighbour window process name"),
+            Some((_, PinnedRowField::TitlePattern)) => Some("Neighbour window title pattern"),
             None => None,
         },
     }
@@ -5516,34 +5692,24 @@ fn tooltip_primitives(tooltip: &TooltipState, screen_h: f64, opacity: f64) -> Ve
         h: box_h,
         rotation: 0.0,
     };
-    vec![
-        Primitive::Fill {
-            rect: frame,
-            color: theme::PANEL_BORDER,
-            opacity: theme::PANEL_BG_OPACITY * opacity,
+    // Подсказка принадлежит кнопке тулбара — и выглядит так же, как он
+    // сам: серая модалка настроек с объёмной рамкой (запрос пользователя
+    // 2026-08-23), а не тёмная плашка старой схемы.
+    let mut out = Vec::new();
+    rst_render::settings_frame(&mut out, frame, opacity);
+    out.push(Primitive::Text {
+        rect: Box2D {
+            cx,
+            cy,
+            w: text_w,
+            h: text_h,
+            rotation: 0.0,
         },
-        Primitive::Fill {
-            rect: Box2D {
-                w: (frame.w - 2.0).max(0.0),
-                h: (frame.h - 2.0).max(0.0),
-                ..frame
-            },
-            color: theme::PANEL_BG,
-            opacity: theme::PANEL_BG_OPACITY * opacity,
-        },
-        Primitive::Text {
-            rect: Box2D {
-                cx,
-                cy,
-                w: text_w,
-                h: text_h,
-                rotation: 0.0,
-            },
-            text: tooltip.text.to_string(),
-            color: theme::TEXT,
-            opacity,
-        },
-    ]
+        text: tooltip.text.to_string(),
+        color: theme::settings::TEXT,
+        opacity,
+    });
+    out
 }
 
 /// Записать `placement`/`transform` и в модель (`cfg.stickers`), и в спрайт
@@ -5801,7 +5967,6 @@ fn window_rect_to_core(r: &WindowRect) -> Option<Rect> {
         h: r.h as u32,
     })
 }
-
 
 /// Радиус скругления маски перекрытия, физические px — должен совпадать с
 /// радиусом в `mainMaskPS` (`crates/rst-render/src/shader.rs`). Дублируется
@@ -6184,15 +6349,7 @@ fn monitor_dip_at(
     monitor_bounds.iter().find_map(|(id, b)| {
         let r = b.bounds_px;
         let inside = x >= r.x && y >= r.y && x < r.x + r.w as i32 && y < r.y + r.h as i32;
-        inside.then(|| {
-            (
-                id,
-                (
-                    (x - r.x) as f64 / b.scale,
-                    (y - r.y) as f64 / b.scale,
-                ),
-            )
-        })
+        inside.then(|| (id, ((x - r.x) as f64 / b.scale, (y - r.y) as f64 / b.scale)))
     })
 }
 
@@ -6353,7 +6510,10 @@ fn timeline_pointer_down(edit: &mut EditState, monitor_id: &MonitorId, pos: (f64
     if state.monitor_id != *monitor_id {
         return false;
     }
-    state.panel.pointer_event(PointerEvent::Down { pos }).consumed
+    state
+        .panel
+        .pointer_event(PointerEvent::Down { pos })
+        .consumed
 }
 
 /// Протяжка по полосе: отдать событие виджету и выполнить перемотку, если
@@ -6449,22 +6609,158 @@ fn handle_timeline_hover_input(
     }
 }
 
-/// Пересобрать панель у курсора (раздел 4): есть, пока режим активен, на
-/// позиции `edit.cursor_pos`. Пересобирается (не `translate`) на каждом
-/// вызове — упрощение этого среза: `translate`-оптимизация из плана бережёт
-/// hover при движении мыши поверх самой панели, здесь это не реализовано
-/// (известный компромисс, а не забытый шаг).
+/// Вырезать (или вернуть) прямоугольник окна настроек во всех окнах
+/// оверлея.
+///
+/// Вырез нужен ТОЛЬКО в режиме редактирования: вне его оверлей и так
+/// кликопрозрачен, а дыра лишь съедала бы стикеры под окном настроек. Вызов
+/// идемпотентен — зовём при каждом изменении прямоугольника и на каждом
+/// переключении режима.
+fn apply_settings_hole(monitors: &HashMap<MonitorId, MonitorState>, edit: &EditState) {
+    let hole = edit.active.then_some(edit.settings_rect).flatten();
+    for state in monitors.values() {
+        state.overlay.set_hole(hole);
+    }
+}
+
+/// Панель редактирования сейчас свёрнута в полоску: что-то выделено (и её
+/// место внизу экрана нужнее под работу со стикером), а курсор на неё не
+/// наведён (запрос пользователя 2026-08-23).
+fn cursor_panel_collapsed(edit: &EditState) -> bool {
+    let selected = !edit.selection.ids().is_empty() || edit.pinned_selection.is_some();
+    selected && !edit.cursor_panel_hovered
+}
+
+/// Пересобрать панель редактирования (раздел 4): есть, пока режим активен;
+/// прижата к низу центра экрана, свёрнута — если [`cursor_panel_collapsed`].
+/// Пересобирается (не `translate`) на каждом вызове — упрощение этого среза:
+/// `translate`-оптимизация из плана бережёт hover при движении мыши поверх
+/// самой панели, здесь это не реализовано (известный компромисс, а не
+/// забытый шаг).
 fn rebuild_cursor_panel(edit: &mut EditState, cfg: &Config, screen: &DipRect) {
     if !edit.active {
         edit.cursor_panel = None;
         return;
     }
+    let now = Instant::now();
+    // Цель выезда задаётся здесь, в единственной точке сборки панели: любая
+    // причина пересборки (сменилось выделение, курсор нашёл полоску,
+    // переключили видимость) сама подхватывает нужное направление.
+    let target = if cursor_panel_collapsed(edit) {
+        0.0
+    } else {
+        1.0
+    };
+    if edit.cursor_panel_slide.to != target {
+        edit.cursor_panel_slide = PanelSlide {
+            from: edit.cursor_panel_slide.value(now),
+            to: target,
+            started: now,
+        };
+    }
     let all_visible = cfg.stickers.iter().all(|s| s.visible);
-    edit.cursor_panel = Some(cursor_panel::build_cursor_panel(
-        edit.cursor_pos,
-        screen,
-        all_visible,
-    ));
+    let progress = edit.cursor_panel_slide.value(now);
+    let mut panel = cursor_panel::build_cursor_panel(screen, all_visible, progress);
+    // Пересборка теряет hover-состояние кнопок (панель — новый объект), а во
+    // время выезда она пересобирается каждый кадр: без этого кнопка под
+    // неподвижным курсором не подсвечивалась бы, пока мышь не дёрнут.
+    panel.pointer_event(PointerEvent::Move {
+        pos: edit.cursor_pos,
+    });
+    edit.cursor_panel = Some(panel);
+}
+
+/// Продвинуть анимацию панели редактирования: пересобрать её на текущем
+/// кадре, пока выезд идёт. Возвращает `true`, если нужна перерисовка.
+fn sync_cursor_panel_slide(
+    edit: &mut EditState,
+    cfg: &Config,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) -> bool {
+    let now = Instant::now();
+    let slide = edit.cursor_panel_slide;
+    if !edit.active || slide.from == slide.to {
+        return false;
+    }
+    if !slide.running(now) {
+        // Последний кадр: зафиксировать конечное значение ровно, иначе
+        // панель осталась бы стоять на 0.98 от хода — предыдущая пересборка
+        // случилась чуть раньше конца анимации.
+        edit.cursor_panel_slide = PanelSlide::fixed(slide.to);
+    }
+    let Some(&(w, h, scale)) = monitor_geometry.get(&edit.cursor_monitor) else {
+        return false;
+    };
+    let screen = screen_dip_rect((w, h), scale);
+    rebuild_cursor_panel(edit, cfg, &screen);
+    true
+}
+
+/// Курсор всё ещё удерживает панель редактирования развёрнутой?
+///
+/// Зона удержания — ОБЪЕДИНЕНИЕ рамки развёрнутой панели с запасом и той же
+/// полоски, что панель разворачивает. Иначе получается автоколебание, и
+/// ровно на него пожаловался пользователь: полоска живёт в нижних
+/// `PEEK_DIP + HOVER_MARGIN` DIP экрана, а низ развёрнутой панели — на
+/// `BOTTOM_MARGIN - HOVER_MARGIN` от края, то есть ВЫШЕ полоски. Курсор,
+/// подведённый к самому краю экрана, попадал в полоску (панель
+/// разворачивалась), но не попадал в рамку (панель тут же сворачивалась) —
+/// и так по кругу на каждом движении мыши.
+///
+/// Правило простое и его стоит держать: множество «развернуть» обязано быть
+/// подмножеством множества «держать развёрнутой» (проверяется тестом
+/// `panel_open_zone_contains_the_trigger_zone`).
+fn cursor_keeps_panel_open(screen: &DipRect, dip: (f64, f64)) -> bool {
+    let (cx, cy) = cursor_panel::panel_center(screen, 1.0);
+    let (pw, ph) = cursor_panel::CURSOR_PANEL_SIZE;
+    let margin = cursor_panel::HOVER_MARGIN_DIP;
+    let frame = Box2D {
+        cx,
+        cy,
+        w: pw + 2.0 * margin,
+        h: ph + 2.0 * margin,
+        rotation: 0.0,
+    };
+    rst_render::box_contains(&frame, dip)
+        || rst_render::box_contains(&cursor_panel::peek_hot_zone(screen), dip)
+}
+
+/// Пересчитать наведение на панель редактирования по позиции курсора и, если
+/// оно изменилось, пересобрать панель. Возвращает `true`, если нужна
+/// перерисовка.
+///
+/// Свёрнутая панель ловит курсор полоской у самого края
+/// ([`cursor_panel::peek_hot_zone`]); развёрнутая держится, пока курсор в её
+/// рамке с небольшим запасом — иначе панель дёргалась бы на каждом пикселе
+/// у собственной границы.
+fn update_cursor_panel_hover(
+    edit: &mut EditState,
+    cfg: &Config,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    dip: (f64, f64),
+) -> bool {
+    if !edit.active {
+        return false;
+    }
+    let Some(&(w, h, scale)) = monitor_geometry.get(&edit.cursor_monitor) else {
+        return false;
+    };
+    let screen = screen_dip_rect((w, h), scale);
+    let selected = !edit.selection.ids().is_empty() || edit.pinned_selection.is_some();
+    let hovered = if !selected {
+        // Сворачиваться нечему — флаг не должен «залипнуть» на потом.
+        false
+    } else if edit.cursor_panel_hovered {
+        cursor_keeps_panel_open(&screen, dip)
+    } else {
+        rst_render::box_contains(&cursor_panel::peek_hot_zone(&screen), dip)
+    };
+    if hovered == edit.cursor_panel_hovered {
+        return false;
+    }
+    edit.cursor_panel_hovered = hovered;
+    rebuild_cursor_panel(edit, cfg, &screen);
+    true
 }
 
 /// Пересобрать и тулбар, и панель у курсора вместе — единая точка вызова
@@ -6783,7 +7079,11 @@ fn pinned_panel_catch_up(
     if monitor_id != state.monitor_id {
         return None; // окно переехало на другой монитор — ждём пересборки
     }
-    let want = pinned_panel_frame(&placement, monitor_bounds.get(&monitor_id)?, state.host_rules);
+    let want = pinned_panel_frame(
+        &placement,
+        monitor_bounds.get(&monitor_id)?,
+        state.host_rules,
+    );
     let have = state.panel.frame();
     let (dx, dy) = (want.cx - have.cx, want.cy - have.cy);
     (dx.abs() >= 0.5 || dy.abs() >= 0.5).then_some((dx, dy))
@@ -6941,12 +7241,8 @@ fn enforce_pinned_geometry(
             live.w as f64,
             live.h as f64,
         );
-        let (max_w, max_h) = pinned_window::clamp_to_monitor_max(
-            target.w(),
-            target.h(),
-            monitor.w(),
-            monitor.h(),
-        );
+        let (max_w, max_h) =
+            pinned_window::clamp_to_monitor_max(target.w(), target.h(), monitor.w(), monitor.h());
         if max_w != target.w() || max_h != target.h() {
             target = pinned_window::PxRect::from_xywh(target.left, target.top, max_w, max_h);
         }
@@ -6995,7 +7291,8 @@ fn enforce_pinned_geometry(
             },
         );
     }
-    edit.pinned_last_rects.retain(|hwnd, _| alive.contains(hwnd));
+    edit.pinned_last_rects
+        .retain(|hwnd, _| alive.contains(hwnd));
     edit.pinned_unmaximized_at
         .retain(|hwnd, _| alive.contains(hwnd));
 }
@@ -7167,7 +7464,9 @@ fn handle_window_picker_up(
             .iter_mut()
             .find(|s| s.id == sticker_id)
             .expect("наличие стикера проверено выше");
-        if let Some(new_rule) = window_picker::toggle_process_group(&sticker.visibility, group, window_snapshot) {
+        if let Some(new_rule) =
+            window_picker::toggle_process_group(&sticker.visibility, group, window_snapshot)
+        {
             sticker.visibility = new_rule;
         }
         if let Err(e) = config::save(cfg, config_path) {
@@ -7208,8 +7507,40 @@ fn open_preset_picker(
         rotation: 0.0,
     };
     edit.preset_picker = Some(PresetPickerState {
-        panel: preset_picker::build(&cfg.presets, frame),
+        panel: preset_picker::build(&cfg.presets, "", frame),
         monitor_id: monitor_id.clone(),
+        name_draft: String::new(),
+    });
+}
+
+/// Пересобрать открытую панель пресетов, сохранив набранное имя и монитор.
+/// Зовётся после каждого действия внутри панели: список меняется, панель
+/// остаётся открытой.
+fn rebuild_preset_picker(
+    edit: &mut EditState,
+    cfg: &Config,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) {
+    let Some(state) = &edit.preset_picker else {
+        return;
+    };
+    let Some(&(w, h, scale)) = monitor_geometry.get(&state.monitor_id) else {
+        return;
+    };
+    let screen = screen_dip_rect((w, h), scale);
+    let frame = Box2D {
+        cx: screen.w / 2.0,
+        cy: screen.h / 2.0,
+        w: preset_picker::WIDTH,
+        h: preset_picker::height(cfg.presets.len()),
+        rotation: 0.0,
+    };
+    let draft = state.name_draft.clone();
+    let monitor_id = state.monitor_id.clone();
+    edit.preset_picker = Some(PresetPickerState {
+        panel: preset_picker::build(&cfg.presets, &draft, frame),
+        monitor_id,
+        name_draft: draft,
     });
 }
 
@@ -7241,28 +7572,104 @@ fn handle_preset_picker_up(
         return true;
     };
     picker.panel.pointer_event(PointerEvent::Up { pos });
-    let clicked_id = cfg.presets.iter().enumerate().find_map(|(i, preset)| {
-        edit.preset_picker
-            .as_mut()
-            .and_then(|s| {
-                s.panel
-                    .widget_mut::<Button>(preset_picker::ROW_BASE + i as WidgetId)
-            })
-            .is_some_and(Button::take_click)
-            .then_some(preset.id)
+    let visible = cfg.presets.len().min(preset_picker::VISIBLE_ROWS);
+
+    // Закрыть — единственное действие, после которого панель уходит.
+    if take_panel_click(picker, preset_picker::BTN_CLOSE) {
+        edit.preset_picker = None;
+        return true;
+    }
+
+    // Удалить пресет: строка исчезает, панель остаётся.
+    let delete_id = (0..visible).find_map(|i| {
+        take_panel_click(picker, preset_picker::DELETE_BASE + i as WidgetId)
+            .then(|| cfg.presets[i].id)
     });
-    edit.preset_picker = None;
-    let Some(id) = clicked_id else {
+    if let Some(id) = delete_id {
+        if let Err(e) = presets::delete_preset(cfg, id) {
+            tracing::warn!(preset = %id, error = %e, "не удалось удалить пресет из панели");
+        }
+        save_after_preset_change(cfg, config_path, "удаления пресета из панели");
+        notify_presets_changed(cfg, &edit.coordinator_tx);
+        rebuild_preset_picker(edit, cfg, monitor_geometry);
+        return true;
+    }
+
+    // Сохранить текущую расстановку. Имя — из поля; пустое поле не повод
+    // отказывать: подставляем «Preset N», как это делают редакторы.
+    if take_panel_click(picker, preset_picker::BTN_SAVE) {
+        // Имя — из черновика, а не из поля: клик по кнопке снимает с поля
+        // фокус, и до этого места поле доходило уже пустым (репорт
+        // пользователя 2026-08-24 — «сохранился как Preset 1»). Черновик
+        // обновляется на каждый введённый символ.
+        let typed = picker.name_draft.trim().to_string();
+        let name = if typed.is_empty() {
+            format!("Preset {}", cfg.presets.len() + 1)
+        } else {
+            typed
+        };
+        let preset = presets::save_preset(cfg, name);
+        cfg.presets.push(preset);
+        save_after_preset_change(cfg, config_path, "сохранения пресета из панели");
+        notify_presets_changed(cfg, &edit.coordinator_tx);
+        if let Some(state) = &mut edit.preset_picker {
+            state.name_draft.clear();
+        }
+        rebuild_preset_picker(edit, cfg, monitor_geometry);
+        return true;
+    }
+
+    // Импорт из файла: тот же системный диалог, что у добавления стикера,
+    // только с фильтром `*.json`.
+    if take_panel_click(picker, preset_picker::BTN_IMPORT) {
+        match rst_win32::file_dialog::pick_preset_file(HWND::default()) {
+            Ok(Some(path)) => match presets::import_preset_from_file(cfg, &path) {
+                Ok(preset) => {
+                    tracing::info!(preset = %preset.id, "пресет импортирован из панели");
+                    save_after_preset_change(cfg, config_path, "импорта пресета из панели");
+                    notify_presets_changed(cfg, &edit.coordinator_tx);
+                }
+                Err(e) => {
+                    tracing::warn!(?path, error = %e, "не удалось импортировать пресет из панели");
+                    let _ = edit
+                        .coordinator_tx
+                        .send(CoordinatorRequest::ShowNotification {
+                            title: "Preset not imported".to_string(),
+                            body: format!("{path:?} is not a valid preset file."),
+                        });
+                }
+            },
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "диалог выбора файла пресета не открылся"),
+        }
+        rebuild_preset_picker(edit, cfg, monitor_geometry);
+        return true;
+    }
+
+    // Применить пресет — клик по строке с именем.
+    let apply_id = (0..visible).find_map(|i| {
+        take_panel_click(picker, preset_picker::ROW_BASE + i as WidgetId).then(|| cfg.presets[i].id)
+    });
+    // Набранное имя переживает пересборку панели.
+    if let Some(text) = picker
+        .panel
+        .widget::<TextField>(preset_picker::FIELD_NAME)
+        .map(|f| f.text().to_string())
+    {
+        picker.name_draft = text;
+    }
+    let Some(id) = apply_id else {
+        // Ни одно действие не сработало — клик по пустому месту панели или
+        // по полю ввода: панель модальная и остаётся открытой.
         return true;
     };
     match presets::apply_preset(cfg, id) {
         Ok(outcome) => {
             edit.selection.clear();
             resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
-            if let Err(e) = config::save(cfg, config_path) {
-                tracing::warn!(error = %e, "не удалось сохранить config.json после применения пресета из панели у курсора");
-            }
+            save_after_preset_change(cfg, config_path, "применения пресета из панели");
             *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
+            edit.preset_picker = None;
             rebuild_ui_panels(edit, cfg, monitor_geometry);
             if !outcome.missing.is_empty() {
                 let _ = edit
@@ -7271,10 +7678,25 @@ fn handle_preset_picker_up(
             }
         }
         Err(e) => {
-            tracing::warn!(preset = %id, error = %e, "не удалось применить пресет из панели у курсора")
+            tracing::warn!(preset = %id, error = %e, "не удалось применить пресет из панели")
         }
     }
     true
+}
+
+/// Опросить клик кнопки панели пресетов по идентификатору.
+fn take_panel_click(state: &mut PresetPickerState, id: WidgetId) -> bool {
+    state
+        .panel
+        .widget_mut::<Button>(id)
+        .is_some_and(Button::take_click)
+}
+
+/// Сохранить конфиг после изменения списка пресетов, залогировав отказ.
+fn save_after_preset_change(cfg: &Config, config_path: &Path, what: &str) {
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, what, "не удалось сохранить config.json");
+    }
 }
 
 /// Закрепить окно `hwnd` из списка выбора (редизайн пинов, SPEC.md
@@ -7320,11 +7742,17 @@ fn pin_window(
         return false;
     };
     if edit.pinned_windows.iter().any(|p| p.hwnd == hwnd as isize) {
-        tracing::warn!(hwnd, "окно уже в списке закреплённых — повторный пин пропущен");
+        tracing::warn!(
+            hwnd,
+            "окно уже в списке закреплённых — повторный пин пропущен"
+        );
         return false;
     }
     let Some(monitor_id) = monitor_for_window_rect(&win.rect, monitor_bounds) else {
-        tracing::warn!(hwnd, "окно вне известной геометрии мониторов — закрепление пропущено");
+        tracing::warn!(
+            hwnd,
+            "окно вне известной геометрии мониторов — закрепление пропущено"
+        );
         return false;
     };
     let bounds = &monitor_bounds[monitor_id];
@@ -7352,10 +7780,12 @@ fn pin_window(
             // гонки момента клика (PinWindowGone/AlreadyPinned) тостом не
             // сопровождаем.
             if matches!(e, Win32Error::PinAccessDenied) {
-                let _ = edit.coordinator_tx.send(CoordinatorRequest::ShowNotification {
-                    title: "Не удалось закрепить окно".to_string(),
-                    body: e.to_string(),
-                });
+                let _ = edit
+                    .coordinator_tx
+                    .send(CoordinatorRequest::ShowNotification {
+                        title: "Could not pin the window".to_string(),
+                        body: e.to_string(),
+                    });
             }
             return false;
         }
@@ -7383,7 +7813,8 @@ fn pin_window(
         }
     }
     edit.pinned_windows.push(PinnedWindow::new(hwnd as isize));
-    edit.pin_flashes.push(PinFlash::new(hwnd as isize, PinFlashKind::Pin));
+    edit.pin_flashes
+        .push(PinFlash::new(hwnd as isize, PinFlashKind::Pin));
     true
 }
 
@@ -7656,7 +8087,8 @@ fn unpin_window(edit: &mut EditState, window_pins: &mut WindowPins, hwnd: usize)
     if let Err(e) = window_pins.unpin(hwnd) {
         tracing::warn!(hwnd, error = %e, "не удалось открепить окно");
     }
-    edit.pin_flashes.push(PinFlash::new(hwnd as isize, PinFlashKind::Unpin));
+    edit.pin_flashes
+        .push(PinFlash::new(hwnd as isize, PinFlashKind::Unpin));
     edit.pinned_windows.retain(|p| p.hwnd != hwnd as isize);
     if edit.pinned_selection == Some(hwnd as isize) {
         edit.pinned_selection = None;
@@ -7874,7 +8306,10 @@ fn sync_pinned_rule_text_fields(edit: &mut EditState, hwnd: isize, rule_count: u
             let submitted = edit
                 .pinned_panel
                 .as_mut()
-                .and_then(|s| s.panel.widget_mut::<TextField>(pinned_row_id(rule_index, field)))
+                .and_then(|s| {
+                    s.panel
+                        .widget_mut::<TextField>(pinned_row_id(rule_index, field))
+                })
                 .and_then(TextField::take_submitted);
             let Some(text) = submitted else { continue };
             let value = (!text.is_empty()).then_some(text);
@@ -7938,7 +8373,10 @@ fn handle_pinned_panel_up(
     if edit
         .pinned_panel
         .as_mut()
-        .and_then(|s| s.panel.widget_mut::<Button>(rst_render::PINNED_BTN_ADD_HOST))
+        .and_then(|s| {
+            s.panel
+                .widget_mut::<Button>(rst_render::PINNED_BTN_ADD_HOST)
+        })
         .is_some_and(Button::take_click)
     {
         let monitor_id = edit
@@ -7954,7 +8392,10 @@ fn handle_pinned_panel_up(
     let move_toggled = edit
         .pinned_panel
         .as_mut()
-        .and_then(|s| s.panel.widget_mut::<Checkbox>(rst_render::PINNED_CHECK_MOVE_LOCK))
+        .and_then(|s| {
+            s.panel
+                .widget_mut::<Checkbox>(rst_render::PINNED_CHECK_MOVE_LOCK)
+        })
         .and_then(Checkbox::take_changed);
     if let Some(checked) = move_toggled {
         if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == hwnd) {
@@ -7967,7 +8408,10 @@ fn handle_pinned_panel_up(
     let interact_toggled = edit
         .pinned_panel
         .as_mut()
-        .and_then(|s| s.panel.widget_mut::<Checkbox>(rst_render::PINNED_CHECK_INTERACT_LOCK))
+        .and_then(|s| {
+            s.panel
+                .widget_mut::<Checkbox>(rst_render::PINNED_CHECK_INTERACT_LOCK)
+        })
         .and_then(Checkbox::take_changed);
     if let Some(checked) = interact_toggled {
         if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == hwnd) {
@@ -7980,7 +8424,10 @@ fn handle_pinned_panel_up(
     if edit
         .pinned_panel
         .as_mut()
-        .and_then(|s| s.panel.widget_mut::<Button>(rst_render::PINNED_BTN_ADD_RULE))
+        .and_then(|s| {
+            s.panel
+                .widget_mut::<Button>(rst_render::PINNED_BTN_ADD_RULE)
+        })
         .is_some_and(Button::take_click)
     {
         if let Some(pinned) = edit.pinned_windows.iter_mut().find(|p| p.hwnd == hwnd) {
@@ -8373,18 +8820,11 @@ fn handle_cursor_panel_up(
         return true;
     }
     if clicked(edit, cursor_panel::BTN_PRESETS) {
-        // M7 (SPEC.md §3.8, ROADMAP.md «быстрое переключение… из панели
-        // редактирования»): пустой список — открывать нечего, сообщаем
-        // тостом (тот же канал, что HotkeyConflict/PinAccessDenied) вместо
-        // пустой панели без единой строки.
-        if cfg.presets.is_empty() {
-            let (title, body) = crate::i18n::no_presets_notification(&cfg.settings.language);
-            let _ = edit
-                .coordinator_tx
-                .send(CoordinatorRequest::ShowNotification { title, body });
-        } else {
-            open_preset_picker(edit, cfg, monitor_id, monitor_geometry);
-        }
+        // Панель открывается ВСЕГДА, в том числе с пустым списком (репорт
+        // пользователя 2026-08-23: «кнопка пресет ничего не делает»): в ней
+        // есть сохранение текущей расстановки и импорт из файла, ради
+        // которых её и открывают в первый раз.
+        open_preset_picker(edit, cfg, monitor_id, monitor_geometry);
         return true;
     }
     if clicked(edit, cursor_panel::BTN_TOGGLE_ALL) {
@@ -8400,6 +8840,11 @@ fn handle_cursor_panel_up(
         return true;
     }
     if clicked(edit, cursor_panel::BTN_SETTINGS) {
+        // Режим редактирования при этом НЕ выключается (запрос пользователя
+        // 2026-08-23: «хочу тыкаться в настройки, не выходя из режима») —
+        // окно настроек становится доступным за счёт выреза в оверлее, см.
+        // `apply_settings_hole`.
+        //
         // Round-trip к главному потоку Tauri (docs/M2_WIRING_PLAN.md, §12) —
         // окна настроек нет на оверлей-потоке, main::setup читает канал.
         let _ = edit.coordinator_tx.send(CoordinatorRequest::OpenSettings);
@@ -8625,7 +9070,11 @@ fn handle_input(
             // docs/M3_STEP4_REVIEW.md, пункт 2.1) — иначе клик по пустому
             // месту монитора A, чьи локальные DIP-координаты совпали с
             // панелью на мониторе B, «поглощался» бы невидимой там панелью.
-            if edit.cursor_monitor == *monitor_id {
+            if edit.cursor_monitor == *monitor_id && !cursor_panel_collapsed(edit) {
+                // Свёрнутая панель кликов не принимает: её видимая полоска —
+                // это верхние пиксели кнопок, и клик по ней означал бы
+                // случайный выход из режима редактирования вместо
+                // разворачивания.
                 if let Some(panel) = &mut edit.cursor_panel {
                     if panel
                         .pointer_event(PointerEvent::Down {
@@ -8958,7 +9407,12 @@ fn handle_input(
             // (docs/M2_WIRING_PLAN.md, раздел 5, п.3). Пересборка вместо
             // `translate` — известное упрощение этого среза (см.
             // rebuild_cursor_panel).
-            let mut need_redraw = false;
+            //
+            // Первым делом — разворачивание/сворачивание панели
+            // редактирования: она могла только что переехать, и hover её
+            // виджетов ниже должен считаться уже по новому положению.
+            let mut need_redraw =
+                update_cursor_panel_hover(edit, cfg, monitor_geometry, (dip_x, dip_y));
             if let Some(panel) = &mut edit.cursor_panel {
                 need_redraw |= panel
                     .pointer_event(PointerEvent::Move {
@@ -8994,9 +9448,7 @@ fn handle_input(
                 .as_ref()
                 .filter(|s| s.monitor_id == *monitor_id)
                 .and_then(|s| s.panel.hovered_widget())
-                .and_then(|(id, bounds)| {
-                    pinned_panel_tooltip_text(id).map(|text| (bounds, text))
-                })
+                .and_then(|(id, bounds)| pinned_panel_tooltip_text(id).map(|text| (bounds, text)))
                 .or_else(|| {
                     edit.cursor_panel
                         .as_ref()
@@ -9138,9 +9590,10 @@ fn handle_input(
                     rebuild_ui_panels(edit, cfg, monitor_geometry);
                 } else if confirm
                     .panel
-                    .widget_mut::<Button>(confirm_dialog::ID_DONT_ASK)
+                    .widget_mut::<Checkbox>(confirm_dialog::ID_DONT_ASK)
                     .expect("ID_DONT_ASK собран в confirm_dialog::build")
-                    .take_click()
+                    .take_changed()
+                    == Some(true)
                 {
                     // Тумблер не закрывает модал — пользователь ещё должен
                     // подтвердить (или отменить) само удаление (раздел 6).
@@ -9919,7 +10372,7 @@ fn redraw(
     if let Some((ax, ay, cx, cy)) = edit.marquee {
         if edit.cursor_monitor == *monitor_id {
             let visuals = marquee_visuals((ax, ay), (cx, cy));
-            if let Some(tex) = ui_cache.fill_texture(renderer, theme::SLIDER_FILL) {
+            if let Some(tex) = ui_cache.fill_texture(renderer, rst_render::SELECTION_COLOR) {
                 if let Some(fill_rect) = &visuals.fill {
                     frame.push(solid_sprite(
                         &tex,
@@ -9950,9 +10403,41 @@ fn redraw(
                 continue;
             };
             let selection_box = SelectionBox::new(&sticker.placement, &sticker.transform);
-            for rect in selection_box.all_rects() {
+            let visuals = selection_box.visuals();
+            // Рамка — акцентная (запрос пользователя 2026-08-23), ручки
+            // остаются белыми: они лежат на самой рамке и одноцветные с ней
+            // читались бы как утолщения линии.
+            if let Some(tex) = ui_cache.fill_texture(renderer, rst_render::SELECTION_COLOR) {
+                for rect in visuals.outline {
+                    frame.push(solid_sprite(&tex, monitor_id, &rect, 1.0));
+                }
+            }
+            for (_, rect) in visuals.handles {
                 frame.push(solid_sprite(white_tex, monitor_id, &rect, 1.0));
             }
+            // Ручки поворота — стрелки за углами рамки (запрос пользователя
+            // 2026-08-23). Рисуются последними: они лежат снаружи и не
+            // должны прятаться под ручками ресайза.
+            let rotate_prims: Vec<Primitive> = selection_box
+                .rotate_handle_rects(
+                    rst_render::ROTATE_HANDLE_SIZE_DIP,
+                    rst_render::ROTATE_HANDLE_GAP_DIP,
+                )
+                .into_iter()
+                .map(|(_, rect)| Primitive::Icon {
+                    rect,
+                    icon: Icon::Rotate,
+                    opacity: 1.0,
+                })
+                .collect();
+            primitives_to_sprites(
+                &rotate_prims,
+                ui_cache,
+                renderer,
+                monitor_id,
+                text_scale,
+                &mut frame,
+            );
         }
         // Выделенное закреплённое окно (SPEC «Закрепление окна», пункт 9) —
         // янтарная рамка (`HighlightKind::Pin`, задача 3/6) вместо белой
@@ -10037,7 +10522,9 @@ fn redraw(
         if pinned.lock_move || pinned.lock_interact {
             prims.extend(lock_indicator(rect));
         }
-        primitives_to_sprites(&prims, ui_cache, renderer, monitor_id, text_scale, &mut frame);
+        primitives_to_sprites(
+            &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+        );
     }
 
     // Пульс рамки при пин/анпин по хоткею (запрос пользователя 2026-08-18) —
@@ -10072,7 +10559,9 @@ fn redraw(
             flash.opacity(flash_now),
             PIN_FLASH_THICKNESS_DIP,
         );
-        primitives_to_sprites(&prims, ui_cache, renderer, monitor_id, text_scale, &mut frame);
+        primitives_to_sprites(
+            &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+        );
     }
 
     // Полоса перемотки видео — ПОД тулбаром и панелью у курсора: она
@@ -10155,8 +10644,7 @@ fn redraw(
             // панели (позиции виджетов для попаданий) не трогаем — оно
             // догонит на ближайшей пересборке, а кликают по панели, когда
             // окно стоит.
-            if let Some((dx, dy)) = pinned_panel_catch_up(state, window_snapshot, monitor_bounds)
-            {
+            if let Some((dx, dy)) = pinned_panel_catch_up(state, window_snapshot, monitor_bounds) {
                 for prim in &mut prims {
                     prim.translate(dx, dy);
                 }
@@ -10564,7 +11052,10 @@ fn window_rect_to_placement(
 /// `WindowPins::move_resize` (SPEC «Закрепление окна», перемещение/ресайз
 /// через ручки). Округление до целого физического px — та же точность,
 /// что у координат мыши.
-fn placement_to_physical_rect(placement: &Placement, bounds: &MonitorBounds) -> (i32, i32, i32, i32) {
+fn placement_to_physical_rect(
+    placement: &Placement,
+    bounds: &MonitorBounds,
+) -> (i32, i32, i32, i32) {
     let scale = bounds.scale;
     let w = (placement.w * scale).round() as i32;
     let h = (placement.h * scale).round() as i32;
@@ -10785,7 +11276,10 @@ fn add_video_sticker(
         }
     };
     let (screen_w, screen_h) = overlay.size();
-    let (monitor_w, monitor_h) = (screen_w as f64 / scale as f64, screen_h as f64 / scale as f64);
+    let (monitor_w, monitor_h) = (
+        screen_w as f64 / scale as f64,
+        screen_h as f64 / scale as f64,
+    );
     let (center_x, center_y) = (monitor_w / 2.0, monitor_h / 2.0);
     // Огромное видео (например портретный ролик выше монитора) иначе
     // вставилось бы в натуральном размере и вылезло бы за края экрана —
@@ -11026,7 +11520,7 @@ mod tests {
     fn onboarding_notification_shown_on_fresh_config_with_default_hotkey() {
         let cfg = Config::default();
         let (title, body) = onboarding_notification(&cfg).expect("свежий конфиг ещё не показывал");
-        assert_eq!(title, "resticker запущен");
+        assert_eq!(title, "resticker is running");
         assert!(
             body.contains("Ctrl+Alt+S"),
             "тело должно содержать дефолтный хоткей: {body}"
@@ -11145,9 +11639,9 @@ mod tests {
             pinned_gesture: None,
             surfaced_pins: HashSet::new(),
             pin_flashes: Vec::new(),
-        pinned_last_rects: HashMap::new(),
-        pinned_unmaximized_at: HashMap::new(),
-        pinned_follow_until: None,
+            pinned_last_rects: HashMap::new(),
+            pinned_unmaximized_at: HashMap::new(),
+            pinned_follow_until: None,
             banner: None,
             pending_animation: None,
             pending_video: None,
@@ -11155,15 +11649,18 @@ mod tests {
             marquee_started: false,
             toolbar: None,
             cursor_panel: None,
+            cursor_panel_hovered: false,
+            cursor_panel_slide: PanelSlide::fixed(1.0),
+            settings_rect: None,
             tooltip: None,
             pointer_owner: PointerOwner::None,
             ui_pending_snapshot: None,
             video_timeline: None,
-        video_playing: false,
-        media_hotkeys_on: None,
-        timeline_dragging: false,
-        timeline_click_target: None,
-        cursor_pos: (0.0, 0.0),
+            video_playing: false,
+            media_hotkeys_on: None,
+            timeline_dragging: false,
+            timeline_click_target: None,
+            cursor_pos: (0.0, 0.0),
             cursor_monitor: monitor_id("main"),
             coordinator_tx,
         }
@@ -11240,6 +11737,7 @@ mod tests {
                 },
             ),
             monitor_id: monitor_id("main"),
+            name_draft: String::new(),
         });
         // Селект-состояние пинов — отдельная часть «пути выхода».
         edit.pinned_selection = Some(42);
@@ -11314,6 +11812,7 @@ mod tests {
                 },
             ),
             monitor_id: monitor_id("main"),
+            name_draft: String::new(),
         });
         let selected = Uuid::new_v4();
         edit.selection.select(selected);
@@ -11403,8 +11902,13 @@ mod tests {
     // MouseDown) — здесь сквозной сценарий на реальном окне, без D3D-
     // пластика, тем же приёмом, что drag_sim_*.
 
-    fn pin_flow_harness(
-    ) -> (Config, PathBuf, Vec<WindowInfo>, HashMap<MonitorId, MonitorBounds>, DragSimWindow) {
+    fn pin_flow_harness() -> (
+        Config,
+        PathBuf,
+        Vec<WindowInfo>,
+        HashMap<MonitorId, MonitorBounds>,
+        DragSimWindow,
+    ) {
         let wnd = DragSimWindow::create();
         let hwnd = wnd.0.0 as usize;
         let snapshot = vec![WindowInfo {
@@ -11435,7 +11939,13 @@ mod tests {
             Uuid::new_v4()
         ));
         let _ = std::fs::remove_file(&config_path);
-        (Config::default(), config_path, snapshot, monitor_bounds, wnd)
+        (
+            Config::default(),
+            config_path,
+            snapshot,
+            monitor_bounds,
+            wnd,
+        )
     }
 
     // --- pin_window: новый рантайм-пин (редизайн пинов, SPEC.md
@@ -11449,10 +11959,19 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
 
-        let pinned = pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd);
+        let pinned = pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd,
+        );
 
         assert!(pinned, "живое окно обязано закрепиться");
-        assert!(window_pins.is_pinned(hwnd), "окно закреплено через WindowPins");
+        assert!(
+            window_pins.is_pinned(hwnd),
+            "окно закреплено через WindowPins"
+        );
         assert_eq!(
             edit.pinned_windows,
             vec![PinnedWindow::new(hwnd as isize)],
@@ -11473,9 +11992,21 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
 
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         assert!(
-            !pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd),
+            !pin_window(
+                &mut edit,
+                &snapshot,
+                &monitor_bounds,
+                &mut window_pins,
+                hwnd
+            ),
             "повторный клик по уже закреплённому — no-op"
         );
         assert_eq!(
@@ -11496,7 +12027,13 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
 
-        assert!(!pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(!pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         assert!(edit.pinned_windows.is_empty(), "реестр не тронут");
         assert!(
             !window_pins.is_pinned(hwnd),
@@ -11515,7 +12052,13 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
 
-        assert!(!pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(!pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         assert!(
             edit.pinned_windows.is_empty(),
             "мёртвое окно не попадает в реестр"
@@ -11552,7 +12095,13 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
 
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         assert!(
             window_pins.is_pinned(hwnd),
             "окно закреплено (WS_EX_TOPMOST + маркер)"
@@ -11576,7 +12125,7 @@ mod tests {
     #[test]
     fn enforce_pinned_geometry_caps_window_grown_by_user() {
         use windows::Win32::UI::WindowsAndMessaging::{
-            HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNA, SetWindowPos, ShowWindow,
+            HWND_TOP, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow,
         };
 
         let (_cfg, _config_path, _snapshot, monitor_bounds, wnd) = pin_flow_harness();
@@ -11601,7 +12150,13 @@ mod tests {
         }];
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
 
         // Пользователь растянул окно на весь монитор мимо нас.
         // SAFETY: окно живо; флаги исключают активацию и смену z-order.
@@ -11626,8 +12181,7 @@ mod tests {
         // врал бы на размер рамки.
         let visible = rst_win32::window_enum::live_rect(hwnd).expect("живые границы окна");
         assert!(
-            visible.w <= 1728 + PINNED_GEOMETRY_EPS_PX
-                && visible.h <= 972 + PINNED_GEOMETRY_EPS_PX,
+            visible.w <= 1728 + PINNED_GEOMETRY_EPS_PX && visible.h <= 972 + PINNED_GEOMETRY_EPS_PX,
             "окно должно быть ужато до 90% монитора, а осталось {}×{}",
             visible.w,
             visible.h
@@ -11640,7 +12194,7 @@ mod tests {
     #[test]
     fn enforce_pinned_geometry_snaps_released_window_to_corner() {
         use windows::Win32::UI::WindowsAndMessaging::{
-            HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNA, SetWindowPos, ShowWindow,
+            HWND_TOP, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow,
         };
 
         let (_cfg, _config_path, _snapshot, monitor_bounds, wnd) = pin_flow_harness();
@@ -11663,14 +12217,28 @@ mod tests {
         }];
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         // Первый проход запоминает исходную геометрию.
         enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds);
 
         // Пользователь перетащил окно почти в угол и отпустил.
         // SAFETY: окно живо; флаги исключают активацию и смену z-order.
         unsafe {
-            SetWindowPos(wnd.0, Some(HWND_TOP), 5, 4, 400, 300, SWP_NOZORDER | SWP_NOACTIVATE)
+            SetWindowPos(
+                wnd.0,
+                Some(HWND_TOP),
+                5,
+                4,
+                400,
+                300,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
         }
         .expect("подвинуть тестовое окно к углу");
 
@@ -11680,8 +12248,7 @@ mod tests {
         // её видит пользователь; `GetWindowRect` показал бы «минус рамка».
         let visible = rst_win32::window_enum::live_rect(hwnd).expect("живые границы окна");
         assert!(
-            visible.x.abs() <= PINNED_GEOMETRY_EPS_PX
-                && visible.y.abs() <= PINNED_GEOMETRY_EPS_PX,
+            visible.x.abs() <= PINNED_GEOMETRY_EPS_PX && visible.y.abs() <= PINNED_GEOMETRY_EPS_PX,
             "окно должно примагнититься в угол, а стоит в ({}, {})",
             visible.x,
             visible.y
@@ -11717,12 +12284,21 @@ mod tests {
         let mut before = RECT::default();
         unsafe { GetWindowRect(wnd.0, &mut before) }.expect("GetWindowRect");
 
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
 
         // SAFETY: чтение прямоугольника живого окна.
         let mut after = RECT::default();
         unsafe { GetWindowRect(wnd.0, &mut after) }.expect("GetWindowRect");
-        assert_eq!(after, before, "окно в пределах 90% — ресайза быть не должно");
+        assert_eq!(
+            after, before,
+            "окно в пределах 90% — ресайза быть не должно"
+        );
     }
 
     #[test]
@@ -11745,14 +12321,33 @@ mod tests {
         // Трапеция (запрос пользователя 2026-08-22): 0.25 с проявления,
         // 1 с на единице, 0.25 с угасания — всего 1.5 с.
         let base = Instant::now();
-        let flash = PinFlash { hwnd: 1, started_at: base, kind: PinFlashKind::Pin };
+        let flash = PinFlash {
+            hwnd: 1,
+            started_at: base,
+            kind: PinFlashKind::Pin,
+        };
         let at = |secs: f64| base + Duration::from_secs_f64(secs);
         assert!((flash.opacity(at(0.0)) - 0.0).abs() < 1e-9);
-        assert!((flash.opacity(at(0.125)) - 0.5).abs() < 1e-9, "середина проявления");
-        assert!((flash.opacity(at(0.25)) - 1.0).abs() < 1e-9, "полная яркость к 0.25 с");
-        assert!((flash.opacity(at(0.8)) - 1.0).abs() < 1e-9, "держится всю секунду");
-        assert!((flash.opacity(at(1.25)) - 1.0).abs() < 1e-9, "конец удержания");
-        assert!((flash.opacity(at(1.375)) - 0.5).abs() < 1e-9, "середина угасания");
+        assert!(
+            (flash.opacity(at(0.125)) - 0.5).abs() < 1e-9,
+            "середина проявления"
+        );
+        assert!(
+            (flash.opacity(at(0.25)) - 1.0).abs() < 1e-9,
+            "полная яркость к 0.25 с"
+        );
+        assert!(
+            (flash.opacity(at(0.8)) - 1.0).abs() < 1e-9,
+            "держится всю секунду"
+        );
+        assert!(
+            (flash.opacity(at(1.25)) - 1.0).abs() < 1e-9,
+            "конец удержания"
+        );
+        assert!(
+            (flash.opacity(at(1.375)) - 0.5).abs() < 1e-9,
+            "середина угасания"
+        );
         assert_eq!(flash.opacity(at(1.5)), 0.0, "ровно в 1.5 с — уже 0");
         assert_eq!(flash.opacity(at(4.0)), 0.0);
         assert_eq!(PIN_FLASH_DURATION, Duration::from_millis(1500));
@@ -11761,7 +12356,11 @@ mod tests {
     #[test]
     fn pin_flash_next_deadline_and_expiry() {
         let base = Instant::now();
-        let flash = PinFlash { hwnd: 1, started_at: base, kind: PinFlashKind::Pin };
+        let flash = PinFlash {
+            hwnd: 1,
+            started_at: base,
+            kind: PinFlashKind::Pin,
+        };
         assert!(
             flash.next_deadline(base).is_some(),
             "живой пульс держит планировщик на коротком шаге"
@@ -11775,8 +12374,16 @@ mod tests {
     fn pin_flash_color_differs_by_kind() {
         // Запрос пользователя 2026-08-19: анпин красный, не cyan закрепления.
         let now = Instant::now();
-        let pin = PinFlash { hwnd: 1, started_at: now, kind: PinFlashKind::Pin };
-        let unpin = PinFlash { hwnd: 1, started_at: now, kind: PinFlashKind::Unpin };
+        let pin = PinFlash {
+            hwnd: 1,
+            started_at: now,
+            kind: PinFlashKind::Pin,
+        };
+        let unpin = PinFlash {
+            hwnd: 1,
+            started_at: now,
+            kind: PinFlashKind::Unpin,
+        };
         assert_eq!(pin.color(), PIN_FLASH_COLOR_PIN);
         assert_eq!(unpin.color(), PIN_FLASH_COLOR_UNPIN);
         assert_ne!(pin.color(), unpin.color());
@@ -11795,13 +12402,23 @@ mod tests {
         assert_eq!(banner.text, text);
         assert_eq!(banner.monitor_id, monitor_id("main"));
         let base = banner.shown_at;
-        assert!(banner.next_deadline(base).is_some(), "живой баннер держит дедлайн");
+        assert!(
+            banner.next_deadline(base).is_some(),
+            "живой баннер держит дедлайн"
+        );
         let expired = base + BANNER_DURATION + Duration::from_millis(1);
-        assert!(banner.expired(expired), "баннер истекает за BANNER_DURATION");
+        assert!(
+            banner.expired(expired),
+            "баннер истекает за BANNER_DURATION"
+        );
         assert_eq!(banner.next_deadline(expired), None);
 
         // Повторный показ перезаписывает предыдущий (новое важнее).
-        show_banner(&mut edit, &monitor_id("main"), "другой конфликт".to_string());
+        show_banner(
+            &mut edit,
+            &monitor_id("main"),
+            "другой конфликт".to_string(),
+        );
         assert_eq!(edit.banner.as_ref().unwrap().text, "другой конфликт");
     }
 
@@ -11814,7 +12431,13 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
 
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         edit.pinned_selection = Some(hwnd as isize);
         rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
 
@@ -11860,7 +12483,13 @@ mod tests {
         let mut window_pins = WindowPins::new();
         let monitor_geometry: HashMap<MonitorId, (u32, u32, f32)> =
             HashMap::from([(monitor_id("main"), (1920u32, 1080u32, 1.0f32))]);
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         edit.pinned_selection = Some(hwnd as isize);
         rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
 
@@ -11888,7 +12517,12 @@ mod tests {
         let mut snapshot = snapshot.clone();
         snapshot.push(WindowInfo {
             hwnd: hwnd + 1,
-            rect: WindowRect { x: 0, y: 0, w: 800, h: 600 },
+            rect: WindowRect {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 600,
+            },
             pid: std::process::id() + 2,
             exe_path: PathBuf::from(r"C:\Program Files\Google\chrome.exe"),
             title: "Пример — Chrome".to_string(),
@@ -11911,9 +12545,8 @@ mod tests {
             .window_picker
             .as_ref()
             .and_then(|s| {
-                s.panel.widget::<Checkbox>(
-                    window_picker::PICKER_ROW_PROCESS_BASE + chrome as WidgetId,
-                )
+                s.panel
+                    .widget::<Checkbox>(window_picker::PICKER_ROW_PROCESS_BASE + chrome as WidgetId)
             })
             .map(|cb| {
                 let r = cb.bounds();
@@ -11921,7 +12554,9 @@ mod tests {
             })
             .expect("чекбокс процесса");
         if let Some(state) = edit.window_picker.as_mut() {
-            state.panel.pointer_event(PointerEvent::Down { pos: cb_pos });
+            state
+                .panel
+                .pointer_event(PointerEvent::Down { pos: cb_pos });
         }
         let mut occluder_cache: HashMap<MonitorId, Vec<OccluderSet>> = HashMap::new();
         handle_window_picker_up(
@@ -11939,7 +12574,9 @@ mod tests {
         // обязана показывать это всеми галочками, а не ни одной.
         let hosts = edit.pinned_windows[0].hosts.rules();
         assert!(
-            hosts.iter().all(|r| r.process_name.as_deref() != Some("chrome.exe")),
+            hosts
+                .iter()
+                .all(|r| r.process_name.as_deref() != Some("chrome.exe")),
             "снятая галочка убирает именно chrome.exe: {hosts:?}"
         );
         assert!(
@@ -11949,7 +12586,9 @@ mod tests {
 
         // Возвращаем галочку: процесс снова становится окном-хозяином.
         if let Some(state) = edit.window_picker.as_mut() {
-            state.panel.pointer_event(PointerEvent::Down { pos: cb_pos });
+            state
+                .panel
+                .pointer_event(PointerEvent::Down { pos: cb_pos });
         }
         handle_window_picker_up(
             &mut edit,
@@ -11980,7 +12619,13 @@ mod tests {
         let hwnd = wnd.0.0 as usize;
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
 
         let visibility = host_rules_as_visibility(&edit.pinned_windows[0].hosts);
         for group in window_picker::group_by_process(&snapshot) {
@@ -12007,7 +12652,13 @@ mod tests {
         let mut window_pins = WindowPins::new();
         let monitor_geometry: HashMap<MonitorId, (u32, u32, f32)> =
             HashMap::from([(monitor_id("main"), (1920u32, 1080u32, 1.0f32))]);
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         edit.pinned_selection = Some(hwnd as isize);
         open_window_picker(
             &mut edit,
@@ -12021,14 +12672,19 @@ mod tests {
         let btn_pos = edit
             .window_picker
             .as_ref()
-            .and_then(|s| s.panel.widget::<Button>(window_picker::PICKER_BTN_SELECT_ALL))
+            .and_then(|s| {
+                s.panel
+                    .widget::<Button>(window_picker::PICKER_BTN_SELECT_ALL)
+            })
             .map(|b| {
                 let r = b.bounds();
                 (r.cx, r.cy)
             })
             .expect("кнопка «Выбрать/Снять все»");
         if let Some(state) = edit.window_picker.as_mut() {
-            state.panel.pointer_event(PointerEvent::Down { pos: btn_pos });
+            state
+                .panel
+                .pointer_event(PointerEvent::Down { pos: btn_pos });
         }
         let mut occluder_cache: HashMap<MonitorId, Vec<OccluderSet>> = HashMap::new();
         handle_window_picker_up(
@@ -12059,7 +12715,9 @@ mod tests {
         // Повторный клик возвращает все галочки — кнопка работает в обе
         // стороны, как у стикера.
         if let Some(state) = edit.window_picker.as_mut() {
-            state.panel.pointer_event(PointerEvent::Down { pos: btn_pos });
+            state
+                .panel
+                .pointer_event(PointerEvent::Down { pos: btn_pos });
         }
         handle_window_picker_up(
             &mut edit,
@@ -12094,14 +12752,19 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
 
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         edit.pinned_selection = Some(hwnd as isize);
         rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
 
         let state = edit.pinned_panel.as_ref().expect("панель собрана");
-        let (_, placement) =
-            pinned_window_dip_placement(hwnd as isize, &snapshot, &monitor_bounds)
-                .expect("геометрия закреплённого окна");
+        let (_, placement) = pinned_window_dip_placement(hwnd as isize, &snapshot, &monitor_bounds)
+            .expect("геометрия закреплённого окна");
         let frame = state.panel.frame();
         let win_left = placement.cx - placement.w / 2.0;
         let win_right = placement.cx + placement.w / 2.0;
@@ -12132,7 +12795,13 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
 
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         edit.pinned_selection = Some(hwnd as isize);
         rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
 
@@ -12160,7 +12829,10 @@ mod tests {
             .expect("окно остаётся в реестре");
         assert!(pinned.lock_move, "клик по чекбоксу включает move-lock");
         assert!(!pinned.lock_interact, "interact-lock не тронут");
-        assert!(edit.pinned_panel.is_some(), "панель пересобрана, а не закрыта");
+        assert!(
+            edit.pinned_panel.is_some(),
+            "панель пересобрана, а не закрыта"
+        );
     }
 
     #[test]
@@ -12170,7 +12842,13 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         let mut window_pins = WindowPins::new();
 
-        assert!(pin_window(&mut edit, &snapshot, &monitor_bounds, &mut window_pins, hwnd));
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
         edit.pinned_selection = Some(hwnd as isize);
         rebuild_pinned_panel(&mut edit, &snapshot, &monitor_bounds);
 
@@ -12196,9 +12874,15 @@ mod tests {
             .iter()
             .find(|p| p.hwnd == hwnd as isize)
             .expect("окно остаётся в реестре");
-        assert!(pinned.lock_interact, "клик по чекбоксу включает interact-lock");
+        assert!(
+            pinned.lock_interact,
+            "клик по чекбоксу включает interact-lock"
+        );
         assert!(!pinned.lock_move, "move-lock не тронут");
-        assert!(edit.pinned_panel.is_some(), "панель пересобрана, а не закрыта");
+        assert!(
+            edit.pinned_panel.is_some(),
+            "панель пересобрана, а не закрыта"
+        );
     }
 
     #[test]
@@ -12230,63 +12914,91 @@ mod tests {
     }
 
     #[test]
-    fn resolve_zone_outside_but_close_to_corner_is_dead_zone_not_rotate() {
-        // (140,140): снаружи рамки (x<150 и y<150), но всего ~14 DIP от угла
-        // (150,150) — меньше ROTATE_MIN_CORNER_GAP_DIP=35, значит НЕ поворот
-        // (фидбэк пользователя: раньше здесь СРАБАТЫВАЛО кольцо поворота
-        // даже так близко к рамке — теперь явный буфер).
+    fn resolve_zone_on_rotate_handle_is_rotate_with_corner_angle() {
+        // Ручка поворота стоит за углом рамки по диагонали наружу; её центр
+        // считаем той же геометрией, что и отрисовка.
+        let sticker = zone_test_sticker(0.0);
+        let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
+        let (cfg, selection, id) = zone_test_config(sticker);
+        for (corner, expected_angle) in [
+            (CoreCorner::NorthWest, -135),
+            (CoreCorner::NorthEast, -45),
+            (CoreCorner::SouthEast, 45),
+            (CoreCorner::SouthWest, 135),
+        ] {
+            let (_, rect) = sbox
+                .rotate_handle_rects(
+                    rst_render::ROTATE_HANDLE_SIZE_DIP,
+                    rst_render::ROTATE_HANDLE_GAP_DIP,
+                )
+                .into_iter()
+                .find(|(kind, _)| corner_of_handle(*kind) == Some(corner))
+                .expect("ручка каждого угла существует");
+            let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), rect.cx, rect.cy);
+            let Zone::Rotate(zid, angle) = zone else {
+                panic!("на ручке угла {corner:?} ожидался Zone::Rotate, получено {zone:?}");
+            };
+            assert_eq!(zid, id);
+            assert_eq!(angle, expected_angle, "угол курсора для {corner:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_zone_rotate_handle_sits_at_expected_distance_from_corner() {
+        // «На такой же дистанции примерно как на фото» (запрос пользователя
+        // 2026-08-23): центр ручки — ровно ROTATE_HANDLE_GAP_DIP от угла.
+        let sticker = zone_test_sticker(0.0);
+        let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
+        for (kind, rect) in sbox.rotate_handle_rects(
+            rst_render::ROTATE_HANDLE_SIZE_DIP,
+            rst_render::ROTATE_HANDLE_GAP_DIP,
+        ) {
+            let (hx, hy) = sbox.handle_center(kind);
+            let dist = (rect.cx - hx).hypot(rect.cy - hy);
+            assert!(
+                (dist - rst_render::ROTATE_HANDLE_GAP_DIP).abs() < 0.001,
+                "{kind:?}: расстояние до угла {dist}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_zone_empty_space_outside_is_background_not_rotate() {
+        // Главное изменение 2026-08-23: раньше ЛЮБАЯ точка снаружи рамки
+        // дальше 35 DIP от угла была поворотом, и снять выделение кликом по
+        // пустому месту было нельзя вовсе. Теперь это фон.
         let (cfg, selection, _id) = zone_test_config(zone_test_sticker(0.0));
-        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), 140.0, 140.0);
-        assert!(matches!(zone, Zone::Background), "должна быть мёртвая зона, не поворот");
-    }
-
-    #[test]
-    fn resolve_zone_outside_past_gap_near_corner_is_rotate_with_local_angle() {
-        // (120,120): снаружи, ~42 DIP от угла (150,150) — за отступом,
-        // ближайший угол NW, без поворота стикера угол курсора = -135°.
-        let (cfg, selection, id) = zone_test_config(zone_test_sticker(0.0));
-        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), 120.0, 120.0);
-        let Zone::Rotate(zid, angle) = zone else {
-            panic!("ожидался Zone::Rotate, получено другое");
-        };
-        assert_eq!(zid, id);
-        assert_eq!(angle, -135);
-    }
-
-    #[test]
-    fn resolve_zone_rotate_has_no_upper_distance_bound() {
-        // Старое кольцо было ограничено ROTATE_RING_MAX_DIP=24 сверху —
-        // очень далёкая точка снаружи ловилась бы в Background. Теперь
-        // поворот действует на бесконечную дистанцию (фидбэк пользователя).
-        let (cfg, selection, id) = zone_test_config(zone_test_sticker(0.0));
-        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), -5000.0, -5000.0);
-        assert!(matches!(zone, Zone::Rotate(zid, _) if zid == id));
-    }
-
-    #[test]
-    fn resolve_zone_captures_whole_perimeter_not_just_near_corners() {
-        // Точка снаружи прямо над серединой верхней грани (не рядом ни с
-        // одним углом конкретно) — тоже поворот, а не «мёртвая зона» (фидбэк
-        // пользователя: «он вообще захватывает всю зону редакции»).
-        let (cfg, selection, id) = zone_test_config(zone_test_sticker(0.0));
-        let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), 200.0, 50.0);
-        assert!(matches!(zone, Zone::Rotate(zid, _) if zid == id));
+        for (x, y) in [
+            (120.0, 120.0),     // по диагонали за углом, но мимо ручки
+            (200.0, 50.0),      // над серединой верхней грани
+            (-5000.0, -5000.0), // далеко за пределами
+            (200.0, 130.0),     // над верхней гранью, вдали от углов
+        ] {
+            let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), x, y);
+            assert!(
+                matches!(zone, Zone::Background),
+                "({x}, {y}) должно быть фоном, получено {zone:?}"
+            );
+        }
     }
 
     #[test]
     fn resolve_zone_rotate_angle_follows_sticker_rotation() {
         // Стикер повёрнут на 90° (по часовой, экранная конвенция) — угол,
         // который был NW у неповёрнутого прямоугольника, теперь физически
-        // там, где раньше был NE. Находим его РЕАЛЬНОЕ мировое положение
-        // через ту же SelectionBox, что использует resolve_zone, и берём
-        // точку далеко за ним по той же радиальной линии от центра.
+        // там, где раньше был NE. Ручка поворота едет вместе с ним, и угол
+        // курсора обязан это учитывать.
         let sticker = zone_test_sticker(std::f64::consts::FRAC_PI_2);
         let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
-        let (hx, hy) = sbox.handle_center(CoreCorner::NorthWest.handle());
-        let (cx, cy) = (sticker.placement.cx, sticker.placement.cy);
-        // Точка вдвое дальше от центра по той же линии центр→угол —
-        // гарантированно снаружи рамки и дальше ROTATE_MIN_CORNER_GAP_DIP.
-        let (px, py) = (cx + (hx - cx) * 3.0, cy + (hy - cy) * 3.0);
+        let (_, handle_rect) = sbox
+            .rotate_handle_rects(
+                rst_render::ROTATE_HANDLE_SIZE_DIP,
+                rst_render::ROTATE_HANDLE_GAP_DIP,
+            )
+            .into_iter()
+            .find(|(kind, _)| corner_of_handle(*kind) == Some(CoreCorner::NorthWest))
+            .expect("ручка NW существует");
+        let (px, py) = (handle_rect.cx, handle_rect.cy);
         let (cfg, selection, id) = zone_test_config(sticker);
         let zone = resolve_zone(&cfg, &selection, &monitor_id("main"), px, py);
         let Zone::Rotate(zid, angle) = zone else {
@@ -12330,7 +13042,7 @@ mod tests {
 
     fn test_tooltip(hover_started: Instant) -> TooltipState {
         TooltipState {
-            text: "Удалить",
+            text: "Delete",
             hover_started,
             anchor: Box2D {
                 cx: 100.0,
@@ -12470,6 +13182,105 @@ mod tests {
     }
 
     #[test]
+    fn panel_open_zone_contains_the_trigger_zone() {
+        // Регрессия на живой репорт «когда подвожу мышку, тулбар очень
+        // сильно дёргается»: точка, которая РАЗВОРАЧИВАЕТ панель, обязана
+        // её же и УДЕРЖИВАТЬ. Иначе каждое движение мыши у нижнего края
+        // экрана давало цикл «развернуть → свернуть».
+        let screen = DipRect::new(0.0, 0.0, 1920.0, 1080.0);
+        let strip = cursor_panel::peek_hot_zone(&screen);
+        let (x0, x1) = (strip.cx - strip.w / 2.0, strip.cx + strip.w / 2.0);
+        let (y0, y1) = (strip.cy - strip.h / 2.0, strip.cy + strip.h / 2.0);
+        let mut checked = 0;
+        let mut x = x0 + 0.5;
+        while x < x1 {
+            let mut y = y0 + 0.5;
+            while y < y1 {
+                let point = (x, y);
+                if rst_render::box_contains(&strip, point) {
+                    assert!(
+                        cursor_keeps_panel_open(&screen, point),
+                        "точка {point:?} разворачивает панель, но не удерживает её"
+                    );
+                    checked += 1;
+                }
+                y += 2.0;
+            }
+            x += 17.0;
+        }
+        assert!(
+            checked > 100,
+            "проверено подозрительно мало точек: {checked}"
+        );
+    }
+
+    #[test]
+    fn panel_open_zone_ends_somewhere() {
+        // Обратная сторона: зона удержания не должна разрастись на весь
+        // экран — уводя курсор вверх, панель обязана сворачиваться.
+        let screen = DipRect::new(0.0, 0.0, 1920.0, 1080.0);
+        assert!(!cursor_keeps_panel_open(&screen, (960.0, 540.0)));
+        assert!(
+            !cursor_keeps_panel_open(&screen, (10.0, 1075.0)),
+            "далеко сбоку"
+        );
+    }
+
+    #[test]
+    fn text_panels_do_not_get_digits_from_the_key_path() {
+        // Регрессия на репорт 2026-08-24 «цифры дублируются»: символ
+        // приходит из WM_CHAR, и если бы цифру отдавали ещё и по vk, она
+        // попадала бы в поле дважды.
+        let mods = Modifiers::default();
+        for vk in 0x30..=0x39u32 {
+            assert!(
+                widget_key(vk, mods).is_some(),
+                "числовое поле тулбара цифры по-прежнему получает"
+            );
+            assert!(
+                widget_text_key(vk, mods).is_none(),
+                "текстовому полю цифра по vk доходить не должна"
+            );
+        }
+        // Управляющие клавиши текстовому полю по-прежнему нужны.
+        for vk in [VK_BACK, VK_RETURN, VK_ESCAPE, VK_LEFT, VK_RIGHT] {
+            assert!(widget_text_key(vk, mods).is_some(), "vk={vk}");
+        }
+    }
+
+    #[test]
+    fn panel_slide_eases_out_and_settles_at_target() {
+        let started = Instant::now();
+        let slide = PanelSlide {
+            from: 0.0,
+            to: 1.0,
+            started,
+        };
+        assert_eq!(slide.value(started), 0.0, "в нулевой момент — старт");
+        let mid = slide.value(started + CURSOR_PANEL_SLIDE / 2);
+        assert!(
+            mid > 0.5,
+            "ease-out: к середине времени пройдено больше половины пути, а не {mid}"
+        );
+        assert!(mid < 1.0);
+        assert!(slide.running(started + CURSOR_PANEL_SLIDE / 2));
+        let end = started + CURSOR_PANEL_SLIDE;
+        assert!((slide.value(end) - 1.0).abs() < 1e-9, "финал ровно в цели");
+        assert!(!slide.running(end), "после срока анимация закончена");
+        assert_eq!(slide.next_deadline(end), None);
+        assert!(slide.next_deadline(started).is_some());
+    }
+
+    #[test]
+    fn panel_slide_fixed_is_not_animating() {
+        let slide = PanelSlide::fixed(0.0);
+        let now = Instant::now();
+        assert_eq!(slide.value(now), 0.0);
+        assert!(!slide.running(now), "покой — не анимация");
+        assert_eq!(slide.next_deadline(now), None, "в покое дедлайн не нужен");
+    }
+
+    #[test]
     fn tooltip_primitives_empty_when_invisible() {
         let tooltip = test_tooltip(Instant::now());
         assert!(tooltip_primitives(&tooltip, 1080.0, 0.0).is_empty());
@@ -12479,11 +13290,19 @@ mod tests {
     fn tooltip_primitives_positions_below_anchor_when_room() {
         let tooltip = test_tooltip(Instant::now());
         let prims = tooltip_primitives(&tooltip, 1080.0, 1.0);
-        assert_eq!(prims.len(), 3, "два Fill (рамка+фон) + один Text");
+        assert_eq!(
+            prims.len(),
+            6,
+            "фон + четыре грани объёмной рамки настроек + один Text"
+        );
         let Primitive::Fill { rect, opacity, .. } = prims[0] else {
-            panic!("первый примитив — фон-рамка");
+            panic!("первый примитив — фон панели");
         };
-        assert_eq!(opacity, theme::PANEL_BG_OPACITY, "полная анимация — полная непрозрачность фона");
+        assert_eq!(
+            opacity,
+            theme::settings::BG_OPACITY,
+            "полная анимация — полная непрозрачность фона"
+        );
         // Верх тултипа строго ниже низа кнопки (anchor.cy + h/2 = 114) плюс
         // зазор TOOLTIP_GAP_DIP.
         let anchor_bottom = tooltip.anchor.cy + tooltip.anchor.h / 2.0;
@@ -12746,7 +13565,10 @@ mod tests {
             "видимая площадь окклюдера — его rect минус то, что реально сверху"
         );
         for r in &rects {
-            assert!(r.x >= 50, "куски не должны заходить в область on_top: {r:?}");
+            assert!(
+                r.x >= 50,
+                "куски не должны заходить в область on_top: {r:?}"
+            );
         }
     }
 
@@ -13391,8 +14213,8 @@ mod tests {
     use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WNDCLASSEXW, WS_OVERLAPPED,
-        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSEXW, WS_OVERLAPPED,
     };
     use windows::core::w;
 
@@ -13502,9 +14324,9 @@ mod tests {
             pinned_gesture: None,
             surfaced_pins: HashSet::new(),
             pin_flashes: Vec::new(),
-        pinned_last_rects: HashMap::new(),
-        pinned_unmaximized_at: HashMap::new(),
-        pinned_follow_until: None,
+            pinned_last_rects: HashMap::new(),
+            pinned_unmaximized_at: HashMap::new(),
+            pinned_follow_until: None,
             banner: None,
             pending_animation: None,
             pending_video: None,
@@ -13512,15 +14334,18 @@ mod tests {
             marquee_started: false,
             toolbar: None,
             cursor_panel: None,
+            cursor_panel_hovered: false,
+            cursor_panel_slide: PanelSlide::fixed(1.0),
+            settings_rect: None,
             tooltip: None,
             pointer_owner: PointerOwner::None,
             ui_pending_snapshot: None,
             video_timeline: None,
-        video_playing: false,
-        media_hotkeys_on: None,
-        timeline_dragging: false,
-        timeline_click_target: None,
-        cursor_pos: (0.0, 0.0),
+            video_playing: false,
+            media_hotkeys_on: None,
+            timeline_dragging: false,
+            timeline_click_target: None,
+            cursor_pos: (0.0, 0.0),
             cursor_monitor: monitor_id("main"),
             coordinator_tx,
         };
@@ -13534,7 +14359,13 @@ mod tests {
     /// в проде `handle_message` читает его через `GetAsyncKeyState`) + реальный
     /// старт Gesture::Drag (эти строки `handle_input` выполняет в ветке
     /// `Zone::StickerBody`): click + захват grab-офсета.
-    fn drag_sim_down(cap: &mut MouseCapture, cfg: &mut Config, edit: &mut EditState, x: i16, y: i16) {
+    fn drag_sim_down(
+        cap: &mut MouseCapture,
+        cfg: &mut Config,
+        edit: &mut EditState,
+        x: i16,
+        y: i16,
+    ) {
         let ev = cap
             .handle_message_checked(WM_LBUTTONDOWN, WPARAM(0), drag_sim_lparam(x, y), true)
             .expect("MouseDown");
@@ -13579,9 +14410,12 @@ mod tests {
         ctrl: bool,
         left_button_down: bool,
     ) {
-        let Some(ev) =
-            cap.handle_message_checked(WM_MOUSEMOVE, WPARAM(0), drag_sim_lparam(x, y), left_button_down)
-        else {
+        let Some(ev) = cap.handle_message_checked(
+            WM_MOUSEMOVE,
+            WPARAM(0),
+            drag_sim_lparam(x, y),
+            left_button_down,
+        ) else {
             // Дедуп точных дубликатов (input.rs:226-244): повторный
             // WM_MOUSEMOVE с бит-в-бит теми же координатами отсекается ещё
             // на входе — до apply_gesture доезжает только несовпадающий.
@@ -13703,7 +14537,10 @@ mod tests {
             let ev = cap
                 .handle_message_checked(WM_MOUSEMOVE, WPARAM(0), drag_sim_lparam(620, 430), false)
                 .expect("move без захвата");
-            assert!(!matches!(ev, InputEvent::MouseDown { .. } | InputEvent::MouseUp { .. }));
+            assert!(!matches!(
+                ev,
+                InputEvent::MouseDown { .. } | InputEvent::MouseUp { .. }
+            ));
         }
     }
 
@@ -13741,12 +14578,7 @@ mod tests {
         assert!(matches!(up, InputEvent::MouseUp { .. }));
         for _ in 0..500 {
             let ev = cap
-                .handle_message_checked(
-                    WM_MOUSEMOVE,
-                    WPARAM(0),
-                    drag_sim_lparam(620, 430),
-                    false,
-                )
+                .handle_message_checked(WM_MOUSEMOVE, WPARAM(0), drag_sim_lparam(620, 430), false)
                 .expect("move после up");
             let InputEvent::MouseMove { dragging, .. } = ev else {
                 panic!("ожидался MouseMove");

@@ -198,7 +198,10 @@ impl Nv12VideoTextures {
                 }
             }
         };
-        *self.current.lock().expect("мьютекс текущего вида NV12 не отравлен") = pair;
+        *self
+            .current
+            .lock()
+            .expect("мьютекс текущего вида NV12 не отравлен") = pair;
         self.index.store(index, Ordering::Relaxed);
         Ok(())
     }
@@ -214,7 +217,9 @@ impl Nv12VideoTextures {
             D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0,
             D3D11_TEX2D_ARRAY_SRV,
         };
-        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM};
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
+        };
 
         let make = |format| -> Result<ID3D11ShaderResourceView, crate::RenderError> {
             let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {

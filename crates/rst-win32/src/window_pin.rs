@@ -73,20 +73,19 @@ use std::collections::{HashMap, HashSet};
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, SetLastError, WPARAM,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GUI_INMOVESIZE, GUITHREADINFO, GetGUIThreadInfo, GetPropW, GetWindow, GetWindowLongPtrW,
-    GetWindowPlacement, IsIconic, PostMessageW, SW_MINIMIZE, SW_SHOWMAXIMIZED,
-    ShowWindowAsync, WM_CANCELMODE,
-    GetWindowRect, GetWindowThreadProcessId, GW_HWNDPREV, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOP,
-    HWND_TOPMOST, IsWindow, RemovePropW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetPropW, SetWindowPlacement, SetWindowPos,
-    WINDOWPLACEMENT, WS_EX_TOPMOST,
-};
 use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GUI_INMOVESIZE, GUITHREADINFO, GW_HWNDPREV, GWL_EXSTYLE, GetGUIThreadInfo, GetPropW, GetWindow,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId, HWND_NOTOPMOST,
+    HWND_TOP, HWND_TOPMOST, IsIconic, IsWindow, PostMessageW, RemovePropW, SW_MINIMIZE,
+    SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SetPropW, SetWindowPlacement, SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT,
+    WM_CANCELMODE, WS_EX_TOPMOST,
+};
 use windows::core::{BOOL, HRESULT, PCWSTR, w};
 
 use crate::error::Win32Error;
-use crate::window_enum::{extended_frame_bounds, WindowInfo};
+use crate::window_enum::{WindowInfo, extended_frame_bounds};
 
 /// Имя маркера-проперти (SetPropW), отличающего закреплённые окна.
 /// Уникально для resticker; значение — маркер вызывающего кода.
@@ -888,24 +887,24 @@ impl WindowPins {
 mod input_guard {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-    use std::sync::{mpsc, Mutex, OnceLock};
+    use std::sync::{Mutex, OnceLock, mpsc};
     use std::time::{Duration, Instant};
 
     use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::ClientToScreen;
-    use windows::Win32::UI::HiDpi::PhysicalToLogicalPointForPerMonitorDPI;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+    use windows::Win32::UI::HiDpi::PhysicalToLogicalPointForPerMonitorDPI;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CHILDID_SELF, CallNextHookEx, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT,
-        GWL_EXSTYLE, GetAncestor, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-        GetWindowRect, HHOOK, HTBORDER, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
-        HTCLIENT, HTGROWBOX, HTHSCROLL, HTLEFT, HTMENU, HTNOWHERE, HTRIGHT, HTSYSMENU, HTTOP,
-        HTTOPLEFT, HTTOPRIGHT, HTVSCROLL, IsWindowVisible, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW,
-        PostMessageW, PostThreadMessageW, SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG,
-        SetWindowsHookExW, SendMessageTimeoutW, UnhookWindowsHookEx, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
-        WM_APP, WM_CANCELMODE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
+        CHILDID_SELF, CallNextHookEx, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, GWL_EXSTYLE,
+        GetAncestor, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect,
+        HHOOK, HTBORDER, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTGROWBOX,
+        HTHSCROLL, HTLEFT, HTMENU, HTNOWHERE, HTRIGHT, HTSYSMENU, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+        HTVSCROLL, IsWindowVisible, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW, PostMessageW,
+        PostThreadMessageW, SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+        SetWindowsHookExW, UnhookWindowsHookEx, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP,
+        WM_CANCELMODE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
         WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
         WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
         WS_EX_TRANSPARENT,
@@ -1382,7 +1381,10 @@ mod input_guard {
     }
 
     fn is_up_message(msg: u32) -> bool {
-        matches!(msg, WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP)
+        matches!(
+            msg,
+            WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP
+        )
     }
 
     fn is_wheel_message(msg: u32) -> bool {
@@ -1688,12 +1690,16 @@ mod input_guard {
         /// UIPI): решение принимает вызывающий по геометрии, консервативно.
         pub(super) fn hit_test(hwnd: HWND, pt: POINT) -> Option<u32> {
             let key = hwnd.0 as isize;
-            LAST.try_lock().ok().and_then(|g| *g).filter(|s| {
-                s.key == key
-                    && (s.pt.x - pt.x).abs() <= TOLERANCE_PX
-                    && (s.pt.y - pt.y).abs() <= TOLERANCE_PX
-                    && s.at.elapsed() <= FRESH
-            }).map(|s| s.ht)
+            LAST.try_lock()
+                .ok()
+                .and_then(|g| *g)
+                .filter(|s| {
+                    s.key == key
+                        && (s.pt.x - pt.x).abs() <= TOLERANCE_PX
+                        && (s.pt.y - pt.y).abs() <= TOLERANCE_PX
+                        && s.at.elapsed() <= FRESH
+                })
+                .map(|s| s.ht)
         }
 
         pub(super) fn start() -> Option<std::thread::JoinHandle<()>> {
@@ -1767,10 +1773,7 @@ mod input_guard {
             };
             match last.as_ref() {
                 Some(s) => {
-                    s.key != key
-                        || s.pt.x != pt.x
-                        || s.pt.y != pt.y
-                        || s.at.elapsed() >= REFRESH
+                    s.key != key || s.pt.x != pt.x || s.pt.y != pt.y || s.at.elapsed() >= REFRESH
                 }
                 None => true,
             }
@@ -1910,9 +1913,8 @@ mod input_guard {
                 WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
             };
 
-            let with_caption = crate::window_pin::tests::TestWindow::create_with(
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            );
+            let with_caption =
+                crate::window_pin::tests::TestWindow::create_with(WS_OVERLAPPEDWINDOW | WS_VISIBLE);
             assert!(
                 has_real_caption(with_caption.0),
                 "окно со штатным заголовком должно опознаваться"
@@ -1936,9 +1938,8 @@ mod input_guard {
                 WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
             };
 
-            let framed = crate::window_pin::tests::TestWindow::create_with(
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            );
+            let framed =
+                crate::window_pin::tests::TestWindow::create_with(WS_OVERLAPPEDWINDOW | WS_VISIBLE);
             let mut wr = RECT::default();
             // SAFETY: окно живо.
             unsafe { GetWindowRect(framed.0, &mut wr) }.unwrap();
@@ -1986,7 +1987,13 @@ mod input_guard {
                     interact_locked: false,
                 },
             );
-            assert!(state().locked.lock().unwrap().contains_key(&(hwnd.0 as isize)));
+            assert!(
+                state()
+                    .locked
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(hwnd.0 as isize))
+            );
             set_policy(
                 hwnd,
                 Policy {
@@ -1994,9 +2001,14 @@ mod input_guard {
                     interact_locked: false,
                 },
             );
-            assert!(!state().locked.lock().unwrap().contains_key(&(hwnd.0 as isize)));
+            assert!(
+                !state()
+                    .locked
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(hwnd.0 as isize))
+            );
         }
-
     }
 }
 
@@ -2147,8 +2159,8 @@ mod tests {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDNEXT, GW_HWNDPREV, GWLP_USERDATA,
-        GWL_STYLE, GetWindow, GetWindowLongPtrW, RegisterClassExW, WINDOW_STYLE, WNDCLASSEXW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDNEXT, GW_HWNDPREV, GWL_STYLE,
+        GWLP_USERDATA, GetWindow, GetWindowLongPtrW, RegisterClassExW, WINDOW_STYLE, WNDCLASSEXW,
         WS_DISABLED, WS_OVERLAPPED, WS_VISIBLE,
     };
     use windows::core::w;
@@ -2376,7 +2388,10 @@ mod tests {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )
         };
-        assert!(!is_topmost(hwnd), "имитация выбивания из topmost не сработала");
+        assert!(
+            !is_topmost(hwnd),
+            "имитация выбивания из topmost не сработала"
+        );
     }
 
     #[test]
@@ -2464,7 +2479,9 @@ mod tests {
     #[test]
     fn move_resize_restores_maximized_window_to_target_rect() {
         use windows::Win32::Foundation::RECT;
-        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsZoomed, SW_MAXIMIZE, ShowWindow};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowRect, IsZoomed, SW_MAXIMIZE, ShowWindow,
+        };
 
         let target = TestWindow::create();
         let mut pins = WindowPins::new();
@@ -2476,7 +2493,10 @@ mod tests {
             let _ = ShowWindow(target.0, SW_MAXIMIZE);
         }
         // SAFETY: чтение состояния живого окна.
-        assert!(unsafe { IsZoomed(target.0) }.as_bool(), "окно должно стать maximized");
+        assert!(
+            unsafe { IsZoomed(target.0) }.as_bool(),
+            "окно должно стать maximized"
+        );
 
         pins.move_resize(key(target.0), 10, 20, 300, 150)
             .expect("move_resize maximized-окна");
@@ -2584,9 +2604,15 @@ mod tests {
     /// шага — защита от патологических ситуаций на очень загруженном десктопе,
     /// не от обычных расстояний (свежее topmost-окно от низа полосы отделяют
     /// обычно 20–40 окон).
+    /// Идти вверх по z-order от `from` и искать `want`.
+    ///
+    /// Предел шагов — не «сколько окон бывает», а страховка от зацикливания:
+    /// раньше стояло 64, и тест падал на машине с большой сессией, где между
+    /// обычной полосой и topmost-полосой оказывалось больше окон (найдено
+    /// 2026-08-24 — падало без единой правки в этом файле).
     fn window_above_in_walk(from: HWND, want: HWND) -> bool {
         let mut cur = from;
-        for _ in 0..64 {
+        for _ in 0..4096 {
             if cur == want {
                 return true;
             }
@@ -2650,7 +2676,10 @@ mod tests {
         pins.enforce_slot(bottom.0, Some(above.0));
 
         pins.surface_topmost_temporarily(bottom.0);
-        assert!(is_topmost(bottom.0), "временный подъём ставит WS_EX_TOPMOST");
+        assert!(
+            is_topmost(bottom.0),
+            "временный подъём ставит WS_EX_TOPMOST"
+        );
         assert!(
             window_above_in_walk(above.0, bottom.0),
             "topmost-окно обязано быть выше обычной полосы"
@@ -2682,16 +2711,17 @@ mod tests {
         // «Внешняя сила» двигает окно (напрямую SetWindowPos, не move_resize —
         // тот был бы нашей операцией).
         // SAFETY: окно живо, флаги исключают активацию/z-order.
-        unsafe {
-            SetWindowPos(hwnd, None, 40, 50, 100, 100, SWP_NOZORDER | SWP_NOACTIVATE)
-        }
-        .expect("движение тестового окна");
+        unsafe { SetWindowPos(hwnd, None, 40, 50, 100, 100, SWP_NOZORDER | SWP_NOACTIVATE) }
+            .expect("движение тестового окна");
 
         // Координатор увидел location-change и передаёт фактический rect —
         // в DWM-координатах, как в снимке трекера.
         let current = dwm_rect(hwnd);
         assert_ne!(current, baseline, "окно реально уехало от эталона");
-        assert!(pins.enforce_move_lock(hwnd, current), "snap-back обязан сработать");
+        assert!(
+            pins.enforce_move_lock(hwnd, current),
+            "snap-back обязан сработать"
+        );
 
         // Окно вернулось на эталонный прямоугольник (позиция и размер).
         let restored = dwm_rect(hwnd);
@@ -2747,10 +2777,8 @@ mod tests {
         pins.set_move_lock(hwnd, false);
 
         // SAFETY: окно живо, флаги исключают активацию/z-order.
-        unsafe {
-            SetWindowPos(hwnd, None, 40, 50, 100, 100, SWP_NOZORDER | SWP_NOACTIVATE)
-        }
-        .expect("движение тестового окна");
+        unsafe { SetWindowPos(hwnd, None, 40, 50, 100, 100, SWP_NOZORDER | SWP_NOACTIVATE) }
+            .expect("движение тестового окна");
         let mut current = RECT::default();
         // SAFETY: чтение прямоугольника живого окна.
         unsafe { GetWindowRect(hwnd, &mut current) }.expect("GetWindowRect");
@@ -2790,13 +2818,12 @@ mod tests {
         use std::time::{Duration, Instant};
         use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
-            MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
-            VK_LBUTTON,
+            GetAsyncKeyState, INPUT, INPUT_0, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput, VK_LBUTTON,
         };
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetCursorPos, GetSystemMetrics, GetWindowRect, HWND_TOP, SM_CYCAPTION, SetCursorPos,
-            SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, WindowFromPoint,
+            GetCursorPos, GetSystemMetrics, GetWindowRect, HWND_TOP, SM_CYCAPTION, SWP_NOACTIVATE,
+            SWP_NOZORDER, SetCursorPos, SetWindowPos, WindowFromPoint,
         };
 
         use crate::window_enum::extended_frame_bounds;
@@ -3018,7 +3045,10 @@ mod tests {
             "move-locked окно уехало с эталона за время драга"
         );
         // Раз окно не двигалось, третьему эшелону нечего возвращать.
-        assert_eq!(snaps, 0, "snap-back сработал, хотя окно не двигалось: {locked:#?}");
+        assert_eq!(
+            snaps, 0,
+            "snap-back сработал, хотя окно не двигалось: {locked:#?}"
+        );
 
         // Нет вечного snap-back-цикла на покое: следующий снимок трекера не
         // должен дёргать неподвижное окно.
@@ -3068,7 +3098,9 @@ mod tests {
         let target = TestWindow::create();
         let hwnd = target.0;
         let mut previous_run = WindowPins::new();
-        previous_run.pin(MARKER, key(hwnd)).expect("пин прошлого запуска");
+        previous_run
+            .pin(MARKER, key(hwnd))
+            .expect("пин прошлого запуска");
         // Прошлый запуск «умер» без unpin — маркер остался на окне.
         drop(previous_run);
 
@@ -3080,13 +3112,16 @@ mod tests {
         );
 
         // Второй рубеж: перенять окно можно всегда.
-        pins.adopt(MARKER, key(hwnd)).expect("перенять осиротевшее окно");
+        pins.adopt(MARKER, key(hwnd))
+            .expect("перенять осиротевшее окно");
         pins.unpin(key(hwnd)).expect("и открепить его");
         assert!(!pins.is_pinned(key(hwnd)), "маркер снят");
 
         // Первый рубеж: стартовая уборка снимает маркер по снимку окон.
         let mut previous_run = WindowPins::new();
-        previous_run.pin(MARKER, key(hwnd)).expect("пин прошлого запуска");
+        previous_run
+            .pin(MARKER, key(hwnd))
+            .expect("пин прошлого запуска");
         drop(previous_run);
         let fresh = WindowPins::new();
         let snapshot = vec![WindowInfo {
@@ -3094,7 +3129,10 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(fresh.clear_orphan_markers(&snapshot), 1);
-        assert!(!fresh.is_pinned(key(hwnd)), "уборка сняла осиротевший маркер");
+        assert!(
+            !fresh.is_pinned(key(hwnd)),
+            "уборка сняла осиротевший маркер"
+        );
     }
 
     #[test]
@@ -3306,8 +3344,8 @@ mod tests {
             use std::sync::{Arc, Mutex};
             use windows::Win32::System::LibraryLoader::GetModuleHandleW;
             use windows::Win32::UI::WindowsAndMessaging::{
-                CreateWindowExW, DispatchMessageW, GetMessageW, GWLP_USERDATA, MSG,
-                RegisterClassExW, SetWindowLongPtrW, ShowWindow, SW_SHOW, TranslateMessage,
+                CreateWindowExW, DispatchMessageW, GWLP_USERDATA, GetMessageW, MSG,
+                RegisterClassExW, SW_SHOW, SetWindowLongPtrW, ShowWindow, TranslateMessage,
                 WNDCLASSEXW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_VISIBLE,
             };
 
@@ -3454,12 +3492,12 @@ mod tests {
         use std::time::Duration;
         use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT, MOUSE_EVENT_FLAGS,
-            MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+            INPUT, INPUT_0, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEINPUT, SendInput,
         };
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, SetCursorPos, WindowFromPoint, WM_ACTIVATE, WM_LBUTTONDOWN,
-            WM_MOUSEACTIVATE, WM_NCACTIVATE,
+            GetForegroundWindow, SetCursorPos, WM_ACTIVATE, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
+            WM_NCACTIVATE, WindowFromPoint,
         };
 
         fn mouse_input(flags: MOUSE_EVENT_FLAGS) -> INPUT {
@@ -3487,7 +3525,10 @@ mod tests {
             // SAFETY: SendInput — системная инъекция нажатия/отпускания ЛКМ.
             let sent = unsafe {
                 SendInput(
-                    &[mouse_input(MOUSEEVENTF_LEFTDOWN), mouse_input(MOUSEEVENTF_LEFTUP)],
+                    &[
+                        mouse_input(MOUSEEVENTF_LEFTDOWN),
+                        mouse_input(MOUSEEVENTF_LEFTUP),
+                    ],
                     size_of::<INPUT>() as i32,
                 )
             };
@@ -3536,7 +3577,13 @@ mod tests {
         click_at(cx, cy);
         let msgs2 = win.log.lock().unwrap().clone();
         assert!(
-            !win.received_any(&[WM_MOUSEACTIVATE, WM_LBUTTONDOWN, 0x0084, WM_NCACTIVATE, WM_ACTIVATE]),
+            !win.received_any(&[
+                WM_MOUSEACTIVATE,
+                WM_LBUTTONDOWN,
+                0x0084,
+                WM_NCACTIVATE,
+                WM_ACTIVATE
+            ]),
             "клик по interact-locked окну должен быть поглощён ДО системного input-routing; сообщения: {msgs2:?}"
         );
         assert_eq!(
@@ -3573,7 +3620,7 @@ mod tests {
     fn reassert_topmost_restores_after_external_knockout_live() {
         use std::time::Duration;
         use windows::Win32::UI::WindowsAndMessaging::{
-            SetWindowPos, ShowWindow, SW_MINIMIZE, SW_RESTORE,
+            SW_MINIMIZE, SW_RESTORE, SetWindowPos, ShowWindow,
         };
 
         let win = RealWindow::create();
@@ -3605,7 +3652,10 @@ mod tests {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
-        assert!(!is_topmost(hwnd), "имитация выбивания из topmost не сработала");
+        assert!(
+            !is_topmost(hwnd),
+            "имитация выбивания из topmost не сработала"
+        );
         assert!(
             pins.reassert_topmost_if_needed(hwnd),
             "backstop должен обнаружить сбитый topmost и вернуть его"

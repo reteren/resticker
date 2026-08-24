@@ -38,9 +38,7 @@
 
 use rst_core::hittest::{to_local, to_world};
 
-use crate::{
-    Box2D, HighlightKind, PointerEvent, Primitive, Widget, WidgetId, text_size, theme,
-};
+use crate::{Box2D, HighlightKind, PointerEvent, Primitive, Widget, WidgetId, text_size, theme};
 
 /// Отступ полосы от краёв стикера, DIP.
 pub const TIMELINE_MARGIN: f64 = 8.0;
@@ -291,8 +289,10 @@ impl Widget for VideoTimeline {
         });
         // Подписи времени: слева — текущая позиция, справа — длительность
         // (выровнены по краям полосы, вертикально — по центру дорожки).
-        let (left_text, right_text) =
-            (format_time(self.position()), format_time(self.duration_secs));
+        let (left_text, right_text) = (
+            format_time(self.position()),
+            format_time(self.duration_secs),
+        );
         let (lw, lh) = text_size(&left_text);
         let (rw, rh) = text_size(&right_text);
         out.push(Primitive::Text {
@@ -373,7 +373,13 @@ pub fn timeline_bounds(sticker_rect: Box2D) -> Option<Box2D> {
     // Центр полосы в локальных координатах стикера: по X — его центр, по
     // Y — низ (нижняя кромка минус отступ минус половина высоты полосы).
     let ly = sticker_rect.h / 2.0 - TIMELINE_MARGIN - TIMELINE_HEIGHT / 2.0;
-    let (cx, cy) = to_world(sticker_rect.cx, sticker_rect.cy, sticker_rect.rotation, 0.0, ly);
+    let (cx, cy) = to_world(
+        sticker_rect.cx,
+        sticker_rect.cy,
+        sticker_rect.rotation,
+        0.0,
+        ly,
+    );
     Some(Box2D {
         cx,
         cy,
@@ -464,7 +470,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn click_at_edges_seeks_zero_and_duration() {
         let mut t = tl();
         let (lx, y) = (left_edge(&t), t.bounds.cy);
@@ -535,7 +541,11 @@ mod tests {
         assert_eq!(t.position(), 0.0, "drag ведёт палец, а не внешняя позиция");
         up_at(&mut t, lx, y);
         t.set_position(42.0);
-        assert_eq!(t.position(), 42.0, "после отпускания внешняя позиция снова принимается");
+        assert_eq!(
+            t.position(),
+            42.0,
+            "после отпускания внешняя позиция снова принимается"
+        );
         // Внешняя позиция клампится к длительности.
         t.set_position(999.0);
         assert_eq!(t.position(), 120.0);
@@ -545,12 +555,20 @@ mod tests {
 
     #[test]
     fn zero_duration_never_uses_division() {
-        let mut t =
-            VideoTimeline::new(1, Box2D::from_center(0.0, 0.0, 200.0, TIMELINE_HEIGHT), 0.0, 5.0);
+        let mut t = VideoTimeline::new(
+            1,
+            Box2D::from_center(0.0, 0.0, 200.0, TIMELINE_HEIGHT),
+            0.0,
+            5.0,
+        );
         assert_eq!(t.position(), 0.0, "позиция поджата к нулевой длительности");
         let (mx, y) = (mid(&t), 0.0);
         down_at(&mut t, mx, y);
-        assert_eq!(t.take_seek(), Some(0.0), "клик по пустой дорожке — позиция 0");
+        assert_eq!(
+            t.take_seek(),
+            Some(0.0),
+            "клик по пустой дорожке — позиция 0"
+        );
         up_at(&mut t, mx, y);
         // Рисование при нулевой длительности не паникует и даёт ровно
         // подложку, дорожку, ручку и две подписи.
@@ -571,7 +589,11 @@ mod tests {
         assert_eq!(format_time(3600.0), "1:00:00");
         assert_eq!(format_time(3661.0), "1:01:01");
         assert_eq!(format_time(2.0 * 3600.0 + 1.0), "2:00:01");
-        assert_eq!(format_time(-1.0), "0:00", "отрицательное время не бывает, но подпись устойчива");
+        assert_eq!(
+            format_time(-1.0),
+            "0:00",
+            "отрицательное время не бывает, но подпись устойчива"
+        );
     }
 
     #[test]
@@ -584,7 +606,10 @@ mod tests {
         assert_eq!(b.w, 400.0 - 2.0 * TIMELINE_MARGIN);
         assert_eq!(b.h, TIMELINE_HEIGHT);
         assert_eq!(b.cx, 300.0);
-        assert_eq!(b.cy, 200.0 + 150.0 - TIMELINE_MARGIN - TIMELINE_HEIGHT / 2.0);
+        assert_eq!(
+            b.cy,
+            200.0 + 150.0 - TIMELINE_MARGIN - TIMELINE_HEIGHT / 2.0
+        );
         assert_eq!(b.rotation, 0.0);
     }
 
@@ -650,14 +675,20 @@ mod tests {
         assert_eq!(bg_idle, TIMELINE_BG_OPACITY);
         assert!(t.set_hovered(true), "смена наведения требует перерисовки");
         assert!(t.hovered);
-        assert!(!t.set_hovered(true), "повторная установка — без перерисовки");
+        assert!(
+            !t.set_hovered(true),
+            "повторная установка — без перерисовки"
+        );
         let mut out = Vec::new();
         t.draw(&mut out);
         let bg_hover = match &out[0] {
             Primitive::Fill { opacity, .. } => *opacity,
             other => panic!("первый примитив — подложка: {other:?}"),
         };
-        assert_eq!(bg_hover, TIMELINE_BG_OPACITY_HOVER, "при наведении контраст выше");
+        assert_eq!(
+            bg_hover, TIMELINE_BG_OPACITY_HOVER,
+            "при наведении контраст выше"
+        );
         let track_h_idle = TIMELINE_TRACK_H;
         let track_h_hover = match &out[1] {
             Primitive::Fill { rect, .. } => rect.h,

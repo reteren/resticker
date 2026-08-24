@@ -1,14 +1,25 @@
-//! Панель инструментов у курсора (SPEC.md, раздел 3.8; ROADMAP.md M2;
-//! docs/M2_INTEGRATION_PLAN.md, §11 — горизонтальная полоса из 4 кнопок).
+//! Панель инструментов режима редактирования (SPEC.md, раздел 3.8;
+//! ROADMAP.md M2) — горизонтальная полоса кнопок.
 //!
-//! Чистый билдер: на входе — позиция курсора и границы экрана в DIP, на
-//! выходе — собранная [`Panel`] рядом с курсором, целиком на экране.
-//! Перетаскивание панели и запоминание позиции (SPEC 3.8), а также действия
-//! кнопок — зона координатора: ему доступны [`Panel::translate`] и
-//! [`Button::take_click`] по идентификаторам ниже.
+//! Чистый билдер: на входе — границы экрана в DIP и два флага состояния, на
+//! выходе — собранная [`Panel`]. Действия кнопок — зона координатора, ему
+//! доступен [`Button::take_click`] по идентификаторам ниже.
+//!
+//! С 2026-08-23 панель НЕ ходит за курсором: она прижата к низу экрана по
+//! центру (запрос пользователя — «перемести его в низ центра экрана»), а её
+//! кнопки вдвое крупнее прежних. Имя модуля и идентификаторы (`CURSOR_*`)
+//! остались прежними: их знает конфиг, история и полсотни мест в
+//! координаторе — переименование не дало бы ничего, кроме шума в диффе.
+//!
+//! Пока выделен стикер, панель уезжает вниз за край экрана и оставляет
+//! видимой полоску в [`PEEK_DIP`] (второй запрос пользователя): она стоит
+//! ровно там, куда тянут стикеры и где всплывает тулбар выделения, и в
+//! развёрнутом виде мешала бы. Наведение курсора на полоску возвращает
+//! панель целиком — решение о том, свёрнута она или нет, принимает
+//! координатор и передаёт сюда флагом.
 
 use rst_core::hittest::DipRect;
-use rst_render::{Box2D, Button, Icon, Panel, WidgetId, theme};
+use rst_render::{Box2D, Button, ButtonContent, Icon, Panel, WidgetId, WidgetStyle, theme};
 
 /// Идентификатор панели у курсора. Диапазон 100+; тулбар стикера
 /// (SPEC 3.6) получит свой диапазон отдельно.
@@ -32,40 +43,76 @@ pub const BTN_ADD_WINDOW: WidgetId = 105;
 /// кнопка всегда на месте, реагирует иначе только по клику.
 pub const BTN_PRESETS: WidgetId = 106;
 
-/// Смещение панели от курсора вправо-вниз, DIP (не закрывать сам курсор).
-pub const CURSOR_OFFSET_DIP: f64 = 12.0;
+/// Сторона кнопки панели, DIP — вдвое больше кнопки тулбара выделения
+/// (запрос пользователя 2026-08-23: «увеличь его размер в 2 раза»). Своя
+/// константа, а не `theme::BUTTON_SIZE`: тулбар стикера остаётся прежним,
+/// он живёт вплотную к стикеру и от размера кнопок там зависит вся
+/// раскладка.
+pub const BUTTON_SIZE: f64 = 2.0 * theme::BUTTON_SIZE;
 /// Внутренний отступ панели, DIP.
-const PANEL_PAD: f64 = 6.0;
+const PANEL_PAD: f64 = 12.0;
 /// Зазор между кнопками, DIP.
-const BUTTON_GAP: f64 = 4.0;
+const BUTTON_GAP: f64 = 8.0;
 /// Число кнопок панели.
 const BUTTON_COUNT: f64 = 6.0;
+/// Отступ панели от нижнего края экрана, DIP.
+pub const BOTTOM_MARGIN_DIP: f64 = 16.0;
+/// Сколько DIP панели видно, когда она свёрнута (выделен стикер).
+pub const PEEK_DIP: f64 = 10.0;
+/// Насколько зона наведения выходит за видимую полоску, DIP (запрос
+/// пользователя 2026-08-23: «чтобы менюшка вылетала за 7 пикселей до
+/// вытаскивания»). Тот же запас держит панель развёрнутой, когда курсор
+/// чуть съехал с её края.
+pub const HOVER_MARGIN_DIP: f64 = 7.0;
 
-/// Размер панели (ширина, высота), DIP: пять кнопок `theme::BUTTON_SIZE`
+/// Размер панели (ширина, высота), DIP: шесть кнопок [`BUTTON_SIZE`]
 /// с зазорами и отступами.
 pub const CURSOR_PANEL_SIZE: (f64, f64) = (
-    2.0 * PANEL_PAD + BUTTON_COUNT * theme::BUTTON_SIZE + (BUTTON_COUNT - 1.0) * BUTTON_GAP,
-    2.0 * PANEL_PAD + theme::BUTTON_SIZE,
+    2.0 * PANEL_PAD + BUTTON_COUNT * BUTTON_SIZE + (BUTTON_COUNT - 1.0) * BUTTON_GAP,
+    2.0 * PANEL_PAD + BUTTON_SIZE,
 );
 
-/// Собрать панель у курсора. `cursor` — позиция курсора в DIP, `screen` —
-/// границы монитора в тех же координатах (начало обычно в `(0, 0)`);
-/// `all_visible` — текущее состояние «все стикеры видимы»: кнопка-
-/// переключатель показывает предстоящее действие (всё видимо → «скрыть»).
+/// Центр панели (DIP) на экране `screen` при степени раскрытия `progress`
+/// (`0` — свёрнута в полоску, `1` — целиком на экране; промежуточные
+/// значения — кадры анимации).
 ///
-/// Панель ставится вправо-вниз от курсора на [`CURSOR_OFFSET_DIP`] и
-/// зажимается так, чтобы целиком оставаться в `screen`; если экран меньше
-/// панели по какой-то оси, панель центрируется по этой оси. Неконечные
-/// координаты курсора заменяются центром экрана.
-pub fn build_cursor_panel(cursor: (f64, f64), screen: &DipRect, all_visible: bool) -> Panel {
+/// Развёрнутая стоит по центру внизу с отступом [`BOTTOM_MARGIN_DIP`];
+/// свёрнутая уезжает за нижний край так, что сверху остаётся ровно
+/// [`PEEK_DIP`]. Если экран уже панели — она всё равно центрируется по
+/// горизонтали (обрезать нечего, лучше симметрично).
+pub fn panel_center(screen: &DipRect, progress: f64) -> (f64, f64) {
+    let (_, h) = CURSOR_PANEL_SIZE;
+    let bottom = screen.y + screen.h;
+    let cx = screen.x + screen.w / 2.0;
+    let hidden = bottom - PEEK_DIP + h / 2.0;
+    let shown = bottom - BOTTOM_MARGIN_DIP - h / 2.0;
+    let t = progress.clamp(0.0, 1.0);
+    (cx, hidden + (shown - hidden) * t)
+}
+
+/// Полоса-«язычок» свёрнутой панели (DIP): по ней координатор понимает, что
+/// курсор навёлся и панель пора развернуть. Выходит за видимую часть на
+/// [`HOVER_MARGIN_DIP`] вверх и в стороны — панель встречает курсор чуть
+/// раньше, чем он доедет до самой полоски.
+pub fn peek_hot_zone(screen: &DipRect) -> Box2D {
+    let (w, _) = CURSOR_PANEL_SIZE;
+    let hot_h = PEEK_DIP + HOVER_MARGIN_DIP;
+    Box2D {
+        cx: screen.x + screen.w / 2.0,
+        cy: screen.y + screen.h - hot_h / 2.0,
+        w: w + 2.0 * HOVER_MARGIN_DIP,
+        h: hot_h,
+        rotation: 0.0,
+    }
+}
+
+/// Собрать панель. `screen` — границы монитора в DIP (начало обычно в
+/// `(0, 0)`); `all_visible` — текущее состояние «все стикеры видимы»
+/// (кнопка-переключатель показывает предстоящее действие: всё видимо →
+/// «скрыть»); `progress` — степень раскрытия, см. [`panel_center`].
+pub fn build_cursor_panel(screen: &DipRect, all_visible: bool, progress: f64) -> Panel {
     let (w, h) = CURSOR_PANEL_SIZE;
-    let (cx, cy) = clamp_to_screen(
-        cursor.0 + CURSOR_OFFSET_DIP,
-        cursor.1 + CURSOR_OFFSET_DIP,
-        w,
-        h,
-        screen,
-    );
+    let (cx, cy) = panel_center(screen, progress);
     let frame = Box2D {
         cx,
         cy,
@@ -73,7 +120,12 @@ pub fn build_cursor_panel(cursor: (f64, f64), screen: &DipRect, all_visible: boo
         h,
         rotation: 0.0,
     };
-    let mut panel = Panel::new(CURSOR_PANEL_ID, frame);
+    // Оформление — стилистика окна настроек (Source VGUI), как у тулбара
+    // стикера и панели свойств закреплённого окна (запрос пользователя
+    // 2026-08-23): весь UI поверх экрана читается как одно окно продукта.
+    let mut panel = Panel::new(CURSOR_PANEL_ID, frame)
+        .with_style(WidgetStyle::Settings)
+        .with_corner_radius(theme::settings::CORNER_RADIUS);
 
     let toggle_icon = if all_visible {
         Icon::HideAll
@@ -89,38 +141,25 @@ pub fn build_cursor_panel(cursor: (f64, f64), screen: &DipRect, all_visible: boo
         (BTN_EXIT, Icon::Exit),
     ];
     // Горизонтальная полоса: кнопки по центру панели, слева направо.
-    let first_cx = cx - w / 2.0 + PANEL_PAD + theme::BUTTON_SIZE / 2.0;
+    let first_cx = cx - w / 2.0 + PANEL_PAD + BUTTON_SIZE / 2.0;
     for (i, (id, icon)) in buttons.into_iter().enumerate() {
-        let bx = first_cx + i as f64 * (theme::BUTTON_SIZE + BUTTON_GAP);
-        panel.add_widget(Button::icon(id, bx, cy, icon));
+        let bx = first_cx + i as f64 * (BUTTON_SIZE + BUTTON_GAP);
+        panel.add_widget(
+            Button::new(
+                id,
+                Box2D {
+                    cx: bx,
+                    cy,
+                    w: BUTTON_SIZE,
+                    h: BUTTON_SIZE,
+                    rotation: 0.0,
+                },
+                ButtonContent::Icon(icon),
+            )
+            .with_style(WidgetStyle::Settings),
+        );
     }
     panel
-}
-
-/// Зажать центр прямоугольника `w`×`h` так, чтобы он целиком лежал
-/// в `screen`.
-fn clamp_to_screen(cx: f64, cy: f64, w: f64, h: f64, screen: &DipRect) -> (f64, f64) {
-    let center = (screen.x + screen.w / 2.0, screen.y + screen.h / 2.0);
-    if ![cx, cy, w, h, screen.x, screen.y, screen.w, screen.h]
-        .iter()
-        .all(|v| v.is_finite())
-    {
-        return center;
-    }
-    (
-        clamp_axis(cx, w, screen.x, screen.x + screen.w),
-        clamp_axis(cy, h, screen.y, screen.y + screen.h),
-    )
-}
-
-/// Одна ось: центр в `[lo + size/2, hi - size/2]`; если прямоугольник не
-/// помещается в диапазон — середина диапазона.
-fn clamp_axis(center: f64, size: f64, lo: f64, hi: f64) -> f64 {
-    if hi - lo <= size {
-        (lo + hi) / 2.0
-    } else {
-        center.clamp(lo + size / 2.0, hi - size / 2.0)
-    }
 }
 
 #[cfg(test)]
@@ -152,22 +191,75 @@ mod tests {
     }
 
     #[test]
-    fn panel_offset_in_free_space() {
-        let panel = build_cursor_panel((960.0, 540.0), &screen(), true);
+    fn panel_sits_at_bottom_center_of_the_screen() {
+        let scr = screen();
+        let panel = build_cursor_panel(&scr, true, 1.0);
         let f = panel.frame();
         let (w, h) = CURSOR_PANEL_SIZE;
-        // Вдали от краёв — ровно смещение от курсора, без зажимания.
-        assert_close(f.cx, 960.0 + CURSOR_OFFSET_DIP, "cx");
-        assert_close(f.cy, 540.0 + CURSOR_OFFSET_DIP, "cy");
+        assert_close(f.cx, scr.x + scr.w / 2.0, "cx по центру экрана");
+        assert_close(
+            f.cy + h / 2.0,
+            scr.y + scr.h - BOTTOM_MARGIN_DIP,
+            "низ панели — на BOTTOM_MARGIN_DIP от края",
+        );
         assert_close(f.w, w, "w");
         assert_close(f.h, h, "h");
-        assert_close(f.rotation, 0.0, "rotation");
         assert_eq!(panel.id(), CURSOR_PANEL_ID);
     }
 
     #[test]
-    fn buttons_layout_and_ids() {
-        let panel = build_cursor_panel((960.0, 540.0), &screen(), true);
+    fn panel_follows_screen_origin_on_second_monitor() {
+        // Монитор со смещённым началом координат: якорь считается от его
+        // собственных границ, а не от нуля.
+        let scr = DipRect::new(-1920.0, 357.0, 1920.0, 1080.0);
+        let f = build_cursor_panel(&scr, true, 1.0).frame();
+        let (_, h) = CURSOR_PANEL_SIZE;
+        assert_close(f.cx, scr.x + scr.w / 2.0, "cx");
+        assert_close(f.cy + h / 2.0, scr.y + scr.h - BOTTOM_MARGIN_DIP, "низ");
+    }
+
+    #[test]
+    fn collapsed_panel_leaves_only_the_peek_strip_on_screen() {
+        let scr = screen();
+        let f = build_cursor_panel(&scr, true, 0.0).frame();
+        let (_, h) = CURSOR_PANEL_SIZE;
+        let top = f.cy - h / 2.0;
+        assert_close(top, scr.y + scr.h - PEEK_DIP, "видно ровно PEEK_DIP");
+        assert!(
+            f.cy + h / 2.0 > scr.y + scr.h,
+            "остальная часть панели — за нижним краем экрана"
+        );
+    }
+
+    #[test]
+    fn peek_hot_zone_covers_the_visible_strip_and_panel_width() {
+        let scr = screen();
+        let zone = peek_hot_zone(&scr);
+        let (w, _) = CURSOR_PANEL_SIZE;
+        assert_close(
+            zone.w,
+            w + 2.0 * HOVER_MARGIN_DIP,
+            "полоса шире панели на запас с каждой стороны",
+        );
+        assert_close(
+            zone.cy + zone.h / 2.0,
+            scr.y + scr.h,
+            "полоса прижата к краю",
+        );
+        assert!(
+            zone.h >= PEEK_DIP,
+            "в полоску нужно попадать мышью: {} < {PEEK_DIP}",
+            zone.h
+        );
+        // Точка внутри видимой полоски свёрнутой панели попадает в зону.
+        let f = build_cursor_panel(&scr, true, 0.0).frame();
+        let strip_y = f.cy - CURSOR_PANEL_SIZE.1 / 2.0 + PEEK_DIP / 2.0;
+        assert!(rst_render::box_contains(&zone, (f.cx, strip_y)));
+    }
+
+    #[test]
+    fn buttons_are_twice_the_toolbar_size_and_ordered() {
+        let panel = build_cursor_panel(&screen(), true, 1.0);
         let f = panel.frame();
         let ids = [
             BTN_LOAD_FILE,
@@ -183,8 +275,8 @@ mod tests {
                 .widget::<Button>(id)
                 .unwrap_or_else(|| panic!("кнопка {id} должна существовать"))
                 .bounds();
-            assert_close(b.w, theme::BUTTON_SIZE, "button w");
-            assert_close(b.h, theme::BUTTON_SIZE, "button h");
+            assert_close(b.w, 2.0 * theme::BUTTON_SIZE, "button w");
+            assert_close(b.h, 2.0 * theme::BUTTON_SIZE, "button h");
             assert_close(b.cy, f.cy, "button cy == panel cy");
             assert!(b.cx > prev_cx, "кнопки упорядочены слева направо");
             prev_cx = b.cx;
@@ -195,9 +287,26 @@ mod tests {
     }
 
     #[test]
+    fn buttons_move_with_the_panel_when_collapsed() {
+        // Кнопки уезжают вместе с рамкой — иначе они остались бы висеть
+        // посреди экрана без панели под ними.
+        let scr = screen();
+        let open = build_cursor_panel(&scr, true, 1.0);
+        let hidden = build_cursor_panel(&scr, true, 0.0);
+        let dy = hidden.frame().cy - open.frame().cy;
+        assert!(dy > 0.0, "свёрнутая панель ниже развёрнутой");
+        for id in [BTN_LOAD_FILE, BTN_EXIT] {
+            let a = open.widget::<Button>(id).unwrap().bounds();
+            let b = hidden.widget::<Button>(id).unwrap().bounds();
+            assert_close(b.cy - a.cy, dy, "кнопка {id} съехала вместе с панелью");
+            assert_close(b.cx, a.cx, "по горизонтали кнопка не двигается");
+        }
+    }
+
+    #[test]
     fn icons_match_spec_and_toggle_state() {
         // Всё видимо → кнопка-переключатель предлагает «скрыть все».
-        let panel = build_cursor_panel((960.0, 540.0), &screen(), true);
+        let panel = build_cursor_panel(&screen(), true, 1.0);
         assert_eq!(
             icons(&panel),
             vec![
@@ -210,7 +319,7 @@ mod tests {
             ]
         );
         // Часть скрыта → предлагает «показать все».
-        let panel = build_cursor_panel((960.0, 540.0), &screen(), false);
+        let panel = build_cursor_panel(&screen(), false, 1.0);
         assert_eq!(
             icons(&panel),
             vec![
@@ -225,83 +334,58 @@ mod tests {
     }
 
     #[test]
-    fn clamps_at_screen_edges_table() {
-        let (w, h) = CURSOR_PANEL_SIZE;
-        let cases: [((f64, f64), (f64, f64)); 5] = [
-            // (курсор, ожидаемый центр панели): левый, правый, верхний,
-            // нижний край и угол.
-            ((5.0, 540.0), (w / 2.0, 540.0 + CURSOR_OFFSET_DIP)),
-            (
-                (1915.0, 540.0),
-                (1920.0 - w / 2.0, 540.0 + CURSOR_OFFSET_DIP),
-            ),
-            ((960.0, 2.0), (960.0 + CURSOR_OFFSET_DIP, h / 2.0)),
-            (
-                (960.0, 1075.0),
-                (960.0 + CURSOR_OFFSET_DIP, 1080.0 - h / 2.0),
-            ),
-            ((1915.0, 1075.0), (1920.0 - w / 2.0, 1080.0 - h / 2.0)),
-        ];
-        for (cursor, (ex, ey)) in cases {
-            let f = build_cursor_panel(cursor, &screen(), true).frame();
-            assert_close(f.cx, ex, &format!("{cursor:?} cx"));
-            assert_close(f.cy, ey, &format!("{cursor:?} cy"));
-            // Панель целиком на экране.
-            assert!(f.cx - f.w / 2.0 >= 0.0, "{cursor:?} левый край");
-            assert!(f.cx + f.w / 2.0 <= 1920.0, "{cursor:?} правый край");
-            assert!(f.cy - f.h / 2.0 >= 0.0, "{cursor:?} верхний край");
-            assert!(f.cy + f.h / 2.0 <= 1080.0, "{cursor:?} нижний край");
-        }
+    fn tiny_screen_still_centers_the_panel() {
+        // Экран уже панели: обрезать нечего, но по горизонтали она обязана
+        // остаться симметричной.
+        let scr = DipRect::new(0.0, 0.0, 200.0, 200.0);
+        let f = build_cursor_panel(&scr, true, 1.0).frame();
+        assert_close(f.cx, 100.0, "cx по центру узкого экрана");
     }
 
     #[test]
-    fn clamps_with_nonzero_origin() {
-        // Границы с ненулевым началом (обобщение под M3, координаты монитора).
-        let screen = DipRect::new(100.0, 50.0, 1920.0, 1080.0);
-        let (w, h) = CURSOR_PANEL_SIZE;
-        let f = build_cursor_panel((105.0, 55.0), &screen, true).frame();
-        assert_close(f.cx, 100.0 + w / 2.0, "левый край у начала");
-        assert_close(f.cy, 50.0 + h / 2.0, "верхний край у начала");
-        let f = build_cursor_panel((2010.0, 1125.0), &screen, true).frame();
-        assert_close(f.cx, 100.0 + 1920.0 - w / 2.0, "правый край");
-        assert_close(f.cy, 50.0 + 1080.0 - h / 2.0, "нижний край");
+    fn half_open_panel_sits_between_the_two_states() {
+        // Кадр анимации: панель ровно посередине между свёрнутым и
+        // развёрнутым положением — по нему видно, что выезд непрерывен, а
+        // не переключается двумя состояниями.
+        let scr = screen();
+        let hidden = build_cursor_panel(&scr, true, 0.0).frame().cy;
+        let shown = build_cursor_panel(&scr, true, 1.0).frame().cy;
+        let half = build_cursor_panel(&scr, true, 0.5).frame().cy;
+        assert_close(half, (hidden + shown) / 2.0, "середина выезда");
+        // Значения вне диапазона зажимаются — анимация не выкинет панель
+        // за пределы своих же двух положений.
+        assert_close(
+            build_cursor_panel(&scr, true, -3.0).frame().cy,
+            hidden,
+            "clamp снизу",
+        );
+        assert_close(
+            build_cursor_panel(&scr, true, 9.0).frame().cy,
+            shown,
+            "clamp сверху",
+        );
     }
 
     #[test]
-    fn tiny_screen_centers_panel() {
-        // Экран меньше панели по обеим осям: центрируем (вылезает
-        // симметрично с двух сторон — лучшего варианта нет).
-        let screen = DipRect::new(0.0, 0.0, 100.0, 30.0);
-        let f = build_cursor_panel((10.0, 10.0), &screen, true).frame();
-        assert_close(f.cx, 50.0, "cx по центру крошечного экрана");
-        assert_close(f.cy, 15.0, "cy по центру крошечного экрана");
-    }
-
-    #[test]
-    fn nan_cursor_falls_back_to_screen_center() {
-        let f = build_cursor_panel((f64::NAN, 540.0), &screen(), true).frame();
-        assert_close(f.cx, 960.0, "NaN → центр экрана x");
-        assert_close(f.cy, 540.0, "NaN → центр экрана y");
-        assert!(f.cx.is_finite() && f.cy.is_finite());
-    }
-
-    #[test]
-    fn panel_stays_on_screen_grid() {
-        // Свойство: ни одна позиция курсора не выводит панель за край.
-        let xs = [-100.0, 0.0, 1.0, 500.0, 1919.0, 1920.0, 2100.0];
-        let ys = [-100.0, 0.0, 1.0, 300.0, 1079.0, 1080.0, 2100.0];
-        for x in xs {
-            for y in ys {
-                let f = build_cursor_panel((x, y), &screen(), true).frame();
-                assert!(
-                    f.cx - f.w / 2.0 >= 0.0 && f.cx + f.w / 2.0 <= 1920.0,
-                    "({x}, {y}): панель вылезла по горизонтали"
-                );
-                assert!(
-                    f.cy - f.h / 2.0 >= 0.0 && f.cy + f.h / 2.0 <= 1080.0,
-                    "({x}, {y}): панель вылезла по вертикали"
-                );
-            }
-        }
+    fn hot_zone_reaches_above_the_strip_by_the_hover_margin() {
+        // Панель обязана «встречать» курсор заранее (запрос пользователя:
+        // за ~7 пикселей до полоски).
+        let scr = screen();
+        let zone = peek_hot_zone(&scr);
+        let strip_top = scr.y + scr.h - PEEK_DIP;
+        assert!(
+            zone.cy - zone.h / 2.0 <= strip_top - HOVER_MARGIN_DIP + 1e-9,
+            "зона наведения не поднимается на HOVER_MARGIN_DIP над полоской"
+        );
+        // Точка на HOVER_MARGIN_DIP выше полоски уже считается наведением.
+        assert!(rst_render::box_contains(
+            &zone,
+            (zone.cx, strip_top - HOVER_MARGIN_DIP + 0.5)
+        ));
+        // А заметно выше — уже нет.
+        assert!(!rst_render::box_contains(
+            &zone,
+            (zone.cx, strip_top - HOVER_MARGIN_DIP - 2.0)
+        ));
     }
 }

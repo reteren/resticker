@@ -1,0 +1,10 @@
+Roboto-Light.ttf — гарнитура Roboto (Google), версия 2.137.
+
+Лицензия: Apache License, Version 2.0.
+Полный текст: https://www.apache.org/licenses/LICENSE-2.0
+Исходники гарнитуры: https://github.com/googlefonts/roboto
+
+Файл включён в репозиторий сознательно, а не берётся из системы: шрифт
+оверлея обязан выглядеть одинаково на любой машине, а Roboto не входит в
+стандартную поставку Windows. Те же начертания в виде woff2-подмножеств
+лежат в `crates/resticker/ui/fonts/` — их использует окно настроек.

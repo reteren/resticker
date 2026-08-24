@@ -38,8 +38,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_ARRAY_SRV, D3D11_TEXTURE2D_DESC,
     D3D11CreateDevice, ID3D11Device, ID3D11ShaderResourceView,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R8_UNORM,
-    DXGI_FORMAT_R8G8_UNORM};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
+};
 
 /// Сколько ждать кадр, прежде чем считать, что его не будет.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);

@@ -22,13 +22,13 @@ use uuid::Uuid;
 #[derive(Debug, thiserror::Error)]
 pub enum PasteError {
     /// Ошибка ввода-вывода при создании каталога или записи файла.
-    #[error("ошибка ввода-вывода: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     /// Изображение не удалось декодировать или перекодировать.
-    #[error("не удалось обработать изображение: {0}")]
+    #[error("could not process the image: {0}")]
     Image(#[from] image::ImageError),
     /// Вариант `ClipboardImage::Files` — это не изображение, а пути к файлам.
-    #[error("вариант ClipboardImage::Files не материализуется в PNG")]
+    #[error("the ClipboardImage::Files variant is not materialized into PNG")]
     UnsupportedFiles,
 }
 

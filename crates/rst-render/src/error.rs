@@ -4,10 +4,10 @@
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
     /// Ошибка Win32/D3D/DXGI вызова.
-    #[error("ошибка Win32/D3D: {0}")]
+    #[error("Win32/D3D error: {0}")]
     Windows(#[from] windows::core::Error),
     /// Файл изображения не удалось прочитать или декодировать.
-    #[error("не удалось декодировать изображение «{path}»: {source}")]
+    #[error("could not decode the image \"{path}\": {source}")]
     ImageDecode {
         /// Путь к файлу (для сообщения пользователю).
         path: String,
@@ -15,13 +15,13 @@ pub enum RenderError {
         source: image::ImageError,
     },
     /// Пиксельные данные не соответствуют размерам текстуры.
-    #[error("некорректные данные текстуры: {0}")]
+    #[error("malformed texture data: {0}")]
     InvalidTextureData(String),
     /// HLSL-шейдер не скомпилировался (текст компилятора прилагается).
-    #[error("не удалось скомпилировать шейдер: {0}")]
+    #[error("shader compilation failed: {0}")]
     ShaderCompile(String),
     /// Устройство D3D потеряно (TDR, смена драйвера, выход из сна).
     /// Устройство и цели рендера нужно пересоздать (ARCHITECTURE.md, раздел 11).
-    #[error("устройство D3D потеряно ({0:?}); устройство и цели нужно пересоздать")]
+    #[error("the D3D device was lost ({0:?}); device and targets must be recreated")]
     DeviceLost(windows::core::HRESULT),
 }

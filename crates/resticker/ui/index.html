@@ -1,8 +1,8 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>resticker — настройки</title>
+    <title>resticker — settings</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -11,19 +11,19 @@
          подвал с OK/Отмена/Применить. -->
     <section class="wrapper">
       <strong class="titlebar" data-tauri-drag-region>
-        <h2 class="header" data-tauri-drag-region data-i18n="window.header">resticker · настройки</h2>
-        <button class="closeButton" id="close" title="Закрыть" data-i18n-title="close">
-          <img src="close.svg" width="16" height="16" alt="Закрыть" data-i18n-alt="close" />
+        <h2 class="header" data-tauri-drag-region data-i18n="window.header">resticker · settings</h2>
+        <button class="closeButton" id="close" title="Close" data-i18n-title="close">
+          <img src="close.svg" width="16" height="16" alt="Close" data-i18n-alt="close" />
         </button>
       </strong>
 
       <div class="tabsWrap">
         <header class="tabList" id="tabs">
-          <div class="tab active" data-tab="stickers"><h3 data-i18n="tab.stickers">Стикеры</h3></div>
-          <div class="tab" data-tab="presets"><h3 data-i18n="tab.presets">Пресеты</h3></div>
-          <div class="tab" data-tab="control"><h3 data-i18n="tab.control">Управление</h3></div>
-          <div class="tab" data-tab="general"><h3 data-i18n="tab.general">Общие</h3></div>
-          <div class="tab" data-tab="denylist"><h3 data-i18n="tab.denylist">Денй-лист</h3></div>
+          <div class="tab active" data-tab="stickers"><h3 data-i18n="tab.stickers">Stickers</h3></div>
+          <div class="tab" data-tab="presets"><h3 data-i18n="tab.presets">Presets</h3></div>
+          <div class="tab" data-tab="control"><h3 data-i18n="tab.control">Controls</h3></div>
+          <div class="tab" data-tab="general"><h3 data-i18n="tab.general">General</h3></div>
+          <div class="tab" data-tab="denylist"><h3 data-i18n="tab.denylist">Denylist</h3></div>
         </header>
 
         <section class="content">
@@ -31,15 +31,15 @@
           <div class="panel active" data-panel="stickers">
             <div class="column">
               <div class="inputGroup">
-                <p class="inputLabel" data-i18n="stickers.listLabel">Список стикеров</p>
-                <button class="button compact" id="add-sticker" data-i18n="stickers.add">Добавить…</button>
+                <p class="inputLabel" data-i18n="stickers.listLabel">Sticker list</p>
+                <button class="button compact" id="add-sticker" data-i18n="stickers.add">Add…</button>
               </div>
               <div class="stickerList" id="sticker-list">
-                <p class="emptyHint" data-i18n="stickers.loading">Загрузка…</p>
+                <p class="emptyHint" data-i18n="stickers.loading">Loading…</p>
               </div>
               <div class="inputGroup">
-                <button class="button compact" id="reset-all-stickers" data-i18n="stickers.resetAll">Сбросить всё</button>
-                <button class="button compact danger" id="delete-all-stickers" data-i18n="stickers.deleteAll">Удалить всё</button>
+                <button class="button compact" id="reset-all-stickers" data-i18n="stickers.resetAll">Reset all</button>
+                <button class="button compact danger" id="delete-all-stickers" data-i18n="stickers.deleteAll">Delete all</button>
                 <span class="status" id="sticker-status"></span>
               </div>
             </div>
@@ -49,15 +49,15 @@
           <div class="panel" data-panel="presets">
             <div class="column">
               <div class="inputGroup">
-                <p class="inputLabel" data-i18n="presets.listLabel">Список пресетов</p>
+                <p class="inputLabel" data-i18n="presets.listLabel">Preset list</p>
                 <button
                   class="button compact"
                   id="import-preset"
-                  title="Импортировать пресет из файла .json"
+                  title="Import a preset from a .json file"
                   data-i18n="presets.import"
                   data-i18n-title="presets.importTitle"
                 >
-                  Импорт из файла…
+                  Import from file…
                 </button>
               </div>
               <div class="inputGroup presetSaveRow">
@@ -65,13 +65,13 @@
                   type="text"
                   class="textInput"
                   id="preset-name"
-                  placeholder="Имя нового пресета"
+                  placeholder="New preset name"
                   data-i18n-placeholder="presets.namePlaceholder"
                 />
-                <button class="button compact" id="save-preset" disabled data-i18n="presets.save">Сохранить как пресет</button>
+                <button class="button compact" id="save-preset" disabled data-i18n="presets.save">Save as preset</button>
               </div>
               <div class="stickerList" id="preset-list">
-                <p class="emptyHint" data-i18n="presets.loading">Загрузка…</p>
+                <p class="emptyHint" data-i18n="presets.loading">Loading…</p>
               </div>
               <div class="inputGroup">
                 <span class="status" id="preset-status"></span>
@@ -82,10 +82,10 @@
           <!-- ==== Управление ==== -->
           <div class="panel" data-panel="control">
             <div class="column">
-              <p data-i18n="control.hotkeysLabel">Глобальные хоткеи:</p>
+              <p data-i18n="control.hotkeysLabel">Global hotkeys:</p>
 
               <label class="inputGroup">
-                <p class="inputLabel" data-i18n="control.editMode">Режим редактирования</p>
+                <p class="inputLabel" data-i18n="control.editMode">Edit mode</p>
                 <input
                   type="text"
                   class="textInput hotkeyInput"
@@ -96,13 +96,13 @@
               </label>
 
               <div class="inputGroup">
-                <p class="inputLabel" data-i18n="control.toggleAll">Показать/скрыть все стикеры</p>
+                <p class="inputLabel" data-i18n="control.toggleAll">Show/hide all stickers</p>
                 <input
                   type="text"
                   class="textInput hotkeyInput"
                   id="hotkey-toggle-all"
                   readonly
-                  placeholder="Не задан"
+                  placeholder="Not set"
                   data-i18n-placeholder="control.notSet"
                   style="max-width: 160px"
                 />
@@ -110,13 +110,13 @@
               </div>
 
               <div class="inputGroup">
-                <p class="inputLabel" data-i18n="control.muteAll">Заглушить всё</p>
+                <p class="inputLabel" data-i18n="control.muteAll">Mute all</p>
                 <input
                   type="text"
                   class="textInput hotkeyInput"
                   id="hotkey-mute-all"
                   readonly
-                  placeholder="Не задан"
+                  placeholder="Not set"
                   data-i18n-placeholder="control.notSet"
                   style="max-width: 160px"
                 />
@@ -124,13 +124,13 @@
               </div>
 
               <div class="inputGroup">
-                <p class="inputLabel" data-i18n="control.pinFocusedWindow">Закрепить активное окно</p>
+                <p class="inputLabel" data-i18n="control.pinFocusedWindow">Pin focused window</p>
                 <input
                   type="text"
                   class="textInput hotkeyInput"
                   id="hotkey-pin"
                   readonly
-                  placeholder="Не задан"
+                  placeholder="Not set"
                   data-i18n-placeholder="control.notSet"
                   style="max-width: 160px"
                 />
@@ -138,7 +138,7 @@
               </div>
 
               <div class="inputGroup">
-                <p class="inputLabel" data-i18n="control.pinSoundVolume">Громкость закрепления окна</p>
+                <p class="inputLabel" data-i18n="control.pinSoundVolume">Pin sound volume</p>
                 <input
                   type="range"
                   class="slider"
@@ -150,14 +150,13 @@
                 <span class="sliderValue" id="pin-sound-volume-value">100</span>
               </div>
 
-              <p class="hint" data-i18n="control.hintClick">Клик по полю, затем нажмите комбинацию клавиш.</p>
-              <p class="hint" data-i18n="control.hintRestart">Изменения хоткеев применяются после перезапуска resticker.</p>
+              <p class="hint" data-i18n="control.hintClick">Click a field, then press a key combination.</p>
+              <p class="hint" data-i18n="control.hintRestart">Hotkey changes apply after restarting resticker.</p>
             </div>
 
             <div class="column">
               <p class="hint" data-i18n="control.hintRequired">
-                «Режим редактирования» — обязательная комбинация (нельзя очистить). Остальные два —
-                опциональны.
+                "Edit mode" is required (cannot be cleared). The others are optional.
               </p>
             </div>
           </div>
@@ -165,77 +164,69 @@
           <!-- ==== Общие ==== -->
           <div class="panel" data-panel="general">
             <div class="column">
-              <p data-i18n="general.startupLabel">Запуск:</p>
+              <p data-i18n="general.startupLabel">Startup:</p>
 
               <label class="checkboxWrapper">
                 <input type="checkbox" id="autostart" />
                 <span class="checkmark"></span>
-                <span data-i18n="general.autostart">Автозапуск с Windows</span>
+                <span data-i18n="general.autostart">Launch with Windows</span>
               </label>
 
               <label class="checkboxWrapper">
                 <input type="checkbox" id="silent-start" />
                 <span class="checkmark"></span>
-                <span data-i18n="general.silentStart">Тихий старт (не открывать настройки)</span>
+                <span data-i18n="general.silentStart">Silent start (don’t open settings)</span>
               </label>
 
               <label class="checkboxWrapper">
                 <input type="checkbox" id="tray-icon" />
                 <span class="checkmark"></span>
-                <span data-i18n="general.trayIcon">Иконка в трее</span>
+                <span data-i18n="general.trayIcon">Tray icon</span>
               </label>
 
               <hr />
-              <p data-i18n="general.dialogsLabel">Диалоги:</p>
+              <p data-i18n="general.dialogsLabel">Dialogs:</p>
 
               <label class="checkboxWrapper">
                 <input type="checkbox" id="skip-delete-confirmation" />
                 <span class="checkmark"></span>
-                <span data-i18n="general.skipDeleteConfirm">Не спрашивать подтверждение при удалении</span>
+                <span data-i18n="general.skipDeleteConfirm">Skip delete confirmation</span>
               </label>
 
-              <hr />
-              <p data-i18n="general.languageLabel">Язык</p>
-              <select class="textInput" id="language" style="max-width: 160px">
-                <option value="ru">Русский</option>
-                <option value="en">English</option>
-              </select>
             </div>
 
             <div class="column">
-              <p data-i18n="general.screenLabel">Экран:</p>
+              <p data-i18n="general.screenLabel">Screen:</p>
 
               <label class="checkboxWrapper">
                 <input type="checkbox" id="outline-pinned-windows" />
                 <span class="checkmark"></span>
-                <span data-i18n="general.outlinePinned">Обводка на закреплённом окне</span>
+                <span data-i18n="general.outlinePinned">Outline on pinned window</span>
               </label>
               <p class="hint" data-i18n="general.outlinePinnedHint">
-                Пока окно закреплено, вокруг него держится рамка. Без опции закрепление видно
-                только по булавке в углу окна.
+                Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.
               </p>
 
               <label class="checkboxWrapper">
                 <input type="checkbox" id="hide-from-capture" />
                 <span class="checkmark"></span>
-                <span data-i18n="general.hideFromCapture">Скрывать стикеры от захвата экрана</span>
+                <span data-i18n="general.hideFromCapture">Hide stickers from screen capture</span>
               </label>
               <p class="hint" data-i18n="general.hideFromCaptureHint">
-                На отдельных сборках Windows 11 работает нестабильно — резульат применения
-                проверяется, при неудаче будет предупреждение в логе.
+                Unstable on some Windows 11 builds — the result is verified after applying; a warning is logged on failure.
               </p>
 
               <label class="checkboxWrapper">
                 <input type="checkbox" id="never-overlap-taskbar" />
                 <span class="checkmark"></span>
-                <span data-i18n="general.neverOverlapTaskbar">Не перекрывать панель задач</span>
+                <span data-i18n="general.neverOverlapTaskbar">Don't overlap the taskbar</span>
               </label>
 
               <hr />
-              <p data-i18n="general.performanceLabel">Производительность:</p>
+              <p data-i18n="general.performanceLabel">Performance:</p>
 
               <div class="inputGroup">
-                <p class="inputLabel" data-i18n="general.fpsLimit">Лимит FPS оверлея</p>
+                <p class="inputLabel" data-i18n="general.fpsLimit">Overlay FPS limit</p>
                 <input
                   type="range"
                   class="slider"
@@ -253,16 +244,14 @@
           <div class="panel" data-panel="denylist">
             <div class="column">
               <div class="inputGroup">
-                <p class="inputLabel" data-i18n="denylist.listLabel">Денй-лист закрепления</p>
+                <p class="inputLabel" data-i18n="denylist.listLabel">Pin denylist</p>
               </div>
               <p class="hint" data-i18n="denylist.hint">
-                Окна, чей процесс или заголовок совпадает с правилом, нельзя закрепить горячей
-                клавишей — они не показываются в списке выбора окна. Больше денй-лист ни на что
-                не влияет.
+                Windows whose process or title matches a rule cannot be pinned via the hotkey and are hidden from the window pick list. The denylist has no other effect.
               </p>
               <div class="inputGroup">
                 <select class="textInput" id="denylist-process-picker" style="max-width: 260px">
-                  <option value="" data-i18n="denylist.pickWindow">Выбрать открытое окно…</option>
+                  <option value="" data-i18n="denylist.pickWindow">Pick an open window…</option>
                 </select>
               </div>
               <div class="inputGroup denylistAddRow">
@@ -277,15 +266,15 @@
                   type="text"
                   class="textInput"
                   id="denylist-title"
-                  placeholder="часть заголовка, * — подстановка"
+                  placeholder="title substring, * wildcard"
                   data-i18n-placeholder="denylist.titlePlaceholder"
                 />
                 <button class="button compact" id="add-denylist-rule" disabled data-i18n="denylist.add">
-                  Добавить
+                  Add
                 </button>
               </div>
               <div class="stickerList" id="denylist-list">
-                <p class="emptyHint" data-i18n="denylist.loading">Загрузка…</p>
+                <p class="emptyHint" data-i18n="denylist.loading">Loading…</p>
               </div>
               <div class="inputGroup">
                 <span class="status" id="denylist-status"></span>
@@ -297,9 +286,9 @@
 
       <div class="footer">
         <span class="status" id="status"></span>
-        <button class="button" id="apply" data-i18n="footer.apply">Применить</button>
-        <button class="button" id="ok" data-i18n="footer.ok">ОК</button>
-        <button class="button" id="cancel" data-i18n="footer.cancel">Отмена</button>
+        <button class="button" id="apply" data-i18n="footer.apply">Apply</button>
+        <button class="button" id="ok" data-i18n="footer.ok">OK</button>
+        <button class="button" id="cancel" data-i18n="footer.cancel">Cancel</button>
       </div>
     </section>
 

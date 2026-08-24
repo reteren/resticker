@@ -20,7 +20,7 @@ use crate::model::{Config, Preset, StickerSource};
 #[derive(Debug, thiserror::Error)]
 pub enum PresetError {
     /// Пресет с данным id не найден в списке `cfg.presets`.
-    #[error("пресет с id {0} не найден")]
+    #[error("no preset with id {0}")]
     PresetNotFound(Uuid),
     /// Ошибка ввода-вывода или JSON при экспорте/импорте файла пресета
     /// (те же варианты, что у `config`).

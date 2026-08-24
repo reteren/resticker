@@ -18,11 +18,11 @@ pub const DUPLICATE_OFFSET: f64 = 16.0;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OpError {
     /// Стикер с данным id не найден в списке.
-    #[error("стикер с id {0} не найден")]
+    #[error("no sticker with id {0}")]
     StickerNotFound(Uuid),
     /// `relink_file` вызван для стикера, чей источник не `File` (`Pasted`
     /// не поддерживает переуказание пути).
-    #[error("у стикера {0} нет файла для переуказания")]
+    #[error("sticker {0} has no file to relink")]
     NotFileBacked(Uuid),
 }
 

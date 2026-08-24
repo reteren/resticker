@@ -429,7 +429,6 @@ pub fn host_action(ctx: &HostContext) -> HostAction {
 mod tests {
     use super::*;
 
-
     fn mon() -> PxRect {
         PxRect::from_xywh(0.0, 0.0, 1920.0, 1080.0)
     }
@@ -549,7 +548,6 @@ mod tests {
         assert_eq!(out.right, 1200.0, "дальняя кромка не двигается");
     }
 
-
     fn rule_for(process: &str) -> OverlapRule {
         OverlapRule {
             process_name: Some(process.to_string()),
@@ -583,7 +581,11 @@ mod tests {
         let rules = only(&["chrome.exe"]);
         let mut c = ctx(&rules, Some("notepad.exe"));
         c.shell_switching = true;
-        assert_eq!(host_action(&c), HostAction::None, "не прячем во время Alt+Tab");
+        assert_eq!(
+            host_action(&c),
+            HostAction::None,
+            "не прячем во время Alt+Tab"
+        );
 
         // И не разворачиваем: список переключателя не должен меняться.
         c.foreground_process = Some("chrome.exe");
@@ -600,7 +602,10 @@ mod tests {
     #[test]
     fn host_action_is_silent_without_rules() {
         let anywhere = HostFilter::Anywhere;
-        assert_eq!(host_action(&ctx(&anywhere, Some("chrome.exe"))), HostAction::None);
+        assert_eq!(
+            host_action(&ctx(&anywhere, Some("chrome.exe"))),
+            HostAction::None
+        );
     }
 
     /// Снятые ВСЕ галочки — это «ни на одном окне», а не «ограничений нет»
@@ -610,14 +615,21 @@ mod tests {
     #[test]
     fn empty_host_list_hides_everywhere_but_yields_to_the_user() {
         let nowhere = HostFilter::Only(Vec::new());
-        assert_eq!(host_action(&ctx(&nowhere, Some("chrome.exe"))), HostAction::Hide);
+        assert_eq!(
+            host_action(&ctx(&nowhere, Some("chrome.exe"))),
+            HostAction::Hide
+        );
         assert_eq!(host_action(&ctx(&nowhere, None)), HostAction::Hide);
 
         let mut c = ctx(&nowhere, Some("chrome.exe"));
         c.foreground_is_target = true;
         c.target_minimized = true;
         c.hidden_by_rules = true;
-        assert_eq!(host_action(&c), HostAction::Show, "вызванное вручную — показываем");
+        assert_eq!(
+            host_action(&c),
+            HostAction::Show,
+            "вызванное вручную — показываем"
+        );
     }
 
     /// Активен хозяин — окно должно быть видно; активно что-то другое —
@@ -626,7 +638,10 @@ mod tests {
     fn host_action_follows_foreground_window() {
         let rules = only(&["chrome.exe"]);
         // Хозяин активен, окно уже видно — трогать нечего.
-        assert_eq!(host_action(&ctx(&rules, Some("chrome.exe"))), HostAction::None);
+        assert_eq!(
+            host_action(&ctx(&rules, Some("chrome.exe"))),
+            HostAction::None
+        );
         // Активен чужой процесс — прячем.
         assert_eq!(host_action(&ctx(&rules, Some("vlc.exe"))), HostAction::Hide);
         // Рабочий стол (переднего окна нет) — тоже прячем.
@@ -753,7 +768,10 @@ mod tests {
     #[test]
     fn host_action_accepts_any_of_several_rules() {
         let rules = only(&["chrome.exe", "firefox.exe"]);
-        assert_eq!(host_action(&ctx(&rules, Some("firefox.exe"))), HostAction::None);
+        assert_eq!(
+            host_action(&ctx(&rules, Some("firefox.exe"))),
+            HostAction::None
+        );
         assert_eq!(host_action(&ctx(&rules, Some("vlc.exe"))), HostAction::Hide);
     }
 
