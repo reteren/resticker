@@ -45,6 +45,20 @@ pub struct MonitorInfo {
     /// Границы в физических пикселях виртуального десктопа; у неосновных
     /// мониторов `x`/`y` могут быть отрицательными.
     pub bounds_px: Rect,
+    /// Рабочая область (`MONITORINFO::rcWork`) — те же координаты, что и
+    /// [`Self::bounds_px`], но без панели задач и прочих закреплённых
+    /// AppBar'ов.
+    ///
+    /// Нужна тайлингу (docs/TILING_DESIGN.md §T0): гэп «до края экрана»,
+    /// отмеренный от `bounds_px`, положил бы плитки ПОД панель задач.
+    /// Стикеры этой областью не пользуются — им панель задач видна как
+    /// обычный окклюдер (`rst_core::occluders`), поэтому до M9 её никто и
+    /// не читал.
+    ///
+    /// Меняется на лету (панель задач с автоскрытием, смена её стороны или
+    /// размера), а события на это Windows не шлёт — значение верно на момент
+    /// снимка, обновляется следующим [`enumerate`].
+    pub work_area_px: Rect,
     /// Точки на дюйм (96 = 100%); масштаб = `dpi / 96.0`.
     pub dpi: u32,
     /// Основной монитор (`MONITORINFOF_PRIMARY`).
@@ -109,6 +123,7 @@ fn monitor_info(hmonitor: HMONITOR) -> Result<MonitorInfo, Win32Error> {
         id: MonitorId(id),
         friendly_name,
         bounds_px: rect_px(mi.rcMonitor),
+        work_area_px: rect_px(mi.rcWork),
         dpi: effective_dpi(hmonitor),
         is_primary: mi.dwFlags & MONITORINFOF_PRIMARY != 0,
     })

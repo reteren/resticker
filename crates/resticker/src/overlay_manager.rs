@@ -48,6 +48,7 @@ use rst_core::pinned_window::{self, HostFilter, PinnedWindow};
 use rst_core::presets;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
+use rst_core::tiling::layout::LayoutParams;
 use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::animation as media_animation;
 use rst_media::paste;
@@ -64,16 +65,62 @@ use rst_win32::clipboard::{self, ClipboardImage};
 use rst_win32::file_dialog;
 use rst_win32::hotkey::HotkeyCombo;
 use rst_win32::input::{CursorShape, CursorZone, Handle as Win32Handle, InputEvent, Modifiers};
-use rst_win32::monitors;
+use rst_win32::keyboard_guard::{KeyEvent, KeyboardGuard, WatchedModifier};
+use rst_win32::monitors::{self, MonitorInfo};
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
+use rst_win32::window_enum;
 use rst_win32::window_enum::{WindowInfo, WindowRect};
 use rst_win32::window_pin::{self as window_pin, WindowPins};
 use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker};
 use uuid::Uuid;
 
+use crate::tiling::{TilingState, bindings_from_config};
 use crate::{
     confirm_dialog, cursor_panel, preset_picker, toolbar, window_pick_list, window_picker,
 };
+
+/// Перенести места, посчитанные раскладкой, в модель стикеров.
+///
+/// `true` — хоть один стикер реально сдвинулся. Сравнение обязательно:
+/// раскладка пересчитывается на каждый снимок окон, и запись в конфиг без
+/// проверки означала бы сохранение файла по нескольку раз в секунду.
+///
+/// Прямоугольник приходит в DIP монитора, а `Placement` хранит центр —
+/// отсюда перевод. Ошибиться здесь тихо: стикер уехал бы на половину своего
+/// размера и выглядел бы просто «немного не там».
+fn apply_sticker_places(
+    cfg: &mut Config,
+    tick: &crate::tiling::TilingTick,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) -> bool {
+    let mut changed = false;
+    for (uuid, monitor, rect) in &tick.sticker_places {
+        // Монитор, которого больше нет: место считать не от чего.
+        if !monitor_geometry.contains_key(monitor) {
+            continue;
+        }
+        let Some(sticker) = cfg.stickers.iter_mut().find(|st| st.id == *uuid) else {
+            continue;
+        };
+        let cx = rect.x as f64 + rect.w as f64 / 2.0;
+        let cy = rect.y as f64 + rect.h as f64 / 2.0;
+        let same = sticker.placement.monitor_id == *monitor
+            && (sticker.placement.cx - cx).abs() < 0.5
+            && (sticker.placement.cy - cy).abs() < 0.5
+            && (sticker.placement.w - rect.w as f64).abs() < 0.5
+            && (sticker.placement.h - rect.h as f64).abs() < 0.5;
+        if same {
+            continue;
+        }
+        sticker.placement.monitor_id = monitor.clone();
+        sticker.placement.cx = cx;
+        sticker.placement.cy = cy;
+        sticker.placement.w = rect.w as f64;
+        sticker.placement.h = rect.h as f64;
+        changed = true;
+    }
+    changed
+}
 
 /// Мост к `Device`/`WindowTarget` (M3 step 2 разделил `rst_render::Renderer`
 /// на процесс-wide устройство и цель на монитор, M3_PREP_NOTES.md §4.2).
@@ -805,6 +852,13 @@ fn show_banner(edit: &mut EditState, monitor_id: &MonitorId, text: String) {
 
 pub enum OverlayCommand {
     AddSticker(PathBuf),
+    /// Включить/выключить тайлинг (M9, docs/TILING_DESIGN.md §T2).
+    ///
+    /// Единственный способ его включить: тайлинг переставляет ЧУЖИЕ окна, то
+    /// есть меняет поведение всего рабочего стола, и включаться сам по факту
+    /// наличия настройки он не должен. Пункт меню трея — явное действие
+    /// пользователя, `MENU_TOGGLE_TILING` в `main.rs`.
+    ToggleTiling,
     /// Заменить `cfg.settings` целиком (окно настроек, вкладка «Общие») —
     /// координатор остаётся единственным писателем `config.json`
     /// (докком `add_sticker`/`OverlayHandle`): Tauri-поток не трогает диск
@@ -904,6 +958,11 @@ enum OverlayMessage {
     /// не привязан к монитору, форвардится тем же паттерном, что и per-monitor
     /// события: поток-мост копирует `WindowEvent` трекера в общий канал.
     Windows(TrackerWindowEvent),
+    /// Событие клавиатурного стража тайлинга (M9,
+    /// `rst_win32::keyboard_guard`): сработавшая комбинация или отпускание
+    /// модификатора, за которым просили следить. Приходит с потока-помпы
+    /// хука через поток-мост — тем же приёмом, что события трекера окон.
+    TilingKey(KeyEvent),
     /// Будильник планировщика анимации (M5a, docs/M5A_ANIMATION_DESIGN.md §5):
     /// отправлен потоком-планировщиком, когда истёк ближайший дедлайн кадра
     /// хотя бы одной анимации. В отличие от `Tick` — переменный интервал, а
@@ -1229,6 +1288,12 @@ struct EditState {
     /// (дизайн §5.2); фактическое открытие происходит в цикле `run()`,
     /// где снимок под рукой, сразу после обработки текущего сообщения.
     pending_open_picker: Option<PickerTarget>,
+    /// Стикер, которого надо отдать тайлингу или забрать обратно (M9).
+    ///
+    /// Тем же приёмом, что `pending_open_picker`: обработчик тулбара не
+    /// видит состояния тайлинга, а лезть туда через полкоординатора хуже,
+    /// чем отложить на один шаг цикла.
+    pending_tile_sticker: Option<Uuid>,
     /// Установлен кликом по `BTN_ADD_WINDOW` (`handle_cursor_panel_up`) — тот
     /// же повод, что у `pending_open_picker`: открытие списка нуждается в
     /// `window_snapshot`, которого нет в `handle_cursor_panel_up`; несёт
@@ -1346,6 +1411,13 @@ struct EditState {
     toolbar: Option<Panel>,
     /// Панель у курсора — есть, пока `active` (раздел 4).
     cursor_panel: Option<Panel>,
+    /// Индикаторы тайлинга на текущий кадр: рамка активной плитки, бар
+    /// воркспейсов, плашка модального режима (M9, `crate::tiling_ui`).
+    ///
+    /// Живёт здесь, а не собирается в `redraw`, по той же причине, что и
+    /// остальные панели: отрисовка обязана быть дешёвой и без логики, а
+    /// пересборка нужна только когда состояние тайлинга изменилось.
+    tiling_overlay: Option<crate::tiling::TilingOverlay>,
     /// Тултип наведённой кнопки тулбара/панели у курсора (фидбэк
     /// пользователя 2026-08-10) — `None`, если курсор не над кнопкой с
     /// текстом подсказки.
@@ -2075,6 +2147,42 @@ fn run(
     // `unpin_all()` вызывается на выходе из `run()`, ниже, по гарантии
     // открепления.
     let mut window_pins = WindowPins::new();
+    // M9: тайлинг. Выключен по умолчанию и включается только пунктом меню
+    // трея (`OverlayCommand::ToggleTiling`) — см. докком этой команды.
+    // Настройки берутся из `config.json` (секция `tiling`). Умолчания живут
+    // ТОЛЬКО там (`TilingConfig::default`), второго набора в коде нет: пока
+    // он был, у программы имелось два разных «набора по умолчанию», и
+    // документация честно на это указала. Пустой список означает ровно то,
+    // что написано, — биндов нет; отсутствующая секция подставляет
+    // умолчания через `#[serde(default)]`.
+    let tiling_bindings = bindings_from_config(&cfg.tiling.bindings);
+    let mut tiling = TilingState::new(
+        false,
+        LayoutParams {
+            gaps_in: cfg.tiling.gaps_in,
+            gaps_out: cfg.tiling.gaps_out,
+            tab_bar_h: cfg.tiling.tab_bar_h,
+        },
+        cfg.tiling.insert_policy,
+        cfg.tiling.rules.clone(),
+        cfg.tiling.monitors.clone(),
+        tiling_bindings,
+        cfg.tiling.own_alt_tab,
+    );
+    // Тайлинг, включённый в конфиге, поднимается тем же путём, что и по
+    // пункту меню: сообщение самому себе. Так стартовый путь и переключатель
+    // не могут разойтись в поведении — а разойтись им было бы легко, у
+    // включения есть побочный эффект (глобальный клавиатурный хук).
+    if cfg.tiling.enabled {
+        let _ = tx.send(OverlayMessage::Command(OverlayCommand::ToggleTiling));
+    }
+    // Живёт, только пока тайлинг включён: глобальный клавиатурный хук —
+    // слишком тяжёлая вещь, чтобы висеть в системе просто так. `Drop`
+    // снимает хук и останавливает поток-помпу.
+    let mut keyboard_guard: Option<KeyboardGuard> = None;
+    // Монотонные часы тайлинга: выдержка после команды окну считается от
+    // них (`tiling::SETTLE_MS`).
+    let tiling_clock = Instant::now();
     // Уборка после аварийного завершения прошлого запуска: маркер закрепления
     // живёт на ЧУЖОМ окне и переживает наш процесс, поэтому долгоживущие окна
     // (Проводник, Блокнот) могли накопить «вечные» маркеры — с ними окно
@@ -2092,6 +2200,19 @@ fn run(
             );
         }
     }
+
+    // Watchdog воркспейсов (docs/TILING_DESIGN.md §Р1): вернуть окна,
+    // спрятанные тайлингом прошлого запуска. Строго ДО того, как тайлинг
+    // спрячет что-нибудь своё, — иначе уборка сняла бы скрытие с окон
+    // текущей сессии.
+    //
+    // Обязательная часть фичи, а не подстраховка: скрытого окна не видно
+    // нигде, ни на экране, ни в Task View, и после падения программы
+    // пользователь не смог бы вернуть его никак, кроме перезапуска самого
+    // приложения. Своим перечислением, а не через `window_enum`: тот
+    // отбрасывает скрытые окна как ненастоящие, то есть не отдал бы ровно
+    // те окна, ради которых уборка и нужна.
+    rst_win32::cloak::recover_orphans();
 
     // Счётчики плавности видео (сводка раз в секунду при
     // `RUST_LOG=resticker=debug`).
@@ -2163,6 +2284,12 @@ fn run(
         .iter()
         .map(|(id, ms)| (id.clone(), (ms.width, ms.height, ms.scale)))
         .collect();
+
+    // Полные снимки мониторов для тайлинга: в отличие от `monitor_bounds`,
+    // здесь есть рабочая область (`work_area_px`), без которой плитки легли
+    // бы под панель задач (docs/TILING_DESIGN.md §T0). Обновляется там же,
+    // где `monitor_bounds`, — на hot-plug.
+    let mut tiling_monitors: Vec<MonitorInfo> = monitor_infos.clone();
 
     // Границы мониторов в физических пикселях виртуального десктопа + масштаб
     // — вход для перепривязки стикера по центру bbox при перетаскивании между
@@ -2326,6 +2453,7 @@ fn run(
         window_picker: None,
         preset_picker: None,
         pending_open_picker: None,
+        pending_tile_sticker: None,
         pending_open_pick_list: None,
         window_pick_list: None,
         pinned_windows: Vec::new(),
@@ -2344,6 +2472,7 @@ fn run(
         marquee_started: false,
         toolbar: None,
         cursor_panel: None,
+        tiling_overlay: None,
         cursor_panel_hovered: false,
         cursor_panel_slide: PanelSlide::fixed(1.0),
         settings_rect: None,
@@ -2686,6 +2815,76 @@ fn run(
                 occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
                 rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
                 need_redraw = true;
+            }
+            OverlayMessage::Command(OverlayCommand::ToggleTiling) => {
+                let on = !tiling.enabled();
+                tiling.set_enabled(on, &window_pins);
+                // Состояние переживает перезапуск: пользователь включил
+                // тайлинг один раз, а не включает его каждое утро.
+                // Координатор — единственный писатель config.json.
+                if cfg.tiling.enabled != on {
+                    cfg.tiling.enabled = on;
+                    if let Err(e) = config::save(&cfg, &config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить состояние тайлинга");
+                    }
+                }
+                // Переменная существует ради своего `Drop`, но читать её
+                // всё равно надо: два хука подряд поставили бы два потока-
+                // помпы, и первый остался бы висеть навсегда.
+                if on && keyboard_guard.is_none() {
+                    match KeyboardGuard::start(tiling.swallow_set()) {
+                        Ok((guard, keys)) => {
+                            // Поток-мост: переливает нажатия с потока-помпы
+                            // хука в общий канал координатора. Тот же приём,
+                            // что у трекера окон выше, — у координатора один
+                            // вход, а не пять.
+                            let key_tx = tx.clone();
+                            if let Err(e) = std::thread::Builder::new()
+                                .name("resticker-tiling-keys".into())
+                                .spawn(move || {
+                                    for event in keys {
+                                        if key_tx.send(OverlayMessage::TilingKey(event)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                })
+                            {
+                                tracing::warn!(error = %e, "поток-мост клавиш тайлинга не создан");
+                            }
+                            keyboard_guard = Some(guard);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "клавиатура тайлинга недоступна");
+                        }
+                    }
+                } else if !on {
+                    // Снимает хук: без этого он остался бы висеть в системе.
+                    keyboard_guard = None;
+                }
+                // Индикаторы пересобираются там же, где меняется состояние
+                // тайлинга: в кадре логики быть не должно.
+                edit.tiling_overlay =
+                    if tiling.enabled() {
+                        Some(tiling.build_overlay(
+                            &tiling_monitors,
+                            tiling_clock.elapsed().as_millis() as u64,
+                        ))
+                    } else {
+                        None
+                    };
+                need_redraw = true;
+
+                tracing::info!(enabled = on, "тайлинг переключён из трея");
+                let _ = edit
+                    .coordinator_tx
+                    .send(CoordinatorRequest::ShowNotification {
+                        title: "resticker".to_string(),
+                        body: if on {
+                            "Tiling enabled".to_string()
+                        } else {
+                            "Tiling disabled".to_string()
+                        },
+                    });
             }
             OverlayMessage::Command(OverlayCommand::ToggleAllStickers) => {
                 // Тот же путь, что `OverlayEvent::ToggleAllStickers` (хоткей)
@@ -3247,6 +3446,7 @@ fn run(
                     .iter()
                     .map(|(id, ms)| (id.clone(), (ms.width, ms.height, ms.scale)))
                     .collect();
+                tiling_monitors = new_infos.clone();
                 monitor_bounds = new_infos
                     .iter()
                     .filter_map(|info| {
@@ -3293,6 +3493,22 @@ fn run(
                 need_redraw = true;
             }
             OverlayMessage::Tick => {
+                // M9: модальный режим биндов сам себя закрывает по
+                // бездействию. Секундного тика для этого достаточно, и он
+                // уже есть — заводить ради таймаута отдельный таймер значило
+                // бы добавить лишнее пробуждение (ADR-006).
+                if tiling.expire_submap(tiling_clock.elapsed().as_millis() as u64) {
+                    rst_win32::keyboard_guard::set_swallow_set(tiling.swallow_set());
+                    edit.tiling_overlay = if tiling.enabled() {
+                        Some(tiling.build_overlay(
+                            &tiling_monitors,
+                            tiling_clock.elapsed().as_millis() as u64,
+                        ))
+                    } else {
+                        None
+                    };
+                    need_redraw = true;
+                }
                 // Тик сам по себе снимок мониторов не меняет (диффить не
                 // против чего) — одна из двух целей — дать шанс истечь
                 // таймерам автомата потери монитора (M3_HOTPLUG_DESIGN.md
@@ -3473,6 +3689,72 @@ fn run(
                 // Вне режима редактирования окно клик-прозрачно — эти
                 // события приходить не должны, но игнорируем на всякий случай.
             }
+            OverlayMessage::TilingKey(KeyEvent::ModifierUp(WatchedModifier::Alt)) => {
+                // Alt отпущен — переключатель окон закрывается и отдаёт
+                // фокус выбранному окну. Следить за модификатором дальше
+                // незачем: пока переключателя нет, эти события никому не
+                // нужны, а хук считает их не бесплатно.
+                if let Some(hwnd) = tiling.close_switcher() {
+                    rst_win32::keyboard_guard::watch_modifier_release(None);
+                    if !rst_win32::tiling_apply::focus(hwnd) {
+                        tracing::debug!(hwnd, "система не отдала фокус выбранному окну");
+                    }
+                    edit.tiling_overlay = if tiling.enabled() {
+                        Some(tiling.build_overlay(
+                            &tiling_monitors,
+                            tiling_clock.elapsed().as_millis() as u64,
+                        ))
+                    } else {
+                        None
+                    };
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::TilingKey(KeyEvent::ModifierUp(_)) => {}
+            OverlayMessage::TilingKey(KeyEvent::Chord(chord)) => {
+                let now_ms = tiling_clock.elapsed().as_millis() as u64;
+                // Свой Alt+Tab разбирается до биндов: это встроенное
+                // поведение, а не настраиваемая комбинация.
+                // Нажатие либо наше (переключатель), либо разбирается
+                // биндами — не то и другое сразу. Отсюда if/else, а не
+                // ранний выход: ветке всё равно нужен общий хвост с
+                // пересборкой индикаторов и запросом кадра.
+                let switcher_took_it = tiling.switcher_key(chord);
+                if switcher_took_it {
+                    if tiling.switcher_open() {
+                        rst_win32::keyboard_guard::watch_modifier_release(Some(
+                            WatchedModifier::Alt,
+                        ));
+                    }
+                } else {
+                    let outcome = tiling.resolve_key(chord, now_ms);
+                    if outcome.mode_changed {
+                        // Набор перехвата зависит от режима: в модальном режиме
+                        // бинды - одиночные клавиши, и глотать их вне режима
+                        // означало бы отобрать эти буквы у всех приложений.
+                        rst_win32::keyboard_guard::set_swallow_set(tiling.swallow_set());
+                    }
+                    if let Some(action) = outcome.action {
+                        let tick = tiling.dispatch(&action, &window_pins, now_ms);
+                        tracing::debug!(?action, moved = tick.moved, "действие тайлинга");
+                    }
+                }
+                // Пересобрать надо и когда действие ничего не сделало: вход
+                // и выход из модального режима не двигают ни одного окна, но
+                // плашку режима показать обязаны.
+                // Индикаторы пересобираются там же, где меняется состояние
+                // тайлинга: в кадре логики быть не должно.
+                edit.tiling_overlay =
+                    if tiling.enabled() {
+                        Some(tiling.build_overlay(
+                            &tiling_monitors,
+                            tiling_clock.elapsed().as_millis() as u64,
+                        ))
+                    } else {
+                        None
+                    };
+                need_redraw = true;
+            }
             OverlayMessage::Windows(TrackerWindowEvent::Changed(windows)) => {
                 // M4: снимок окон трекера — пересчитываем группы окклюдеров
                 // по всем мониторам (M4_OCCLUDERS_DESIGN.md §1) и просим
@@ -3507,6 +3789,71 @@ fn run(
                             state.overlay.raise_above_pinned(&pinned);
                         }
                     }
+                }
+                // M9: тайлинг живёт с того же снимка окон, что и пины.
+                //
+                // Три гейта, и каждый — из чужой боли:
+                // * `edit.active` — пока идёт редактирование стикеров, всё
+                //   принуждение над чужими окнами молчит (тот же принцип, что
+                //   у пинов выше, пункт 5 спеки пинов);
+                // * `shell_switching` — пока открыт Alt+Tab, меню Пуск или
+                //   идёт клик по панели задач, «активного приложения»
+                //   фактически нет, и любое вмешательство в чужие окна ломает
+                //   сам переключатель (репорт 2026-08-22 по пинам; R1 §9.5
+                //   прямо требует сделать этот гейт общим для всей подсистемы
+                //   чужих окон, а не только для пинов);
+                // * пользователь ПРЯМО СЕЙЧАС тащит окно мышью — перекладка
+                //   в этот момент дралась бы с его рукой.
+                // Отдельного вопроса «тащит ли пользователь ХОТЬ КАКОЕ-ТО
+                // окно» в Win32-слое нет: `is_user_dragging` спрашивает про
+                // конкретный hwnd. Поэтому драг проверяется точечно, для
+                // каждого окна перед его перестановкой (`tiling.rs`), а здесь
+                // остаются два общих гейта.
+                if tiling.enabled() && !edit.active && !window_enum::shell_switching() {
+                    let now_ms = tiling_clock.elapsed().as_millis() as u64;
+                    let tick = tiling.on_snapshot(
+                        &window_snapshot,
+                        &tiling_monitors,
+                        &window_pins,
+                        now_ms,
+                    );
+                    if !tick.is_quiet() {
+                        tracing::debug!(
+                            moved = tick.moved,
+                            to_hide = tick.to_hide.len(),
+                            gave_up = ?tick.gave_up,
+                            "такт тайлинга"
+                        );
+                    }
+                    // Стикеры-плитки едут вместе с окнами: их место задаёт та
+                    // же раскладка. Конфиг пишем только при реальном сдвиге —
+                    // иначе файл сохранялся бы на каждый снимок окон.
+                    if apply_sticker_places(&mut cfg, &tick, &monitor_geometry) {
+                        if let Err(e) = config::save(&cfg, &config_path) {
+                            tracing::warn!(error = %e, "не удалось сохранить раскладку стикеров");
+                        }
+                        rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
+                    }
+                    // Индикаторы пересобираются там же, где меняется состояние
+                    // тайлинга: в кадре логики быть не должно.
+                    edit.tiling_overlay = if tiling.enabled() {
+                        Some(tiling.build_overlay(
+                            &tiling_monitors,
+                            tiling_clock.elapsed().as_millis() as u64,
+                        ))
+                    } else {
+                        None
+                    };
+                    // `need_redraw` эта ветка не трогает: снимок окон и так
+                    // всегда просит кадр несколькими строками ниже.
+                }
+                // Порядок «последнее использованное первым» для своего
+                // переключателя: без него Alt+Tab показывал бы окна в
+                // порядке дерева, а не в порядке работы с ними.
+                if tiling.enabled()
+                    && let Some(fg) = window_enum::foreground_hwnd()
+                {
+                    tiling.note_focus(fg);
                 }
                 occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
                 // Открытая панель выбора окон показывает СТАРЫЙ снимок —
@@ -4023,6 +4370,49 @@ fn run(
         // Открытие панели выбора окон отложено до этой точки — кликом по
         // `TB_LAYERS` в `handle_toolbar_up`, у которого нет `window_snapshot`
         // (дизайн §5.2); здесь, в цикле `run()`, снимок уже под рукой.
+        // M9: стикер в раскладку и обратно. Отложенный флаг ставит
+        // обработчик тулбара (`TB_TILE`), а исполняется он здесь — тайлинг
+        // виден только отсюда.
+        if let Some(sticker_id) = edit.pending_tile_sticker.take() {
+            if !tiling.enabled() {
+                let _ = edit
+                    .coordinator_tx
+                    .send(CoordinatorRequest::ShowNotification {
+                        title: "resticker".to_string(),
+                        body: "Turn tiling on first (tray menu)".to_string(),
+                    });
+            } else {
+                let monitor = cfg
+                    .stickers
+                    .iter()
+                    .find(|st| st.id == sticker_id)
+                    .map(|st| st.placement.monitor_id.clone());
+                if let Some(monitor) = monitor {
+                    let now_ms = tiling_clock.elapsed().as_millis() as u64;
+                    if tiling.has_sticker(sticker_id) {
+                        tiling.remove_sticker(sticker_id);
+                    } else {
+                        tiling.add_sticker(sticker_id, &monitor);
+                    }
+                    let tick = tiling.relayout_now(&window_pins, now_ms);
+                    if apply_sticker_places(&mut cfg, &tick, &monitor_geometry) {
+                        if let Err(e) = config::save(&cfg, &config_path) {
+                            tracing::warn!(error = %e, "не удалось сохранить раскладку стикеров");
+                        }
+                        rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
+                    }
+                    edit.tiling_overlay = if tiling.enabled() {
+                        Some(tiling.build_overlay(
+                            &tiling_monitors,
+                            tiling_clock.elapsed().as_millis() as u64,
+                        ))
+                    } else {
+                        None
+                    };
+                    need_redraw = true;
+                }
+            }
+        }
         if let Some(picker_target) = edit.pending_open_picker.take() {
             open_window_picker(
                 &mut edit,
@@ -5618,6 +6008,7 @@ fn cursor_shape_for_zone(zone: &Zone) -> CursorShape {
 fn toolbar_tooltip_text(id: WidgetId) -> Option<&'static str> {
     match id {
         toolbar::TB_LAYERS => Some("Visibility layers"),
+        toolbar::TB_TILE => Some("Tile / untile"),
         toolbar::TB_EYE => Some("Show/hide"),
         toolbar::TB_ORDER_UP => Some("Bring forward"),
         toolbar::TB_ORDER_DOWN => Some("Send backward"),
@@ -8606,6 +8997,11 @@ fn handle_toolbar_up(
         }
         return true;
     }
+    if clicked(edit, toolbar::TB_TILE) {
+        // Решение принимает `run()`: там живёт состояние тайлинга.
+        edit.pending_tile_sticker = Some(id);
+        return true;
+    }
     if clicked(edit, toolbar::TB_EYE) {
         commit_undo_snapshot(edit, cfg.clone());
         let _ = ops::toggle_visibility(cfg, id);
@@ -10599,6 +10995,19 @@ fn redraw(
             );
         }
     }
+    // M9: индикаторы тайлинга. Рисуются последними — поверх всего
+    // остального UI: рамка активной плитки и плашка режима отвечают на
+    // вопрос «что сейчас в фокусе и в каком я режиме», и перекрывать их
+    // нечем.
+    if let Some(overlay) = &edit.tiling_overlay {
+        let mut prims = Vec::new();
+        overlay.draw(monitor_id, &mut prims);
+        if !prims.is_empty() {
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
+    }
 
     // Тултип (фидбэк пользователя 2026-08-10) — над тулбаром/панелью у
     // курсора (та кнопка, к которой он относится, уже нарисована выше),
@@ -11631,6 +12040,7 @@ mod tests {
             window_picker: None,
             preset_picker: None,
             pending_open_picker: None,
+            pending_tile_sticker: None,
             pending_open_pick_list: None,
             window_pick_list: None,
             pinned_windows: Vec::new(),
@@ -11649,6 +12059,7 @@ mod tests {
             marquee_started: false,
             toolbar: None,
             cursor_panel: None,
+            tiling_overlay: None,
             cursor_panel_hovered: false,
             cursor_panel_slide: PanelSlide::fixed(1.0),
             settings_rect: None,
@@ -14316,6 +14727,7 @@ mod tests {
             window_picker: None,
             preset_picker: None,
             pending_open_picker: None,
+            pending_tile_sticker: None,
             pending_open_pick_list: None,
             window_pick_list: None,
             pinned_windows: Vec::new(),
@@ -14334,6 +14746,7 @@ mod tests {
             marquee_started: false,
             toolbar: None,
             cursor_panel: None,
+            tiling_overlay: None,
             cursor_panel_hovered: false,
             cursor_panel_slide: PanelSlide::fixed(1.0),
             settings_rect: None,

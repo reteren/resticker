@@ -21,6 +21,7 @@ pub mod presets;
 pub mod selection_set;
 pub mod sizing;
 pub mod snap;
+pub mod tiling;
 pub mod transform_ops;
 pub mod undo;
 

@@ -19,6 +19,8 @@ mod i18n;
 mod logging;
 mod overlay_manager;
 mod preset_picker;
+mod tiling;
+mod tiling_ui;
 mod toolbar;
 /// Оффскрин-превью панелей в PNG — инструмент разработки оформления.
 #[cfg(test)]
@@ -40,6 +42,10 @@ use rst_win32::tray::{self, MenuItem, TrayEvent, TrayIcon};
 const MENU_OPEN_SETTINGS: u32 = 1;
 const MENU_TOGGLE_VISIBLE: u32 = 2;
 const MENU_EXIT: u32 = 3;
+/// Переключатель тайлинга (M9). Отдельный пункт меню, а не настройка в окне:
+/// включение переставляет чужие окна, и это должно быть однозначным
+/// действием пользователя (докком `OverlayCommand::ToggleTiling`).
+const MENU_TOGGLE_TILING: u32 = 4;
 /// Первый id пункта меню трея под пресет (M7, «быстрое переключение из
 /// трея» — ROADMAP.md). `WM_COMMAND` несёт id только в младшем слове
 /// `wParam` (Win32-соглашение, `tray.rs::wndproc` берёт `wparam.0 & 0xffff`)
@@ -61,6 +67,7 @@ fn build_tray_menu(presets: &[(Uuid, String)]) -> (Vec<MenuItem>, Vec<Uuid>) {
         MenuItem::new(MENU_OPEN_SETTINGS, i18n::tray_open_settings()),
         tray::separator(),
         MenuItem::new(MENU_TOGGLE_VISIBLE, i18n::tray_toggle_visible()),
+        MenuItem::new(MENU_TOGGLE_TILING, i18n::tray_toggle_tiling()),
     ];
     let ids: Vec<Uuid> = presets.iter().map(|(id, _)| *id).collect();
     if !ids.is_empty() {
@@ -542,6 +549,11 @@ fn main() -> anyhow::Result<()> {
                             handle
                                 .state::<OverlayHandle>()
                                 .send(OverlayCommand::ToggleAllStickers);
+                        }
+                        TrayEvent::MenuItem(MENU_TOGGLE_TILING) => {
+                            handle
+                                .state::<OverlayHandle>()
+                                .send(OverlayCommand::ToggleTiling);
                         }
                         TrayEvent::MenuItem(MENU_EXIT) => handle.exit(0),
                         // M7: клик по пункту пресета в меню трея — id несёт

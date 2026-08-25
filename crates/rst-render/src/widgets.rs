@@ -50,6 +50,8 @@ pub fn box_contains(r: &Box2D, pos: Point) -> bool {
 pub enum Icon {
     /// «Слои видимости» — панель выбора окон (SPEC 3.6, п. 3).
     Layers,
+    /// «В раскладку» — отдать стикер тайлингу и забрать обратно (M9).
+    Tile,
     /// «Глаз» — показать/скрыть стикер (SPEC 3.7).
     Eye,
     /// «Глаз закрытый» — стикер скрыт.
@@ -115,8 +117,9 @@ impl Icon {
     /// Все варианты в порядке объявления — для предварительной генерации
     /// кэша иконок (текс-карта `HashMap<Icon, Texture>`, M2_WIRING_PLAN §3)
     /// и тестов генератора `icon_rgba`.
-    pub const ALL: [Icon; 24] = [
+    pub const ALL: [Icon; 25] = [
         Icon::Layers,
+        Icon::Tile,
         Icon::Eye,
         Icon::EyeOff,
         Icon::OrderUp,

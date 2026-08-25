@@ -27,6 +27,11 @@ pub fn tray_toggle_visible() -> &'static str {
     "Show/hide all stickers"
 }
 
+/// Пункт меню трея «Включить/выключить тайлинг» (M9).
+pub fn tray_toggle_tiling() -> &'static str {
+    "Toggle tiling"
+}
+
 /// Заголовок подменю «Пресеты» в трее.
 pub fn tray_presets_submenu() -> &'static str {
     "Presets"
@@ -82,6 +87,7 @@ mod tests {
     fn tray_labels_are_english() {
         assert_eq!(tray_open_settings(), "Open settings");
         assert_eq!(tray_toggle_visible(), "Show/hide all stickers");
+        assert_eq!(tray_toggle_tiling(), "Toggle tiling");
         assert_eq!(tray_presets_submenu(), "Presets");
         assert_eq!(tray_exit(), "Exit");
     }

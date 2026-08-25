@@ -21,10 +21,10 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow,
-    GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW,
+    EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW,
+    GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PWSTR};
 
@@ -92,6 +92,13 @@ pub struct WindowInfo {
     /// Окно свёрнуто: не оклюдер (прямоугольник мусорный), но показывается
     /// в панели выбора (M4_PREP_NOTES §2.2).
     pub iconic: bool,
+    /// У окна есть рамка изменения размера (`WS_THICKFRAME`).
+    ///
+    /// Тайлинг двигает только такие окна: плитка обязана принять заданный
+    /// размер, а окно фиксированного размера его молча проигнорирует и
+    /// вылезет за гэпы (docs/TILING_DESIGN.md §Р2). Такие окна уходят в
+    /// floating, а не ломают сетку.
+    pub resizable: bool,
     /// Место под иконку окна (панель выбора M4): заполняется [`window_icon`]
     /// при перечислении; `None` — у окна нет exe-пути (protected process),
     /// извлечение не удалось или иконки нет (панель рисует плейсхолдер).
@@ -144,6 +151,7 @@ struct WindowFlags {
     app_window: bool,
     has_owner: bool,
     iconic: bool,
+    resizable: bool,
 }
 
 /// Фильтр «реальных окон» дословно по ARCHITECTURE.md 3.3 и
@@ -169,6 +177,51 @@ fn is_real_window(f: &WindowFlags) -> bool {
     }
     true
 }
+
+/// Окно, которое тайлинг имеет право поставить в плитку
+/// (docs/TILING_DESIGN.md §Р2).
+///
+/// Строго уже, чем [`is_real_window`]: тот отвечает на вопрос «показывать ли
+/// окно пользователю в списке», а этот — «можно ли им РАСПОРЯЖАТЬСЯ». Разница
+/// в четырёх пунктах, и каждый — из чужого опыта (docs/research/tiling/R3 §1):
+///
+/// * свёрнутое окно в раскладке не участвует — у него и прямоугольник
+///   мусорный; вернётся в сетку, когда его развернут;
+/// * без `WS_THICKFRAME` окно не примет размер плитки (см.
+///   [`WindowInfo::resizable`]);
+/// * окно с владельцем — это диалог, палитра или сплэш; затайленный диалог
+///   сохранения файла бесит сразу и заслуженно;
+/// * окна шелла (панель задач, Task View, меню Пуск) трогать нельзя вовсе —
+///   тот же список, что защищает переключатель в [`shell_switching`].
+///
+/// Чего здесь ЕЩЁ нет и что честно оставлено на потом: минимальный размер
+/// окна (`WM_GETMINMAXINFO`). Он требует синхронного запроса в чужой процесс,
+/// а перечисление окон — горячий путь координатора; спрашивать его нужно
+/// точечно, в момент постановки окна в плитку, а не на каждом снимке.
+pub fn is_tileable(info: &WindowInfo) -> bool {
+    tileable(info.iconic, info.resizable, &info.class)
+}
+
+/// Чистая часть [`is_tileable`] — тестируется без окон, как и
+/// [`is_real_window`].
+fn tileable(iconic: bool, resizable: bool, class: &str) -> bool {
+    if iconic {
+        return false;
+    }
+    if !resizable {
+        return false;
+    }
+    if SHELL_TRANSIENT_CLASSES.contains(&class) || DESKTOP_CLASSES.contains(&class) {
+        return false;
+    }
+    true
+}
+
+/// Классы окон рабочего стола: подложка Explorer и её слой с обоями.
+///
+/// Формально это обычные видимые top-level окна, и `is_real_window` их
+/// пропускает — но «затайлить рабочий стол» означает развалить оболочку.
+const DESKTOP_CLASSES: [&str; 2] = ["Progman", "WorkerW"];
 
 /// Контекст колбэка `EnumWindows`: `raw_index` считает **все** окна из
 /// сырого перечисления (даже отфильтрованные) — так `WindowInfo::z_order`
@@ -235,6 +288,7 @@ fn collect_window(hwnd: HWND, z_order: u32) -> Option<WindowInfo> {
         class: window_class(hwnd),
         z_order,
         iconic: flags.iconic,
+        resizable: flags.resizable,
         icon,
     })
 }
@@ -246,6 +300,8 @@ fn window_flags(hwnd: HWND) -> WindowFlags {
         let visible = IsWindowVisible(hwnd).as_bool();
         let iconic = IsIconic(hwnd).as_bool();
         let is_root = GetAncestor(hwnd, GA_ROOT) == hwnd;
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let resizable = style & WS_THICKFRAME.0 != 0;
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
         let no_activate = ex_style & WS_EX_NOACTIVATE.0 != 0;
         let tool_window = ex_style & WS_EX_TOOLWINDOW.0 != 0;
@@ -270,6 +326,7 @@ fn window_flags(hwnd: HWND) -> WindowFlags {
             app_window,
             has_owner,
             iconic,
+            resizable,
         }
     }
 }
@@ -611,6 +668,45 @@ mod tests {
         };
         overrides(&mut f);
         f
+    }
+
+    #[test]
+    fn a_plain_resizable_window_is_tileable() {
+        assert!(tileable(false, true, "Chrome_WidgetWin_1"));
+    }
+
+    #[test]
+    fn minimized_window_is_not_tileable() {
+        // Свёрнутое окно не занимает плитку: вернётся, когда его развернут.
+        assert!(!tileable(true, true, "Chrome_WidgetWin_1"));
+    }
+
+    #[test]
+    fn fixed_size_window_is_not_tileable() {
+        // Без WS_THICKFRAME окно молча проигнорирует размер плитки.
+        assert!(!tileable(false, false, "#32770"));
+    }
+
+    #[test]
+    fn shell_windows_are_never_tileable() {
+        for class in ["Shell_TrayWnd", "XamlExplorerHostIslandWindow"] {
+            assert!(!tileable(false, true, class), "{class} — окно шелла");
+        }
+    }
+
+    #[test]
+    fn the_desktop_itself_is_not_tileable() {
+        for class in ["Progman", "WorkerW"] {
+            assert!(!tileable(false, true, class), "{class} — рабочий стол");
+        }
+    }
+
+    #[test]
+    fn tileable_is_stricter_than_is_real_window() {
+        // Окно фиксированного размера — «реальное» для списка, но
+        // неуправляемое для тайлинга. Эта пара и есть смысл двух фильтров.
+        assert!(is_real_window(&flags(|_| {})));
+        assert!(!tileable(false, false, "#32770"));
     }
 
     #[test]

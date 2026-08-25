@@ -455,6 +455,13 @@ pub struct Config {
     /// структуре — тот же прецедент, что `PlaybackSettings.paused`
     /// (docs/M4_PREP_NOTES.md: «миграция схемы не нужна (`#[serde(default)]`)»).
     pub presets: Vec<Preset>,
+    /// Секция тайлинга (docs/TILING_DESIGN.md, M9).
+    ///
+    /// Тип живёт в `crate::config` рядом с механикой load/save; здесь только
+    /// поле. Обратная совместимость — та же, что у `presets`: старый
+    /// config.json без секции `"tiling"` читается через `#[serde(default)]`
+    /// на структуре и получает [`TilingConfig::default`] (тайлинг выключен).
+    pub tiling: crate::config::TilingConfig,
 }
 
 impl Default for Config {
@@ -466,6 +473,7 @@ impl Default for Config {
             monitors: Vec::new(),
             stickers: Vec::new(),
             presets: Vec::new(),
+            tiling: crate::config::TilingConfig::default(),
         }
     }
 }
