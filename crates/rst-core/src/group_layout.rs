@@ -654,4 +654,246 @@ mod tests {
         let empty = Preset { slots: Vec::new() };
         assert!(apply(&empty, work_area(), 8).is_empty());
     }
+
+    /// Реальные разрешения для исчерпывающей проверки: монитор пользователя
+    /// минус панель задач (2560x1400, из жалобы 2026-08-26), FullHD,
+    /// маленький ноутбук, ультраширокий, плюс второй монитор слева с
+    /// отрицательным origin (ADR-010) — кромки считаются от origin области,
+    /// и проверка обязана покрыть отрицательные координаты.
+    const REAL_AREAS: [Rect; 5] = [
+        Rect {
+            x: 0,
+            y: 0,
+            w: 2560,
+            h: 1400,
+        },
+        Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        },
+        Rect {
+            x: 0,
+            y: 0,
+            w: 1366,
+            h: 768,
+        },
+        Rect {
+            x: 0,
+            y: 0,
+            w: 3440,
+            h: 1440,
+        },
+        Rect {
+            x: -1920,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        },
+    ];
+
+    /// Зазор в пикселях ровно как это делает вызывающий код
+    /// (`resticker/src/groups.rs`, `layout_targets` — читать можно, править
+    /// нельзя): процент от наименьшей стороны слота при нулевом зазоре,
+    /// целочисленное умножение в `u32`. Только такая копия формулы честно
+    /// проверяет то, что реально попадёт на экран пользователя.
+    fn realistic_gap(preset: &Preset, area: Rect, pct: u8) -> i32 {
+        let bare = apply(preset, area, 0);
+        let smallest = bare.iter().map(|r| r.w.min(r.h)).min().unwrap_or(0);
+        (u32::from(pct) * smallest / 100) as i32
+    }
+
+    /// Исчерпывающая проверка нахлёста: КАЖДАЯ раскладка каждого размера на
+    /// КАЖДОЙ рабочей области при КАЖДОМ реальном зазоре (0, 1, 4 — реальный
+    /// зазор пользователя, 10, 35 процентов). Два окна на одном слоте —
+    /// жалоба пользователя 2026-08-26 («2 окна полетели на один слот»);
+    /// этот тест доказывает, что таблица и `apply` не дают нахлёста ни в
+    /// одном сочетании. Счётчик проверок фиксируется числом: если циклы
+    /// молча перестанут выполняться, тест не «позеленеет» впустую.
+    #[test]
+    fn slots_never_overlap_for_any_work_area_and_realistic_gap() {
+        let mut pair_checks = 0usize;
+        let mut apply_calls = 0usize;
+        for area in REAL_AREAS {
+            for count in 2..=8 {
+                for preset in presets_for(count) {
+                    for pct in [0u8, 1, 4, 10, 35] {
+                        let gap = realistic_gap(preset, area, pct);
+                        let slots = apply(preset, area, gap);
+                        apply_calls += 1;
+                        assert_eq!(
+                            slots.len(),
+                            count,
+                            "area={area:?}, count={count}, pct={pct}: слотов не {count}"
+                        );
+                        for (i, a) in slots.iter().enumerate() {
+                            for (j, b) in slots.iter().enumerate().skip(i + 1) {
+                                pair_checks += 1;
+                                assert_eq!(
+                                    overlap(*a, *b),
+                                    0,
+                                    "area={area:?}, count={count}, pct={pct}%: слоты {i} и {j} налезают друг на друга: {a:?} vs {b:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(apply_calls, 5 * 7 * 7 * 5, "полнота перебора");
+        // Пар на пресет: count*(count-1)/2 для 2..=8, сумма по пресетам —
+        // 588 пар на каждую область×зазор, всего 5×5×588.
+        assert_eq!(pair_checks, 5 * 5 * 588, "полнота пар");
+    }
+
+    /// Вырожденный случай: очень маленькая рабочая область и зазор от
+    /// реальных 35% до заведомо нереальных (больше самой области). Слот
+    /// обязан схлопнуться в нулевой размер, а не вывернуться наизнанку, и —
+    /// главное — два разных слота не могут получить ОДИНАКОВЫЙ НЕНУЛЕВОЙ
+    /// прямоугольник: это и есть «окно на окне» из жалобы. Совпадение
+    /// нулевых слотов в одной точке допускается сознательно: окно нулевого
+    /// размера невидимо и ничего не заслоняет, а при зазоре, большем
+    /// размера области, развести два ненулевых окна с зазором между ними
+    /// физически невозможно.
+    #[test]
+    fn degenerate_area_with_big_gap_never_duplicates_nonzero_slots() {
+        let tiny_areas = [
+            Rect {
+                x: 0,
+                y: 0,
+                w: 300,
+                h: 200,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 50,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 30,
+            },
+        ];
+        for area in tiny_areas {
+            for count in 2..=8 {
+                for preset in presets_for(count) {
+                    // 0 и 1 — реальные; 20 и больше — уже схлопывают слоты
+                    // на этих областях, вплоть до «зазор больше области».
+                    for gap in [0, 1, 20, 60, 150, 9999] {
+                        let slots = apply(preset, area, gap);
+                        for (i, a) in slots.iter().enumerate() {
+                            for (j, b) in slots.iter().enumerate().skip(i + 1) {
+                                let both_zero = a.w == 0 && a.h == 0 && b.w == 0 && b.h == 0;
+                                assert!(
+                                    both_zero || a != b,
+                                    "area={area:?}, count={count}, gap={gap}: слоты {i} и {j} совпали по позиции и размеру: {a:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Реальный зазор (0..35% от наименьшей стороны слота) не может
+    /// схлопнуть слот в ноль даже на самой маленькой рабочей области:
+    /// зазор меньше самого маленького слота, поэтому каждый слот обязан
+    /// остаться строго положительным. Это гарантирует, что «окно на окне»
+    /// из жалобы пользователя невозможно и в вырожденном по размерам
+    /// сценарии — схлопывание случается только при заведомо нереальных
+    /// зазорах (тест `degenerate_area_with_big_gap_never_duplicates_nonzero_slots`).
+    #[test]
+    fn realistic_gap_never_collapses_a_slot_on_a_tiny_area() {
+        let tiny_areas = [
+            Rect {
+                x: 0,
+                y: 0,
+                w: 300,
+                h: 200,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 640,
+                h: 360,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1366,
+                h: 200,
+            },
+        ];
+        for area in tiny_areas {
+            for count in 2..=8 {
+                for preset in presets_for(count) {
+                    for pct in [0u8, 1, 4, 10, 35] {
+                        let gap = realistic_gap(preset, area, pct);
+                        let slots = apply(preset, area, gap);
+                        assert!(
+                            slots.iter().all(|s| s.w > 0 && s.h > 0),
+                            "area={area:?}, count={count}, pct={pct}%: слот схлопнулся в ноль"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ни один слот не выходит за рабочую область ни на одном реальном
+    /// разрешении, ни при каком зазоре — в том числе экстремальном, где
+    /// слоты схлопываются: схлопнутый слот обязан остаться на краю области,
+    /// а не «уехать» за неё. Дополняет `no_slot_leaves_the_work_area`
+    /// (та проверяет одну область) несколькими областями, включая монитор
+    /// слева с отрицательным origin.
+    #[test]
+    fn no_slot_leaves_any_work_area_at_any_gap() {
+        let mut areas = REAL_AREAS.to_vec();
+        areas.push(Rect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 30,
+        });
+        for area in areas {
+            let (max_x, max_y) = (
+                i64::from(area.x) + i64::from(area.w),
+                i64::from(area.y) + i64::from(area.h),
+            );
+            for count in 2..=8 {
+                for preset in presets_for(count) {
+                    for gap in [0, 1, 64, 4096] {
+                        for slot in apply(preset, area, gap) {
+                            assert!(
+                                i64::from(slot.x) >= i64::from(area.x)
+                                    && i64::from(slot.y) >= i64::from(area.y)
+                                    && i64::from(slot.x) + i64::from(slot.w) <= max_x
+                                    && i64::from(slot.y) + i64::from(slot.h) <= max_y,
+                                "area={area:?}, count={count}, gap={gap}: слот {slot:?} вышел за область"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Пресеты всегда ровно на то число окон, для которого запрошены:
+    /// лишний слот оставил бы окно без места (жалоба «вылетают не все
+    /// окна»), недостающий — два окна на одном слоте. Проверка намеренно
+    /// дублирует `each_count_offers_seven_distinct_layouts_of_the_right_size`,
+    /// чтобы держать размерность слотов отдельным явным утверждением.
+    #[test]
+    fn presets_for_every_count_have_exactly_that_many_slots() {
+        for count in 2..=8 {
+            for (i, preset) in presets_for(count).iter().enumerate() {
+                assert_eq!(preset.slots.len(), count, "count={count}, пресет {i}");
+            }
+        }
+    }
 }

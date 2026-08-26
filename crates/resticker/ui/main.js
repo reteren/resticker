@@ -141,6 +141,7 @@ const HOTKEY_FIELDS = [
   ['hotkey-unpin-all', 'unpin_all'],
   ['hotkey-groups-menu', 'edit_groups_menu'],
   ['hotkey-delete-group', 'delete_open_group'],
+  ['hotkey-pin-group', 'pin_open_group'],
   // Открытие группы — девять хоткеев, по одному на цифру, но настраивается
   // ОДНИМ полем: пользователь задаёт модификаторы, цифры подставляются сами.
   // Девять отдельных полей были бы стеной одинаковых строк, а разные
@@ -152,12 +153,25 @@ const HOTKEY_FIELDS = [
 const OPEN_GROUP_FIELD = 'hotkey-open-group';
 const GROUP_SLOTS = 9;
 
-// Показать значение поля: массив цифровых хоткеев сворачивается в первую
-// строку — остальные отличаются только цифрой.
+// Показать значение поля: массив цифровых хоткеев сворачивается в
+// «модификаторы + подставной хвост» (см. groupDisplayValue) — остальные
+// строки массива отличаются только цифрой.
 function hotkeyFieldValue(key, value) {
   if (key !== 'open_group_by_number') return value ?? '';
   const first = Array.isArray(value) ? value.find((v) => v) : null;
-  return first ?? '';
+  return first ? groupDisplayValue(first) : '';
+}
+
+// Конкретную цифру пользователь не выбирает никогда: каждая из девяти
+// занята номером своей группы, и последняя часть бинда не редактируется.
+// Показывать «Ctrl+Alt+1» как будто единица и есть бинд — враньё (репорт
+// 2026-08-26), поэтому в показе цифра заменяется подставным хвостом из
+// i18n. Строка без модификаторов (мусор в конфиге) даёт пустое значение —
+// поле уходит в плейсхолдер, а не в «Ctrl+Alt+» с пустым хвостом.
+function groupDisplayValue(combo) {
+  const mods = combo.split('+').slice(0, -1);
+  if (mods.length === 0) return '';
+  return [...mods, t('control.openGroupNumber')].join('+');
 }
 
 // Раздать одни и те же модификаторы всем девяти цифрам.
@@ -268,7 +282,10 @@ window.addEventListener(
     }
     const input = document.getElementById(recordingField);
     if (input) {
-      input.value = combo;
+      // Для поля открытия группы это не набранная комбинация (в ней цифра
+      // случайная — в значение она и так не попадает, см. spreadDigits), а
+      // та же форма, что в renderControl: модификаторы + подставной хвост.
+      input.value = hotkeyFieldValue(key, draftHotkeys[key]);
       input.classList.remove('recording');
     }
     recordingField = null;
@@ -302,21 +319,27 @@ window.addEventListener('blur', () => {
   cancelRecording();
 });
 
-document.getElementById('clear-hotkey-toggle-all').addEventListener('click', () => {
-  cancelRecording();
-  draftHotkeys.toggle_all_stickers = null;
-  document.getElementById('hotkey-toggle-all').value = '';
-});
-document.getElementById('clear-hotkey-mute-all').addEventListener('click', () => {
-  cancelRecording();
-  draftHotkeys.mute_all = null;
-  document.getElementById('hotkey-mute-all').value = '';
-});
-document.getElementById('clear-hotkey-pin').addEventListener('click', () => {
-  cancelRecording();
-  draftHotkeys.pin_focused_window = null;
-  document.getElementById('hotkey-pin').value = '';
-});
+// Кнопки «×» рядом с полями хоткеев — по одной на каждое поле, кроме
+// режима редактирования: без него в программу нельзя войти вообще, и
+// стирать его нечем по замыслу.
+//
+// Раньше обработчики были выписаны поштучно, и три хоткея групп, добавленные
+// позже, остались с кнопками, которые ничего не делали (найдено при ревью
+// 2026-08-26). Список полей уже есть — берём его, чтобы новое поле не могло
+// снова остаться без обработчика.
+for (const [elId, key] of HOTKEY_FIELDS) {
+  if (elId === 'hotkey-edit') continue;
+  const button = document.getElementById(`clear-${elId}`);
+  if (!button) continue;
+  button.addEventListener('click', () => {
+    cancelRecording();
+    // Поле открытия группы хранит массив из девяти строк: очистка — пустой
+    // массив, а не null, иначе Rust прочитал бы отсутствие поля как «взять
+    // значение по умолчанию» и хоткей вернулся бы сам собой.
+    draftHotkeys[key] = key === 'open_group_by_number' ? [] : null;
+    document.getElementById(elId).value = '';
+  });
+}
 
 // ==== Вкладка «Стикеры» ====
 

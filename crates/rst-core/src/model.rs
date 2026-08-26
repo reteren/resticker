@@ -169,6 +169,17 @@ pub struct Hotkeys {
     /// редактирования и ткнув в каждое. Когда закреплённое окно мешает прямо
     /// сейчас, это слишком долго.
     pub unpin_all: Option<String>,
+    /// Закрепить текущую (последнюю открытую) группу поверх всех окон —
+    /// ПЕРЕКЛЮЧАТЕЛЬ: повторное нажатие открепляет (запрос пользователя
+    /// 2026-08-26). `None` — не назначен.
+    ///
+    /// Дефолт `Ctrl+Alt+Shift+T` — в один ряд с остальными хоткеями
+    /// программы и мимо пары `Alt+Shift`, которую Windows отдаёт
+    /// переключателю раскладки (см. `edit_groups_menu`). От
+    /// `pin_focused_window` (`Ctrl+Alt+T`) отличается добавленным Shift: оба
+    /// хоткея про закрепление, но один закрепляет окно, другой — всю группу,
+    /// и две комбинации рядом обязаны отличаться, чтобы не спутать их.
+    pub pin_open_group: Option<String>,
 }
 
 impl Hotkeys {
@@ -201,6 +212,7 @@ impl Default for Hotkeys {
             delete_open_group: Some("Ctrl+Alt+Shift+G".to_string()),
             open_group_by_number: default_open_group_by_number(),
             unpin_all: Some("Ctrl+Alt+U".to_string()),
+            pin_open_group: Some("Ctrl+Alt+Shift+T".to_string()),
         }
     }
 }
@@ -695,5 +707,34 @@ impl Default for Config {
             presets: Vec::new(),
             groups: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_pin_open_group_hotkey_is_ctrl_alt_shift_t() {
+        assert_eq!(
+            Hotkeys::default().pin_open_group.as_deref(),
+            Some("Ctrl+Alt+Shift+T")
+        );
+    }
+
+    #[test]
+    fn config_without_pin_open_group_field_reads_with_default() {
+        // Старый config.json без нового поля обязан читаться без миграции
+        // схемы: недостающее поле достраивается дефолтом из
+        // `Hotkeys::default()` через `#[serde(default)]` на структуре — тот
+        // же прецедент, что `pin_focused_window` и `unpin_all`.
+        let raw = r#"{"schema_version":1,"hotkeys":{"edit_mode":"Ctrl+Alt+S"}}"#;
+        let cfg: Config = serde_json::from_str(raw).expect("старый конфиг обязан читаться");
+        assert_eq!(cfg.hotkeys.edit_mode.as_deref(), Some("Ctrl+Alt+S"));
+        assert_eq!(
+            cfg.hotkeys.pin_open_group.as_deref(),
+            Some("Ctrl+Alt+Shift+T"),
+            "отсутствующий хоткей достраивается дефолтом"
+        );
     }
 }

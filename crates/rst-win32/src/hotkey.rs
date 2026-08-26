@@ -244,7 +244,16 @@ pub const GROUP_DELETE_HOTKEY_ID: i32 = 18;
 /// первой же занятой комбинации.
 pub const UNPIN_ALL_HOTKEY_ID: i32 = 19;
 
-/// Все хоткеи групп одним списком: девятка открытия плюс меню и удаление.
+/// Хоткей «закрепить/открепить открытую группу поверх всех окон»
+/// (`Ctrl+Alt+Shift+T`).
+///
+/// Следующий после `UNPIN_ALL_HOTKEY_ID`: одиночные хоткеи групп идут
+/// подряд (17, 18, 19, 20), а девятка открытия живёт отдельным диапазоном
+/// [`GROUP_OPEN_HOTKEY_ID_BASE`] — между ними чужих id нет.
+pub const PIN_OPEN_GROUP_HOTKEY_ID: i32 = 20;
+
+/// Все хоткеи групп одним списком: девятка открытия плюс меню, удаление,
+/// «открепить всё» и «закрепить открытую группу».
 ///
 /// Собирается здесь, а не в оверлее, по той же причине, что и
 /// [`group_open_combos`]: разбор `WM_HOTKEY` и регистрация обязаны знать об
@@ -259,6 +268,7 @@ pub fn group_hotkey_combos(hotkeys: &Hotkeys) -> Vec<(i32, HotkeyCombo)> {
         (GROUP_MENU_HOTKEY_ID, hotkeys.edit_groups_menu.as_deref()),
         (GROUP_DELETE_HOTKEY_ID, hotkeys.delete_open_group.as_deref()),
         (UNPIN_ALL_HOTKEY_ID, hotkeys.unpin_all.as_deref()),
+        (PIN_OPEN_GROUP_HOTKEY_ID, hotkeys.pin_open_group.as_deref()),
     ] {
         if let Some(combo) = raw.and_then(|s| HotkeyCombo::parse(s).ok()) {
             combos.push((id, combo));
@@ -342,6 +352,17 @@ impl RegisteredHotkeySet {
     /// чужие сообщения игнорировать.
     pub fn registered_ids(&self) -> std::collections::HashSet<i32> {
         self.hotkeys.iter().map(|h| h.id()).collect()
+    }
+
+    /// Забрать зарегистрированные хоткеи из набора, оставив конфликты.
+    ///
+    /// Для перерегистрации на лету (overlay.rs, `WM_APP_REREGISTER_HOTKEYS`):
+    /// оверлей хранит владельцев в своём `WndState`, а на каждом обновлении
+    /// снимает прежних (Drop = UnregisterHotKey), ставит новых и забирает их
+    /// из свежего набора. `conflicts` при этом остаются в наборе — отчёт о
+    /// неудавшихся комбинациях читается отдельно.
+    pub fn take_hotkeys(&mut self) -> Vec<RegisteredHotkey> {
+        std::mem::take(&mut self.hotkeys)
     }
 }
 
@@ -590,5 +611,34 @@ mod tests {
         assert!(f.alt && f.shift && !f.ctrl && !f.win);
         assert_eq!(f.vk, 'F' as u32);
         assert_eq!(f.display_string(), "Alt+Shift+F");
+    }
+
+    #[test]
+    fn parse_default_pin_open_group_combo_yields_ctrl_alt_shift_t() {
+        // Ctrl+Alt+Shift+T — три модификатора; от pin_focused_window
+        // (Ctrl+Alt+T) отличается ровно Shift, и парсер обязан различать
+        // обе комбинации.
+        let c = HotkeyCombo::parse("Ctrl+Alt+Shift+T").expect("валидная комбинация");
+        assert!(c.ctrl && c.alt && c.shift && !c.win);
+        assert_eq!(c.vk, 'T' as u32);
+        assert_eq!(c.display_string(), "Ctrl+Alt+Shift+T");
+    }
+
+    #[test]
+    fn group_hotkey_combos_registers_pin_open_group_under_id_twenty() {
+        let combos = group_hotkey_combos(&Hotkeys::default());
+        let (id, combo) = combos
+            .iter()
+            .find(|(id, _)| *id == PIN_OPEN_GROUP_HOTKEY_ID)
+            .expect("хоткей закрепления открытой группы обязан регистрироваться");
+        assert_eq!(*id, 20);
+        assert_eq!(combo.display_string(), "Ctrl+Alt+Shift+T");
+        // Сосед по пакету — unpin_all с id 19, чтобы пары «открепить всё /
+        // закрепить группу» не разъехались по id.
+        let unpin = combos
+            .iter()
+            .find(|(id, _)| *id == UNPIN_ALL_HOTKEY_ID)
+            .expect("unpin_all обязан регистрироваться тем же пакетом");
+        assert_eq!(unpin.1.display_string(), "Ctrl+Alt+U");
     }
 }

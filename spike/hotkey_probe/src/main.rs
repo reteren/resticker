@@ -486,6 +486,98 @@ fn main() {
     }
     println!();
 
+    println!("--- 8. Перерегистрация на лету: снять старый бинд, поставить новый ---");
+    {
+        let mods = mods_of(true, true, false, false);
+        // Первичная регистрация: комбинация свободна.
+        let id_a = next_id();
+        // SAFETY: hwnd=None, id из допустимого диапазона.
+        let r = unsafe {
+            RegisterHotKey(
+                None,
+                id_a,
+                windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(mods),
+                VK_F24,
+            )
+        };
+        match r {
+            Ok(()) => {
+                press_seq(&[VK_LCONTROL, VK_LMENU], VK_F24, 40);
+                let fired = pump(700);
+                println!(
+                    "первичная регистрация id={id_a}: WM_HOTKEY = {}",
+                    if fired { "ДА" } else { "НЕТ" }
+                );
+                // Контроль: повторная регистрация ТОЙ ЖЕ комбинации без снятия
+                // обязана дать конфликт — именно поэтому перерегистрация на
+                // лету сначала снимает старые хоткеи, а потом ставит новые.
+                let id_b = next_id();
+                // SAFETY: hwnd=None, id допустимый.
+                let dup = unsafe {
+                    RegisterHotKey(
+                        None,
+                        id_b,
+                        windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(mods),
+                        VK_F24,
+                    )
+                };
+                match dup {
+                    Ok(()) => {
+                        println!("повторная регистрация без снятия: НЕОЖИДАННЫЙ УСПЕХ");
+                        // SAFETY: тот же поток, что регистрировал.
+                        unsafe {
+                            let _ = UnregisterHotKey(None, id_b);
+                        }
+                    }
+                    Err(e) => println!(
+                        "повторная регистрация без снятия: КОНФЛИКТ 0x{:08X} — как и ожидалось",
+                        e.code().0
+                    ),
+                }
+                // Смена бинда «на ту же клавишу»: снять старую, поставить новую.
+                // SAFETY: тот же поток — снятие и регистрация здесь же.
+                unsafe {
+                    let _ = UnregisterHotKey(None, id_a);
+                }
+                let id_c = next_id();
+                // SAFETY: hwnd=None, id допустимый.
+                let r2 = unsafe {
+                    RegisterHotKey(
+                        None,
+                        id_c,
+                        windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(mods),
+                        VK_F24,
+                    )
+                };
+                match r2 {
+                    Ok(()) => {
+                        press_seq(&[VK_LCONTROL, VK_LMENU], VK_F24, 40);
+                        let fired2 = pump(700);
+                        println!(
+                            "перерегистрация id={id_c}: WM_HOTKEY = {}",
+                            if fired2 { "ДА" } else { "НЕТ" }
+                        );
+                        // SAFETY: тот же поток, что регистрировал.
+                        unsafe {
+                            let _ = UnregisterHotKey(None, id_c);
+                        }
+                    }
+                    Err(e) => println!(
+                        "перерегистрация после снятия: ОТКАЗ 0x{:08X} ({})",
+                        e.code().0,
+                        e.message()
+                    ),
+                }
+            }
+            Err(e) => println!(
+                "первичная регистрация Ctrl+Alt+F24: ОТКАЗ 0x{:08X} ({})",
+                e.code().0,
+                e.message()
+            ),
+        }
+    }
+    println!();
+
     println!("Готово.");
 }
 

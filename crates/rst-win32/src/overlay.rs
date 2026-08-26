@@ -52,10 +52,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-use rst_core::model::Rect;
+use rst_core::model::{Hotkeys, Rect};
 
 use crate::error::Win32Error;
-use crate::hotkey::{HotkeyCombo, RegisteredHotkey, message_hotkey_id};
+use crate::hotkey::{
+    HotkeyCombo, HotkeyRegistrationConflict, RegisteredHotkeySet, message_hotkey_id,
+};
 use crate::input::{CursorManager, CursorShape, InputEvent, Modifiers, MouseCapture};
 use crate::monitors::{self, MonitorInfo};
 
@@ -114,6 +116,15 @@ const WM_APP_RELEASE_CAPTURE: u32 = WM_APP + 2;
 /// не прямым вызовом: `RegisterHotKey` привязан к ПОТОКУ, снять его может
 /// только тот же поток, а просит координатор со своего.
 const WM_APP_MEDIA_HOTKEYS: u32 = WM_APP + 3;
+
+/// Полностью заменить набор постоянных хоткеев окна. `lParam` — указатель на
+/// `Box<Vec<(i32, HotkeyCombo)>>` (все комбинации разом: режим редактирования,
+/// стикеры, звук, пин, группы); владение переходит потоку окна и
+/// освобождается в `wndproc`. Сообщением, а не прямым вызовом, по той же
+/// причине, что `WM_APP_MEDIA_HOTKEYS`: `RegisterHotKey` привязан к потоку,
+/// и регистрировать новые комбинации обязан поток окна — координатор
+/// передаёт только описание.
+const WM_APP_REREGISTER_HOTKEYS: u32 = WM_APP + 4;
 
 /// Смещение кода угла поворота в кодировке `WPARAM` — коды `0..ROTATE_BASE`
 /// заняты фиксированными формами, `ROTATE_BASE + N` (`N` — 0..359) кодирует
@@ -194,6 +205,11 @@ pub enum OverlayEvent {
     OpenGroup(u8),
     /// Открепить все закреплённые окна разом (`Ctrl+Alt+U`).
     UnpinAll,
+    /// Закрепить текущую (последнюю открытую) группу поверх всех окон —
+    /// переключатель (`Ctrl+Alt+Shift+T`). Имя совпадает с
+    /// `GroupVisibilityEvent::PinTogglePressed` в rst-core: координатору
+    /// останется переложить событие один в один, не придумывая маппинг.
+    PinTogglePressed,
     /// Пробел на видео-стикере под курсором: пауза/воспроизведение
     /// (запрос пользователя 2026-08-22). Приходит только пока
     /// медиа-хоткеи включены — см. [`OverlayWindow::set_media_hotkeys`].
@@ -207,6 +223,16 @@ pub enum OverlayEvent {
     /// (ARCHITECTURE.md, раздел 5.1). Окно продолжает работать — недоступны
     /// только хоткеи, которые не удалось зарегистрировать.
     HotkeyConflict(HotkeyName, String),
+    /// Полный набор постоянных хоткеев переустановлен на лету
+    /// ([`OverlayWindow::reload_hotkeys`]): пользователь сменил бинды в
+    /// настройках, и поток окна снял прежние комбинации и зарегистрировал
+    /// новые. `registered` — сколько зарегистрировалось, `conflicts` — какие
+    /// комбинации оказались заняты другими приложениями. Окно при этом
+    /// продолжает работать; текст для пользователя формирует координатор.
+    HotkeysReloaded {
+        registered: usize,
+        conflicts: Vec<HotkeyRegistrationConflict>,
+    },
     /// Масштаб монитора сменился (`WM_DPICHANGED`): окно уже применило
     /// рекомендованный прямоугольник (`SetWindowPos`), `dpi` — новый DPI
     /// монитора (младшее слово `wParam`), `size` — новый размер окна в
@@ -534,6 +560,46 @@ impl OverlayWindow {
         }
     }
 
+    /// Полностью заменить набор постоянных хоткеев окна без перезапуска
+    /// (живой репорт 2026-08-26: пользователь сменил бинд открытия группы в
+    /// настройках, а он не поменялся — регистрация была только при создании
+    /// окна).
+    ///
+    /// `combos` — ВСЕ комбинации разом (режим редактирования, показ стикеров,
+    /// звук, пин, группы), каждая под своим id; налетевший на место старой
+    /// комбинации новый набор заменяет её целиком, а не дополняет. Снятие
+    /// старых и регистрация новых происходят на потоке окна
+    /// (`RegisterHotKey` привязан к потоку, [`RegisteredHotkey`] намеренно
+    /// `!Send`) — сюда передаётся только описание, см.
+    /// [`WM_APP_REREGISTER_HOTKEYS`].
+    ///
+    /// Безопасен, если окно уже закрыто: сообщение не доставится, и набор,
+    /// не переданный потоку, освобождается здесь же. Итог перерегистрации
+    /// (сколько зарегистрировалось, какие комбинации заняты) придёт событием
+    /// [`OverlayEvent::HotkeysReloaded`].
+    pub fn reload_hotkeys(&self, combos: Vec<(i32, HotkeyCombo)>) {
+        // SAFETY: Box::into_raw передаёт владение потоку окна; если
+        // PostMessageW не доставил сообщение (окно уже уничтожено),
+        // владение возвращается сюда и освобождается. Доставленное сообщение
+        // гарантированно обрабатывается: уничтожение окна идёт через ту же
+        // очередь сообщений, FIFO.
+        let ptr = Box::into_raw(Box::new(combos));
+        let delivered = unsafe {
+            PostMessageW(
+                Some(self.hwnd),
+                WM_APP_REREGISTER_HOTKEYS,
+                WPARAM(0),
+                LPARAM(ptr as isize),
+            )
+        };
+        if delivered.is_err() {
+            // SAFETY: ptr — наш, поток окна его не получил.
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
+        }
+    }
+
     /// Скрыть/показать окно для захвата экрана (SPEC.md, раздел 8):
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`/`WDA_NONE`.
     /// Возвращает `Ok(true)`, если проверка (`GetWindowDisplayAffinity`)
@@ -743,6 +809,20 @@ struct WndState {
     /// Живут здесь, потому что `RegisteredHotkey` привязан к потоку окна —
     /// а `WndState` живёт ровно на нём.
     media_hotkeys: Vec<crate::hotkey::RegisteredHotkey>,
+    /// ВСЕ постоянные хоткеи окна (режим редактирования, стикеры, звук, пин,
+    /// группы) — их владельцы. Поменять набор на лету — снять прежних
+    /// (`clear()`, Drop зовёт `UnregisterHotKey` на этом потоке) и добавить
+    /// новых; это делает [`install_hotkeys`] на `WM_APP_REREGISTER_HOTKEYS`.
+    /// Медиа-хоткеи сюда намеренно НЕ входят — они временные, живут в
+    /// [`Self::media_hotkeys`].
+    hotkeys: Vec<crate::hotkey::RegisteredHotkey>,
+    /// id хоткеев, которые ЭТОТ поток реально зарегистрировал, — разбор
+    /// `WM_HOTKEY` решает по ним, своё ли это сообщение. Живёт здесь, а не в
+    /// цикле сообщений, потому что перерегистрация происходит в `wndproc`, и
+    /// набор обязан обновляться вместе с регистрацией — два хранилища
+    /// разошлись бы ровно так, как это уже случалось (см. доккомент у
+    /// `install_hotkeys`).
+    owned: std::collections::HashSet<i32>,
     /// Верхняя половина суррогатной пары из предыдущего `WM_CHAR`: символы
     /// вне BMP (эмодзи) Windows шлёт двумя сообщениями.
     pending_surrogate: Option<u16>,
@@ -771,17 +851,92 @@ fn char_from_wm_char(unit: u16, pending: &mut Option<u16>) -> Option<char> {
     char::from_u32(u32::from(unit))
 }
 
-/// Смаппить ошибку регистрации хоткея на событие оверлея. Наружу уходит
-/// только пользовательский случай — [`Win32Error::HotkeyConflict`]: комбинация
-/// занята другим приложением, пользователя надо предупредить и предложить
-/// другую (M2b6). Прочие ошибки `RegisterHotKey` — редкие системные сбои,
-/// им достаточно warn-лога в `run_message_loop`.
-fn hotkey_conflict_event(err: &Win32Error, name: HotkeyName) -> Option<OverlayEvent> {
-    match err {
-        Win32Error::HotkeyConflict(combo) => {
-            Some(OverlayEvent::HotkeyConflict(name, combo.clone()))
+/// Полный набор постоянных хоткеев по конфигу — то, что принимает
+/// [`OverlayWindow::reload_hotkeys`].
+///
+/// Живёт здесь, а не у координатора, потому что номера (`EDIT_HOTKEY_ID` и
+/// соседи) — внутреннее дело этого модуля: он же их и разбирает в `WM_HOTKEY`.
+/// Заставлять координатора собирать пары «номер + комбинация» значило бы
+/// разложить одно знание по двум крейтам, и первое же добавление хоткея
+/// разошлось бы между ними.
+///
+/// Медиа-хоткеи сюда не входят: они временные, регистрируются и снимаются по
+/// наведению курсора на стикер (`WM_APP_MEDIA_HOTKEYS`), и смена биндов в
+/// настройках их не касается.
+pub fn all_hotkey_combos(hotkeys: &Hotkeys) -> Vec<(i32, HotkeyCombo)> {
+    let mut combos = Vec::new();
+    for (id, raw) in [
+        (EDIT_HOTKEY_ID, hotkeys.edit_mode.as_deref()),
+        (TOGGLE_ALL_HOTKEY_ID, hotkeys.toggle_all_stickers.as_deref()),
+        (MUTE_ALL_HOTKEY_ID, hotkeys.mute_all.as_deref()),
+        (PIN_FOCUSED_HOTKEY_ID, hotkeys.pin_focused_window.as_deref()),
+    ] {
+        if let Some(combo) = raw.and_then(|s| HotkeyCombo::parse(s).ok()) {
+            combos.push((id, combo));
         }
+    }
+    combos.extend(crate::hotkey::group_hotkey_combos(hotkeys));
+    combos
+}
+
+/// Имя глобального хоткея по его id — для сообщения о конфликте пользователю.
+/// Медиа-хоткеи (5..=7) и хоткеи групп (8..) сюда не входят: у медиа
+/// конфликт не сообщается вовсе (см. `WM_APP_MEDIA_HOTKEYS`), а групповые
+/// перечислены отдельным списком [`HotkeyRegistrationConflict`], который
+/// координатор разбирает по `id` сам.
+fn hotkey_name_of(id: i32) -> Option<HotkeyName> {
+    match id {
+        EDIT_HOTKEY_ID => Some(HotkeyName::EditMode),
+        TOGGLE_ALL_HOTKEY_ID => Some(HotkeyName::ToggleAllStickers),
+        MUTE_ALL_HOTKEY_ID => Some(HotkeyName::MuteAll),
+        PIN_FOCUSED_HOTKEY_ID => Some(HotkeyName::PinFocusedWindow),
         _ => None,
+    }
+}
+
+/// Отчёт об установке набора хоткеев: сколько зарегистрировалось и какие
+/// комбинации оказались заняты другими приложениями.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HotkeysInstallReport {
+    registered: usize,
+    conflicts: Vec<HotkeyRegistrationConflict>,
+}
+
+/// Установить полный набор постоянных хоткеев окна: снять прежние,
+/// зарегистрировать новые и обновить `owned`. Вызывается при создании окна
+/// и на каждое `WM_APP_REREGISTER_HOTKEYS`.
+///
+/// Два требования, которые собирает эта функция:
+/// * `RegisterHotKey` привязан к ПОТОКУ (`RegisteredHotkey` намеренно
+///   `!Send`), поэтому снятие и установка происходят здесь, на потоке окна;
+/// * старые хоткеи снимаются ДО регистрации новых — иначе новая комбинация,
+///   совпадающая со старой, получила бы конфликт сама с собой.
+///
+/// Пакетная регистрация (`RegisteredHotkeySet::register_all`) изолирует
+/// конфликты: один занятый хоткей не мешает остальным, а его id и комбинация
+/// попадают в отчёт.
+fn install_hotkeys(state: &mut WndState, combos: &[(i32, HotkeyCombo)]) -> HotkeysInstallReport {
+    // Снятие прежних — Drop зовёт UnregisterHotKey на этом же потоке.
+    state.hotkeys.clear();
+    state.owned.clear();
+    match RegisteredHotkeySet::register_all(combos.iter().copied()) {
+        Ok(mut set) => {
+            state.owned = set.registered_ids();
+            state.hotkeys.append(&mut set.take_hotkeys());
+            HotkeysInstallReport {
+                registered: state.hotkeys.len(),
+                conflicts: set.conflicts().to_vec(),
+            }
+        }
+        Err(e) => {
+            // Не-конфликтная ошибка (например, id вне диапазона) —
+            // программистская, а не занятая пользователем комбинация.
+            tracing::warn!(error = %e, "не удалось зарегистрировать набор хоткеев");
+            HotkeysInstallReport {
+                registered: 0,
+                conflicts: Vec::new(),
+            }
+        }
     }
 }
 
@@ -817,131 +972,9 @@ fn run_message_loop(
         }
     };
 
-    // Хоткеи групп — пакетом: одна занятая комбинация не мешает остальным
-    // (`RegisteredHotkeySet::register_all`). Держится до конца цикла, как и
-    // одиночные хоткеи ниже: отпустить их значит разрегистрировать.
-    let _group_hotkeys = match crate::hotkey::RegisteredHotkeySet::register_all(group_hotkeys) {
-        Ok(set) => {
-            for conflict in set.conflicts() {
-                tracing::warn!(
-                    id = conflict.id,
-                    combo = %conflict.combo,
-                    "хоткей группы занят другим приложением"
-                );
-            }
-            Some(set)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "не удалось зарегистрировать хоткеи групп");
-            None
-        }
-    };
-
-    // Хоткеи — на этом же потоке (тип `!Send`, ADR-009). Конфликт окно не
-    // ломает (ARCHITECTURE.md, раздел 5.1), но наружу уходит событием
-    // `OverlayEvent::HotkeyConflict`, чтобы координатор мог предупредить
-    // пользователя, а не только warn-лог в трассировке (M2b6).
-    // Какие хоткеи ЭТОТ поток реально зарегистрировал.
-    //
-    // Без этой проверки поток реагировал бы на любое `WM_HOTKEY` со знакомым
-    // id, даже если хоткей принадлежит другому окну оверлея: у процесса их
-    // столько же, сколько мониторов, а регистрирует хоткеи ровно одно.
-    // Найдено 2026-08-25 замером — посланное вручную сообщение переключило
-    // режим редактирования дважды, по разу на монитор.
-    let mut owned_hotkeys: std::collections::HashSet<i32> = _group_hotkeys
-        .as_ref()
-        .map(|set| set.registered_ids())
-        .unwrap_or_default();
-
-    let _hotkey = match edit_hotkey {
-        Some(combo) => match RegisteredHotkey::register(EDIT_HOTKEY_ID, combo) {
-            Ok(h) => {
-                owned_hotkeys.insert(EDIT_HOTKEY_ID);
-                tracing::info!(
-                    id = EDIT_HOTKEY_ID,
-                    "хоткей режима редактирования зарегистрирован"
-                );
-                Some(h)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "не удалось зарегистрировать хоткей режима редактирования");
-                if let Some(event) = hotkey_conflict_event(&e, HotkeyName::EditMode) {
-                    let _ = event_tx.send(event);
-                }
-                None
-            }
-        },
-        // M3: глобальный хоткей регистрирует ровно одно окно на процесс
-        // (docs/M3_PREP_NOTES.md, раздел 3.3); остальные создаются без него.
-        None => None,
-    };
-    // «Показать/скрыть все стикеры» — опциональный хоткей: при `None`
-    // (пусто/не парсится в конфиге) просто не регистрируется (M2b7).
-    let _toggle_all = match toggle_all_hotkey {
-        Some(combo) => match RegisteredHotkey::register(TOGGLE_ALL_HOTKEY_ID, combo) {
-            Ok(h) => {
-                owned_hotkeys.insert(TOGGLE_ALL_HOTKEY_ID);
-                Some(h)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "не удалось зарегистрировать хоткей «показать/скрыть все стикеры»"
-                );
-                if let Some(event) = hotkey_conflict_event(&e, HotkeyName::ToggleAllStickers) {
-                    let _ = event_tx.send(event);
-                }
-                None
-            }
-        },
-        None => None,
-    };
-    // «Заглушить все стикеры» — опциональный хоткей, тот же паттерн, что
-    // и «показать/скрыть все стикеры» выше (M5d).
-    let _mute_all = match mute_all_hotkey {
-        Some(combo) => match RegisteredHotkey::register(MUTE_ALL_HOTKEY_ID, combo) {
-            Ok(h) => {
-                owned_hotkeys.insert(MUTE_ALL_HOTKEY_ID);
-                Some(h)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "не удалось зарегистрировать хоткей «заглушить все стикеры»"
-                );
-                if let Some(event) = hotkey_conflict_event(&e, HotkeyName::MuteAll) {
-                    let _ = event_tx.send(event);
-                }
-                None
-            }
-        },
-        None => None,
-    };
-    // «Закрепить/открепить сфокусированное окно» — опциональный хоткей
-    // (редизайн пинов), тот же паттерн, что у трёх предыдущих: здесь только
-    // регистрация + эмиссия события, логика пина — задача координатора.
-    let _pin_focused = match pin_focused_hotkey {
-        Some(combo) => match RegisteredHotkey::register(PIN_FOCUSED_HOTKEY_ID, combo) {
-            Ok(h) => {
-                owned_hotkeys.insert(PIN_FOCUSED_HOTKEY_ID);
-                Some(h)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "не удалось зарегистрировать хоткей «закрепить/открепить сфокусированное окно»"
-                );
-                if let Some(event) = hotkey_conflict_event(&e, HotkeyName::PinFocusedWindow) {
-                    let _ = event_tx.send(event);
-                }
-                None
-            }
-        },
-        None => None,
-    };
-
     // Клон для перехвата WM_HOTKEY прямо в цикле сообщений (см. ниже) —
-    // wndproc его не увидит (сообщение с hwnd=NULL).
+    // wndproc его не увидит (сообщение с hwnd=NULL). Тем же каналом уходит
+    // стартовый конфликт-отчёт.
     let hotkey_tx = event_tx.clone();
 
     let state = Box::new(WndState {
@@ -949,12 +982,58 @@ fn run_message_loop(
         cursor: CursorManager::new(),
         tx: event_tx,
         media_hotkeys: Vec::new(),
+        hotkeys: Vec::new(),
+        owned: std::collections::HashSet::new(),
         pending_surrogate: None,
     });
     // SAFETY: hwnd — наше окно этого потока; указатель освобождается в
     // WM_NCDESTROY ниже (единственное место, где он читается и дропается).
+    let state_ptr = Box::into_raw(state);
     unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+    }
+
+    // Стартовый набор — все постоянные хоткеи программы одним пакетом.
+    // `None` в аргументах конструктора означает «не регистрировать»: глобальные
+    // хоткеи регистрирует ровно одно окно на процесс (M3, docs/M3_PREP_NOTES.md,
+    // раздел 3.3), остальные создаются без них.
+    let mut initial_combos: Vec<(i32, HotkeyCombo)> = Vec::new();
+    if let Some(combo) = edit_hotkey {
+        initial_combos.push((EDIT_HOTKEY_ID, combo));
+    }
+    if let Some(combo) = toggle_all_hotkey {
+        initial_combos.push((TOGGLE_ALL_HOTKEY_ID, combo));
+    }
+    if let Some(combo) = mute_all_hotkey {
+        initial_combos.push((MUTE_ALL_HOTKEY_ID, combo));
+    }
+    if let Some(combo) = pin_focused_hotkey {
+        initial_combos.push((PIN_FOCUSED_HOTKEY_ID, combo));
+    }
+    initial_combos.extend(group_hotkeys);
+
+    // Хоткеи — на этом же потоке (тип `!Send`, ADR-009). Конфликт окно не
+    // ломает (ARCHITECTURE.md, раздел 5.1), но наружу уходит событием
+    // `OverlayEvent::HotkeyConflict`, чтобы координатор мог предупредить
+    // пользователя, а не только warn-лог в трассировке (M2b6). Групповые
+    // конфликты (id >= 8) только логируются: их набор большой, и каждый раз
+    // слать отдельное событие — шум; понадобится — координатор прочитает их
+    // из `HotkeysReloaded` при следующей перерегистрации.
+    // SAFETY: state_ptr установлен строкой выше и живёт до WM_NCDESTROY.
+    {
+        let state = unsafe { state_ptr.as_mut() }.expect("state установлен выше");
+        let report = install_hotkeys(state, &initial_combos);
+        for conflict in &report.conflicts {
+            if let Some(name) = hotkey_name_of(conflict.id) {
+                let _ = hotkey_tx.send(OverlayEvent::HotkeyConflict(name, conflict.combo.clone()));
+            } else {
+                tracing::warn!(
+                    id = conflict.id,
+                    combo = %conflict.combo,
+                    "хоткей занят другим приложением"
+                );
+            }
+        }
     }
 
     if ready_tx.send(Ok(SendHwnd(hwnd))).is_err() {
@@ -990,11 +1069,26 @@ fn run_message_loop(
         }
         if msg.message == WM_HOTKEY && msg.hwnd.0.is_null() {
             let id = message_hotkey_id(msg.wParam);
+            // Какие хоткеи ЭТОТ поток реально зарегистрировал.
+            //
+            // Без этой проверки поток реагировал бы на любое `WM_HOTKEY` со
+            // знакомым id, даже если хоткей принадлежит другому окну оверлея:
+            // у процесса их столько же, сколько мониторов, а регистрирует
+            // хоткеи ровно одно. Найдено 2026-08-25 замером — посланное
+            // вручную сообщение переключило режим редактирования дважды, по
+            // разу на монитор. Набор живёт в `WndState`, а не здесь, потому
+            // что перерегистрация (`WM_APP_REREGISTER_HOTKEYS`) меняет его в
+            // `wndproc` — две копии разошлись бы.
+            // SAFETY: state_ptr живёт до WM_NCDESTROY, цикл завершается
+            // раньше; сообщения с hwnd=NULL разбираются на том же потоке.
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                continue;
+            };
             // Медиа-хоткеи регистрируются и снимаются на лету (`wndproc`,
             // `WM_APP_MEDIA_HOTKEYS`), поэтому их id в набор не входят —
             // для них проверка владения не нужна и была бы неверной.
             let media = (MEDIA_PLAY_PAUSE_HOTKEY_ID..=MEDIA_VOLUME_DOWN_HOTKEY_ID).contains(&id);
-            if !media && !owned_hotkeys.contains(&id) {
+            if !media && !state.owned.contains(&id) {
                 continue;
             }
             if id == EDIT_HOTKEY_ID {
@@ -1017,6 +1111,10 @@ fn run_message_loop(
                 let _ = hotkey_tx.send(OverlayEvent::DeleteOpenGroup);
             } else if id == crate::hotkey::UNPIN_ALL_HOTKEY_ID {
                 let _ = hotkey_tx.send(OverlayEvent::UnpinAll);
+            } else if id == crate::hotkey::PIN_OPEN_GROUP_HOTKEY_ID {
+                // ДО `group_number_of`: id 20 вне диапазона открытия (8..=16),
+                // но ветка держится рядом с unpin_all, где живёт её константа.
+                let _ = hotkey_tx.send(OverlayEvent::PinTogglePressed);
             } else if let Some(n) = group_number_of(id) {
                 let _ = hotkey_tx.send(OverlayEvent::OpenGroup(n));
             }
@@ -1366,6 +1464,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                 }
+            }
+            LRESULT(0)
+        }
+        WM_APP_REREGISTER_HOTKEYS => {
+            // `lParam` — `Box<Vec<(id, combo)>>`, владение перешло нам в
+            // момент доставки сообщения. Освобождаем его в ЛЮБОМ случае:
+            // если state уже нет (окно догоняет уничтожение), набор просто
+            // выбросить — регистрировать некуда.
+            let combos = unsafe { Box::from_raw(lparam.0 as *mut Vec<(i32, HotkeyCombo)>) };
+            if let Some(state) = unsafe { state_ptr.as_mut() } {
+                let report = install_hotkeys(state, &combos);
+                for conflict in &report.conflicts {
+                    tracing::warn!(
+                        id = conflict.id,
+                        combo = %conflict.combo,
+                        "хоткей занят другим приложением — комбинация не перерегистрирована"
+                    );
+                }
+                tracing::info!(
+                    registered = report.registered,
+                    conflicts = report.conflicts.len(),
+                    "набор хоткеев переустановлен"
+                );
+                // Отчёт наружу целиком: текст для пользователя формирует
+                // координатор, он же знает, какие id что означают.
+                let _ = state.tx.send(OverlayEvent::HotkeysReloaded {
+                    registered: report.registered,
+                    conflicts: report.conflicts,
+                });
             }
             LRESULT(0)
         }
@@ -1752,43 +1879,76 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_conflict_maps_only_conflicts() {
-        // Конфликт → событие с той же каноничной комбинацией.
-        let conflict = Win32Error::HotkeyConflict("Ctrl+Alt+Shift+F22".to_string());
+    fn hotkey_name_maps_global_ids_and_ignores_media_and_group_ids() {
+        assert_eq!(hotkey_name_of(EDIT_HOTKEY_ID), Some(HotkeyName::EditMode));
         assert_eq!(
-            hotkey_conflict_event(&conflict, HotkeyName::EditMode),
-            Some(OverlayEvent::HotkeyConflict(
-                HotkeyName::EditMode,
-                "Ctrl+Alt+Shift+F22".to_string()
-            ))
-        );
-        // Имя хоткея прокидывается насквозь, а не всегда EditMode.
-        assert_eq!(
-            hotkey_conflict_event(&conflict, HotkeyName::MuteAll),
-            Some(OverlayEvent::HotkeyConflict(
-                HotkeyName::MuteAll,
-                "Ctrl+Alt+Shift+F22".to_string()
-            ))
+            hotkey_name_of(TOGGLE_ALL_HOTKEY_ID),
+            Some(HotkeyName::ToggleAllStickers)
         );
         assert_eq!(
-            hotkey_conflict_event(&conflict, HotkeyName::PinFocusedWindow),
-            Some(OverlayEvent::HotkeyConflict(
-                HotkeyName::PinFocusedWindow,
-                "Ctrl+Alt+Shift+F22".to_string()
-            ))
-        );
-        // Прочие ошибки регистрации события не порождают — им хватает warn-лога.
-        assert_eq!(
-            hotkey_conflict_event(&Win32Error::OverlayWindowCreateFailed, HotkeyName::EditMode),
-            None
+            hotkey_name_of(MUTE_ALL_HOTKEY_ID),
+            Some(HotkeyName::MuteAll)
         );
         assert_eq!(
-            hotkey_conflict_event(
-                &Win32Error::InvalidHotkey("Ctrl".to_string()),
-                HotkeyName::EditMode
-            ),
-            None
+            hotkey_name_of(PIN_FOCUSED_HOTKEY_ID),
+            Some(HotkeyName::PinFocusedWindow)
         );
+        for foreign in [
+            MEDIA_PLAY_PAUSE_HOTKEY_ID,
+            crate::hotkey::GROUP_MENU_HOTKEY_ID,
+            crate::hotkey::UNPIN_ALL_HOTKEY_ID,
+            crate::hotkey::GROUP_OPEN_HOTKEY_ID_BASE,
+        ] {
+            assert_eq!(
+                hotkey_name_of(foreign),
+                None,
+                "id {foreign} — не глобальный хоткей с именем"
+            );
+        }
+    }
+
+    /// Перерегистрация набора: конфликт одной комбинации не роняет остальные
+    /// и попадает в отчёт; владельцы успешных передаются хранилищу потока, а
+    /// `owned` обновляется ровно по зарегистрированным id (тест без живого
+    /// окна — `WndState` собирается вручную).
+    #[test]
+    fn install_hotkeys_isolates_conflicts_and_updates_owned_set() {
+        let state = WndState {
+            capture: MouseCapture::new(HWND(std::ptr::null_mut())),
+            cursor: CursorManager::new(),
+            tx: mpsc::channel::<OverlayEvent>().0,
+            media_hotkeys: Vec::new(),
+            hotkeys: Vec::new(),
+            owned: std::collections::HashSet::new(),
+            pending_surrogate: None,
+        };
+        let mut state = Box::new(state);
+
+        let ok = HotkeyCombo::parse("Ctrl+Alt+Shift+F21").expect("валидная комбинация");
+        let taken = HotkeyCombo::parse("Ctrl+Alt+Shift+F20").expect("валидная комбинация");
+        // Первая установка: оба свободны.
+        let report = install_hotkeys(
+            &mut state,
+            &[(EDIT_HOTKEY_ID, ok), (TOGGLE_ALL_HOTKEY_ID, taken)],
+        );
+        assert_eq!(report.registered, 2);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(state.owned.len(), 2);
+        assert_eq!(state.hotkeys.len(), 2);
+
+        // Вторая установка: `ok` теперь занят нами же (та же комбинация —
+        // классический случай «сменили конфиг на ту же клавишу»), а `taken`
+        // свободен. Снятие старых происходит ДО регистрации, поэтому
+        // «сам с собой» конфликта нет — если бы порядок был обратным, вторая
+        // установка увидела бы свою же комбинацию как занятую.
+        let report = install_hotkeys(
+            &mut state,
+            &[(EDIT_HOTKEY_ID, taken), (TOGGLE_ALL_HOTKEY_ID, ok)],
+        );
+        assert_eq!(report.registered, 2, "обе комбинации перерегистрировались");
+        assert!(report.conflicts.is_empty());
+        assert_eq!(state.owned.len(), 2);
+        assert_eq!(state.hotkeys.len(), 2);
     }
 
     #[test]
@@ -2086,6 +2246,35 @@ mod tests {
         );
         for m in &monitors {
             assert!(m.id.0.starts_with("\\\\?\\DISPLAY#"), "id: {}", m.id.0);
+        }
+    }
+
+    #[test]
+    fn all_hotkey_ids_are_unique() {
+        // id хоткея — единственный ключ разбора WM_HOTKEY (цепочка else-if
+        // выше): дубликат значил бы «одно нажатие включает два действия» и
+        // нашёлся бы только вживую. Тест собирает ВСЕ id программы —
+        // оверлейные константы и пакет групп — в один набор: новый хоткей
+        // с уже занятым id упадёт здесь, а не в поле.
+        let mut ids = std::collections::HashSet::new();
+        for id in [
+            EDIT_HOTKEY_ID,
+            TOGGLE_ALL_HOTKEY_ID,
+            MUTE_ALL_HOTKEY_ID,
+            PIN_FOCUSED_HOTKEY_ID,
+            MEDIA_PLAY_PAUSE_HOTKEY_ID,
+            MEDIA_VOLUME_UP_HOTKEY_ID,
+            MEDIA_VOLUME_DOWN_HOTKEY_ID,
+            crate::hotkey::GROUP_MENU_HOTKEY_ID,
+            crate::hotkey::GROUP_DELETE_HOTKEY_ID,
+            crate::hotkey::UNPIN_ALL_HOTKEY_ID,
+            crate::hotkey::PIN_OPEN_GROUP_HOTKEY_ID,
+        ] {
+            assert!(ids.insert(id), "id хоткея {id} уже занят другим хоткеем");
+        }
+        for n in 0..rst_core::model::Hotkeys::GROUP_OPEN_SLOTS {
+            let id = crate::hotkey::GROUP_OPEN_HOTKEY_ID_BASE + n as i32;
+            assert!(ids.insert(id), "id открытия группы {id} уже занят");
         }
     }
 }

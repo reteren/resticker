@@ -21,6 +21,11 @@ pub type WindowId = u64;
 pub enum GroupVisibilityEvent {
     /// Нажат хоткей группы — переключатель «показать/спрятать» (правило 2).
     HotkeyPressed,
+    /// Нажат переключатель закрепления всей группы поверх всех окон
+    /// (Ctrl+Alt+Shift+T): закрепить всех членов / снять закрепление.
+    /// Закрепление и показ — разные вещи: `shown` этим событием не
+    /// меняется, окна не прячутся и не поднимаются.
+    PinTogglePressed,
     /// Сменилось окно переднего плана (Alt+Tab, клик по другому окну,
     /// рабочий стол). Кто теперь в фокусе, машина узнаёт из
     /// [`MemberFacts::is_foreground`] членов.
@@ -68,6 +73,17 @@ pub enum WindowAction {
     /// Вернуть на место между окнами: снять с topmost и передать обратно
     /// машине соседства (правило 7: окно с правилами не исчезает совсем).
     RestoreBetweenWindows,
+    /// Закрепить окно поверх всех — установить постоянный topmost-стиль
+    /// окна. Отличие от [`WindowAction::ShowTopmost`]: тот — разовый подъём
+    /// наверх, который группа сама же отыгрывает при сокрытии и уходе на
+    /// постороннее окно; закрепление — постоянное свойство окна, которое
+    /// переживает переключение на другое приложение и снимается только
+    /// явной командой (переключатель группы или пользователь).
+    PinTopmost,
+    /// Снять закрепление поверх всех: окно остаётся на экране, но
+    /// возвращается в обычный z-порядок. Отличие от [`WindowAction::Hide`]:
+    /// окно НЕ прячется — снимается только стиль «поверх всего».
+    UnpinTopmost,
     /// Спрятать (свернуть) окно.
     Hide,
     /// Не трогать: состояние окна уже соответствует решению, либо судьбой
@@ -93,13 +109,26 @@ pub struct GroupVisibilityState {
     /// Группа показана: её окна подняты группой (а не открыты пользователем
     /// вручную) и будут спрятаны при уходе на постороннее окно.
     pub shown: bool,
+    /// Группа закреплена целиком поверх всех: её окнам по команде группы
+    /// выставлен постоянный topmost-стиль (переключатель Ctrl+Alt+Shift+T).
+    /// Независимо от `shown` — закреплённая группа может быть спрятана:
+    /// окна свёрнуты, но при следующем показе останутся поверх всего.
+    /// Факт `MemberFacts::pinned`, который координатор передаёт на каждое
+    /// событие, покрывает и личное закрепление окна пользователем, и
+    /// закрепление группой — машина их не различает: для всех её правил
+    /// важен только итоговый стиль окна.
+    pub pinned: bool,
 }
 
 impl Default for GroupVisibilityState {
-    /// Свежая группа (после перезапуска программы) — спрятана: никто её
-    /// не показывал, и притворяться показанной нельзя.
+    /// Свежая группа (после перезапуска программы) — спрятана и не
+    /// закреплена: никто её не показывал и не закреплял, и притворяться
+    /// нельзя.
     fn default() -> Self {
-        Self { shown: false }
+        Self {
+            shown: false,
+            pinned: false,
+        }
     }
 }
 
@@ -120,8 +149,20 @@ pub fn decide_visibility(
             // больше нет, — переключатель честный и предсказуемый.
             let next = GroupVisibilityState {
                 shown: !state.shown,
+                ..state
             };
             let decisions = hotkey_decisions(members, state);
+            (next, decisions)
+        }
+        GroupVisibilityEvent::PinTogglePressed => {
+            // Переключатель закрепления: не закреплена → закрепить всех
+            // членов, закреплена → снять со всех. Показ/сокрытие этим
+            // событием не трогается — закрепление и видимость разные вещи.
+            let next = GroupVisibilityState {
+                pinned: !state.pinned,
+                ..state
+            };
+            let decisions = pin_toggle_decisions(members, state);
             (next, decisions)
         }
         GroupVisibilityEvent::ForegroundChanged => {
@@ -133,7 +174,10 @@ pub fn decide_visibility(
                 (state, decisions)
             } else {
                 // Фокус на окне ВНЕ группы (правило 3): группа прячется.
-                let next = GroupVisibilityState { shown: false };
+                let next = GroupVisibilityState {
+                    shown: false,
+                    ..state
+                };
                 let decisions = foreign_foreground_decisions(members, state);
                 (next, decisions)
             }
@@ -158,27 +202,29 @@ pub fn decide_visibility(
 /// Решения по хоткею: каждое окно приводится к желаемой видимости, но
 /// только если фактическое состояние отличается — уже показанное не
 /// трогаем (правило 6 «уже показанное не трогаем»), уже спрятанное тоже.
+///
+/// Хоткей — хозяин группы, и он НЕ щадит закреплённые окна: «по повторному
+/// нажатию вся группа прячется, включая закреплённые» (запрос пользователя
+/// 2026-08-26). Различие проходит по событию, а не по типу окна: уход на
+/// постороннее окно ([`foreign_foreground_decisions`]) закреплённое щадит —
+/// там его прямое назначение «оставаться поверх всего» вступает в силу;
+/// здесь же пользователь явно командует именно этой группой, и команда
+/// сильнее стиля отдельного окна.
 fn hotkey_decisions(members: &[MemberFacts], state: GroupVisibilityState) -> Vec<WindowDecision> {
     let want_visible = !state.shown;
     members
         .iter()
         .map(|m| {
-            let action = if m.pinned {
-                // Закреплённое «поверх всех» группа не прячет никогда —
-                // постоянная видимость и есть его прямое назначение
-                // (правило 4). Показ касается его только когда оно
-                // невидимо (пользователь свернул его вручную) — хоткей
-                // возвращает его вместе со всеми.
-                if want_visible && !m.visible {
-                    WindowAction::ShowTopmost
-                } else {
-                    WindowAction::None
-                }
-            } else if m.has_host_rules {
+            let action = if m.has_host_rules {
                 // Окно «между окнами» (правило 7): при показе группы
                 // поднимается со всеми; при сокрытии НЕ прячется, а
                 // возвращается на своё место — Hide сломал бы машину
                 // соседства, которая сама решает его видимость.
+                //
+                // Ветка стоит ПЕРВОЙ намеренно: если факты противоречат и
+                // окно одновременно закреплено «поверх всех», приоритет у
+                // правил соседства — это более сильное ограничение
+                // (доккомент [`MemberFacts::has_host_rules`]).
                 if want_visible && !m.visible {
                     WindowAction::ShowTopmost
                 } else if !want_visible && m.visible {
@@ -186,10 +232,53 @@ fn hotkey_decisions(members: &[MemberFacts], state: GroupVisibilityState) -> Vec
                 } else {
                     WindowAction::None
                 }
+            } else if m.pinned {
+                // Закреплённое «поверх всех»: хоткей прячет его вместе со
+                // всеми (см. докфункцию). Показ касается его только когда
+                // оно невидимо (пользователь свернул его вручную) — хоткей
+                // возвращает его вместе со всеми.
+                if want_visible && !m.visible {
+                    WindowAction::ShowTopmost
+                } else if !want_visible && m.visible {
+                    WindowAction::Hide
+                } else {
+                    WindowAction::None
+                }
             } else if want_visible && !m.visible {
                 WindowAction::ShowTopmost
             } else if !want_visible && m.visible {
                 WindowAction::Hide
+            } else {
+                WindowAction::None
+            };
+            WindowDecision {
+                window: m.id,
+                action,
+            }
+        })
+        .collect()
+}
+
+/// Решения по переключателю закрепления группы: каждый член приводится к
+/// желаемому стилю, но только если фактический стиль отличается — окно,
+/// которое и так в нужном состоянии, не трогаем (тот же принцип «не
+/// дёргать зря», что в [`hotkey_decisions`]).
+///
+/// Видимость этими решениями не меняется: закрепление — свойство окна,
+/// а не команда показа/сокрытия. Свёрнутое окно тоже получает решение —
+/// при следующем показе оно уже будет поверх всего.
+fn pin_toggle_decisions(
+    members: &[MemberFacts],
+    state: GroupVisibilityState,
+) -> Vec<WindowDecision> {
+    let want_pinned = !state.pinned;
+    members
+        .iter()
+        .map(|m| {
+            let action = if want_pinned && !m.pinned {
+                WindowAction::PinTopmost
+            } else if !want_pinned && m.pinned {
+                WindowAction::UnpinTopmost
             } else {
                 WindowAction::None
             };
@@ -351,7 +440,10 @@ mod tests {
         let b = member(2); // уже свёрнуто
         let (state, decisions) = decide_visibility(
             GroupVisibilityEvent::HotkeyPressed,
-            GroupVisibilityState { shown: true },
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
             &[a, b],
         );
         assert!(!state.shown);
@@ -381,7 +473,10 @@ mod tests {
         a.visible = true;
         let (state, decisions) = decide_visibility(
             GroupVisibilityEvent::ForegroundChanged,
-            GroupVisibilityState { shown: true },
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
             &[a],
         );
         assert!(!state.shown, "группа обязана перейти в спрятанную");
@@ -425,7 +520,10 @@ mod tests {
         a.visible = true;
         let (_, decisions) = decide_visibility(
             GroupVisibilityEvent::ForegroundChanged,
-            GroupVisibilityState { shown: true },
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
             &[a],
         );
         assert_eq!(
@@ -435,23 +533,29 @@ mod tests {
         );
     }
 
-    /// Закреплённое окно не прячет и хоткей: если бы хоткей сворачивал
-    /// его, правило 4 «оно и должно быть поверх всех» теряло бы смысл —
-    /// закрепление стало бы переключаемым из группы.
+    /// Закреплённое окно прячет и хоткей-сокрытие: хоткей — хозяин группы,
+    /// и команда «спрятать группу» сильнее стиля отдельного окна (запрос
+    /// пользователя 2026-08-26: «по повторному нажатию вся группа прячется,
+    /// включая закреплённые»). Щадит закреплённое только уход на постороннее
+    /// окно — там его прямое назначение, см.
+    /// `user_pinned_window_survives_switch_to_foreign_window`.
     #[test]
-    fn hotkey_hide_never_touches_user_pinned_window() {
+    fn hotkey_hide_collapses_user_pinned_window_too() {
         let mut a = member(1);
         a.pinned = true;
         a.visible = true;
         let (_, decisions) = decide_visibility(
             GroupVisibilityEvent::HotkeyPressed,
-            GroupVisibilityState { shown: true },
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
             &[a],
         );
         assert_eq!(
             actions(&decisions),
-            WindowAction::None,
-            "хоткей-сокрытие не сворачивает закреплённое окно"
+            WindowAction::Hide,
+            "хоткей-сокрытие сворачивает и закреплённое окно"
         );
     }
 
@@ -591,7 +695,10 @@ mod tests {
         a.visible = true;
         let (_, decisions) = decide_visibility(
             GroupVisibilityEvent::ForegroundChanged,
-            GroupVisibilityState { shown: true },
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
             &[a],
         );
         assert_eq!(
@@ -630,7 +737,10 @@ mod tests {
         a.visible = true;
         let (_, decisions) = decide_visibility(
             GroupVisibilityEvent::HotkeyPressed,
-            GroupVisibilityState { shown: true },
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
             &[a],
         );
         assert_eq!(
@@ -652,7 +762,10 @@ mod tests {
         b.visible = true;
         let (state, decisions) = decide_visibility(
             GroupVisibilityEvent::WindowClosed(1),
-            GroupVisibilityState { shown: true },
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
             &[a, b],
         );
         assert!(state.shown, "закрытие окна не меняет состояние группы");
@@ -699,7 +812,10 @@ mod tests {
         let b = member(2);
         let (state, decisions) = decide_visibility(
             GroupVisibilityEvent::WindowClosed(1),
-            GroupVisibilityState { shown: true },
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
             &[a, b],
         );
         assert_eq!(
@@ -718,5 +834,221 @@ mod tests {
         let (state, decisions) = decide_visibility(GroupVisibilityEvent::HotkeyPressed, state, &[]);
         assert!(!state.shown);
         assert!(decisions.is_empty());
+    }
+
+    // --- ошибка трактовки правила: хоткей прячет закреплённые ---
+
+    /// Хоткей-сокрытие прячет закреплённое окно, даже если пользователь
+    /// открыл его вручную: правило 6 (уже показанное не трогаем при ПОКАЗЕ)
+    /// не отменяет хозяина группы при СКРЫТИИ.
+    #[test]
+    fn hotkey_after_manual_show_hides_pinned_window_opened_by_user() {
+        let mut a = member(1);
+        a.pinned = true;
+        a.visible = true; // открыто пользователем вручную, группа спрятана
+        let hidden = GroupVisibilityState::default();
+
+        // Первый хоткей: показывать нечего — окно уже видимо.
+        let (shown, decisions) =
+            decide_visibility(GroupVisibilityEvent::HotkeyPressed, hidden, &[a]);
+        assert!(shown.shown);
+        assert_eq!(
+            actions(&decisions),
+            WindowAction::None,
+            "уже показанное не трогаем при показе группы"
+        );
+
+        // Второй хоткей: прячем всё, включая закреплённое.
+        let (hidden_again, decisions) =
+            decide_visibility(GroupVisibilityEvent::HotkeyPressed, shown, &[a]);
+        assert!(!hidden_again.shown);
+        assert_eq!(
+            actions(&decisions),
+            WindowAction::Hide,
+            "хоткей-сокрытие сворачивает закреплённое окно"
+        );
+    }
+
+    /// Окно одновременно закреплённое и с правилами соседства: приоритет у
+    /// правил — ветка `has_host_rules` стоит первой и сокрытие возвращает
+    /// окно между окнами, а не сворачивает его (доккомент
+    /// [`MemberFacts::has_host_rules`]).
+    #[test]
+    fn hotkey_hide_prefers_host_rules_over_conflicting_pinned_fact() {
+        let mut a = member(1);
+        a.pinned = true; // факты противоречат — окно «и поверх всех, и между»
+        a.has_host_rules = true;
+        a.visible = true;
+        let (_, decisions) = decide_visibility(
+            GroupVisibilityEvent::HotkeyPressed,
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
+            &[a],
+        );
+        assert_eq!(
+            actions(&decisions),
+            WindowAction::RestoreBetweenWindows,
+            "правила соседства сильнее закрепления"
+        );
+    }
+
+    /// То же при показе: окно с правилами поднимается со всеми, а не
+    /// молчит из-за того, что закреплено.
+    #[test]
+    fn hotkey_show_prefers_host_rules_over_conflicting_pinned_fact() {
+        let mut a = member(1);
+        a.pinned = true;
+        a.has_host_rules = true;
+        let (_, decisions) = decide_visibility(
+            GroupVisibilityEvent::HotkeyPressed,
+            GroupVisibilityState::default(),
+            &[a],
+        );
+        assert_eq!(
+            actions(&decisions),
+            WindowAction::ShowTopmost,
+            "показ поднимает окно с правилами, закрепление не мешает"
+        );
+    }
+
+    // --- переключатель закрепления всей группы ---
+
+    /// Переключатель закрепления на незакреплённой группе выдаёт каждому
+    /// члену «закрепить поверх всех» и помечает группу закреплённой.
+    #[test]
+    fn pin_toggle_pins_all_members_topmost() {
+        let a = member(1);
+        let mut b = member(2);
+        b.pinned = true; // уже закреплено — трогать не надо
+        let (state, decisions) = decide_visibility(
+            GroupVisibilityEvent::PinTogglePressed,
+            GroupVisibilityState::default(),
+            &[a, b],
+        );
+        assert!(state.pinned, "группа становится закреплённой");
+        assert_eq!(
+            decisions,
+            vec![
+                WindowDecision {
+                    window: 1,
+                    action: WindowAction::PinTopmost,
+                },
+                WindowDecision {
+                    window: 2,
+                    action: WindowAction::None,
+                },
+            ],
+            "незакреплённые закрепляются, уже закреплённые не трогаются"
+        );
+    }
+
+    /// Переключатель на закреплённой группе снимает закрепление со всех,
+    /// но НЕ прячет их: окна остаются на экране, просто в обычном
+    /// z-порядке.
+    #[test]
+    fn pin_toggle_unpins_all_members_without_hiding_them() {
+        let mut a = member(1);
+        a.pinned = true;
+        a.visible = true;
+        let mut b = member(2);
+        b.visible = true; // закреплена группой? нет — факт не выставлен
+        let (state, decisions) = decide_visibility(
+            GroupVisibilityEvent::PinTogglePressed,
+            GroupVisibilityState {
+                shown: true,
+                pinned: true,
+            },
+            &[a, b],
+        );
+        assert!(!state.pinned, "группа перестаёт быть закреплённой");
+        assert_eq!(
+            decisions,
+            vec![
+                WindowDecision {
+                    window: 1,
+                    action: WindowAction::UnpinTopmost,
+                },
+                WindowDecision {
+                    window: 2,
+                    action: WindowAction::None,
+                },
+            ],
+            "закреплённые снимаются, незакреплённые не трогаются, никто не прячется"
+        );
+    }
+
+    /// Переключатель закрепления не меняет показанность группы: закрепить
+    /// можно и показанную, и спрятанную — это разные вещи.
+    #[test]
+    fn pin_toggle_does_not_change_shown_state() {
+        let mut a = member(1);
+        a.visible = true;
+        let (state, decisions) = decide_visibility(
+            GroupVisibilityEvent::PinTogglePressed,
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
+            &[a],
+        );
+        assert!(state.shown, "показанность не тронута закреплением");
+        assert_eq!(
+            actions(&decisions),
+            WindowAction::PinTopmost,
+            "закрепление не поднимает и не прячет — только ставит стиль"
+        );
+    }
+
+    /// Переключатель закрепления на пустой группе честно переключает
+    /// состояние и не паникует — тот же принцип, что у хоткея показа.
+    #[test]
+    fn pin_toggle_on_empty_group_switches_state_without_panic() {
+        let (state, decisions) = decide_visibility(
+            GroupVisibilityEvent::PinTogglePressed,
+            GroupVisibilityState::default(),
+            &[],
+        );
+        assert!(state.pinned);
+        assert!(decisions.is_empty());
+        let (state, decisions) =
+            decide_visibility(GroupVisibilityEvent::PinTogglePressed, state, &[]);
+        assert!(!state.pinned);
+        assert!(decisions.is_empty());
+    }
+
+    // --- вырожденный вход: все члены невидимы ---
+
+    /// Группа, где все окна невидимы, на хоткей-сокрытие отвечает только
+    /// None (прятать нечего), но состояние переключается честно — следующий
+    /// хоткей покажет её заново.
+    #[test]
+    fn hotkey_hide_on_all_invisible_members_only_toggles_state() {
+        let a = member(1);
+        let b = member(2);
+        let (state, decisions) = decide_visibility(
+            GroupVisibilityEvent::HotkeyPressed,
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
+            &[a, b],
+        );
+        assert!(!state.shown);
+        assert_eq!(
+            decisions,
+            vec![
+                WindowDecision {
+                    window: 1,
+                    action: WindowAction::None,
+                },
+                WindowDecision {
+                    window: 2,
+                    action: WindowAction::None,
+                },
+            ],
+            "невидимые окна не дёргаются при сокрытии"
+        );
     }
 }

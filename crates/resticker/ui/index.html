@@ -166,7 +166,7 @@
               </label>
 
               <label class="inputGroup">
-                <p class="inputLabel" data-i18n="control.openGroup">Open group (digit 1-9)</p>
+                <p class="inputLabel" data-i18n="control.openGroup">Open group</p>
                 <input
                   type="text"
                   class="textInput hotkeyInput"
@@ -179,7 +179,7 @@
                 <button class="button compact" id="clear-hotkey-open-group">×</button>
               </label>
               <p class="hint" data-i18n="control.openGroupHint">
-                Press the combination with any digit — the same modifiers apply to digits 1 through 9, one per group.
+                Only the modifiers are set here — the digit is the group number (1–9), fixed for each group and not editable. Press the combination with any digit.
               </p>
 
               <label class="inputGroup">
@@ -194,6 +194,20 @@
                   style="max-width: 160px"
                 />
                 <button class="button compact" id="clear-hotkey-delete-group">×</button>
+              </label>
+
+              <label class="inputGroup">
+                <p class="inputLabel" data-i18n="control.pinGroup">Keep open group on top</p>
+                <input
+                  type="text"
+                  class="textInput hotkeyInput"
+                  id="hotkey-pin-group"
+                  readonly
+                  placeholder="Not set"
+                  data-i18n-placeholder="control.notSet"
+                  style="max-width: 160px"
+                />
+                <button class="button compact" id="clear-hotkey-pin-group">×</button>
               </label>
 
               <div class="inputGroup">

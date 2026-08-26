@@ -25,5 +25,6 @@ pub mod window_pick;
 pub mod window_pin;
 pub mod window_thumb;
 pub mod window_tracker;
+pub mod window_visibility;
 
 pub use error::Win32Error;

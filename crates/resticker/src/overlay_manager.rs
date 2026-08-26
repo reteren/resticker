@@ -35,6 +35,9 @@ use windows::Win32::Foundation::{HWND, RECT};
 use rst_audio::{AudioMixer, AudioSource};
 use rst_core::AnimationClock;
 use rst_core::config;
+use rst_core::group_visibility::{
+    GroupVisibilityEvent, MemberFacts, WindowAction, WindowDecision, decide_visibility,
+};
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{
     Config, GroupPlace, Hotkeys, MediaType, MonitorId, OverlapRule, Placement, Rect, Settings,
@@ -68,7 +71,7 @@ use rst_win32::input::{CursorShape, CursorZone, Handle as Win32Handle, InputEven
 use rst_win32::monitors;
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
 use rst_win32::window_enum::{WindowInfo, WindowRect};
-use rst_win32::window_pin::{self as window_pin, WindowPins};
+use rst_win32::window_pin::{self as window_pin, LayoutDiscrepancyKind, WindowPins};
 use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker};
 use uuid::Uuid;
 
@@ -2704,6 +2707,20 @@ fn run(
                 if let Err(e) = config::save(&cfg, &config_path) {
                     tracing::warn!(error = %e, "не удалось сохранить config.json после изменения хоткеев");
                 }
+                // Новый бинд действует СРАЗУ, без перезапуска программы
+                // (живой репорт 2026-08-26: «поменял бинд в настройках и
+                // ничего не поменялось»). Раньше `RegisterHotKey` звался
+                // ровно один раз — при создании окна монитора, — и настройка
+                // молча лежала в config.json до следующего запуска.
+                //
+                // Просим только главный монитор: постоянные хоткеи
+                // регистрирует именно его окно, у остальных их нет вовсе
+                // (иначе одна комбинация конфликтовала бы сама с собой на
+                // втором мониторе).
+                if let Some(ms) = monitors_map.get(&primary_id) {
+                    ms.overlay
+                        .reload_hotkeys(rst_win32::overlay::all_hotkey_combos(&cfg.hotkeys));
+                }
             }
             OverlayMessage::Command(OverlayCommand::SetStickerEnabled(id, enabled)) => {
                 ops::set_visible_many(&mut cfg, &[id], enabled);
@@ -3833,7 +3850,7 @@ fn run(
                         &monitors_map,
                         &monitor_geometry,
                         &monitor_bounds,
-                        &window_pins,
+                        &mut window_pins,
                     );
                 } else {
                     // Меню набора интерактивно только вне режима
@@ -3885,6 +3902,60 @@ fn run(
                 }
                 need_redraw = true;
             }
+            OverlayMessage::Event(_, OverlayEvent::PinTogglePressed) => {
+                // `Ctrl+Alt+Shift+T` — закрепить/открепить поверх всех ВСЮ
+                // группу, открытую последней (запрос пользователя
+                // 2026-08-26). Ни одной группы не открыто — тишина: угадывать,
+                // какую из девяти он имел в виду, нельзя, ровно как у
+                // удаления группы рядом.
+                if toggle_group_pin(
+                    &mut groups,
+                    &cfg,
+                    &mut edit,
+                    &mut window_pins,
+                    &monitor_bounds,
+                    &rst_win32::window_enum::enumerate(),
+                ) {
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::Event(
+                _,
+                OverlayEvent::HotkeysReloaded {
+                    registered,
+                    conflicts,
+                },
+            ) => {
+                tracing::info!(registered, "хоткеи перерегистрированы");
+                // Занятую комбинацию называем поимённо и по одному
+                // уведомлению на всё: список из девяти строк в трее
+                // прочитать невозможно, а знать надо одно — какая именно
+                // комбинация не досталась.
+                for conflict in &conflicts {
+                    tracing::warn!(
+                        id = conflict.id,
+                        combo = %conflict.combo,
+                        "комбинация занята другим приложением"
+                    );
+                }
+                if let Some(first) = conflicts.first() {
+                    let body = if conflicts.len() > 1 {
+                        format!(
+                            "{} и ещё {}: заняты другими приложениями",
+                            first.combo,
+                            conflicts.len() - 1
+                        )
+                    } else {
+                        format!("{}: занята другим приложением", first.combo)
+                    };
+                    let _ = edit
+                        .coordinator_tx
+                        .send(CoordinatorRequest::ShowNotification {
+                            title: "Хоткей не назначен".to_string(),
+                            body,
+                        });
+                }
+            }
             OverlayMessage::Event(_, OverlayEvent::UnpinAll) => {
                 // Открепить всё разом (запрос пользователя 2026-08-26).
                 // Разобрать закрепления поштучно можно только войдя в режим
@@ -3915,6 +3986,7 @@ fn run(
                     cfg.groups.retain(|g| g.id != id);
                     if cfg.groups.len() != before {
                         groups.close_group();
+                        groups.forget_visibility(id);
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить удаление группы");
                         }
@@ -3924,13 +3996,26 @@ fn run(
                 }
             }
             OverlayMessage::Event(_, OverlayEvent::OpenGroup(number)) => {
-                if open_group_by_number(
+                // Перечисляем окна ПРЯМО СЕЙЧАС, а не берём `window_snapshot`.
+                //
+                // Живой замер по журналу 2026-08-26: хоткей доходил
+                // (`WM_HOTKEY получен id=8`), но следом шло
+                // `группа открыта number=1 windows=0` — ни одно окно не
+                // находилось. Причина: трекер окон работает только пока
+                // нужны маски стикеров, и без них `window_snapshot` остаётся
+                // пустым. Опознавать сохранённых членов было попросту не с
+                // чем, и группа молча не всплывала.
+                //
+                // Та же грабля уже ловилась на полосе окон в меню групп —
+                // там перечисление тоже пришлось делать своё.
+                if toggle_group_by_number(
                     &mut groups,
                     &mut cfg,
                     &config_path,
-                    &window_pins,
+                    &mut edit,
+                    &mut window_pins,
                     &monitor_bounds,
-                    &window_snapshot,
+                    &rst_win32::window_enum::enumerate(),
                     number,
                 ) {
                     need_redraw = true;
@@ -4024,6 +4109,22 @@ fn run(
                 // молчит (пункт 5 спеки).
                 if !edit.active {
                     maintain_pinned_windows(&mut edit, &window_snapshot, &mut window_pins);
+                    // Группа, показанная хоткеем, прячется при уходе на
+                    // постороннее окно (правило пользователя: «альт-табнулся
+                    // на другое окно — группа свернулась»). Тем же снимком,
+                    // что и обслуживание закреплённых: смена переднего плана
+                    // и приходит трекеру как полное перечисление.
+                    // Перерисовка не нужна: снимок трекера всё равно её
+                    // запрашивает в конце ветки — трогали мы чужие окна или
+                    // нет, на нашем кадре это не сказывается.
+                    maintain_group_visibility(
+                        &mut groups,
+                        &cfg,
+                        &mut edit,
+                        &mut window_pins,
+                        &monitor_bounds,
+                        &window_snapshot,
+                    );
                     enforce_pinned_geometry(
                         &mut edit,
                         &window_pins,
@@ -4607,7 +4708,7 @@ fn run(
                 &monitors_map,
                 &monitor_geometry,
                 &monitor_bounds,
-                &window_pins,
+                &mut window_pins,
             );
             need_redraw = true;
         }
@@ -4769,7 +4870,7 @@ fn run(
         // выбора окон, снимок обязан оставаться живым независимо от
         // `mask_needed(cfg)` (дизайн §5.1) — иначе если ВСЕ стикеры сейчас
         // `Always`, трекер спит, и список окон в панели не наполнится вовсе.
-        let new_mask_needed = tracker_mask_needed(&cfg, &edit);
+        let new_mask_needed = tracker_mask_needed(&cfg, &edit, &groups);
         if new_mask_needed != last_mask_needed {
             last_mask_needed = new_mask_needed;
             if let Some(tracker) = &window_tracker {
@@ -6550,11 +6651,20 @@ fn mask_needed(cfg: &Config) -> bool {
 /// собственное разовое перечисление ([`toggle_focused_pin`]), но
 /// `window_snapshot` координатора всё равно обязан оставаться живым, пока
 /// есть что обслуживать).
-fn tracker_mask_needed(cfg: &Config, edit: &EditState) -> bool {
+///
+/// `groups.open().is_some()` — та же болезнь, найденная 2026-08-26 по
+/// журналу. Пока группа ПОКАЗАНА, координатору нужен живой снимок на каждый
+/// тик сразу для двух вещей: запоминать новые места окон (пользователь
+/// двигает окна группы — группа обязана это запомнить) и узнавать о смене
+/// переднего плана, чтобы прятать группу при уходе на постороннее окно. Без
+/// этого условия трекер спал, `OverlayMessage::Windows(Changed)` не
+/// приходило вовсе, и обе механики молчали, хотя код для них был написан.
+fn tracker_mask_needed(cfg: &Config, edit: &EditState, groups: &GroupsState) -> bool {
     mask_needed(cfg)
         || edit.window_picker.is_some()
         || edit.window_pick_list.is_some()
         || !edit.pinned_windows.is_empty()
+        || groups.shown_group().is_some()
 }
 
 /// Пересчитать группы окклюдеров по каждому монитору (M4_OCCLUDERS_DESIGN.md
@@ -9205,7 +9315,7 @@ fn confirm_group_editor(
     monitors_map: &HashMap<MonitorId, MonitorState>,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
-    window_pins: &WindowPins,
+    window_pins: &mut WindowPins,
 ) {
     // Раскладку считаем ДО подтверждения: `confirm` забирает состояние
     // набора себе и закрывает меню, а слоты живут именно в нём.
@@ -9252,14 +9362,36 @@ fn confirm_group_editor(
     };
 
     if let Some(targets) = targets {
+        // Свёрнутые окна разворачиваем ДО раскладки. Свёрнутое окно нельзя
+        // ни поставить на место, ни измерить: `SetWindowPos` меняет ему лишь
+        // «нормальный» прямоугольник, а границы от DWM у него мусорные
+        // (доккомент `WindowInfo::rect`).
+        //
+        // Живой репорт 2026-08-26: «я выбрал 4 окна, а появилось 3, и два
+        // окна оказались на одном слоте, окно на окне». Свёрнутые окна
+        // показываются в ленте набора намеренно (запрос пользователя), и
+        // одно из выбранных было свёрнуто: раскладка его не двигала, а
+        // мусорные границы записывались в группу как «место» — окно потом
+        // всплывало поверх соседа.
+        for (hwnd, _) in &targets {
+            rst_win32::window_visibility::show_group_window(HWND(*hwnd as *mut core::ffi::c_void));
+        }
         let oversized = apply_group_layout(&targets, window_pins);
-        report_oversized_windows(&oversized, &windows, &edit.coordinator_tx);
+        report_oversized_windows(&oversized, &windows, Some(&edit.coordinator_tx));
         // Места записываем ТЕ, ЧТО ОКНА РЕАЛЬНО ЗАНЯЛИ, а не те, что мы
-        // просили: чужое окно могло не подчиниться (права выше наших,
-        // собственный минимальный размер), и сохранить желаемое значило бы
-        // при следующем открытии группы снова гнать окно туда, куда оно не
-        // встаёт.
-        remember_actual_places(&mut group, &targets, monitor_bounds);
+        // просили: чужое окно могло не подчиниться (права выше наших), и
+        // сохранить желаемое значило бы при следующем открытии группы снова
+        // гнать окно туда, куда оно не встаёт. Исключение — окна, упёршиеся
+        // в собственный минимальный размер: см. `remember_actual_places`.
+        //
+        // Здесь порядок целей и порядок членов совпадают по построению:
+        // и то и другое собрано из отмеченных окон по номерам слотов.
+        let placed: Vec<(usize, usize)> = targets
+            .iter()
+            .enumerate()
+            .map(|(index, (hwnd, _))| (index, *hwnd))
+            .collect();
+        remember_actual_places(&mut group, &placed, monitor_bounds, &oversized);
     }
 
     let (number, id) = (group.number, group.id);
@@ -9272,58 +9404,72 @@ fn confirm_group_editor(
         tracing::warn!(error = %e, "не удалось сохранить группу");
     }
 
-    // Созданная группа сразу становится открытой и всплывает на экран
-    // (запрос пользователя 2026-08-26: «когда объединяю окна в группу, пусть
-    // сразу вылетают, а то приходится открывать её отдельно»). Пользователь
-    // только что назвал эти окна вместе — заставлять его после этого жать
-    // ещё и `Ctrl+Shift+<номер>` ради того, чтобы увидеть результат, значит
-    // просить подтвердить дважды.
-    //
-    // Через тот же `open_group`, что и хоткей, а не «поднять и забыть»: это
-    // ещё и делает группу активной, а значит удаление по
-    // `Ctrl+Alt+Shift+G` целится в неё, и новые места окон начинают
-    // запоминаться сразу.
-    if let Some(saved) = cfg.groups.iter().find(|g| g.id == id) {
-        // Опознаём среди ТЕХ ЖЕ окон, из которых группа только что собрана,
-        // и в том же порядке. Раньше сюда шёл общий снимок, и опознание по
-        // exe с похожестью заголовка иногда не находило одно из окон —
-        // группа из четырёх всплывала тремя (репорт 2026-08-26). Список
-        // членов построен ровно из этих окон, значит и совпасть обязан
-        // целиком.
-        let live: Vec<rst_core::group_match::LiveWindow> = picked_windows
-            .iter()
-            .map(|w| rst_core::group_match::LiveWindow {
-                hwnd: w.hwnd,
-                exe_path: w.exe_path.clone(),
-                title: w.title.clone(),
-                class: w.class.clone(),
-            })
-            .collect();
-        groups.open_group(saved, &live);
-        // Поднимаем ПОСЛЕ раскладки: порядок членов задаёт и порядок
-        // всплытия, поэтому слот 1 оказывается не под остальными.
-        raise_group_windows(groups, window_pins);
-    }
-    tracing::info!(number, "группа сохранена и показана");
+    // Меню закрываем ДО показа: сейчас на экран вылетят чужие окна и одно
+    // из них заберёт фокус — оставлять поверх них собственную панель набора
+    // значит показать пользователю результат из-под неё.
     close_group_editor(groups, edit, monitors_map);
+
+    // Созданная группа показывается СРАЗУ и ровно тем же путём, что и хоткей
+    // `Ctrl+Alt+<номер>` (репорт 2026-08-26: «создал группу = она сразу
+    // показалась», причём именно так, как по бинду).
+    //
+    // Раньше здесь был свой укороченный показ — `open_group` плюс подъём, — и
+    // он отличался от хоткея тремя вещами, каждая из которых была видна
+    // пользователю: свёрнутое окно не разворачивалось, ни одно окно не
+    // получало фокус, и машина видимости оставалась в состоянии «группа
+    // спрятана», отчего первое же нажатие хоткея не прятало группу, а
+    // «показывало» уже показанную. Двух путей показа быть не должно.
+    //
+    // Опознаём среди ТЕХ ЖЕ окон, из которых группа только что собрана: их
+    // список построен ровно из этих окон, значит совпасть обязан целиком, и
+    // общий снимок трекера тут только добавил бы неоднозначности.
+    toggle_group_by_number(
+        groups,
+        cfg,
+        config_path,
+        edit,
+        window_pins,
+        monitor_bounds,
+        &picked_windows,
+        number,
+    );
+    tracing::info!(number, group = %id, "группа сохранена и показана");
     let _ = monitor_geometry;
 }
 
-/// Открыть группу по номеру хоткея. `true` — что-то изменилось на экране.
-#[allow(clippy::too_many_arguments)]
-fn open_group_by_number(
-    groups: &mut GroupsState,
-    cfg: &mut Config,
-    config_path: &Path,
-    window_pins: &WindowPins,
-    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
-    windows: &[WindowInfo],
-    number: u8,
-) -> bool {
-    let Some(index) = cfg.groups.iter().position(|g| g.number == number) else {
-        return false;
+/// Назвать поимённо членов группы, которым не нашлось живого окна.
+///
+/// Живой репорт 2026-08-26 (пункт 5): «вылетает только часть окон». Без
+/// этого журнала отличить «приложение закрыто» от «опознание не сработало»
+/// нельзя — а это две совершенно разные починки. Пишем на каждое открытие:
+/// строк ровно столько, сколько потерянных членов, то есть обычно ноль.
+fn report_unmatched_members(group: &WindowGroup, groups: &GroupsState, live_count: usize) {
+    let Some(open) = groups.open() else {
+        return;
     };
-    let live: Vec<rst_core::group_match::LiveWindow> = windows
+    for (index, member) in group.members.iter().enumerate() {
+        if open.window_of(index).is_none() {
+            tracing::warn!(
+                number = group.number,
+                title = %member.title,
+                class = %member.class,
+                exe = %member.exe_path.display(),
+                live_count,
+                "член группы не опознан среди живых окон"
+            );
+        } else if member.place.is_none() {
+            tracing::warn!(
+                number = group.number,
+                title = %member.title,
+                "у члена группы нет сохранённого места — окно не переставлено"
+            );
+        }
+    }
+}
+
+/// Живые окна для опознания членов группы.
+fn live_windows_for_match(windows: &[WindowInfo]) -> Vec<rst_core::group_match::LiveWindow> {
+    windows
         .iter()
         .map(|w| rst_core::group_match::LiveWindow {
             hwnd: w.hwnd,
@@ -9331,33 +9477,318 @@ fn open_group_by_number(
             title: w.title.clone(),
             class: w.class.clone(),
         })
-        .collect();
-    let placements = groups.open_group(&cfg.groups[index], &live);
+        .collect()
+}
 
-    // Ставим окна на их сохранённые места и поднимаем над остальными. Чужие
-    // окна при этом не трогаются вовсе: пользователь выбрал «группа просто
-    // всплывает сверху», а не «всё остальное прячется».
-    let mut targets = Vec::new();
-    for p in &placements {
-        let Some(bounds) = monitor_bounds.get(&p.place.monitor_id) else {
-            continue;
-        };
-        targets.push((p.hwnd, place_to_px(&p.place, bounds)));
-    }
-    let _ = apply_group_layout(&targets, window_pins);
-    raise_group_windows(groups, window_pins);
+/// Собрать факты о членах открытой группы для машины видимости.
+///
+/// Факты берутся из ЖИВОГО перечисления, а не из состояния координатора:
+/// свернуть окно, закрепить его или переключиться на другое пользователь мог
+/// мимо нас, и машина обязана исходить из того, что на экране сейчас, а не из
+/// того, что мы помним.
+fn group_member_facts(
+    group: &WindowGroup,
+    groups: &GroupsState,
+    edit: &EditState,
+    windows: &[WindowInfo],
+    foreground: Option<usize>,
+) -> Vec<MemberFacts> {
+    let Some(open) = groups.open() else {
+        return Vec::new();
+    };
+    (0..group.members.len())
+        .filter_map(|index| {
+            let hwnd = open.window_of(index)?;
+            let pin = edit.pinned_windows.iter().find(|p| p.hwnd == hwnd as isize);
+            Some(MemberFacts {
+                id: hwnd as u64,
+                pinned: pin.is_some(),
+                has_host_rules: pin.is_some_and(|p| p.hosts.is_restricted()),
+                // Свёрнутое окно — единственная форма «не на экране», в
+                // которой мы прячем чужие окна: скрытое `SW_HIDE` пропало бы
+                // из Alt+Tab, а пользователь потребовал обратного.
+                visible: !windows
+                    .iter()
+                    .find(|w| w.hwnd == hwnd)
+                    .is_some_and(|w| w.iconic),
+                is_foreground: foreground == Some(hwnd),
+            })
+        })
+        .collect()
+}
 
-    // Места могли не примениться в точности — запоминаем фактические, чтобы
-    // следующий снимок не считал группу «поехавшей» и не переписывал конфиг.
-    let mut group = cfg.groups[index].clone();
-    if remember_actual_places(&mut group, &targets, monitor_bounds) {
-        cfg.groups[index] = group;
-        if let Err(e) = config::save(cfg, config_path) {
-            tracing::warn!(error = %e, "не удалось сохранить места окон группы");
+/// Исполнить решения машины видимости. `true` — на экране что-то изменилось.
+fn apply_visibility_decisions(
+    decisions: &[WindowDecision],
+    cfg: &Config,
+    edit: &mut EditState,
+    window_pins: &mut WindowPins,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    windows: &[WindowInfo],
+) -> bool {
+    let mut changed = false;
+    for decision in decisions {
+        let hwnd = decision.window as usize;
+        let win = HWND(hwnd as *mut core::ffi::c_void);
+        match decision.action {
+            WindowAction::ShowTopmost => {
+                rst_win32::window_visibility::show_group_window(win);
+                rst_win32::window_visibility::raise_group_window(win);
+                changed = true;
+            }
+            WindowAction::ShowNormal => {
+                rst_win32::window_visibility::show_group_window(win);
+                window_pins.raise_without_topmost(win);
+                changed = true;
+            }
+            WindowAction::RestoreBetweenWindows => {
+                // Окно живёт по машине соседства: наше дело — только снять с
+                // него разовый подъём, дальше `maintain_pinned_windows`
+                // вернёт его в свой слот сам. Прятать его нельзя — этим мы
+                // отобрали бы у соседской машины право решать.
+                window_pins.drop_topmost(win);
+                edit.surfaced_pins.remove(&(hwnd as isize));
+                changed = true;
+            }
+            WindowAction::Hide => {
+                rst_win32::window_visibility::hide_group_window(win);
+                changed = true;
+            }
+            WindowAction::PinTopmost => {
+                if pin_window(edit, windows, monitor_bounds, window_pins, hwnd) {
+                    rst_win32::sound::play_pin_sound(cfg.settings.pin_sound_volume);
+                    changed = true;
+                }
+            }
+            WindowAction::UnpinTopmost => {
+                if edit.pinned_windows.iter().any(|p| p.hwnd == hwnd as isize) {
+                    unpin_window(edit, window_pins, hwnd);
+                    changed = true;
+                }
+            }
+            WindowAction::None => {}
         }
     }
-    tracing::info!(number, windows = targets.len(), "группа открыта");
-    !placements.is_empty()
+    changed
+}
+
+/// Хоткей `Ctrl+Shift+<номер>`: показать группу или спрятать её.
+///
+/// Это ПЕРЕКЛЮЧАТЕЛЬ, а не «открыть». Пользователь описал поведение так:
+/// нажал — вся группа вылетела поверх всего, даже поверх полноэкранной
+/// программы; нажал ещё раз — вся группа спряталась. Решает, что именно
+/// делать с каждым окном, чистая машина [`decide_visibility`]; здесь только
+/// сбор фактов и исполнение.
+///
+/// Геометрия применяется ТОЛЬКО при показе: у свёрнутого окна прямоугольник
+/// от DWM мусорный, и «расставить по местам» на сокрытии означало бы
+/// записать этот мусор в конфиг группы.
+#[allow(clippy::too_many_arguments)]
+fn toggle_group_by_number(
+    groups: &mut GroupsState,
+    cfg: &mut Config,
+    config_path: &Path,
+    edit: &mut EditState,
+    window_pins: &mut WindowPins,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    windows: &[WindowInfo],
+    number: u8,
+) -> bool {
+    let Some(index) = cfg.groups.iter().position(|g| g.number == number) else {
+        tracing::info!(number, "группы с таким номером нет");
+        return false;
+    };
+    let group = cfg.groups[index].clone();
+    let live = live_windows_for_match(windows);
+    groups.open_group(&group, &live);
+    report_unmatched_members(&group, groups, live.len());
+
+    let foreground = rst_win32::window_enum::foreground_hwnd();
+    let facts = group_member_facts(&group, groups, edit, windows, foreground);
+    let state = groups.visibility(group.id);
+    let (next, decisions) = decide_visibility(GroupVisibilityEvent::HotkeyPressed, state, &facts);
+    groups.set_visibility(group.id, next);
+
+    // При показе окна сперва встают на свои места, и только потом
+    // поднимаются: порядок членов задаёт и порядок всплытия, поэтому окно
+    // слота 1 не оказывается под остальными.
+    // Цели идут ВМЕСТЕ С НОМЕРОМ ЧЛЕНА, которому принадлежат: члена без
+    // живого окна или без сохранённого места здесь нет, и считать, что
+    // третья цель принадлежит третьему члену, нельзя — это перепутало бы
+    // места окон при первом же закрытом приложении.
+    let mut targets: Vec<(usize, Rect)> = Vec::new();
+    let mut placed: Vec<(usize, usize)> = Vec::new();
+    let mut oversized: Vec<(usize, i32, i32)> = Vec::new();
+    if next.shown {
+        for member_index in 0..group.members.len() {
+            let Some(hwnd) = groups.open().and_then(|open| open.window_of(member_index)) else {
+                continue;
+            };
+            let Some(place) = group.members[member_index].place.as_ref() else {
+                continue;
+            };
+            let Some(bounds) = monitor_bounds.get(&place.monitor_id) else {
+                tracing::warn!(
+                    monitor = ?place.monitor_id,
+                    hwnd,
+                    "монитор члена группы не найден — окно осталось на месте"
+                );
+                continue;
+            };
+            targets.push((hwnd, place_to_px(place, bounds)));
+            placed.push((member_index, hwnd));
+        }
+        // Свёрнутое окно надо сперва развернуть, иначе `SetWindowPos` уйдёт в
+        // его свёрнутое состояние и размер потеряется.
+        for (hwnd, _) in &targets {
+            rst_win32::window_visibility::show_group_window(HWND(*hwnd as *mut core::ffi::c_void));
+        }
+        oversized = apply_group_layout(&targets, window_pins);
+        if !oversized.is_empty() {
+            report_oversized_windows(&oversized, windows, Some(&edit.coordinator_tx));
+        }
+    }
+
+    let changed =
+        apply_visibility_decisions(&decisions, cfg, edit, window_pins, monitor_bounds, windows);
+
+    // Фокус отдаётся окну первого слота: показ группы — это переход к ней,
+    // а не фоновое всплытие. Заодно это единственное, что удерживает группу
+    // на экране: механика «ушёл на постороннее окно — группа прячется»
+    // иначе сработала бы на первом же снимке трекера, потому что активным
+    // осталось бы то окно, с которого пользователь нажал хоткей.
+    if next.shown
+        && let Some((hwnd, _)) = targets.first()
+    {
+        rst_win32::window_visibility::focus_group_window(HWND(*hwnd as *mut core::ffi::c_void));
+    }
+
+    if next.shown && !targets.is_empty() {
+        // Места могли не примениться в точности — запоминаем фактические,
+        // чтобы следующий снимок не счёл группу «поехавшей» и не переписывал
+        // конфиг на каждом тике.
+        let mut group = group.clone();
+        if remember_actual_places(&mut group, &placed, monitor_bounds, &oversized) {
+            cfg.groups[index] = group;
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить места окон группы");
+            }
+        }
+    }
+    tracing::info!(
+        number,
+        shown = next.shown,
+        members = facts.len(),
+        placed = targets.len(),
+        "группа переключена хоткеем"
+    );
+    changed
+}
+
+/// Хоткей `Ctrl+Alt+Shift+T`: закрепить всю открытую группу поверх всех окон
+/// или снять закрепление со всей группы.
+///
+/// В отличие от разового подъёма при показе группы, здесь выставляется
+/// постоянный `WS_EX_TOPMOST` тем же путём, что и обычное закрепление окна, —
+/// а значит закреплённые так окна попадают в общий список закреплённых, их
+/// видно на панели и снимает их же `Ctrl+Alt+U`.
+fn toggle_group_pin(
+    groups: &mut GroupsState,
+    cfg: &Config,
+    edit: &mut EditState,
+    window_pins: &mut WindowPins,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    windows: &[WindowInfo],
+) -> bool {
+    let Some(id) = groups.active() else {
+        tracing::info!("закреплять нечего — ни одна группа не открыта");
+        return false;
+    };
+    let Some(group) = cfg.groups.iter().find(|g| g.id == id).cloned() else {
+        return false;
+    };
+    let foreground = rst_win32::window_enum::foreground_hwnd();
+    let facts = group_member_facts(&group, groups, edit, windows, foreground);
+    let state = groups.visibility(id);
+    let (next, decisions) =
+        decide_visibility(GroupVisibilityEvent::PinTogglePressed, state, &facts);
+    groups.set_visibility(id, next);
+    let changed =
+        apply_visibility_decisions(&decisions, cfg, edit, window_pins, monitor_bounds, windows);
+    tracing::info!(
+        number = group.number,
+        pinned = next.pinned,
+        members = facts.len(),
+        "закрепление группы переключено"
+    );
+    changed
+}
+
+/// Сменился передний план: группа, показанная хоткеем, прячется, если
+/// пользователь ушёл на постороннее окно.
+///
+/// Вызывается на каждый снимок трекера — а трекер, пока группа открыта,
+/// держится разбуженным намеренно ([`tracker_mask_needed`]).
+fn maintain_group_visibility(
+    groups: &mut GroupsState,
+    cfg: &Config,
+    edit: &mut EditState,
+    window_pins: &mut WindowPins,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    windows: &[WindowInfo],
+) -> bool {
+    let Some(id) = groups.active() else {
+        return false;
+    };
+    let Some(group) = cfg.groups.iter().find(|g| g.id == id).cloned() else {
+        return false;
+    };
+    let state = groups.visibility(id);
+    if !state.shown {
+        return false;
+    }
+    // Пока показано системное всплывающее меню (Alt+Tab, Task View, меню
+    // снап-раскладок), переднего плана в обычном смысле нет: активна сама
+    // оболочка. Прятать по нему группу значило бы прятать её ровно в тот
+    // момент, когда пользователь в Alt+Tab выбирает её же окно.
+    if rst_win32::window_enum::shell_switching() {
+        return false;
+    }
+    // Залп окон группы ещё не улёгся — передний план сейчас перебрасывают
+    // сами показываемые окна, а не пользователь (см. `just_shown`).
+    if groups.just_shown() {
+        return false;
+    }
+    let foreground = rst_win32::window_enum::foreground_hwnd();
+    // Передний план, которого нет в перечислении окон, — не окно
+    // пользователя: так выглядят наши собственные оверлеи (они `no_activate`
+    // и отсеиваются `is_real_window`), панель задач и всплывающие меню.
+    // Прятать по ним группу нельзя: пользователь никуда не уходил.
+    let Some(foreground_hwnd) = foreground else {
+        return false;
+    };
+    if !windows.iter().any(|w| w.hwnd == foreground_hwnd) {
+        return false;
+    }
+    let facts = group_member_facts(&group, groups, edit, windows, foreground);
+    if facts.is_empty() {
+        return false;
+    }
+    let (next, decisions) =
+        decide_visibility(GroupVisibilityEvent::ForegroundChanged, state, &facts);
+    if next == state && decisions.iter().all(|d| d.action == WindowAction::None) {
+        return false;
+    }
+    groups.set_visibility(id, next);
+    let changed =
+        apply_visibility_decisions(&decisions, cfg, edit, window_pins, monitor_bounds, windows);
+    if !next.shown {
+        tracing::info!(
+            number = group.number,
+            "группа спрятана — фокус ушёл на постороннее окно"
+        );
+    }
+    changed
 }
 
 /// Уступить системному всплывающему меню Windows: снять «поверх всех» с
@@ -9393,25 +9824,6 @@ fn yield_pinned_to_shell(edit: &mut EditState, window_pins: &WindowPins) -> bool
     true
 }
 
-/// Поднять окна открытой группы наверх.
-///
-/// БЕЗ `HWND_TOPMOST`: этот флаг выставляет стиль `WS_EX_TOPMOST`, который
-/// остаётся на чужом окне навсегда. Живой репорт 2026-08-26: после открытия
-/// группы аудиоплеер и проводник висели поверх всех окон, хотя пользователь
-/// им этого не назначал, — снимать стиль было некому.
-///
-/// Закреплённые пользователем окна пропускаются: у них topmost стоит по его
-/// прямому выбору, и опускать их в обычную стопку значило бы отменять
-/// закрепление.
-fn raise_group_windows(groups: &GroupsState, window_pins: &WindowPins) {
-    for hwnd in groups.open().map(|g| g.windows()).unwrap_or_default() {
-        if window_pins.is_pinned(hwnd) {
-            continue;
-        }
-        window_pins.raise_without_topmost(HWND(hwnd as *mut core::ffi::c_void));
-    }
-}
-
 /// Допуск раскладки, физические пиксели: меньшее расхождение — округление,
 /// а не отказ окна ужаться.
 const LAYOUT_TOLERANCE_PX: i32 = 4;
@@ -9434,10 +9846,28 @@ fn apply_group_layout(
     window_pins: &WindowPins,
 ) -> Vec<(usize, i32, i32)> {
     let mut oversized = Vec::new();
+    let mut moved: Vec<usize> = Vec::with_capacity(targets.len());
     for (hwnd, rect) in targets {
+        // Одно окно не может занять два слота. Если такое пришло, значит
+        // выше кто-то выдал одному окну два места — и второе применение
+        // унесло бы его из первого слота, оставив тот пустым. Ровно этот
+        // симптом описал пользователь 2026-08-26: «два окна полетели на один
+        // слот, и они заслоились». Молча двигать второй раз нельзя, молчать
+        // тоже: без строки в журнале причину не найти.
+        if moved.contains(hwnd) {
+            tracing::warn!(
+                hwnd,
+                slot_x = rect.x,
+                slot_y = rect.y,
+                "окну выдали второй слот — раскладка построена неверно, второй слот пропущен"
+            );
+            continue;
+        }
+        moved.push(*hwnd);
         if rst_win32::window_pin::is_user_dragging(*hwnd) {
             // Спорить с рукой пользователя нельзя — тот же принцип, что в
             // `enforce_pinned_geometry`.
+            tracing::info!(hwnd, "окно тащат мышью — раскладка его не трогает");
             continue;
         }
         let win = HWND(*hwnd as *mut core::ffi::c_void);
@@ -9447,12 +9877,41 @@ fn apply_group_layout(
             right: rect.x + rect.w as i32,
             bottom: rect.y + rect.h as i32,
         };
+        // Прежнее место замеряем ДО того, как двигать: без него исход
+        // «окно не сдвинулось вовсе» не отличить от «встало не туда», а это
+        // разные болезни с разными причинами.
+        let Some(previous) = rst_win32::window_enum::live_rect(*hwnd) else {
+            continue;
+        };
         window_pins.set_dwm_bounds(win, target);
-        if let Some(d) = window_pins.check_layout_discrepancy(win, target, LAYOUT_TOLERANCE_PX)
-            && d.exceeds_tolerance
-            && (d.dw > LAYOUT_TOLERANCE_PX || d.dh > LAYOUT_TOLERANCE_PX)
-        {
-            oversized.push((*hwnd, d.dw.max(0), d.dh.max(0)));
+        let Some(d) =
+            window_pins.check_layout_discrepancy(win, previous, target, LAYOUT_TOLERANCE_PX)
+        else {
+            continue;
+        };
+        match d.kind {
+            LayoutDiscrepancyKind::Exact => {}
+            LayoutDiscrepancyKind::Oversized => {
+                // У приложения свой минимальный размер — сделать нечего,
+                // но пользователю об этом скажут словами.
+                oversized.push((*hwnd, d.dw.max(0), d.dh.max(0)));
+            }
+            LayoutDiscrepancyKind::NotMoved | LayoutDiscrepancyKind::Elsewhere => {
+                // Ровно этот случай и был в репорте 2026-08-26 («два окна на
+                // одном слоте»): окно осталось там, где стояло, и накрыло
+                // соседа. Числа в журнал — без них причину не отличить от
+                // предыдущей.
+                tracing::warn!(
+                    hwnd,
+                    kind = ?d.kind,
+                    want = ?(rect.x, rect.y, rect.w, rect.h),
+                    dx = d.dx,
+                    dy = d.dy,
+                    dw = d.dw,
+                    dh = d.dh,
+                    "окно не встало на своё место в раскладке"
+                );
+            }
         }
     }
     oversized
@@ -9467,7 +9926,7 @@ fn apply_group_layout(
 fn report_oversized_windows(
     oversized: &[(usize, i32, i32)],
     windows: &[WindowInfo],
-    coordinator_tx: &Sender<CoordinatorRequest>,
+    coordinator_tx: Option<&Sender<CoordinatorRequest>>,
 ) {
     let Some((hwnd, dw, dh)) = oversized.first().copied() else {
         return;
@@ -9490,20 +9949,46 @@ fn report_oversized_windows(
     } else {
         format!("{title}: окно не становится ниже своего предела, слот меньше на {dh} px")
     };
-    let _ = coordinator_tx.send(CoordinatorRequest::ShowNotification {
-        title: "Раскладка применена не полностью".to_string(),
-        body,
-    });
+    if let Some(tx) = coordinator_tx {
+        let _ = tx.send(CoordinatorRequest::ShowNotification {
+            title: "Раскладка применена не полностью".to_string(),
+            body,
+        });
+    }
 }
 
 /// Записать в группу фактическую геометрию окон. `true` — что-то изменилось.
 fn remember_actual_places(
     group: &mut WindowGroup,
-    targets: &[(usize, Rect)],
+    placed: &[(usize, usize)],
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    oversized: &[(usize, i32, i32)],
 ) -> bool {
     let mut changed = false;
-    for ((hwnd, _), member) in targets.iter().zip(group.members.iter_mut()) {
+    for (index, hwnd) in placed {
+        // Окно, которое не ужалось до своего слота, здесь не запоминаем: у
+        // него собственный минимальный размер (замер 2026-08-26: Spotify не
+        // ниже 600 px, OBS не уже 1018 px), и записать его перекрывающий
+        // прямоугольник как «место в группе» значило бы объявить неудачу
+        // намерением. В группе остаётся то, что мы просили; перекрытие видно
+        // на экране и названо в уведомлении.
+        //
+        // Это не отменяет живого запоминания мест (`note_places`): подвинет
+        // окно пользователь — запомним, как он и просил. Здесь речь только о
+        // моменте применения раскладки, когда двигали окно мы.
+        if oversized.iter().any(|(h, _, _)| h == hwnd) {
+            continue;
+        }
+        // У свёрнутого окна границы от DWM мусорные — запомнить их значит
+        // записать в группу место, которого окно никогда не занимало, и при
+        // следующем показе поставить его туда всерьёз.
+        if rst_win32::window_visibility::is_minimized(HWND(*hwnd as *mut core::ffi::c_void)) {
+            tracing::info!(hwnd, "окно свёрнуто — его место в группе не обновляем");
+            continue;
+        }
+        let Some(member) = group.members.get_mut(*index) else {
+            continue;
+        };
         let Some(live) = rst_win32::window_enum::live_rect(*hwnd) else {
             continue;
         };
@@ -14152,12 +14637,166 @@ mod tests {
         }
     }
 
+    /// Группа из двух окон с сохранёнными местами — общий вход для тестов
+    /// склейки машины видимости с миром.
+    fn group_of(hwnds: [usize; 2]) -> WindowGroup {
+        WindowGroup {
+            id: Uuid::new_v4(),
+            number: 1,
+            name: String::new(),
+            gap_pct: 0,
+            members: hwnds
+                .iter()
+                .map(|hwnd| rst_core::model::GroupMember {
+                    exe_path: PathBuf::from(format!("C:/app{hwnd}.exe")),
+                    title: format!("окно {hwnd}"),
+                    class: "Cls".to_string(),
+                    place: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn live_window(hwnd: usize, iconic: bool) -> WindowInfo {
+        WindowInfo {
+            hwnd,
+            rect: WindowRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
+            pid: 1,
+            exe_path: PathBuf::from(format!("C:/app{hwnd}.exe")),
+            title: format!("окно {hwnd}"),
+            class: "Cls".to_string(),
+            z_order: 0,
+            iconic,
+            icon: None,
+        }
+    }
+
+    /// Открыть группу так, как это делает хоткей: опознать её окна среди
+    /// живых. Без этого шага `GroupsState` не знает, какие hwnd её члены.
+    fn opened(groups: &mut GroupsState, group: &WindowGroup, live: &[WindowInfo]) {
+        let live: Vec<rst_core::group_match::LiveWindow> = live
+            .iter()
+            .map(|w| rst_core::group_match::LiveWindow {
+                hwnd: w.hwnd,
+                exe_path: w.exe_path.clone(),
+                title: w.title.clone(),
+                class: w.class.clone(),
+            })
+            .collect();
+        groups.open_group(group, &live);
+    }
+
+    #[test]
+    fn minimized_member_is_reported_as_not_visible() {
+        // Это единственный признак «окно спрятано», который мы понимаем:
+        // прячем мы сворачиванием, значит и читать обязаны его же. Спутать
+        // свёрнутое с видимым — значит на показе группы не тронуть окно,
+        // которое как раз и надо вернуть.
+        let group = group_of([11, 22]);
+        let live = vec![live_window(11, false), live_window(22, true)];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        let edit = mask_gate_edit_state();
+        let facts = group_member_facts(&group, &groups, &edit, &live, None);
+        assert_eq!(facts.len(), 2);
+        assert!(facts[0].visible, "развёрнутое окно видимо");
+        assert!(!facts[1].visible, "свёрнутое окно не видимо");
+    }
+
+    #[test]
+    fn member_pinned_with_host_rules_is_reported_as_having_them() {
+        // Закрепление «поверх всех» и закрепление «между окнами» ведут себя
+        // по-разному при сокрытии группы (второе не прячется, а возвращается
+        // в свой слот), и различить их обязаны факты, а не машина.
+        let group = group_of([11, 22]);
+        let live = vec![live_window(11, false), live_window(22, false)];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        let mut edit = mask_gate_edit_state();
+        edit.pinned_windows.push(PinnedWindow::new(11));
+        let mut between = PinnedWindow::new(22);
+        between.hosts = HostFilter::Only(Vec::new());
+        edit.pinned_windows.push(between);
+        let facts = group_member_facts(&group, &groups, &edit, &live, Some(22));
+        assert!(facts[0].pinned && !facts[0].has_host_rules);
+        assert!(facts[1].pinned && facts[1].has_host_rules);
+        assert!(
+            facts[1].is_foreground && !facts[0].is_foreground,
+            "передний план читается по живому hwnd, а не по порядку членов"
+        );
+    }
+
+    #[test]
+    fn member_that_no_longer_exists_produces_no_facts() {
+        // Приложение закрыли, пока группа была спрятана. Решать судьбу окна,
+        // которого нет, нельзя — фактов о нём просто не должно быть.
+        let group = group_of([11, 22]);
+        let live = vec![live_window(11, false)];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        let edit = mask_gate_edit_state();
+        let facts = group_member_facts(&group, &groups, &edit, &live, None);
+        assert_eq!(facts.len(), 1, "фактов ровно столько, сколько живых окон");
+        assert_eq!(facts[0].id, 11);
+    }
+
+    #[test]
+    fn tracker_stays_awake_while_a_group_is_shown() {
+        // Ровно тот баг, что нашёлся 2026-08-26: без этого условия трекер
+        // спал, снимков не приходило, и группа не пряталась при уходе на
+        // постороннее окно — механика была написана и молчала.
+        let cfg = Config::default();
+        let edit = mask_gate_edit_state();
+        let group = group_of([11, 22]);
+        let live = vec![live_window(11, false), live_window(22, false)];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        groups.set_visibility(
+            group.id,
+            rst_core::group_visibility::GroupVisibilityState {
+                shown: true,
+                ..Default::default()
+            },
+        );
+        assert!(tracker_mask_needed(&cfg, &edit, &groups));
+    }
+
+    #[test]
+    fn tracker_sleeps_again_once_the_group_is_hidden() {
+        // Спрятанная группа остаётся «последней открытой» (её удаляет
+        // `Ctrl+Alt+Shift+G`), но обслуживать на каждом снимке её незачем:
+        // прятать уже спрятанное не от чего.
+        let cfg = Config::default();
+        let edit = mask_gate_edit_state();
+        let group = group_of([11, 22]);
+        let live = vec![live_window(11, false), live_window(22, false)];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        groups.set_visibility(
+            group.id,
+            rst_core::group_visibility::GroupVisibilityState {
+                shown: false,
+                ..Default::default()
+            },
+        );
+        assert!(
+            groups.open().is_some(),
+            "группа остаётся последней открытой"
+        );
+        assert!(!tracker_mask_needed(&cfg, &edit, &groups));
+    }
+
     #[test]
     fn tracker_mask_needed_false_on_clean_config_and_idle_edit() {
         // Ни одного стикера, никакой UI не открыт — трекеру спать.
         let cfg = Config::default();
         let edit = mask_gate_edit_state();
-        assert!(!tracker_mask_needed(&cfg, &edit));
+        assert!(!tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
     }
 
     #[test]
@@ -14182,7 +14821,7 @@ mod tests {
             monitor_id: monitor_id("main"),
             scroll: 0,
         });
-        assert!(tracker_mask_needed(&cfg, &edit));
+        assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
     }
 
     #[test]
@@ -14353,7 +14992,7 @@ mod tests {
             scroll: 0,
             monitor_id: monitor_id("main"),
         });
-        assert!(tracker_mask_needed(&cfg, &edit));
+        assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
     }
 
     #[test]
@@ -14365,7 +15004,7 @@ mod tests {
         sticker.visibility.mode = VisibilityMode::Desktop;
         cfg.stickers.push(sticker);
         let edit = mask_gate_edit_state();
-        assert!(tracker_mask_needed(&cfg, &edit));
+        assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
     }
 
     #[test]
@@ -14380,7 +15019,7 @@ mod tests {
         let cfg = Config::default();
         let mut edit = mask_gate_edit_state();
         edit.pinned_windows.push(PinnedWindow::new(12345));
-        assert!(tracker_mask_needed(&cfg, &edit));
+        assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
     }
 
     // --- pin_window: пин-флоу через список выбора (SPEC.md «Закрепление
@@ -14645,7 +15284,7 @@ mod tests {
         ));
         let monitors: HashMap<MonitorId, MonitorState> = HashMap::new();
         let bounds: HashMap<MonitorId, MonitorBounds> = HashMap::new();
-        let pins = WindowPins::new();
+        let mut pins = WindowPins::new();
         // Снимок координатора НАМЕРЕННО пуст — ровно как у пользователя.
         assert!(!windows.is_empty(), "у меню свой список окон");
 
@@ -14657,7 +15296,7 @@ mod tests {
             &monitors,
             &geometry,
             &bounds,
-            &pins,
+            &mut pins,
         );
 
         assert_eq!(cfg.groups.len(), 1, "группа обязана создаться");
@@ -14690,7 +15329,7 @@ mod tests {
             &HashMap::new(),
             &geometry,
             &HashMap::new(),
-            &WindowPins::new(),
+            &mut WindowPins::new(),
         );
 
         let created = cfg.groups.first().expect("группа создана");
@@ -14721,7 +15360,7 @@ mod tests {
             &HashMap::new(),
             &geometry,
             &HashMap::new(),
-            &WindowPins::new(),
+            &mut WindowPins::new(),
         );
         assert!(cfg.groups.is_empty());
         assert!(groups.editor().is_some(), "меню остаётся открытым");

@@ -732,30 +732,38 @@ impl WindowPins {
     ///
     /// Зачем отдельный примитив: `SetWindowPos` работает в
     /// `GetWindowRect`-координатах, которые у окон Win11 отличаются от
-    /// DWM-габаритов на невидимые поля ресайза (сверху ~1 px, по бокам и
-    /// снизу ~7–8 px). Складывать эти пространства напрямую — значит
-    /// systematically промахиваться на размер рамки и, при повторных
-    /// применениях, дрейфовать. Смещение между системами от позиции не
-    /// зависит (метрики рамки постоянны), поэтому считаем его здесь и
-    /// применяем один раз.
-    ///
-    /// Поставить окну ТАКИЕ границы, чтобы его DWM-габариты
-    /// (`DWMWA_EXTENDED_FRAME_BOUNDS` — та же система координат, в которой
-    /// живут снимки трекера и весь UI поверх окна) совпали с `target`.
-    ///
-    /// Зачем отдельный примитив: `SetWindowPos` работает в
-    /// `GetWindowRect`-координатах, которые у окон Win11 отличаются от
     /// DWM-габаритов на невидимые поля ресайза (сверху ~0 px, по бокам и
     /// снизу ~7–8 px, у custom-chrome окон вроде Discord/Spotify/Obsidian — 0 px).
     /// Складывать эти пространства напрямую — значит систематически
-    /// промахиваться на размер рамки.
+    /// промахиваться на размер рамки. Смещение между системами от позиции не
+    /// зависит (метрики рамки постоянны), поэтому считаем его здесь и
+    /// применяем один раз.
     ///
-    /// Если окно было развёрнуто (`WS_MAXIMIZE`), его рамки в развёрнутом
-    /// виде вылезают за границы экрана (на ~8 px с каждой стороны). Поэтому
-    /// развёрнутое окно СНАЧАЛА переводится в нормальное состояние через
-    /// `SetWindowPlacement` (`SW_SHOWNOACTIVATE`), и лишь затем замеряются
-    /// честные метрики его рамки для точной установки `SetWindowPos` (фикс
-    /// репорта 2026-08-26: окна группы наезжали друг на друга при раскладке).
+    /// РАЗВЁРНУТОЕ ОКНО — особая болезнь, измерена пробой 2026-08-26
+    /// (`spike/maximize_probe`): у maximized-окна `SetWindowPos` меняет
+    /// видимую геометрию НЕ так, как у обычного — окно остаётся развёрнутым,
+    /// а размер получает не тот, что просили (замер: цель 1280x696, факт
+    /// 1264x680), и в следующий же максимизированный кадр геометрия теряется.
+    /// Поэтому развёрнутое окно СНАЧАЛА переводится в нормальное состояние
+    /// через `SetWindowPlacement` (`SW_SHOWNOACTIVATE`), и лишь затем
+    /// замеряются честные метрики его рамки для точной установки
+    /// `SetWindowPos` (фикс репорта 2026-08-26: окна группы наезжали друг на
+    /// друга при раскладке).
+    ///
+    /// Почему именно `SetWindowPlacement`, а не `ShowWindowAsync(SW_RESTORE)`
+    /// (сравнение тех же пробой): первый задаёт нормальный прямоугольник и
+    /// снимает развёрнутость ОДНИМ вызовом — промежуточного кадра «окно
+    /// вернулось на старый rcNormalPosition, потом поехало» не существует в
+    /// принципе; второй сначала восстанавливает окно на старое место и лишь
+    /// вторым шагом двигает на цель. По замерам оба не крадут фокус и дают
+    /// один `WM_MOVE`, но один вызов структурно не может мигнуть, а два —
+    /// могут.
+    ///
+    /// ПРИСНАПЛЕННОЕ окно (Win+Left к половине экрана) специальной обработки
+    /// НЕ требует: замер пробы показал, что по всем признакам
+    /// (`IsZoomed`, `WS_MAXIMIZE`, `showCmd`) оно неотличимо от обычного, и
+    /// `SetWindowPos` ставит его точно. Надёжного флага «окно приснаплено»
+    /// не существует — и не нужно, ловить нечего.
     ///
     /// `false` — окна нет или система отказала.
     pub fn set_dwm_bounds(&self, hwnd: HWND, target: RECT) -> bool {
@@ -768,10 +776,18 @@ impl WindowPins {
         let good_w = good.right - good.left;
         let good_h = good.bottom - good.top;
 
-        // Если окно развёрнуто — сначала восстанавливаем его в нормальное состояние,
-        // чтобы получить честные метрики рамки обычного окна, а не максимизированного.
-        if is_maximized(hwnd) {
-            let _ = self.move_resize(hwnd.0 as usize, good.left, good.top, good_w, good_h);
+        // Если окно развёрнуто — сначала восстанавливаем его в нормальное
+        // состояние, чтобы получить честные метрики рамки обычного окна, а не
+        // максимизированного (см. доккомент метода: замер пробы 2026-08-26).
+        // Ошибка restore (например, UIPI у elevated-окна) — честный отказ:
+        // продолжать с развёрнутым окном бессмысленно, компенсирующий
+        // SetWindowPos по замеру пробы промахивается по размеру.
+        if is_maximized(hwnd)
+            && self
+                .move_resize(hwnd.0 as usize, good.left, good.top, good_w, good_h)
+                .is_err()
+        {
+            return false;
         }
 
         let mut gwr = RECT::default();
@@ -821,14 +837,20 @@ impl WindowPins {
     /// на соседа. Этот метод позволяет координатору измерить расхождение
     /// и отреагировать (живой репорт 2026-08-26).
     ///
+    /// `previous` — прежнее место окна (DWM-границы до применения раскладки,
+    /// обычно из снимка трекера или сохранённого места члена группы): без него
+    /// нельзя отличить «не влезло по размеру» от «вообще не сдвинулось»
+    /// ([`WindowLayoutDiscrepancy::kind`]).
+    ///
     /// `None` — окно уничтожено или DWM-границы недоступны.
     pub fn check_layout_discrepancy(
         &self,
         hwnd: HWND,
+        previous: WindowRect,
         target: RECT,
         tolerance_px: i32,
     ) -> Option<WindowLayoutDiscrepancy> {
-        check_layout_discrepancy(hwnd, target, tolerance_px)
+        check_layout_discrepancy(hwnd, previous, target, tolerance_px)
     }
 
     /// Включить/выключить interact-lock для `hwnd` (редизайн пинов,
@@ -899,12 +921,57 @@ pub struct WindowLayoutDiscrepancy {
     pub dh: i32,
     /// Превышает ли хотя бы одно из расхождений допустимый допуск `tolerance_px`.
     pub exceeds_tolerance: bool,
+    /// Куда окно в итоге попало — свёрнутый вывод из чисел выше
+    /// ([`LayoutDiscrepancyKind`]): «встало точно» и «встало, но крупнее»
+    /// различимы и без него, а «не сдвинулось вовсе» требует прежнего места
+    /// окна, которое в числах `dx/dy/dw/dh` не закодировано.
+    pub kind: LayoutDiscrepancyKind,
+}
+
+/// Куда окно попало относительно слота и своего прежнего места (H4, репорт
+/// 2026-08-26). Три исхода, которые обязан различать вызывающий:
+///
+/// * [`LayoutDiscrepancyKind::Exact`] — раскладка применилась.
+/// * [`LayoutDiscrepancyKind::Oversized`] — окно ДОЕХАЛО до слота, но не
+///   ужалось (минимальный размер приложения).
+/// * [`LayoutDiscrepancyKind::NotMoved`] — окно вообще не сдвинулось и стоит
+///   на прежнем месте. Это ДРУГАЯ болезнь с другой причиной (окно было
+///   развёрнуто и restore не сработал, UIPI, окно на другом виртуальном
+///   десктопе) и другим лечением — путать её с `Oversized` в одном числе
+///   нельзя: по одним лишь `dw/dh` развёрнутое-и-не-сдвинутое окно выглядит
+///   как «не влезло по размеру», и координатор починит не то.
+///
+/// Четвёртый исход — [`LayoutDiscrepancyKind::Elsewhere`] — не встречается
+/// в живой практике, но обязан существовать: без него случай «сдвинулось,
+/// но не туда» молча притворился бы одним из трёх.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutDiscrepancyKind {
+    /// Встало в слот с точностью до допуска.
+    Exact,
+    /// Встало в слот, но крупнее него (положительные `dw`/`dh` — насколько).
+    Oversized,
+    /// Не сдвинулось с прежнего места вовсе.
+    NotMoved,
+    /// Сдвинулось, но не в слот и не на прежнем месте.
+    Elsewhere,
 }
 
 impl WindowLayoutDiscrepancy {
-    /// Вычисляет расхождение между фактическими DWM-границами `actual`
-    /// и запрошенным прямоугольником `target`.
-    pub fn compute(actual: WindowRect, target: RECT, tolerance_px: i32) -> Self {
+    /// Вычисляет расхождение между фактическими DWM-границами `actual`,
+    /// прежним местом окна `previous` и запрошенным прямоугольником `target`.
+    ///
+    /// `previous` обязателен, а не опционален: без прежнего места окна исход
+    /// [`LayoutDiscrepancyKind::NotMoved`] не вычислить (окно «не сдвинулось»
+    /// — это отношение к самому себе в прошлом), а подставлять вместо него
+    /// что-то умолчательное — значит молча терять ровно ту болезнь, ради
+    /// которой тип и появился. `previous` должен быть в той же системе
+    /// координат, что `actual` (DWM-границы, физические пиксели).
+    pub fn compute(
+        actual: WindowRect,
+        previous: WindowRect,
+        target: RECT,
+        tolerance_px: i32,
+    ) -> Self {
         let target_w = target.right - target.left;
         let target_h = target.bottom - target.top;
         let dx = actual.x - target.left;
@@ -914,12 +981,28 @@ impl WindowLayoutDiscrepancy {
         let tol = tolerance_px.max(0);
         let exceeds_tolerance =
             dx.abs() > tol || dy.abs() > tol || dw.abs() > tol || dh.abs() > tol;
+        // Порядок проверок значим: «в слоте» — самое сильное утверждение,
+        // дальше — «до слота доехало, но не влезло», дальше — «не двигалось
+        // вовсе»; последним остаётся «куда-то уехало».
+        let in_slot = dx.abs() <= tol && dy.abs() <= tol;
+        let kind = if !exceeds_tolerance {
+            LayoutDiscrepancyKind::Exact
+        } else if in_slot && (dw > tol || dh > tol) {
+            LayoutDiscrepancyKind::Oversized
+        } else if (actual.x - previous.x).abs() <= tol && (actual.y - previous.y).abs() <= tol {
+            // Позиция осталась прежней (размер мог измениться на месте — это
+            // всё равно «не сдвинулось»: слот не увидело).
+            LayoutDiscrepancyKind::NotMoved
+        } else {
+            LayoutDiscrepancyKind::Elsewhere
+        };
         Self {
             dx,
             dy,
             dw,
             dh,
             exceeds_tolerance,
+            kind,
         }
     }
 }
@@ -937,6 +1020,7 @@ impl WindowLayoutDiscrepancy {
 /// `None` — окно уничтожено или DWM-границы недоступны.
 pub fn check_layout_discrepancy(
     hwnd: HWND,
+    previous: WindowRect,
     target: RECT,
     tolerance_px: i32,
 ) -> Option<WindowLayoutDiscrepancy> {
@@ -948,7 +1032,12 @@ pub fn check_layout_discrepancy(
     if dwm.w == 0 || dwm.h == 0 {
         return None;
     }
-    Some(WindowLayoutDiscrepancy::compute(dwm, target, tolerance_px))
+    Some(WindowLayoutDiscrepancy::compute(
+        dwm,
+        previous,
+        target,
+        tolerance_px,
+    ))
 }
 
 /// Единый мышиный «страж» обеих блокировок (редизайн пинов): один глобальный
@@ -2669,6 +2758,53 @@ mod tests {
         assert!(pins.move_resize(dead, 0, 0, 100, 100).is_err());
     }
 
+    /// Живой сценарий H4 (репорт 2026-08-26), повторённый тестом: окно
+    /// развёрнуто на весь экран, а мы ставим ему DWM-границы четверти экрана.
+    /// Без восстановления из maximized `SetWindowPos` промахивается по размеру
+    /// (замер пробы spike/maximize_probe: цель 1280x696, факт 1264x680) —
+    /// `set_dwm_bounds` обязан сам вывести окно из развёрнутого состояния и
+    /// встать в целевой прямоугольник с точностью до рамки.
+    #[test]
+    fn set_dwm_bounds_places_maximized_window_into_target_dwm_rect() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MAXIMIZE, ShowWindow};
+
+        let target = TestWindow::create_visible();
+        let pins = WindowPins::new();
+
+        // SAFETY: наше живое окно; SW_MAXIMIZE — обычный show-command.
+        unsafe {
+            let _ = ShowWindow(target.0, SW_MAXIMIZE);
+        }
+        // SAFETY: чтение состояния живого окна.
+        assert!(unsafe { IsZoomed(target.0) }.as_bool(), "окно maximized");
+
+        let goal = RECT {
+            left: 40,
+            top: 60,
+            right: 640,
+            bottom: 460,
+        };
+        assert!(
+            pins.set_dwm_bounds(target.0, goal),
+            "set_dwm_bounds на maximized-окне обязан пройти"
+        );
+        // SAFETY: чтение состояния живого окна.
+        assert!(
+            !unsafe { IsZoomed(target.0) }.as_bool(),
+            "set_dwm_bounds обязан снять maximized, иначе следующее же событие вернёт окно в прежнее состояние"
+        );
+        let dwm = extended_frame_bounds(target.0);
+        let dx = dwm.x - goal.left;
+        let dy = dwm.y - goal.top;
+        let dw = dwm.w - (goal.right - goal.left);
+        let dh = dwm.h - (goal.bottom - goal.top);
+        assert!(
+            dx.abs() <= 2 && dy.abs() <= 2 && dw.abs() <= 2 && dh.abs() <= 2,
+            "DWM-границы обязаны совпасть с целью: dx={dx} dy={dy} dw={dw} dh={dh}"
+        );
+    }
+
     #[test]
     fn snapshot_with_target_present_keeps_pin() {
         let target = TestWindow::create();
@@ -3853,7 +3989,7 @@ mod tests {
             right: 900,
             bottom: 650,
         };
-        let disc = WindowLayoutDiscrepancy::compute(actual, target, 0);
+        let disc = WindowLayoutDiscrepancy::compute(actual, actual, target, 0);
         assert_eq!(
             disc,
             WindowLayoutDiscrepancy {
@@ -3862,6 +3998,7 @@ mod tests {
                 dw: 0,
                 dh: 0,
                 exceeds_tolerance: false,
+                kind: LayoutDiscrepancyKind::Exact,
             }
         );
     }
@@ -3883,12 +4020,125 @@ mod tests {
             right: 900,
             bottom: 650,
         };
-        let disc = WindowLayoutDiscrepancy::compute(actual, target, 2);
+        // Прежнее место — где-то в другом углу: окно ДОЕХАЛО до слота
+        // (позиция совпала), но не ужалось.
+        let previous = WindowRect {
+            x: 1500,
+            y: 800,
+            w: 900,
+            h: 700,
+        };
+        let disc = WindowLayoutDiscrepancy::compute(actual, previous, target, 2);
         assert_eq!(disc.dx, 0);
         assert_eq!(disc.dy, 0);
         assert_eq!(disc.dw, 100, "окно шире слота на 100 px");
         assert_eq!(disc.dh, 100, "окно выше слота на 100 px");
         assert!(disc.exceeds_tolerance);
+        assert_eq!(
+            disc.kind,
+            LayoutDiscrepancyKind::Oversized,
+            "окно в слоте, но крупнее — это «не влезло по размеру»"
+        );
+    }
+
+    /// Живой репорт H4 2026-08-26: окно вообще НЕ СДВИНУЛОСЬ (осталось на
+    /// прежнем месте, слот — в другом углу). Это другая болезнь, чем
+    /// «не влезло по размеру», и обязана называться иначе: развёрнутое окно,
+    /// которое не восстановили, по одним лишь dw/dh выглядело бы как
+    /// Oversized, и координатор починил бы не то.
+    #[test]
+    fn layout_discrepancy_window_that_stayed_put_is_not_moved_not_oversized() {
+        // Точный живой сценарий: окно стоит на 146,231 размером 1240x656
+        // (место из конфига репорта), слот — нижняя правая четверть экрана,
+        // и по замерам никуда не поехало.
+        let previous = WindowRect {
+            x: 146,
+            y: 231,
+            w: 1240,
+            h: 656,
+        };
+        let actual = previous;
+        let target = RECT {
+            left: 1280,
+            top: 696,
+            right: 2560,
+            bottom: 1392,
+        };
+        let disc = WindowLayoutDiscrepancy::compute(actual, previous, target, 4);
+        assert!(disc.exceeds_tolerance);
+        assert_eq!(
+            disc.kind,
+            LayoutDiscrepancyKind::NotMoved,
+            "позиция осталась прежней — окно слота не увидело"
+        );
+        // И главное: даже если бы окно было КРУПНЕЕ слота, это всё равно
+        // NotMoved, а не Oversized — путать нельзя.
+        let oversized_but_stuck = WindowRect {
+            x: 146,
+            y: 231,
+            w: 2000,
+            h: 1000,
+        };
+        let disc2 = WindowLayoutDiscrepancy::compute(oversized_but_stuck, previous, target, 4);
+        assert_eq!(
+            disc2.kind,
+            LayoutDiscrepancyKind::NotMoved,
+            "не сдвинувшееся окно крупнее слота — по-прежнему NotMoved"
+        );
+        assert_eq!(disc2.dw, 720, "числа остаются честными: dw виден");
+    }
+
+    #[test]
+    fn layout_discrepancy_window_moved_elsewhere_is_neither_in_slot_nor_old_place() {
+        let previous = WindowRect {
+            x: 146,
+            y: 231,
+            w: 1240,
+            h: 656,
+        };
+        let actual = WindowRect {
+            x: 600,
+            y: 700,
+            w: 900,
+            h: 500,
+        };
+        let target = RECT {
+            left: 1280,
+            top: 696,
+            right: 2560,
+            bottom: 1392,
+        };
+        let disc = WindowLayoutDiscrepancy::compute(actual, previous, target, 4);
+        assert!(disc.exceeds_tolerance);
+        assert_eq!(
+            disc.kind,
+            LayoutDiscrepancyKind::Elsewhere,
+            "сдвинулось, но не в слот и не на прежнем месте"
+        );
+    }
+
+    #[test]
+    fn layout_discrepancy_old_place_within_tolerance_of_slot_is_exact_not_not_moved() {
+        // Слот совпадает с прежним местом окна — «не сдвинулось» тут не
+        // болезнь: окно и так стоит ровно где надо. Exact проверяется ДО
+        // NotMoved, иначе любая несостоявшаяся раскладка на неподвижном окне
+        // лгала бы «не сдвинулось».
+        let previous = WindowRect {
+            x: 100,
+            y: 50,
+            w: 800,
+            h: 600,
+        };
+        let actual = previous;
+        let target = RECT {
+            left: 100,
+            top: 50,
+            right: 900,
+            bottom: 650,
+        };
+        let disc = WindowLayoutDiscrepancy::compute(actual, previous, target, 4);
+        assert!(!disc.exceeds_tolerance);
+        assert_eq!(disc.kind, LayoutDiscrepancyKind::Exact);
     }
 
     /// Погрешности в 1 px из-за субпиксельного округления укладываются в допуск.
@@ -3906,13 +4156,20 @@ mod tests {
             right: 900,
             bottom: 650,
         };
-        let disc = WindowLayoutDiscrepancy::compute(actual, target, 1);
+        let previous = WindowRect {
+            x: 20,
+            y: 20,
+            w: 500,
+            h: 400,
+        };
+        let disc = WindowLayoutDiscrepancy::compute(actual, previous, target, 1);
         assert_eq!(disc.dx, 1);
         assert_eq!(disc.dh, -1);
         assert!(
             !disc.exceeds_tolerance,
             "отклонение в 1 px укладывается в допуск"
         );
+        assert_eq!(disc.kind, LayoutDiscrepancyKind::Exact);
     }
 
     /// Мёртвый HWND возвращает `None` без паник.
@@ -3920,6 +4177,12 @@ mod tests {
     fn check_layout_discrepancy_dead_target_returns_none() {
         let disc = check_layout_discrepancy(
             HWND(core::ptr::null_mut()),
+            WindowRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
             RECT {
                 left: 0,
                 top: 0,
