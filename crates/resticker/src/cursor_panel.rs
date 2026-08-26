@@ -42,6 +42,10 @@ pub const BTN_ADD_WINDOW: WidgetId = 105;
 /// список пресетов не открывает панель (см. `handle_cursor_panel_up`) —
 /// кнопка всегда на месте, реагирует иначе только по клику.
 pub const BTN_PRESETS: WidgetId = 106;
+/// «Группы окон» — менеджер групп (запрос пользователя 2026-08-25: «кнопка в
+/// режиме редактирования, по которой вылезет менеджер окон»). Открывает
+/// панель `group_manager.rs` — список групп с их составом.
+pub const BTN_GROUPS: WidgetId = 107;
 
 /// Сторона кнопки панели, DIP — вдвое больше кнопки тулбара выделения
 /// (запрос пользователя 2026-08-23: «увеличь его размер в 2 раза»). Своя
@@ -53,8 +57,9 @@ pub const BUTTON_SIZE: f64 = 2.0 * theme::BUTTON_SIZE;
 const PANEL_PAD: f64 = 12.0;
 /// Зазор между кнопками, DIP.
 const BUTTON_GAP: f64 = 8.0;
-/// Число кнопок панели.
-const BUTTON_COUNT: f64 = 6.0;
+/// Число кнопок панели: открыть файл, добавить окно, пресеты, группы,
+/// показать/скрыть все, настройки, выход.
+const BUTTON_COUNT: f64 = 7.0;
 /// Отступ панели от нижнего края экрана, DIP.
 pub const BOTTOM_MARGIN_DIP: f64 = 16.0;
 /// Сколько DIP панели видно, когда она свёрнута (выделен стикер).
@@ -65,8 +70,8 @@ pub const PEEK_DIP: f64 = 10.0;
 /// чуть съехал с её края.
 pub const HOVER_MARGIN_DIP: f64 = 7.0;
 
-/// Размер панели (ширина, высота), DIP: шесть кнопок [`BUTTON_SIZE`]
-/// с зазорами и отступами.
+/// Размер панели (ширина, высота), DIP: [`BUTTON_COUNT`] кнопок
+/// [`BUTTON_SIZE`] с зазорами и отступами.
 pub const CURSOR_PANEL_SIZE: (f64, f64) = (
     2.0 * PANEL_PAD + BUTTON_COUNT * BUTTON_SIZE + (BUTTON_COUNT - 1.0) * BUTTON_GAP,
     2.0 * PANEL_PAD + BUTTON_SIZE,
@@ -136,6 +141,7 @@ pub fn build_cursor_panel(screen: &DipRect, all_visible: bool, progress: f64) ->
         (BTN_LOAD_FILE, Icon::FileOpen),
         (BTN_ADD_WINDOW, Icon::Layers),
         (BTN_PRESETS, Icon::PresetLoad),
+        (BTN_GROUPS, Icon::Groups),
         (BTN_TOGGLE_ALL, toggle_icon),
         (BTN_SETTINGS, Icon::Settings),
         (BTN_EXIT, Icon::Exit),
@@ -265,6 +271,7 @@ mod tests {
             BTN_LOAD_FILE,
             BTN_ADD_WINDOW,
             BTN_PRESETS,
+            BTN_GROUPS,
             BTN_TOGGLE_ALL,
             BTN_SETTINGS,
             BTN_EXIT,
@@ -313,6 +320,7 @@ mod tests {
                 Icon::FileOpen,
                 Icon::Layers,
                 Icon::PresetLoad,
+                Icon::Groups,
                 Icon::HideAll,
                 Icon::Settings,
                 Icon::Exit
@@ -326,6 +334,7 @@ mod tests {
                 Icon::FileOpen,
                 Icon::Layers,
                 Icon::PresetLoad,
+                Icon::Groups,
                 Icon::ShowAll,
                 Icon::Settings,
                 Icon::Exit

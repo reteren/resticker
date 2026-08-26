@@ -6,19 +6,17 @@
 
 pub mod autostart;
 pub mod clipboard;
-pub mod cloak;
 pub mod dwm;
 mod error;
 pub mod file_dialog;
 pub mod hotkey;
+pub mod hotkey_check;
 pub mod input;
-pub mod keyboard_guard;
 pub mod monitors;
 pub mod overlay;
 pub mod single_instance;
 pub mod sound;
 pub mod thumb_cache;
-pub mod tiling_apply;
 pub mod tray;
 pub mod virtual_desktops;
 pub mod window_enum;

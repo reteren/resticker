@@ -70,6 +70,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::window_enum::WindowRect;
+
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, SetLastError, WPARAM,
 };
@@ -516,6 +518,46 @@ impl WindowPins {
     ///
     /// Парный вызов — [`Self::restore_slot`]: стиль `WS_EX_TOPMOST` сам не
     /// снимается, оставить его навсегда значит сломать соседский слот.
+    /// Поднять окно наверх обычного порядка, НЕ делая его «поверх всех».
+    ///
+    /// В отличие от [`Self::surface_topmost_temporarily`], здесь `HWND_TOP`,
+    /// а не `HWND_TOPMOST`: первый только меняет положение в стопке, второй
+    /// ВЫСТАВЛЯЕТ СТИЛЬ `WS_EX_TOPMOST`, который остаётся на окне навсегда,
+    /// пока его не снимут явно.
+    ///
+    /// Найдено вживую 2026-08-26: группа поднимала свои окна через topmost,
+    /// снимать стиль было некому, и чужие окна (аудиоплеер, проводник)
+    /// оставались висеть поверх всего до перезапуска. Пользователь их
+    /// «поверх всех» не назначал и понять причину не мог.
+    ///
+    /// Закреплённых окон это не касается: у них topmost стоит по прямому
+    /// выбору пользователя, и трогать его нельзя — вызывающий код обязан
+    /// такие окна пропускать.
+    /// Снять с окна «поверх всех», не трогая ни положение, ни размер, ни
+    /// соседский слот.
+    ///
+    /// В отличие от [`Self::restore_slot`], который ещё и переставляет окно
+    /// над соседом, здесь только `HWND_NOTOPMOST`: окно должно СПУСТИТЬСЯ в
+    /// обычную стопку и остаться там, где было.
+    ///
+    /// Нужно, чтобы уступать системным всплывающим меню Windows (меню
+    /// снап-раскладок над кнопкой разворачивания, Alt+Tab, Task View):
+    /// системный интерфейс обязан быть выше пользовательских topmost-окон,
+    /// а наш «дожим» topmost иначе перекрывает его (репорт 2026-08-26).
+    pub fn drop_topmost(&self, hwnd: HWND) {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        // SAFETY: снятие topmost без движения и активации; безопасно для
+        // любого HWND, мёртвый вернёт ошибку.
+        let _ = unsafe { SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags) };
+    }
+
+    pub fn raise_without_topmost(&self, hwnd: HWND) {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        // SAFETY: то же, что у `pin` — позиционирование без активации;
+        // безопасно для любого HWND, мёртвый просто вернёт ошибку.
+        let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags) };
+    }
+
     pub fn surface_topmost_temporarily(&self, hwnd: HWND) {
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
         // SAFETY: то же, что у `pin` — позиционирование без активации.
@@ -697,43 +739,60 @@ impl WindowPins {
     /// зависит (метрики рамки постоянны), поэтому считаем его здесь и
     /// применяем один раз.
     ///
+    /// Поставить окну ТАКИЕ границы, чтобы его DWM-габариты
+    /// (`DWMWA_EXTENDED_FRAME_BOUNDS` — та же система координат, в которой
+    /// живут снимки трекера и весь UI поверх окна) совпали с `target`.
+    ///
+    /// Зачем отдельный примитив: `SetWindowPos` работает в
+    /// `GetWindowRect`-координатах, которые у окон Win11 отличаются от
+    /// DWM-габаритов на невидимые поля ресайза (сверху ~0 px, по бокам и
+    /// снизу ~7–8 px, у custom-chrome окон вроде Discord/Spotify/Obsidian — 0 px).
+    /// Складывать эти пространства напрямую — значит систематически
+    /// промахиваться на размер рамки.
+    ///
+    /// Если окно было развёрнуто (`WS_MAXIMIZE`), его рамки в развёрнутом
+    /// виде вылезают за границы экрана (на ~8 px с каждой стороны). Поэтому
+    /// развёрнутое окно СНАЧАЛА переводится в нормальное состояние через
+    /// `SetWindowPlacement` (`SW_SHOWNOACTIVATE`), и лишь затем замеряются
+    /// честные метрики его рамки для точной установки `SetWindowPos` (фикс
+    /// репорта 2026-08-26: окна группы наезжали друг на друга при раскладке).
+    ///
     /// `false` — окна нет или система отказала.
     pub fn set_dwm_bounds(&self, hwnd: HWND, target: RECT) -> bool {
         // SAFETY: IsWindow безопасен для любых значений.
         if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return false;
         }
+
+        let good = target;
+        let good_w = good.right - good.left;
+        let good_h = good.bottom - good.top;
+
+        // Если окно развёрнуто — сначала восстанавливаем его в нормальное состояние,
+        // чтобы получить честные метрики рамки обычного окна, а не максимизированного.
+        if is_maximized(hwnd) {
+            let _ = self.move_resize(hwnd.0 as usize, good.left, good.top, good_w, good_h);
+        }
+
         let mut gwr = RECT::default();
         // SAFETY: GetWindowRect — чтение экранного прямоугольника, безопасно
         // и для чужих окон.
         if unsafe { GetWindowRect(hwnd, &mut gwr) }.is_err() {
             return false;
         }
+
         let dwm = extended_frame_bounds(hwnd);
-        let dx = dwm.x - gwr.left;
-        let dy = dwm.y - gwr.top;
-        let dw = dwm.w - (gwr.right - gwr.left);
-        let dh = dwm.h - (gwr.bottom - gwr.top);
-        let good = target;
-        let good_w = good.right - good.left;
-        let good_h = good.bottom - good.top;
-        if is_maximized(hwnd) {
-            // Развёрнутое окно `SetWindowPos` ужать нельзя честно: стиль
-            // `WS_MAXIMIZE` остаётся, и система вправе вернуть окну полный
-            // размер на следующем же пересчёте. Единственный корректный
-            // выход из развёрнутого состояния с ОДНОВРЕМЕННОЙ установкой
-            // нормального прямоугольника — `SetWindowPlacement`
-            // (`SW_SHOWNOACTIVATE` не трогает фокус).
-            return self
-                .move_resize(
-                    hwnd.0 as usize,
-                    good.left - dx,
-                    good.top - dy,
-                    good_w - dw,
-                    good_h - dh,
-                )
-                .is_ok();
-        }
+        let (dx, dy, dw, dh) = if dwm.w > 0 && dwm.h > 0 {
+            (
+                dwm.x - gwr.left,
+                dwm.y - gwr.top,
+                dwm.w - (gwr.right - gwr.left),
+                dwm.h - (gwr.bottom - gwr.top),
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+
         let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
         // SAFETY: окно живо; SetWindowPos потокобезопасен для чужого окна,
         // флаги исключают активацию/смену z-order. Цель — GetWindowRect,
@@ -750,6 +809,26 @@ impl WindowPins {
             )
         };
         true
+    }
+
+    /// Проверяет фактические DWM-границы окна после применения раскладки
+    /// и сообщает расхождение с запрошенным прямоугольником.
+    ///
+    /// Зачем: некоторые приложения (Discord, Spotify, OBS, Steam) имеют
+    /// минимальный размер окна (`WM_GETMINMAXINFO` / `ptMinTrackSize`), ниже
+    /// которого система не даёт их ужать. При делении экрана на много слотов
+    /// или при тесных раскладках окно молча остаётся крупнее слота и налезает
+    /// на соседа. Этот метод позволяет координатору измерить расхождение
+    /// и отреагировать (живой репорт 2026-08-26).
+    ///
+    /// `None` — окно уничтожено или DWM-границы недоступны.
+    pub fn check_layout_discrepancy(
+        &self,
+        hwnd: HWND,
+        target: RECT,
+        tolerance_px: i32,
+    ) -> Option<WindowLayoutDiscrepancy> {
+        check_layout_discrepancy(hwnd, target, tolerance_px)
     }
 
     /// Включить/выключить interact-lock для `hwnd` (редизайн пинов,
@@ -802,6 +881,74 @@ impl WindowPins {
             },
         );
     }
+}
+
+/// Расхождение между запрошенным и фактическим DWM-прямоугольником окна.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowLayoutDiscrepancy {
+    /// Отклонение по X (фактический `dwm.left - target.left`).
+    pub dx: i32,
+    /// Отклонение по Y (фактический `dwm.top - target.top`).
+    pub dy: i32,
+    /// Расхождение по ширине (фактический `dwm.w - target.w`).
+    /// Положительное значение означает, что окно шире запрошенного слота
+    /// (например, упёрлось в свой `WM_GETMINMAXINFO` / `ptMinTrackSize`).
+    pub dw: i32,
+    /// Расхождение по высоте (фактический `dwm.h - target.h`).
+    /// Положительное значение означает, что окно выше запрошенного слота.
+    pub dh: i32,
+    /// Превышает ли хотя бы одно из расхождений допустимый допуск `tolerance_px`.
+    pub exceeds_tolerance: bool,
+}
+
+impl WindowLayoutDiscrepancy {
+    /// Вычисляет расхождение между фактическими DWM-границами `actual`
+    /// и запрошенным прямоугольником `target`.
+    pub fn compute(actual: WindowRect, target: RECT, tolerance_px: i32) -> Self {
+        let target_w = target.right - target.left;
+        let target_h = target.bottom - target.top;
+        let dx = actual.x - target.left;
+        let dy = actual.y - target.top;
+        let dw = actual.w - target_w;
+        let dh = actual.h - target_h;
+        let tol = tolerance_px.max(0);
+        let exceeds_tolerance =
+            dx.abs() > tol || dy.abs() > tol || dw.abs() > tol || dh.abs() > tol;
+        Self {
+            dx,
+            dy,
+            dw,
+            dh,
+            exceeds_tolerance,
+        }
+    }
+}
+
+/// Проверяет фактические DWM-границы окна после применения раскладки
+/// и сообщает расхождение с запрошенным прямоугольником.
+///
+/// Зачем: некоторые приложения (Discord, Spotify, OBS, Steam) имеют
+/// минимальный размер окна (`WM_GETMINMAXINFO` / `ptMinTrackSize`), ниже
+/// которого система не даёт их ужать. При делении экрана на много слотов
+/// или при тесных раскладках окно молча остаётся крупнее слота и налезает
+/// на соседа. Эта функция позволяет координатору измерить расхождение
+/// и отреагировать (живой репорт 2026-08-26).
+///
+/// `None` — окно уничтожено или DWM-границы недоступны.
+pub fn check_layout_discrepancy(
+    hwnd: HWND,
+    target: RECT,
+    tolerance_px: i32,
+) -> Option<WindowLayoutDiscrepancy> {
+    // SAFETY: IsWindow безопасен для любых значений.
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return None;
+    }
+    let dwm = extended_frame_bounds(hwnd);
+    if dwm.w == 0 || dwm.h == 0 {
+        return None;
+    }
+    Some(WindowLayoutDiscrepancy::compute(dwm, target, tolerance_px))
 }
 
 /// Единый мышиный «страж» обеих блокировок (редизайн пинов): один глобальный
@@ -3689,5 +3836,98 @@ mod tests {
         // Открепить — окно возвращается в обычную полосу, topmost снят.
         pins.unpin(key(hwnd)).expect("unpin");
         assert!(!is_topmost(hwnd), "unpin снял WS_EX_TOPMOST");
+    }
+
+    /// Проверка вычисления расхождения геометрии окна при точном совпадении.
+    #[test]
+    fn layout_discrepancy_exact_match_has_zero_diff_and_does_not_exceed_tolerance() {
+        let actual = WindowRect {
+            x: 100,
+            y: 50,
+            w: 800,
+            h: 600,
+        };
+        let target = RECT {
+            left: 100,
+            top: 50,
+            right: 900,
+            bottom: 650,
+        };
+        let disc = WindowLayoutDiscrepancy::compute(actual, target, 0);
+        assert_eq!(
+            disc,
+            WindowLayoutDiscrepancy {
+                dx: 0,
+                dy: 0,
+                dw: 0,
+                dh: 0,
+                exceeds_tolerance: false,
+            }
+        );
+    }
+
+    /// Окно с ограничением минимального размера (например, WM_GETMINMAXINFO)
+    /// остаётся шире и выше слота — расхождение обязано фиксировать избыток
+    /// ширины и высоты (живой репорт 2026-08-26).
+    #[test]
+    fn layout_discrepancy_detects_min_track_size_overflow() {
+        let actual = WindowRect {
+            x: 100,
+            y: 50,
+            w: 900,
+            h: 700,
+        };
+        let target = RECT {
+            left: 100,
+            top: 50,
+            right: 900,
+            bottom: 650,
+        };
+        let disc = WindowLayoutDiscrepancy::compute(actual, target, 2);
+        assert_eq!(disc.dx, 0);
+        assert_eq!(disc.dy, 0);
+        assert_eq!(disc.dw, 100, "окно шире слота на 100 px");
+        assert_eq!(disc.dh, 100, "окно выше слота на 100 px");
+        assert!(disc.exceeds_tolerance);
+    }
+
+    /// Погрешности в 1 px из-за субпиксельного округления укладываются в допуск.
+    #[test]
+    fn layout_discrepancy_tolerates_subpixel_rounding() {
+        let actual = WindowRect {
+            x: 101,
+            y: 50,
+            w: 800,
+            h: 599,
+        };
+        let target = RECT {
+            left: 100,
+            top: 50,
+            right: 900,
+            bottom: 650,
+        };
+        let disc = WindowLayoutDiscrepancy::compute(actual, target, 1);
+        assert_eq!(disc.dx, 1);
+        assert_eq!(disc.dh, -1);
+        assert!(
+            !disc.exceeds_tolerance,
+            "отклонение в 1 px укладывается в допуск"
+        );
+    }
+
+    /// Мёртвый HWND возвращает `None` без паник.
+    #[test]
+    fn check_layout_discrepancy_dead_target_returns_none() {
+        let disc = check_layout_discrepancy(
+            HWND(core::ptr::null_mut()),
+            RECT {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 100,
+            },
+            2,
+        );
+        assert!(disc.is_none());
     }
 }

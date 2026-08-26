@@ -37,8 +37,9 @@ use rst_core::AnimationClock;
 use rst_core::config;
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::model::{
-    Config, Hotkeys, MediaType, MonitorId, OverlapRule, Placement, Rect, Settings, Sticker,
-    StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode, VisibilityRule,
+    Config, GroupPlace, Hotkeys, MediaType, MonitorId, OverlapRule, Placement, Rect, Settings,
+    Sticker, StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode, VisibilityRule,
+    WindowGroup,
 };
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
@@ -48,7 +49,6 @@ use rst_core::pinned_window::{self, HostFilter, PinnedWindow};
 use rst_core::presets;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
-use rst_core::tiling::layout::LayoutParams;
 use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::animation as media_animation;
 use rst_media::paste;
@@ -65,62 +65,17 @@ use rst_win32::clipboard::{self, ClipboardImage};
 use rst_win32::file_dialog;
 use rst_win32::hotkey::HotkeyCombo;
 use rst_win32::input::{CursorShape, CursorZone, Handle as Win32Handle, InputEvent, Modifiers};
-use rst_win32::keyboard_guard::{KeyEvent, KeyboardGuard, WatchedModifier};
-use rst_win32::monitors::{self, MonitorInfo};
+use rst_win32::monitors;
 use rst_win32::overlay::{OverlayEvent, OverlayWindow};
-use rst_win32::window_enum;
 use rst_win32::window_enum::{WindowInfo, WindowRect};
 use rst_win32::window_pin::{self as window_pin, WindowPins};
 use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker};
 use uuid::Uuid;
 
-use crate::tiling::{TilingState, bindings_from_config};
 use crate::{
-    confirm_dialog, cursor_panel, preset_picker, toolbar, window_pick_list, window_picker,
+    confirm_dialog, cursor_panel, gap_panel, group_manager, group_strip, groups::GroupsState,
+    monitor_badge, preset_picker, preset_strip, toolbar, window_pick_list, window_picker,
 };
-
-/// Перенести места, посчитанные раскладкой, в модель стикеров.
-///
-/// `true` — хоть один стикер реально сдвинулся. Сравнение обязательно:
-/// раскладка пересчитывается на каждый снимок окон, и запись в конфиг без
-/// проверки означала бы сохранение файла по нескольку раз в секунду.
-///
-/// Прямоугольник приходит в DIP монитора, а `Placement` хранит центр —
-/// отсюда перевод. Ошибиться здесь тихо: стикер уехал бы на половину своего
-/// размера и выглядел бы просто «немного не там».
-fn apply_sticker_places(
-    cfg: &mut Config,
-    tick: &crate::tiling::TilingTick,
-    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
-) -> bool {
-    let mut changed = false;
-    for (uuid, monitor, rect) in &tick.sticker_places {
-        // Монитор, которого больше нет: место считать не от чего.
-        if !monitor_geometry.contains_key(monitor) {
-            continue;
-        }
-        let Some(sticker) = cfg.stickers.iter_mut().find(|st| st.id == *uuid) else {
-            continue;
-        };
-        let cx = rect.x as f64 + rect.w as f64 / 2.0;
-        let cy = rect.y as f64 + rect.h as f64 / 2.0;
-        let same = sticker.placement.monitor_id == *monitor
-            && (sticker.placement.cx - cx).abs() < 0.5
-            && (sticker.placement.cy - cy).abs() < 0.5
-            && (sticker.placement.w - rect.w as f64).abs() < 0.5
-            && (sticker.placement.h - rect.h as f64).abs() < 0.5;
-        if same {
-            continue;
-        }
-        sticker.placement.monitor_id = monitor.clone();
-        sticker.placement.cx = cx;
-        sticker.placement.cy = cy;
-        sticker.placement.w = rect.w as f64;
-        sticker.placement.h = rect.h as f64;
-        changed = true;
-    }
-    changed
-}
 
 /// Мост к `Device`/`WindowTarget` (M3 step 2 разделил `rst_render::Renderer`
 /// на процесс-wide устройство и цель на монитор, M3_PREP_NOTES.md §4.2).
@@ -242,15 +197,17 @@ fn create_monitor_state(
     toggle_all_hotkey: Option<HotkeyCombo>,
     mute_all_hotkey: Option<HotkeyCombo>,
     pin_focused_hotkey: Option<HotkeyCombo>,
+    group_hotkeys: Vec<(i32, HotkeyCombo)>,
     edit_active: bool,
     hide_from_capture: bool,
 ) -> Option<MonitorState> {
-    let (overlay, events) = match OverlayWindow::create_on_monitor(
+    let (overlay, events) = match OverlayWindow::create_on_monitor_with_groups(
         info.bounds_px,
         edit_hotkey,
         toggle_all_hotkey,
         mute_all_hotkey,
         pin_focused_hotkey,
+        group_hotkeys,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -852,13 +809,6 @@ fn show_banner(edit: &mut EditState, monitor_id: &MonitorId, text: String) {
 
 pub enum OverlayCommand {
     AddSticker(PathBuf),
-    /// Включить/выключить тайлинг (M9, docs/TILING_DESIGN.md §T2).
-    ///
-    /// Единственный способ его включить: тайлинг переставляет ЧУЖИЕ окна, то
-    /// есть меняет поведение всего рабочего стола, и включаться сам по факту
-    /// наличия настройки он не должен. Пункт меню трея — явное действие
-    /// пользователя, `MENU_TOGGLE_TILING` в `main.rs`.
-    ToggleTiling,
     /// Заменить `cfg.settings` целиком (окно настроек, вкладка «Общие») —
     /// координатор остаётся единственным писателем `config.json`
     /// (докком `add_sticker`/`OverlayHandle`): Tauri-поток не трогает диск
@@ -882,6 +832,25 @@ pub enum OverlayCommand {
     /// курсора, просто с другого источника (меню трея живёт вне оверлей-
     /// потока, `OverlayEvent` ему недоступен).
     ToggleAllStickers,
+    /// Войти в режим редактирования или выйти из него (пункт меню трея).
+    ///
+    /// Дублирует глобальный хоткей намеренно: хоткей может не дойти вовсе —
+    /// его перехватывает низкоуровневый хук чужой программы, и тогда
+    /// пользователь остаётся заперт снаружи (живой репорт 2026-08-25).
+    /// Пункт меню в трее от клавиатуры не зависит.
+    ToggleEditMode,
+    /// Открыть панель величины зазора (пункт трея «Set value…»).
+    ///
+    /// Меню трея не умеет полей ввода, поэтому число задаётся панелью
+    /// поверх экрана — см. [`crate::gap_panel`].
+    OpenGapPanel,
+    /// Переключить область действия отступа снап-зоны: только закреплённые
+    /// окна ↔ все обычные тоже (галочка в подменю трея).
+    ///
+    /// Без значения: текущее состояние живёт в `cfg`, то есть у
+    /// координатора, — меню трея переключает его вслепую и тем самым не
+    /// заводит вторую копию флага.
+    ToggleSnapGapAllWindows,
     /// Прямоугольник видимого окна настроек в физических пикселях экрана
     /// (`None` — окно скрыто). Оверлей режима редактирования вырезает его в
     /// своём окне, иначе в настройки нельзя тыкнуть: оверлей растянут на
@@ -937,12 +906,23 @@ pub enum CoordinatorRequest {
     /// уходили только в лог (`HotkeyConflict`, `PinAccessDenied`) — SPEC.md
     /// требует показать их пользователю, не только записать в файл лога.
     ShowNotification { title: String, body: String },
-    /// Список пресетов изменился (сохранение/переименование/удаление/
-    /// импорт — не `ApplyPreset`, он не трогает сам список). Main.rs
-    /// пересобирает пункты меню трея (M7, «быстрое переключение из трея» —
-    /// ROADMAP.md) из `(id, name)`, не полного `Preset` (имя — единственное,
-    /// что нужно для пункта меню).
-    PresetsChanged(Vec<(Uuid, String)>),
+    /// Меню трея пора пересобрать. Main.rs строит его целиком заново
+    /// (`TrayIcon::set_menu` другого API не даёт), поэтому запрос несёт всё
+    /// изменчивое содержимое сразу, а не дельту.
+    ///
+    /// Поводов два: изменился список пресетов (сохранение/переименование/
+    /// удаление/импорт — не `ApplyPreset`, он сам список не трогает) и
+    /// изменился отступ снап-зоны (галочка в подменю). Разделять их на две
+    /// команды нечем: обе перестраивают одно и то же меню и обе обязаны
+    /// принести актуальным ВТОРОЕ поле тоже.
+    ///
+    /// Пресеты приходят как `(id, name)`, не полным `Preset`: имя —
+    /// единственное, что нужно пункту меню.
+    TrayMenuChanged {
+        presets: Vec<(Uuid, String)>,
+        snap_shrink_pct: u8,
+        snap_shrink_all_windows: bool,
+    },
 }
 
 /// Сообщение объединённого канала координатора: команда от Tauri, событие от
@@ -958,11 +938,6 @@ enum OverlayMessage {
     /// не привязан к монитору, форвардится тем же паттерном, что и per-monitor
     /// события: поток-мост копирует `WindowEvent` трекера в общий канал.
     Windows(TrackerWindowEvent),
-    /// Событие клавиатурного стража тайлинга (M9,
-    /// `rst_win32::keyboard_guard`): сработавшая комбинация или отпускание
-    /// модификатора, за которым просили следить. Приходит с потока-помпы
-    /// хука через поток-мост — тем же приёмом, что события трекера окон.
-    TilingKey(KeyEvent),
     /// Будильник планировщика анимации (M5a, docs/M5A_ANIMATION_DESIGN.md §5):
     /// отправлен потоком-планировщиком, когда истёк ближайший дедлайн кадра
     /// хотя бы одной анимации. В отличие от `Tick` — переменный интервал, а
@@ -1283,17 +1258,43 @@ struct EditState {
     /// конкретный стикер, а предлагает одноразовый выбор действия, ближе
     /// по семантике к `confirm`, чем к `window_picker`.
     preset_picker: Option<PresetPickerState>,
+    /// Закреплённые окна сейчас уступают системному всплывающему меню
+    /// Windows: с них временно снят `WS_EX_TOPMOST`.
+    ///
+    /// Флаг один на все окна, потому что и меню одно: оно либо показано,
+    /// либо нет. Без флага пришлось бы дёргать `SetWindowPos` на каждом
+    /// тике — а это чужие окна, трогать их без причины нельзя.
+    pinned_yielded_to_shell: bool,
+    /// Панель величины зазора (`gap_panel.rs`), открытая из трея.
+    gap_panel: Option<GapPanelState>,
+    /// Открытое меню редактирования групп: цифра монитора, лента окон и
+    /// лента раскладок. Само состояние набора живёт в `GroupsState`, здесь
+    /// только собранные панели.
+    group_editor: Option<GroupEditorPanels>,
+    /// Открытая панель менеджера групп (кнопка `cursor_panel::BTN_GROUPS`).
+    group_manager: Option<GroupManagerState>,
+    /// Отложенное открытие менеджера групп: обработчик панели у курсора не
+    /// видит `cfg.groups`, а лезть туда через полкоординатора хуже, чем
+    /// отложить на один шаг цикла (тот же приём, что `pending_open_picker`).
+    pending_open_group_manager: bool,
+    /// Нажата галочка подтверждения в ленте окон.
+    ///
+    /// Отложенным флагом, а не прямо в разборе нажатий: подтверждение
+    /// создаёт группу, двигает окна и пишет конфиг — на это нужен доступ к
+    /// половине координатора, которого у обработчика мыши нет.
+    pending_confirm_group: bool,
+    /// Отложенное открытие меню набора из менеджера: `None` — не просили,
+    /// `Some(None)` — новая группа, `Some(Some(i))` — правка группы с этим
+    /// индексом в `cfg.groups`.
+    ///
+    /// Тем же приёмом, что и открытие самого менеджера: обработчику нажатий
+    /// недоступны ни снимок окон, ни кэш снимков, а без них ленту не собрать.
+    pending_open_group_editor: Option<Option<usize>>,
     /// Установлен кликом по `TB_LAYERS` (`handle_toolbar_up`) — открытие
     /// нуждается в `window_snapshot`, которого нет в `handle_toolbar_up`
     /// (дизайн §5.2); фактическое открытие происходит в цикле `run()`,
     /// где снимок под рукой, сразу после обработки текущего сообщения.
     pending_open_picker: Option<PickerTarget>,
-    /// Стикер, которого надо отдать тайлингу или забрать обратно (M9).
-    ///
-    /// Тем же приёмом, что `pending_open_picker`: обработчик тулбара не
-    /// видит состояния тайлинга, а лезть туда через полкоординатора хуже,
-    /// чем отложить на один шаг цикла.
-    pending_tile_sticker: Option<Uuid>,
     /// Установлен кликом по `BTN_ADD_WINDOW` (`handle_cursor_panel_up`) — тот
     /// же повод, что у `pending_open_picker`: открытие списка нуждается в
     /// `window_snapshot`, которого нет в `handle_cursor_panel_up`; несёт
@@ -1365,6 +1366,35 @@ struct EditState {
     /// которое пользователь сознательно поставил в паре пикселей от края и
     /// больше не трогает. Чисто рантайм, чистится вместе с откреплением.
     pinned_last_rects: HashMap<isize, WindowRect>,
+    /// `hwnd → снап-зона Windows`, в которой сейчас живёт окно (физические
+    /// пиксели, DWM-границы — то же пространство, что `pinned_last_rects`).
+    ///
+    /// Общая для закреплённых и обычных окон: правило распознавания зоны
+    /// одно и то же, а окно может стать закреплённым и перестать им быть, не
+    /// покидая своей половины экрана — две раздельные карты разошлись бы
+    /// ровно в этот момент.
+    ///
+    /// Зачем помнить. Ужатое окно больше НЕ совпадает ни с одной снап-зоной:
+    /// распознать его повторно можно только зная, из какой зоны оно ужато.
+    /// Без этого отступ действовал бы ровно один снимок, а смена процента в
+    /// меню вообще не доходила бы до уже ужатого окна.
+    ///
+    /// Запись появляется, когда окно совпало со снап-зоной, и исчезает,
+    /// когда окно перестало быть и зоной, и нашим ужатым результатом (то
+    /// есть пользователь увёл его из снапа). Только рантайм, как и
+    /// `pinned_last_rects`.
+    snap_gap_zones: HashMap<isize, pinned_window::PxRect>,
+    /// `hwnd → сколько раз подряд мы просили окно встать в зазор, а оно не
+    /// встало`. Только для НЕзакреплённых окон — у закреплённых сходимость
+    /// сторожит `pinned_last_rects` вместе с move-lock.
+    ///
+    /// Зачем. Чужое окно может не послушаться: права выше наших (UIPI молча
+    /// глотает `SetWindowPos`), собственный минимальный размер больше
+    /// зазора, приложение само возвращает себе геометрию. Без счётчика
+    /// каждый такой случай превращался бы в бесконечную переписку с окном на
+    /// частоте событий трекера. Три попытки — и окно оставляем в покое до
+    /// тех пор, пока оно не покинет зону (тогда забывается и зона, и счёт).
+    snap_gap_strikes: HashMap<isize, u8>,
     /// Момент, когда закреплённое окно последний раз было замечено в живом
     /// жесте (перетаскивание/ресайз силами самой ОС). Пока он свежее
     /// [`PIN_FOLLOW_TAIL`], планировщик держит кадровый дедлайн
@@ -1411,13 +1441,6 @@ struct EditState {
     toolbar: Option<Panel>,
     /// Панель у курсора — есть, пока `active` (раздел 4).
     cursor_panel: Option<Panel>,
-    /// Индикаторы тайлинга на текущий кадр: рамка активной плитки, бар
-    /// воркспейсов, плашка модального режима (M9, `crate::tiling_ui`).
-    ///
-    /// Живёт здесь, а не собирается в `redraw`, по той же причине, что и
-    /// остальные панели: отрисовка обязана быть дешёвой и без логики, а
-    /// пересборка нужна только когда состояние тайлинга изменилось.
-    tiling_overlay: Option<crate::tiling::TilingOverlay>,
     /// Тултип наведённой кнопки тулбара/панели у курсора (фидбэк
     /// пользователя 2026-08-10) — `None`, если курсор не над кнопкой с
     /// текстом подсказки.
@@ -1576,6 +1599,46 @@ struct WindowPickerState {
 /// пересобирается на лету: список пресетов не может измениться, пока эта
 /// модальная панель открыта (единственный способ её закрыть — клик по
 /// строке или `Esc`, оба сразу же убирают `Some`).
+/// Открытая панель величины зазора (`gap_panel.rs`).
+///
+/// Отдельно от остальных панелей и БЕЗ входа в режим редактирования: её
+/// зовут из трея, когда пользователь ничего не редактирует. Включать ради
+/// неё `edit.active` нельзя — это затемнило бы экран, показало скрытые
+/// стикеры, отключило маски окклюзии и сняло замки закреплённых окон
+/// (разбор: docs/research/groups/R_OVERLAY_INTERACTION.md, §4.1). Поэтому у
+/// оверлея снимается только кликопрозрачность.
+struct GapPanelState {
+    panel: Panel,
+    /// Монитор, на котором панель нарисована и чей оверлей сделан
+    /// интерактивным: вернуть кликопрозрачность надо ровно ему.
+    monitor_id: MonitorId,
+    /// Значение, с которым панель открылась, — чтобы отличить «пользователь
+    /// покрутил колесо» от «ничего не трогал» и не переписывать конфиг
+    /// на каждое закрытие.
+    applied_pct: u8,
+    /// Последняя позиция курсора в DIP (координаты панели).
+    ///
+    /// `WM_MOUSEWHEEL` не сообщает, над чем крутят: событие приходит с
+    /// координатами экрана, но до нас доезжает только число щелчков
+    /// (`InputEvent::MouseWheel`). Поэтому позицию запоминаем с последнего
+    /// движения мыши — иначе колесо било бы в точку (0, 0) и поле, стоящее
+    /// в центре панели, не реагировало бы никогда.
+    last_pos: (f64, f64),
+}
+
+/// Открытая панель менеджера групп (`group_manager.rs`).
+///
+/// Тот же приём, что у [`PresetPickerState`]: панель плюс монитор плюс
+/// черновик поля имени. Отличается одним — раскрытой группой: список
+/// показывает состав только одной группы за раз (две раскрытые по восемь
+/// окон уже не помещаются на экран).
+struct GroupManagerState {
+    panel: Panel,
+    monitor_id: MonitorId,
+    /// Индекс раскрытой группы в `cfg.groups`. `None` — все свёрнуты.
+    expanded: Option<usize>,
+}
+
 struct PresetPickerState {
     /// Набранное имя нового пресета: панель пересобирается после каждого
     /// действия (сохранил/удалил/импортировал), и без этого поле каждый раз
@@ -2147,42 +2210,15 @@ fn run(
     // `unpin_all()` вызывается на выходе из `run()`, ниже, по гарантии
     // открепления.
     let mut window_pins = WindowPins::new();
-    // M9: тайлинг. Выключен по умолчанию и включается только пунктом меню
-    // трея (`OverlayCommand::ToggleTiling`) — см. докком этой команды.
-    // Настройки берутся из `config.json` (секция `tiling`). Умолчания живут
-    // ТОЛЬКО там (`TilingConfig::default`), второго набора в коде нет: пока
-    // он был, у программы имелось два разных «набора по умолчанию», и
-    // документация честно на это указала. Пустой список означает ровно то,
-    // что написано, — биндов нет; отсутствующая секция подставляет
-    // умолчания через `#[serde(default)]`.
-    let tiling_bindings = bindings_from_config(&cfg.tiling.bindings);
-    let mut tiling = TilingState::new(
-        false,
-        LayoutParams {
-            gaps_in: cfg.tiling.gaps_in,
-            gaps_out: cfg.tiling.gaps_out,
-            tab_bar_h: cfg.tiling.tab_bar_h,
-        },
-        cfg.tiling.insert_policy,
-        cfg.tiling.rules.clone(),
-        cfg.tiling.monitors.clone(),
-        tiling_bindings,
-        cfg.tiling.own_alt_tab,
-    );
-    // Тайлинг, включённый в конфиге, поднимается тем же путём, что и по
-    // пункту меню: сообщение самому себе. Так стартовый путь и переключатель
-    // не могут разойтись в поведении — а разойтись им было бы легко, у
-    // включения есть побочный эффект (глобальный клавиатурный хук).
-    if cfg.tiling.enabled {
-        let _ = tx.send(OverlayMessage::Command(OverlayCommand::ToggleTiling));
-    }
-    // Живёт, только пока тайлинг включён: глобальный клавиатурный хук —
-    // слишком тяжёлая вещь, чтобы висеть в системе просто так. `Drop`
-    // снимает хук и останавливает поток-помпу.
-    let mut keyboard_guard: Option<KeyboardGuard> = None;
-    // Монотонные часы тайлинга: выдержка после команды окну считается от
-    // них (`tiling::SETTLE_MS`).
-    let tiling_clock = Instant::now();
+    // Группы окон (запрос пользователя 2026-08-25): состояние набора и
+    // открытой группы. Рантайм, как и закрепления, — сами группы живут в
+    // `cfg.groups`.
+    let mut groups = GroupsState::new();
+    // Снимки окон для карточек ленты. Снимать окно дорого (`PrintWindow` —
+    // синхронный поход в чужой процесс), а лента перестраивается на каждый
+    // клик, поэтому кэш живёт весь сеанс, а не открытие меню.
+    let mut group_thumbs =
+        rst_win32::thumb_cache::ThumbCache::new(GROUP_THUMB_CACHE_ENTRIES, GROUP_THUMB_TTL_MS);
     // Уборка после аварийного завершения прошлого запуска: маркер закрепления
     // живёт на ЧУЖОМ окне и переживает наш процесс, поэтому долгоживущие окна
     // (Проводник, Блокнот) могли накопить «вечные» маркеры — с ними окно
@@ -2200,19 +2236,6 @@ fn run(
             );
         }
     }
-
-    // Watchdog воркспейсов (docs/TILING_DESIGN.md §Р1): вернуть окна,
-    // спрятанные тайлингом прошлого запуска. Строго ДО того, как тайлинг
-    // спрячет что-нибудь своё, — иначе уборка сняла бы скрытие с окон
-    // текущей сессии.
-    //
-    // Обязательная часть фичи, а не подстраховка: скрытого окна не видно
-    // нигде, ни на экране, ни в Task View, и после падения программы
-    // пользователь не смог бы вернуть его никак, кроме перезапуска самого
-    // приложения. Своим перечислением, а не через `window_enum`: тот
-    // отбрасывает скрытые окна как ненастоящие, то есть не отдал бы ровно
-    // те окна, ради которых уборка и нужна.
-    rst_win32::cloak::recover_orphans();
 
     // Счётчики плавности видео (сводка раз в секунду при
     // `RUST_LOG=resticker=debug`).
@@ -2242,16 +2265,17 @@ fn run(
     for info in &monitor_infos {
         // Глобальные хоткеи — ровно одно окно на процесс (основного
         // монитора), остальные создаются без них, чтобы не конфликтовать.
-        let (edit_hotkey, this_toggle_all, this_mute_all, this_pin_focused) =
+        let (edit_hotkey, this_toggle_all, this_mute_all, this_pin_focused, this_groups) =
             if info.id == primary_id {
                 (
                     Some(hotkey),
                     toggle_all_hotkey,
                     mute_all_hotkey,
                     Some(pin_focused_hotkey),
+                    rst_win32::hotkey::group_hotkey_combos(&cfg.hotkeys),
                 )
             } else {
-                (None, None, None, None)
+                (None, None, None, None, Vec::new())
             };
         if let Some(ms) = create_monitor_state(
             &device,
@@ -2261,6 +2285,7 @@ fn run(
             this_toggle_all,
             this_mute_all,
             this_pin_focused,
+            this_groups,
             false,
             cfg.settings.hide_from_capture,
         ) {
@@ -2284,12 +2309,6 @@ fn run(
         .iter()
         .map(|(id, ms)| (id.clone(), (ms.width, ms.height, ms.scale)))
         .collect();
-
-    // Полные снимки мониторов для тайлинга: в отличие от `monitor_bounds`,
-    // здесь есть рабочая область (`work_area_px`), без которой плитки легли
-    // бы под панель задач (docs/TILING_DESIGN.md §T0). Обновляется там же,
-    // где `monitor_bounds`, — на hot-plug.
-    let mut tiling_monitors: Vec<MonitorInfo> = monitor_infos.clone();
 
     // Границы мониторов в физических пикселях виртуального десктопа + масштаб
     // — вход для перепривязки стикера по центру bbox при перетаскивании между
@@ -2452,8 +2471,14 @@ fn run(
         confirm: None,
         window_picker: None,
         preset_picker: None,
+        pinned_yielded_to_shell: false,
+        gap_panel: None,
+        group_editor: None,
+        group_manager: None,
+        pending_open_group_manager: false,
+        pending_confirm_group: false,
+        pending_open_group_editor: None,
         pending_open_picker: None,
-        pending_tile_sticker: None,
         pending_open_pick_list: None,
         window_pick_list: None,
         pinned_windows: Vec::new(),
@@ -2463,6 +2488,8 @@ fn run(
         surfaced_pins: HashSet::new(),
         pin_flashes: Vec::new(),
         pinned_last_rects: HashMap::new(),
+        snap_gap_zones: HashMap::new(),
+        snap_gap_strikes: HashMap::new(),
         pinned_unmaximized_at: HashMap::new(),
         pinned_follow_until: None,
         banner: None,
@@ -2472,7 +2499,6 @@ fn run(
         marquee_started: false,
         toolbar: None,
         cursor_panel: None,
-        tiling_overlay: None,
         cursor_panel_hovered: false,
         cursor_panel_slide: PanelSlide::fixed(1.0),
         settings_rect: None,
@@ -2617,7 +2643,18 @@ fn run(
             // и шлёт команды, применение и сохранение — всегда здесь.
             OverlayMessage::Command(OverlayCommand::UpdateSettings(settings)) => {
                 let old_hide_from_capture = cfg.settings.hide_from_capture;
+                let old_snap_gap = (
+                    cfg.settings.snap_shrink_pct,
+                    cfg.settings.snap_shrink_all_windows,
+                );
                 cfg.settings = settings;
+                // Значение из окна настроек правится руками — потолок здесь
+                // тот же, что в `shrink_in_zone`, чтобы конфиг на диске не
+                // расходился с тем, что реально применяется.
+                cfg.settings.snap_shrink_pct = cfg
+                    .settings
+                    .snap_shrink_pct
+                    .min(pinned_window::SNAP_SHRINK_MAX_PCT);
                 if let Err(e) = config::save(&cfg, &config_path) {
                     tracing::warn!(error = %e, "не удалось сохранить config.json после изменения общих настроек");
                 }
@@ -2635,6 +2672,31 @@ fn run(
                 // от трекера окон его бы не было ещё долго; пересчитываем
                 // сразу, тем же путём, что `Windows(Changed)`.
                 occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
+                // Отступ можно вписать числом прямо в настройках — тогда
+                // подменю трея обязано показать новое значение в заголовке,
+                // а окна — встать по нему, не дожидаясь события трекера.
+                if old_snap_gap
+                    != (
+                        cfg.settings.snap_shrink_pct,
+                        cfg.settings.snap_shrink_all_windows,
+                    )
+                {
+                    notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
+                    enforce_pinned_geometry(
+                        &mut edit,
+                        &window_pins,
+                        &monitor_bounds,
+                        cfg.settings.snap_shrink_pct,
+                    );
+                    if cfg.settings.snap_shrink_all_windows && cfg.settings.snap_shrink_pct > 0 {
+                        enforce_snap_gap_on_free_windows(
+                            &mut edit,
+                            &window_pins,
+                            &window_snapshot,
+                            cfg.settings.snap_shrink_pct,
+                        );
+                    }
+                }
                 need_redraw = true;
             }
             OverlayMessage::Command(OverlayCommand::UpdateHotkeys(hotkeys)) => {
@@ -2816,76 +2878,6 @@ fn run(
                 rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
                 need_redraw = true;
             }
-            OverlayMessage::Command(OverlayCommand::ToggleTiling) => {
-                let on = !tiling.enabled();
-                tiling.set_enabled(on, &window_pins);
-                // Состояние переживает перезапуск: пользователь включил
-                // тайлинг один раз, а не включает его каждое утро.
-                // Координатор — единственный писатель config.json.
-                if cfg.tiling.enabled != on {
-                    cfg.tiling.enabled = on;
-                    if let Err(e) = config::save(&cfg, &config_path) {
-                        tracing::warn!(error = %e, "не удалось сохранить состояние тайлинга");
-                    }
-                }
-                // Переменная существует ради своего `Drop`, но читать её
-                // всё равно надо: два хука подряд поставили бы два потока-
-                // помпы, и первый остался бы висеть навсегда.
-                if on && keyboard_guard.is_none() {
-                    match KeyboardGuard::start(tiling.swallow_set()) {
-                        Ok((guard, keys)) => {
-                            // Поток-мост: переливает нажатия с потока-помпы
-                            // хука в общий канал координатора. Тот же приём,
-                            // что у трекера окон выше, — у координатора один
-                            // вход, а не пять.
-                            let key_tx = tx.clone();
-                            if let Err(e) = std::thread::Builder::new()
-                                .name("resticker-tiling-keys".into())
-                                .spawn(move || {
-                                    for event in keys {
-                                        if key_tx.send(OverlayMessage::TilingKey(event)).is_err() {
-                                            break;
-                                        }
-                                    }
-                                })
-                            {
-                                tracing::warn!(error = %e, "поток-мост клавиш тайлинга не создан");
-                            }
-                            keyboard_guard = Some(guard);
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "клавиатура тайлинга недоступна");
-                        }
-                    }
-                } else if !on {
-                    // Снимает хук: без этого он остался бы висеть в системе.
-                    keyboard_guard = None;
-                }
-                // Индикаторы пересобираются там же, где меняется состояние
-                // тайлинга: в кадре логики быть не должно.
-                edit.tiling_overlay =
-                    if tiling.enabled() {
-                        Some(tiling.build_overlay(
-                            &tiling_monitors,
-                            tiling_clock.elapsed().as_millis() as u64,
-                        ))
-                    } else {
-                        None
-                    };
-                need_redraw = true;
-
-                tracing::info!(enabled = on, "тайлинг переключён из трея");
-                let _ = edit
-                    .coordinator_tx
-                    .send(CoordinatorRequest::ShowNotification {
-                        title: "resticker".to_string(),
-                        body: if on {
-                            "Tiling enabled".to_string()
-                        } else {
-                            "Tiling disabled".to_string()
-                        },
-                    });
-            }
             OverlayMessage::Command(OverlayCommand::ToggleAllStickers) => {
                 // Тот же путь, что `OverlayEvent::ToggleAllStickers` (хоткей)
                 // ниже — источник другой (меню трея, главный поток Tauri),
@@ -2903,13 +2895,61 @@ fn run(
                     need_redraw = true;
                 }
             }
+            OverlayMessage::Command(OverlayCommand::ToggleEditMode) => {
+                // Тот же путь, что у хоткея, но монитор берём по курсору:
+                // у пункта трея своего монитора нет.
+                let monitor_id = if monitors_map.contains_key(&edit.cursor_monitor) {
+                    edit.cursor_monitor.clone()
+                } else {
+                    match monitors_map.keys().next() {
+                        Some(id) => id.clone(),
+                        None => continue,
+                    }
+                };
+                let _ = tx.send(OverlayMessage::Event(
+                    monitor_id,
+                    OverlayEvent::ToggleEditMode,
+                ));
+            }
+            OverlayMessage::Command(OverlayCommand::OpenGapPanel) => {
+                // Повторный вызов из трея при уже открытой панели закрывает
+                // её: пункт меню работает как переключатель, иначе панель
+                // нельзя убрать тем же способом, каким её позвали.
+                if edit.gap_panel.is_some() {
+                    close_gap_panel(&mut edit, &monitors_map);
+                } else {
+                    open_gap_panel(&mut edit, &cfg, &monitors_map, &monitor_geometry);
+                }
+                need_redraw = true;
+            }
+            OverlayMessage::Command(OverlayCommand::ToggleSnapGapAllWindows) => {
+                let on = !cfg.settings.snap_shrink_all_windows;
+                {
+                    cfg.settings.snap_shrink_all_windows = on;
+                    if let Err(e) = config::save(&cfg, &config_path) {
+                        tracing::warn!(error = %e, "не удалось сохранить область действия отступа");
+                    }
+                    notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
+                    // Снятая галочка ничего не возвращает на место: окна
+                    // остаются там, где стоят. Вернуть их в исходные зоны
+                    // значило бы двигать чужие окна на ВЫКЛЮЧЕНИИ функции —
+                    // ровно то, чего пользователь этим выключением и просит
+                    // не делать. Забываем накопленное и молчим.
+                    if !on {
+                        edit.snap_gap_strikes.clear();
+                        let pinned: HashSet<isize> =
+                            edit.pinned_windows.iter().map(|p| p.hwnd).collect();
+                        edit.snap_gap_zones.retain(|hwnd, _| pinned.contains(hwnd));
+                    }
+                }
+            }
             OverlayMessage::Command(OverlayCommand::SavePreset(name)) => {
                 let preset = presets::save_preset(&cfg, name);
                 cfg.presets.push(preset);
                 if let Err(e) = config::save(&cfg, &config_path) {
                     tracing::warn!(error = %e, "не удалось сохранить config.json после сохранения пресета");
                 }
-                notify_presets_changed(&cfg, &edit.coordinator_tx);
+                notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
             }
             OverlayMessage::Command(OverlayCommand::ApplyPreset(id)) => {
                 match presets::apply_preset(&mut cfg, id) {
@@ -2952,7 +2992,7 @@ fn run(
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить config.json после переименования пресета");
                         }
-                        notify_presets_changed(&cfg, &edit.coordinator_tx);
+                        notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
                     }
                     Err(e) => {
                         tracing::warn!(preset = %id, error = %e, "не удалось переименовать пресет")
@@ -2965,7 +3005,7 @@ fn run(
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить config.json после удаления пресета");
                         }
-                        notify_presets_changed(&cfg, &edit.coordinator_tx);
+                        notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
                     }
                     Err(e) => tracing::warn!(preset = %id, error = %e, "не удалось удалить пресет"),
                 }
@@ -2982,7 +3022,7 @@ fn run(
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить config.json после импорта пресета");
                         }
-                        notify_presets_changed(&cfg, &edit.coordinator_tx);
+                        notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
                     }
                     Err(e) => {
                         tracing::warn!(path = %path.display(), error = %e, "не удалось импортировать пресет");
@@ -3030,6 +3070,24 @@ fn run(
                 edit.settings_rect = rect;
             }
             OverlayMessage::Event(monitor_id, OverlayEvent::ToggleEditMode) => {
+                // Два полноэкранных режима одновременно — это экран, на
+                // котором ничего не понятно: меню групп рисуется поверх всего
+                // и перехватывает мышь, и войдя в режим редактирования из-под
+                // него, пользователь решает, что режим «не вылезает» (репорт
+                // 2026-08-25). Меню уступает.
+                // След в журнале: если режим «не вылезает», по нему сразу
+                // видно, доехал ли хоткей до координатора вообще — а это
+                // разные починки (репорт 2026-08-25).
+                tracing::info!(
+                    monitor = %monitor_id.0,
+                    was_active = edit.active,
+                    group_menu = edit.group_editor.is_some(),
+                    "хоткей режима редактирования"
+                );
+                if edit.group_editor.is_some() {
+                    close_group_editor(&mut groups, &mut edit, &monitors_map);
+                }
+                edit.gap_panel.take();
                 let Some(ms) = monitors_map.get_mut(&monitor_id) else {
                     continue;
                 };
@@ -3287,6 +3345,7 @@ fn run(
                             None,
                             None,
                             None,
+                            Vec::new(),
                             edit.active,
                             cfg.settings.hide_from_capture,
                         ) {
@@ -3302,6 +3361,7 @@ fn run(
                             toggle_all_hotkey,
                             mute_all_hotkey,
                             Some(pin_focused_hotkey),
+                            rst_win32::hotkey::group_hotkey_combos(&cfg.hotkeys),
                             edit.active,
                             cfg.settings.hide_from_capture,
                         ) {
@@ -3322,17 +3382,23 @@ fn run(
                     if monitors_map.contains_key(&info.id) {
                         continue;
                     }
-                    let (edit_hotkey, this_toggle_all, this_mute_all, this_pin_focused) =
-                        if info.id == new_primary_id {
-                            (
-                                Some(hotkey),
-                                toggle_all_hotkey,
-                                mute_all_hotkey,
-                                Some(pin_focused_hotkey),
-                            )
-                        } else {
-                            (None, None, None, None)
-                        };
+                    let (
+                        edit_hotkey,
+                        this_toggle_all,
+                        this_mute_all,
+                        this_pin_focused,
+                        this_groups,
+                    ) = if info.id == new_primary_id {
+                        (
+                            Some(hotkey),
+                            toggle_all_hotkey,
+                            mute_all_hotkey,
+                            Some(pin_focused_hotkey),
+                            rst_win32::hotkey::group_hotkey_combos(&cfg.hotkeys),
+                        )
+                    } else {
+                        (None, None, None, None, Vec::new())
+                    };
                     if let Some(ms) = create_monitor_state(
                         &device,
                         &tx,
@@ -3341,6 +3407,7 @@ fn run(
                         this_toggle_all,
                         this_mute_all,
                         this_pin_focused,
+                        this_groups,
                         edit.active,
                         cfg.settings.hide_from_capture,
                     ) {
@@ -3446,7 +3513,6 @@ fn run(
                     .iter()
                     .map(|(id, ms)| (id.clone(), (ms.width, ms.height, ms.scale)))
                     .collect();
-                tiling_monitors = new_infos.clone();
                 monitor_bounds = new_infos
                     .iter()
                     .filter_map(|info| {
@@ -3493,20 +3559,10 @@ fn run(
                 need_redraw = true;
             }
             OverlayMessage::Tick => {
-                // M9: модальный режим биндов сам себя закрывает по
-                // бездействию. Секундного тика для этого достаточно, и он
-                // уже есть — заводить ради таймаута отдельный таймер значило
-                // бы добавить лишнее пробуждение (ADR-006).
-                if tiling.expire_submap(tiling_clock.elapsed().as_millis() as u64) {
-                    rst_win32::keyboard_guard::set_swallow_set(tiling.swallow_set());
-                    edit.tiling_overlay = if tiling.enabled() {
-                        Some(tiling.build_overlay(
-                            &tiling_monitors,
-                            tiling_clock.elapsed().as_millis() as u64,
-                        ))
-                    } else {
-                        None
-                    };
+                // Меню снап-раскладок Windows появляется по наведению мыши,
+                // а не по событию трекера окон — заметить его можно только
+                // на тике.
+                if yield_pinned_to_shell(&mut edit, &window_pins) {
                     need_redraw = true;
                 }
                 // Тик сам по себе снимок мониторов не меняет (диффить не
@@ -3620,24 +3676,287 @@ fn run(
             }
             OverlayMessage::Event(monitor_id, OverlayEvent::Input(event)) if !edit.active => {
                 // Вне режима редактирования оверлей кликопрозрачен, и сюда
-                // события приходят ТОЛЬКО когда мы сами сняли прозрачность
-                // ради полосы перемотки (см. `set_hover_click_target`). В
-                // сцену они не уходят: вне режима редактирования стикеры не
-                // двигают и не выделяют.
-                let scale = monitors_map.get(&monitor_id).map(|ms| ms.scale);
-                if let Some(scale) = scale {
-                    if handle_timeline_hover_input(
+                // события приходят ТОЛЬКО когда мы сами сняли прозрачность —
+                // ради полосы перемотки (`set_hover_click_target`) или ради
+                // панели зазора (`open_gap_panel`). В сцену они не уходят:
+                // вне режима редактирования стикеры не двигают и не выделяют.
+                if edit.group_editor.is_some() {
+                    let scale = monitors_map.get(&monitor_id).map(|ms| ms.scale);
+                    if let Some(scale) = scale
+                        && handle_group_editor_input(
+                            &mut groups,
+                            &mut edit,
+                            event,
+                            f64::from(scale),
+                            &monitor_id,
+                            &monitor_geometry,
+                            &mut group_thumbs,
+                        )
+                    {
+                        need_redraw = true;
+                    }
+                } else if edit.gap_panel.is_some() {
+                    // Без `continue`: он унёс бы выполнение мимо перерисовки в
+                    // конце тела цикла, и панель не обновлялась бы вообще —
+                    // ни каретка, ни новое число.
+                    let scale = monitors_map.get(&monitor_id).map(|ms| ms.scale);
+                    if let Some(scale) = scale {
+                        let action =
+                            handle_gap_panel_input(&mut edit, event, f64::from(scale), &monitor_id);
+                        if action.consumed {
+                            if let Some(pct) = take_gap_panel_value(&mut edit) {
+                                apply_snap_gap(
+                                    &mut cfg,
+                                    &config_path,
+                                    &mut edit,
+                                    &window_pins,
+                                    &monitor_bounds,
+                                    &window_snapshot,
+                                    pct,
+                                );
+                            }
+                            if action.close {
+                                close_gap_panel(&mut edit, &monitors_map);
+                            }
+                            need_redraw = true;
+                        }
+                    }
+                } else {
+                    let scale = monitors_map.get(&monitor_id).map(|ms| ms.scale);
+                    if let Some(scale) = scale {
+                        if handle_timeline_hover_input(
+                            &mut edit,
+                            &mut videos,
+                            event,
+                            scale,
+                            &monitor_id,
+                        ) {
+                            need_redraw = true;
+                        }
+                    }
+                }
+            }
+            // Меню групп ловит `Esc` раньше всех: оно перекрывает экран
+            // целиком, и выйти из него надо в первую очередь.
+            OverlayMessage::Event(
+                _,
+                OverlayEvent::Key {
+                    vk: VK_ESCAPE,
+                    pressed: true,
+                    ..
+                },
+            ) if edit.group_editor.is_some() => {
+                close_group_editor(&mut groups, &mut edit, &monitors_map);
+                need_redraw = true;
+            }
+            // Поле зазора в ленте раскладок — числовое, и цифры в него
+            // приходят как `Key::Digit`. Без этой ветки в него нельзя было
+            // вписать ничего: клавиатура в меню групп не маршрутизировалась
+            // вовсе, работало только колесо мыши (репорт 2026-08-26).
+            OverlayMessage::Event(
+                _,
+                OverlayEvent::Key {
+                    vk,
+                    modifiers,
+                    pressed: true,
+                },
+            ) if edit.group_editor.is_some() => {
+                if let Some(key) = widget_key(vk, modifiers)
+                    && let Some(panels) = &mut edit.group_editor
+                    && panels.presets.panel.key_event(key).consumed
+                {
+                    // Набранное значение сразу становится зазором группы:
+                    // панель пересобирается на каждое действие, и без этого
+                    // введённое число терялось бы.
+                    if let Some(value) = edit
+                        .group_editor
+                        .as_ref()
+                        .and_then(|p| {
+                            p.presets
+                                .panel
+                                .widget::<NumericField>(preset_strip::GAP_FIELD_ID)
+                        })
+                        .map(|f| f.value() as u8)
+                        && let Some(editor) = groups.editor_mut()
+                    {
+                        editor.gap_pct = value;
+                    }
+                    need_redraw = true;
+                }
+            }
+            // Панель зазора живёт ВНЕ режима редактирования и потому обязана
+            // сама разбирать клавиатуру: обычный разбор ниже стоит под
+            // `edit.active`.
+            OverlayMessage::Event(
+                _,
+                OverlayEvent::Key {
+                    vk,
+                    modifiers,
+                    pressed: true,
+                },
+            ) if !edit.active && edit.gap_panel.is_some() => {
+                if vk == VK_ESCAPE {
+                    close_gap_panel(&mut edit, &monitors_map);
+                    need_redraw = true;
+                // `widget_key`, а НЕ `widget_text_key`: второй намеренно
+                // выбрасывает цифры — он для текстовых полей, куда цифры
+                // приходят символом. Числовое поле принимает именно
+                // `Key::Digit`, и через `widget_text_key` в него нельзя было
+                // вписать ни одной цифры (репорт 2026-08-26).
+                } else if let Some(key) = widget_key(vk, modifiers)
+                    && let Some(state) = &mut edit.gap_panel
+                    && state.panel.key_event(key).consumed
+                {
+                    if let Some(pct) = take_gap_panel_value(&mut edit) {
+                        apply_snap_gap(
+                            &mut cfg,
+                            &config_path,
+                            &mut edit,
+                            &window_pins,
+                            &monitor_bounds,
+                            &window_snapshot,
+                            pct,
+                        );
+                    }
+                    need_redraw = true;
+                }
+            }
+            // Один и тот же хоткей открывает меню и подтверждает набор
+            // (требование пользователя: «нажимаешь галочку или Alt+Shift+G»).
+            OverlayMessage::Event(monitor_id, OverlayEvent::ToggleGroupsMenu) => {
+                if groups.editor().is_some() {
+                    confirm_group_editor(
+                        &mut groups,
                         &mut edit,
-                        &mut videos,
-                        event,
-                        scale,
+                        &mut cfg,
+                        &config_path,
+                        &monitors_map,
+                        &monitor_geometry,
+                        &monitor_bounds,
+                        &window_pins,
+                    );
+                } else {
+                    // Меню набора интерактивно только вне режима
+                    // редактирования (см. отложенное открытие из менеджера):
+                    // открыть его поверх режима значит показать панель, с
+                    // которой нельзя взаимодействовать. Режим уступает.
+                    if edit.active {
+                        let active_monitor = edit.cursor_monitor.clone();
+                        if let Some(ms) = monitors_map.get_mut(&active_monitor) {
+                            let renderer = Renderer {
+                                device: &device,
+                                target: &mut ms.target,
+                            };
+                            toggle_edit_mode(
+                                &ms.overlay,
+                                &mut edit,
+                                &mut cfg,
+                                &mut sprites,
+                                &mut animations,
+                                &mut videos,
+                                audio_mixer.as_ref(),
+                                &renderer,
+                                &config_path,
+                                &monitor_geometry,
+                                &monitor_bounds,
+                                &mut window_pins,
+                                &window_snapshot,
+                            );
+                            sync_other_monitors_edit_mode(
+                                &monitors_map,
+                                &active_monitor,
+                                edit.active,
+                            );
+                        }
+                    }
+                    // Перечисляем окна ПРЯМО СЕЙЧАС, а не берём снимок
+                    // трекера: трекер живёт только ради масок стикеров и без
+                    // них молчит, оставляя снимок пустым.
+                    open_group_editor(
+                        &mut groups,
+                        &mut edit,
+                        &cfg,
+                        &monitors_map,
+                        &monitor_geometry,
+                        rst_win32::window_enum::enumerate(),
+                        &mut group_thumbs,
                         &monitor_id,
-                    ) {
+                    );
+                }
+                need_redraw = true;
+            }
+            OverlayMessage::Event(_, OverlayEvent::UnpinAll) => {
+                // Открепить всё разом (запрос пользователя 2026-08-26).
+                // Разобрать закрепления поштучно можно только войдя в режим
+                // редактирования и ткнув в каждое окно — когда закреплённое
+                // окно мешает прямо сейчас, это слишком долго.
+                let count = edit.pinned_windows.len();
+                if count > 0 {
+                    window_pins.unpin_all();
+                    edit.pinned_windows.clear();
+                    edit.pinned_selection = None;
+                    edit.pinned_panel = None;
+                    edit.pinned_last_rects.clear();
+                    edit.pinned_unmaximized_at.clear();
+                    // Уступка системному меню держится флагом: с окон
+                    // закрепление снято, и возвращать им topmost больше
+                    // некому и незачем.
+                    edit.pinned_yielded_to_shell = false;
+                    tracing::info!(count, "все закрепления сняты хоткеем");
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::Event(_, OverlayEvent::DeleteOpenGroup) => {
+                // Удаляется группа, которая сейчас открыта (решение
+                // пользователя). Ничего не открыто — ничего не происходит:
+                // угадывать, какую из девяти он имел в виду, нельзя.
+                if let Some(id) = groups.active() {
+                    let before = cfg.groups.len();
+                    cfg.groups.retain(|g| g.id != id);
+                    if cfg.groups.len() != before {
+                        groups.close_group();
+                        if let Err(e) = config::save(&cfg, &config_path) {
+                            tracing::warn!(error = %e, "не удалось сохранить удаление группы");
+                        }
+                        tracing::info!(group = %id, "группа удалена хоткеем");
                         need_redraw = true;
                     }
                 }
             }
+            OverlayMessage::Event(_, OverlayEvent::OpenGroup(number)) => {
+                if open_group_by_number(
+                    &mut groups,
+                    &mut cfg,
+                    &config_path,
+                    &window_pins,
+                    &monitor_bounds,
+                    &window_snapshot,
+                    number,
+                ) {
+                    need_redraw = true;
+                }
+            }
             OverlayMessage::Event(_, OverlayEvent::Key { .. }) => {}
+            OverlayMessage::Event(_, OverlayEvent::Char(ch))
+                if !edit.active && edit.gap_panel.is_some() =>
+            {
+                if let Some(state) = &mut edit.gap_panel
+                    && state.panel.key_event(Key::Char(ch)).consumed
+                {
+                    if let Some(pct) = take_gap_panel_value(&mut edit) {
+                        apply_snap_gap(
+                            &mut cfg,
+                            &config_path,
+                            &mut edit,
+                            &window_pins,
+                            &monitor_bounds,
+                            &window_snapshot,
+                            pct,
+                        );
+                    }
+                    need_redraw = true;
+                }
+            }
             OverlayMessage::Event(_, OverlayEvent::Char(ch)) if edit.active => {
                 // Набор текста в поля панелей (имя пресета, правила
                 // соседства): символ уже с раскладкой и регистром — см.
@@ -3689,72 +4008,6 @@ fn run(
                 // Вне режима редактирования окно клик-прозрачно — эти
                 // события приходить не должны, но игнорируем на всякий случай.
             }
-            OverlayMessage::TilingKey(KeyEvent::ModifierUp(WatchedModifier::Alt)) => {
-                // Alt отпущен — переключатель окон закрывается и отдаёт
-                // фокус выбранному окну. Следить за модификатором дальше
-                // незачем: пока переключателя нет, эти события никому не
-                // нужны, а хук считает их не бесплатно.
-                if let Some(hwnd) = tiling.close_switcher() {
-                    rst_win32::keyboard_guard::watch_modifier_release(None);
-                    if !rst_win32::tiling_apply::focus(hwnd) {
-                        tracing::debug!(hwnd, "система не отдала фокус выбранному окну");
-                    }
-                    edit.tiling_overlay = if tiling.enabled() {
-                        Some(tiling.build_overlay(
-                            &tiling_monitors,
-                            tiling_clock.elapsed().as_millis() as u64,
-                        ))
-                    } else {
-                        None
-                    };
-                    need_redraw = true;
-                }
-            }
-            OverlayMessage::TilingKey(KeyEvent::ModifierUp(_)) => {}
-            OverlayMessage::TilingKey(KeyEvent::Chord(chord)) => {
-                let now_ms = tiling_clock.elapsed().as_millis() as u64;
-                // Свой Alt+Tab разбирается до биндов: это встроенное
-                // поведение, а не настраиваемая комбинация.
-                // Нажатие либо наше (переключатель), либо разбирается
-                // биндами — не то и другое сразу. Отсюда if/else, а не
-                // ранний выход: ветке всё равно нужен общий хвост с
-                // пересборкой индикаторов и запросом кадра.
-                let switcher_took_it = tiling.switcher_key(chord);
-                if switcher_took_it {
-                    if tiling.switcher_open() {
-                        rst_win32::keyboard_guard::watch_modifier_release(Some(
-                            WatchedModifier::Alt,
-                        ));
-                    }
-                } else {
-                    let outcome = tiling.resolve_key(chord, now_ms);
-                    if outcome.mode_changed {
-                        // Набор перехвата зависит от режима: в модальном режиме
-                        // бинды - одиночные клавиши, и глотать их вне режима
-                        // означало бы отобрать эти буквы у всех приложений.
-                        rst_win32::keyboard_guard::set_swallow_set(tiling.swallow_set());
-                    }
-                    if let Some(action) = outcome.action {
-                        let tick = tiling.dispatch(&action, &window_pins, now_ms);
-                        tracing::debug!(?action, moved = tick.moved, "действие тайлинга");
-                    }
-                }
-                // Пересобрать надо и когда действие ничего не сделало: вход
-                // и выход из модального режима не двигают ни одного окна, но
-                // плашку режима показать обязаны.
-                // Индикаторы пересобираются там же, где меняется состояние
-                // тайлинга: в кадре логики быть не должно.
-                edit.tiling_overlay =
-                    if tiling.enabled() {
-                        Some(tiling.build_overlay(
-                            &tiling_monitors,
-                            tiling_clock.elapsed().as_millis() as u64,
-                        ))
-                    } else {
-                        None
-                    };
-                need_redraw = true;
-            }
             OverlayMessage::Windows(TrackerWindowEvent::Changed(windows)) => {
                 // M4: снимок окон трекера — пересчитываем группы окклюдеров
                 // по всем мониторам (M4_OCCLUDERS_DESIGN.md §1) и просим
@@ -3771,7 +4024,41 @@ fn run(
                 // молчит (пункт 5 спеки).
                 if !edit.active {
                     maintain_pinned_windows(&mut edit, &window_snapshot, &mut window_pins);
-                    enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds);
+                    enforce_pinned_geometry(
+                        &mut edit,
+                        &window_pins,
+                        &monitor_bounds,
+                        cfg.settings.snap_shrink_pct,
+                    );
+                    // Отступ снап-зоны для обычных окон — только когда
+                    // пользователь включил галочку И задал сам отступ:
+                    // галочка расширяет область действия, а не включает
+                    // функцию.
+                    if cfg.settings.snap_shrink_all_windows && cfg.settings.snap_shrink_pct > 0 {
+                        enforce_snap_gap_on_free_windows(
+                            &mut edit,
+                            &window_pins,
+                            &window_snapshot,
+                            cfg.settings.snap_shrink_pct,
+                        );
+                    }
+                    prune_snap_gap_state(&mut edit, &window_snapshot);
+                    // Открытая группа запоминает новые места окон на лету
+                    // (выбор пользователя: «постоянно, пока группа открыта»).
+                    // Порог против дрожания округления живёт в `note_places`,
+                    // иначе конфиг переписывался бы на каждом снимке.
+                    if let Some(id) = groups.active()
+                        && let Some(index) = cfg.groups.iter().position(|g| g.id == id)
+                    {
+                        let live = live_group_places(&window_snapshot, &monitor_bounds);
+                        let mut group = cfg.groups[index].clone();
+                        if groups.note_places(&mut group, &live) {
+                            cfg.groups[index] = group;
+                            if let Err(e) = config::save(&cfg, &config_path) {
+                                tracing::warn!(error = %e, "не удалось сохранить места окон группы");
+                            }
+                        }
+                    }
                     // Закреплённое окно живёт в той же topmost-полосе, что и
                     // оверлей, и активация поднимает его НАД нами — бейдж
                     // «закреплено» и индикаторы замков уходят под окно
@@ -3789,71 +4076,6 @@ fn run(
                             state.overlay.raise_above_pinned(&pinned);
                         }
                     }
-                }
-                // M9: тайлинг живёт с того же снимка окон, что и пины.
-                //
-                // Три гейта, и каждый — из чужой боли:
-                // * `edit.active` — пока идёт редактирование стикеров, всё
-                //   принуждение над чужими окнами молчит (тот же принцип, что
-                //   у пинов выше, пункт 5 спеки пинов);
-                // * `shell_switching` — пока открыт Alt+Tab, меню Пуск или
-                //   идёт клик по панели задач, «активного приложения»
-                //   фактически нет, и любое вмешательство в чужие окна ломает
-                //   сам переключатель (репорт 2026-08-22 по пинам; R1 §9.5
-                //   прямо требует сделать этот гейт общим для всей подсистемы
-                //   чужих окон, а не только для пинов);
-                // * пользователь ПРЯМО СЕЙЧАС тащит окно мышью — перекладка
-                //   в этот момент дралась бы с его рукой.
-                // Отдельного вопроса «тащит ли пользователь ХОТЬ КАКОЕ-ТО
-                // окно» в Win32-слое нет: `is_user_dragging` спрашивает про
-                // конкретный hwnd. Поэтому драг проверяется точечно, для
-                // каждого окна перед его перестановкой (`tiling.rs`), а здесь
-                // остаются два общих гейта.
-                if tiling.enabled() && !edit.active && !window_enum::shell_switching() {
-                    let now_ms = tiling_clock.elapsed().as_millis() as u64;
-                    let tick = tiling.on_snapshot(
-                        &window_snapshot,
-                        &tiling_monitors,
-                        &window_pins,
-                        now_ms,
-                    );
-                    if !tick.is_quiet() {
-                        tracing::debug!(
-                            moved = tick.moved,
-                            to_hide = tick.to_hide.len(),
-                            gave_up = ?tick.gave_up,
-                            "такт тайлинга"
-                        );
-                    }
-                    // Стикеры-плитки едут вместе с окнами: их место задаёт та
-                    // же раскладка. Конфиг пишем только при реальном сдвиге —
-                    // иначе файл сохранялся бы на каждый снимок окон.
-                    if apply_sticker_places(&mut cfg, &tick, &monitor_geometry) {
-                        if let Err(e) = config::save(&cfg, &config_path) {
-                            tracing::warn!(error = %e, "не удалось сохранить раскладку стикеров");
-                        }
-                        rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
-                    }
-                    // Индикаторы пересобираются там же, где меняется состояние
-                    // тайлинга: в кадре логики быть не должно.
-                    edit.tiling_overlay = if tiling.enabled() {
-                        Some(tiling.build_overlay(
-                            &tiling_monitors,
-                            tiling_clock.elapsed().as_millis() as u64,
-                        ))
-                    } else {
-                        None
-                    };
-                    // `need_redraw` эта ветка не трогает: снимок окон и так
-                    // всегда просит кадр несколькими строками ниже.
-                }
-                // Порядок «последнее использованное первым» для своего
-                // переключателя: без него Alt+Tab показывал бы окна в
-                // порядке дерева, а не в порядке работы с ними.
-                if tiling.enabled()
-                    && let Some(fg) = window_enum::foreground_hwnd()
-                {
-                    tiling.note_focus(fg);
                 }
                 occluder_cache = refresh_occlusion(&cfg, &monitor_bounds, &window_snapshot);
                 // Открытая панель выбора окон показывает СТАРЫЙ снимок —
@@ -3920,7 +4142,12 @@ fn run(
                         .iter()
                         .any(|p| rst_win32::window_pin::is_user_dragging(p.hwnd as usize));
                     if !still_dragging && !edit.active {
-                        enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds);
+                        enforce_pinned_geometry(
+                            &mut edit,
+                            &window_pins,
+                            &monitor_bounds,
+                            cfg.settings.snap_shrink_pct,
+                        );
                     }
                 }
                 // Баннер предупреждений (конфликт хоткея и т.п.) — тот же
@@ -4370,48 +4597,134 @@ fn run(
         // Открытие панели выбора окон отложено до этой точки — кликом по
         // `TB_LAYERS` в `handle_toolbar_up`, у которого нет `window_snapshot`
         // (дизайн §5.2); здесь, в цикле `run()`, снимок уже под рукой.
-        // M9: стикер в раскладку и обратно. Отложенный флаг ставит
-        // обработчик тулбара (`TB_TILE`), а исполняется он здесь — тайлинг
-        // виден только отсюда.
-        if let Some(sticker_id) = edit.pending_tile_sticker.take() {
-            if !tiling.enabled() {
-                let _ = edit
-                    .coordinator_tx
-                    .send(CoordinatorRequest::ShowNotification {
-                        title: "resticker".to_string(),
-                        body: "Turn tiling on first (tray menu)".to_string(),
-                    });
-            } else {
-                let monitor = cfg
-                    .stickers
-                    .iter()
-                    .find(|st| st.id == sticker_id)
-                    .map(|st| st.placement.monitor_id.clone());
-                if let Some(monitor) = monitor {
-                    let now_ms = tiling_clock.elapsed().as_millis() as u64;
-                    if tiling.has_sticker(sticker_id) {
-                        tiling.remove_sticker(sticker_id);
-                    } else {
-                        tiling.add_sticker(sticker_id, &monitor);
-                    }
-                    let tick = tiling.relayout_now(&window_pins, now_ms);
-                    if apply_sticker_places(&mut cfg, &tick, &monitor_geometry) {
-                        if let Err(e) = config::save(&cfg, &config_path) {
-                            tracing::warn!(error = %e, "не удалось сохранить раскладку стикеров");
-                        }
-                        rebuild_ui_panels(&mut edit, &cfg, &monitor_geometry);
-                    }
-                    edit.tiling_overlay = if tiling.enabled() {
-                        Some(tiling.build_overlay(
-                            &tiling_monitors,
-                            tiling_clock.elapsed().as_millis() as u64,
-                        ))
-                    } else {
-                        None
+        // Галочка подтверждения в ленте окон — тот же путь, что и хоткей.
+        if std::mem::take(&mut edit.pending_confirm_group) {
+            confirm_group_editor(
+                &mut groups,
+                &mut edit,
+                &mut cfg,
+                &config_path,
+                &monitors_map,
+                &monitor_geometry,
+                &monitor_bounds,
+                &window_pins,
+            );
+            need_redraw = true;
+        }
+        // Открытая группа могла исчезнуть — её удалили в менеджере или
+        // правкой конфига. Держаться за неё дальше значит целиться хоткеем
+        // удаления в пустоту.
+        if let Some(id) = groups.active()
+            && !cfg.groups.iter().any(|g| g.id == id)
+        {
+            groups.close_group();
+        }
+        // Меню набора, вызванное из менеджера: новая группа или правка
+        // состава существующей.
+        if let Some(which) = edit.pending_open_group_editor.take() {
+            // Меню набора — само по себе полноэкранный режим, и ввод в него
+            // маршрутизируется только вне режима редактирования. Открыть его
+            // поверх режима значит показать панель, с которой нельзя
+            // взаимодействовать (репорт 2026-08-25: «вылетает менюшка, но
+            // из-за режима редактирования не могу с ней ничего сделать»).
+            // Поэтому режим редактирования уступает — так же, как меню
+            // уступает ему при входе с хоткея.
+            if edit.active {
+                let monitor_id = edit.cursor_monitor.clone();
+                if let Some(ms) = monitors_map.get_mut(&monitor_id) {
+                    let renderer = Renderer {
+                        device: &device,
+                        target: &mut ms.target,
                     };
-                    need_redraw = true;
+                    toggle_edit_mode(
+                        &ms.overlay,
+                        &mut edit,
+                        &mut cfg,
+                        &mut sprites,
+                        &mut animations,
+                        &mut videos,
+                        audio_mixer.as_ref(),
+                        &renderer,
+                        &config_path,
+                        &monitor_geometry,
+                        &monitor_bounds,
+                        &mut window_pins,
+                        &window_snapshot,
+                    );
+                    sync_other_monitors_edit_mode(&monitors_map, &monitor_id, edit.active);
                 }
             }
+            match which.and_then(|i| cfg.groups.get(i)) {
+                Some(group) => {
+                    // Окна группы отмечаются заранее — правка состава
+                    // начинается с того, что в группе уже есть, а не с
+                    // пустого листа.
+                    let live: Vec<rst_core::group_match::LiveWindow> =
+                        rst_win32::window_enum::enumerate()
+                            .iter()
+                            .map(|w| rst_core::group_match::LiveWindow {
+                                hwnd: w.hwnd,
+                                exe_path: w.exe_path.clone(),
+                                title: w.title.clone(),
+                                class: w.class.clone(),
+                            })
+                            .collect();
+                    let keys: Vec<rst_core::group_match::MemberKey> = group
+                        .members
+                        .iter()
+                        .map(|m| rst_core::group_match::MemberKey {
+                            exe_path: m.exe_path.clone(),
+                            title: m.title.clone(),
+                            class: m.class.clone(),
+                        })
+                        .collect();
+                    let picked: Vec<usize> = rst_core::group_match::match_members(&keys, &live)
+                        .into_iter()
+                        .flatten()
+                        .map(|i| live[i].hwnd)
+                        .collect();
+                    let monitor = edit.cursor_monitor.clone();
+                    groups.open_editor_for(group, monitor, picked);
+                }
+                None => {
+                    groups.open_editor(edit.cursor_monitor.clone(), cfg.settings.snap_shrink_pct)
+                }
+            }
+            let now_ms = editor_clock_ms();
+            // Правим существующую — её номер; собираем новую — первый
+            // свободный.
+            let number = which
+                .and_then(|i| cfg.groups.get(i))
+                .map(|g| u32::from(g.number))
+                .unwrap_or_else(|| u32::from(WindowGroup::next_number(&cfg.groups).unwrap_or(0)));
+            edit.group_editor = build_group_editor(
+                &groups,
+                rst_win32::window_enum::enumerate(),
+                &monitor_geometry,
+                &mut group_thumbs,
+                now_ms,
+                0,
+                number,
+            );
+            if edit.group_editor.is_none() {
+                groups.close_editor();
+            } else if !edit.active
+                && let Some(ms) = monitors_map.get(&edit.cursor_monitor)
+            {
+                ms.overlay.set_click_through(false);
+            }
+            need_redraw = true;
+        }
+        if std::mem::take(&mut edit.pending_open_group_manager) {
+            if edit.group_manager.is_some() {
+                // Повторное нажатие кнопки закрывает панель: она открывается
+                // тем же способом, каким закрывается, — иначе кнопка выглядит
+                // сломанной.
+                edit.group_manager = None;
+            } else {
+                open_group_manager(&mut edit, &cfg, &monitor_geometry);
+            }
+            need_redraw = true;
         }
         if let Some(picker_target) = edit.pending_open_picker.take() {
             open_window_picker(
@@ -4666,6 +4979,13 @@ fn reset_edit_mode_panels(edit: &mut EditState, exiting: bool) {
     edit.pending_open_pick_list = None;
     edit.window_pick_list = None;
     edit.preset_picker = None;
+    // Менеджер групп открывается кнопкой панели у курсора, то есть живёт
+    // ровно столько же, сколько режим редактирования. Без сброса он висел
+    // поверх экрана и после выхода — а вне режима оверлей кликопрозрачен, и
+    // панель превращалась в мёртвую картинку, которую нечем закрыть (живой
+    // репорт 2026-08-26).
+    edit.group_manager = None;
+    edit.pending_open_group_manager = false;
     edit.tooltip = None;
     edit.pending_animation = None;
     edit.pending_video = None;
@@ -5314,6 +5634,17 @@ fn handle_key(
     // нового пресета — тот же приём, что у панели свойств закреплённого
     // окна ниже: сперва отдаём клавишу панели (наберётся, если поле в
     // фокусе), и только если она её не взяла, `Esc` закрывает панель.
+    if edit.group_manager.is_some() {
+        // Текстовых полей в менеджере нет — группы только нумеруются, имён у
+        // них не бывает. Поэтому клавиатура здесь нужна ровно для одного:
+        // закрыть панель.
+        return if vk == VK_ESCAPE {
+            edit.group_manager = None;
+            true
+        } else {
+            false
+        };
+    }
     if edit.preset_picker.is_some() {
         if let Some(key) = widget_text_key(vk, modifiers) {
             let consumed = edit
@@ -5633,6 +5964,10 @@ fn widget_key(vk: u32, modifiers: Modifiers) -> Option<Key> {
 /// Числовое поле тулбара сюда не входит: оно принимает только цифры, а те
 /// приходят отдельным путём (`Key::Digit`) — символ ему не нужен.
 fn handle_char(edit: &mut EditState, ch: char) -> bool {
+    // Менеджер групп символы не принимает: текстовых полей в нём нет.
+    if edit.group_manager.is_some() {
+        return false;
+    }
     if edit.preset_picker.is_some() {
         let consumed = edit
             .preset_picker
@@ -6008,7 +6343,6 @@ fn cursor_shape_for_zone(zone: &Zone) -> CursorShape {
 fn toolbar_tooltip_text(id: WidgetId) -> Option<&'static str> {
     match id {
         toolbar::TB_LAYERS => Some("Visibility layers"),
-        toolbar::TB_TILE => Some("Tile / untile"),
         toolbar::TB_EYE => Some("Show/hide"),
         toolbar::TB_ORDER_UP => Some("Bring forward"),
         toolbar::TB_ORDER_DOWN => Some("Send backward"),
@@ -7563,6 +7897,7 @@ fn enforce_pinned_geometry(
     edit: &mut EditState,
     window_pins: &WindowPins,
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    snap_shrink_pct: u8,
 ) {
     let desktop = desktop_px_rect(monitor_bounds);
     let mut alive: HashSet<isize> = HashSet::new();
@@ -7638,17 +7973,32 @@ fn enforce_pinned_geometry(
             target = pinned_window::PxRect::from_xywh(target.left, target.top, max_w, max_h);
         }
 
-        let moved = edit
-            .pinned_last_rects
-            .get(&hwnd)
-            .is_none_or(|last| !rects_within(last, &live, PINNED_GEOMETRY_EPS_PX));
-        if moved {
-            target = pinned_window::snap_move(
-                target,
-                monitor,
-                desktop,
-                pinned_window::EDGE_SNAP_DIP * bounds.scale,
-            );
+        // ОТСТУП СНАП-ЗОНЫ (запрос пользователя 2026-08-25). Окно, которое
+        // Windows положила в свою половину/четверть/треть, ужимается на
+        // выбранный процент и встаёт по центру зоны.
+        //
+        // Цель отсюда — окончательная: ни потолок 90%, ни магнит кромок к
+        // ней не применяются. Потолок — потому что зона и так внутри
+        // рабочей области, и срезать по нему значило бы сдвинуть окно из
+        // центра зоны на десяток пикселей (левая половина FullHD при 5%
+        // отступа как раз задевает потолок по высоте). Магнит — потому что
+        // он тянет кромки к КРАЯМ МОНИТОРА, то есть ровно отменяет тот
+        // зазор, ради которого всё и затевалось.
+        if let Some(shrunk) = snap_shrink_target(edit, hwnd, &live, snap_shrink_pct) {
+            target = shrunk;
+        } else {
+            let moved = edit
+                .pinned_last_rects
+                .get(&hwnd)
+                .is_none_or(|last| !rects_within(last, &live, PINNED_GEOMETRY_EPS_PX));
+            if moved {
+                target = pinned_window::snap_move(
+                    target,
+                    monitor,
+                    desktop,
+                    pinned_window::EDGE_SNAP_DIP * bounds.scale,
+                );
+            }
         }
 
         let applied = if px_rect_differs(&target, &live, PINNED_GEOMETRY_EPS_PX) {
@@ -7686,6 +8036,179 @@ fn enforce_pinned_geometry(
         .retain(|hwnd, _| alive.contains(hwnd));
     edit.pinned_unmaximized_at
         .retain(|hwnd, _| alive.contains(hwnd));
+}
+
+/// Сколько раз подряд просим незакреплённое окно встать в зазор, прежде чем
+/// оставить его в покое ([`EditState::snap_gap_strikes`]).
+///
+/// Три, а не одна: первая попытка может разойтись с окном по времени (оно
+/// ещё доигрывает собственную анимацию снапа), вторая — упереться в его
+/// минимальный размер по одной оси, и только третья говорит, что окно нам
+/// действительно не подчиняется.
+const SNAP_GAP_MAX_ATTEMPTS: u8 = 3;
+
+/// Отступ снап-зоны для ОБЫЧНЫХ, незакреплённых окон
+/// (`Settings.snap_shrink_all_windows`).
+///
+/// Отдельный проход, а не расширение [`enforce_pinned_geometry`], и это
+/// принципиально: тот проход навязывает окну ещё и потолок 90% монитора,
+/// магнит кромок и борьбу с разворачиванием — правила ЗАКРЕПЛЕНИЯ, которые
+/// пользователь включил осознанно для конкретного окна. К чужому окну,
+/// попавшему сюда лишь потому, что стоит в снапе, применяется ровно одно
+/// правило — сам зазор.
+///
+/// Чего касаться нельзя (в порядке проверок): свои же окна, свёрнутые,
+/// закреплённые (их ведёт другой проход), нерастягиваемые (Windows такие и
+/// не снапит), развёрнутые (там своя ветка) и те, которые пользователь
+/// прямо сейчас тащит мышью.
+fn enforce_snap_gap_on_free_windows(
+    edit: &mut EditState,
+    window_pins: &WindowPins,
+    windows: &[WindowInfo],
+    pct: u8,
+) {
+    let own_pid = std::process::id();
+    for info in windows {
+        let hwnd = info.hwnd as isize;
+        if info.pid == own_pid
+            || info.iconic
+            || window_pins.is_pinned(info.hwnd)
+            || !rst_win32::window_enum::is_resizable(info.hwnd)
+        {
+            continue;
+        }
+        // Живые границы, а не из снимка: снимок мог устареть на несколько
+        // событий, а мы собираемся ДВИГАТЬ окно — решение обязано опираться
+        // на то, где оно находится сейчас.
+        let Some(live) = rst_win32::window_enum::live_rect(info.hwnd) else {
+            continue;
+        };
+        let Some(target) = snap_shrink_target(edit, hwnd, &live, pct) else {
+            // Окно вне снапа: зону забыл сам `snap_shrink_target`, счёт
+            // безуспешных попыток снимаем здесь — вернувшись в зону, окно
+            // получит полные три попытки заново.
+            edit.snap_gap_strikes.remove(&hwnd);
+            continue;
+        };
+        if !px_rect_differs(&target, &live, PINNED_GEOMETRY_EPS_PX) {
+            // Окно уже там, где надо, — попытки засчитывать не за что.
+            edit.snap_gap_strikes.remove(&hwnd);
+            continue;
+        }
+        // Жест пользователя не перебиваем: спорить с модальным циклом
+        // ресайза, который живёт в чужом процессе, — та же тяга-перетяга с
+        // рукой, что описана в `enforce_pinned_geometry`. Отпустит — снимок
+        // придёт снова, и зазор встанет на место.
+        if rst_win32::window_pin::is_user_dragging(info.hwnd)
+            || rst_win32::window_pin::is_window_maximized(info.hwnd)
+        {
+            continue;
+        }
+        let strikes = edit.snap_gap_strikes.entry(hwnd).or_insert(0);
+        if *strikes >= SNAP_GAP_MAX_ATTEMPTS {
+            continue;
+        }
+        *strikes += 1;
+        window_pins.set_dwm_bounds(
+            HWND(info.hwnd as *mut core::ffi::c_void),
+            RECT {
+                left: target.left.round() as i32,
+                top: target.top.round() as i32,
+                right: target.right.round() as i32,
+                bottom: target.bottom.round() as i32,
+            },
+        );
+    }
+}
+
+/// Выкинуть записи об окнах, которых больше нет.
+///
+/// Одна уборка на оба прохода — по снимку окон, а не по списку закреплённых:
+/// [`EditState::snap_gap_zones`] общая, и уборка «своего» из каждого прохода
+/// по отдельности стирала бы записи соседа (закреплённых окон единицы,
+/// обычных — десятки, и каждый проход считал бы чужие записи мусором).
+fn prune_snap_gap_state(edit: &mut EditState, windows: &[WindowInfo]) {
+    let alive: HashSet<isize> = windows.iter().map(|w| w.hwnd as isize).collect();
+    edit.snap_gap_zones.retain(|hwnd, _| alive.contains(hwnd));
+    edit.snap_gap_strikes.retain(|hwnd, _| alive.contains(hwnd));
+}
+
+/// Куда обязано встать закреплённое окно, если для него включён отступ
+/// снап-зоны (`Settings.snap_shrink_pct`), — или `None`, если окно не в
+/// снапе и трогать его нечем.
+///
+/// Порядок проверок важен. Сначала «окно СЕЙЧАС совпадает со снап-зоной» —
+/// это только что снапнутое окно, зону запоминаем. Только потом «окно — наш
+/// собственный ужатый результат в запомненной зоне»: этот случай обязан
+/// пережить и повторные снимки, и смену процента в меню (см.
+/// [`pinned_window::is_shrunk_in_zone`] — конкретный процент там не
+/// проверяется намеренно).
+///
+/// Если не подошло ни то, ни другое — пользователь увёл окно из снапа:
+/// зона забывается, и дальше окном занимается обычный магнит кромок.
+///
+/// Рабочая область берётся у Windows по самому окну
+/// (`work_area_for_window` → `MONITOR_DEFAULTTONEAREST`): это ровно тот
+/// монитор, от которого сама Windows считала снап, — расходиться с ней в
+/// выборе монитора нельзя, иначе половина соседнего экрана «не половина».
+fn snap_shrink_target(
+    edit: &mut EditState,
+    hwnd: isize,
+    live: &WindowRect,
+    pct: u8,
+) -> Option<pinned_window::PxRect> {
+    if pct == 0 {
+        // Функция выключена — и запомненные зоны больше не нужны: иначе,
+        // включив её обратно, мы утащили бы окно в зону, из которой
+        // пользователь давно его увёл.
+        edit.snap_gap_zones.remove(&hwnd);
+        return None;
+    }
+    let work = rst_win32::monitors::work_area_for_window(hwnd as usize)?;
+    let work = pinned_window::PxRect::from_xywh(
+        f64::from(work.x),
+        f64::from(work.y),
+        f64::from(work.w),
+        f64::from(work.h),
+    );
+    snap_shrink_in_work_area(&mut edit.snap_gap_zones, hwnd, live, work, pct)
+}
+
+/// Решение [`snap_shrink_target`] при УЖЕ известной рабочей области.
+///
+/// Отделено от запроса к Windows, чтобы вся логика зон — запоминание,
+/// узнавание собственного результата, забывание при уходе из снапа —
+/// проверялась тестами без живого окна на экране: именно здесь живут
+/// переходы состояния, а `work_area_for_window` только подставляет число.
+fn snap_shrink_in_work_area(
+    zones: &mut HashMap<isize, pinned_window::PxRect>,
+    hwnd: isize,
+    live: &WindowRect,
+    work: pinned_window::PxRect,
+    pct: u8,
+) -> Option<pinned_window::PxRect> {
+    let live_px = pinned_window::PxRect::from_xywh(
+        f64::from(live.x),
+        f64::from(live.y),
+        f64::from(live.w),
+        f64::from(live.h),
+    );
+
+    let zone = if let Some(zone) =
+        pinned_window::snap_zone_of(live_px, work, pinned_window::SNAP_ZONE_EPS_PX)
+    {
+        zones.insert(hwnd, zone);
+        zone
+    } else {
+        let remembered = *zones.get(&hwnd)?;
+        if pinned_window::is_shrunk_in_zone(live_px, remembered, pinned_window::SNAP_ZONE_EPS_PX) {
+            remembered
+        } else {
+            zones.remove(&hwnd);
+            return None;
+        }
+    };
+    Some(pinned_window::shrink_in_zone(zone, pct))
 }
 
 /// Прямоугольники совпадают с точностью до `eps` по каждой кромке.
@@ -7872,6 +8395,1483 @@ fn handle_window_picker_up(
     true
 }
 
+/// Ввод мышью в панель величины зазора. `true` — панель событие взяла.
+///
+/// Клик мимо панели закрывает её (панель обнуляется здесь же, и вызывающий
+/// код это увидит) — тот же приём, что у панели пресетов: у модального окна
+/// без заголовка щелчок мимо это единственный интуитивный способ выйти,
+/// кроме `Esc`.
+/// Чего хочет панель после события ввода.
+///
+/// Отдельный тип, а не `bool` и не прямое обнуление `edit.gap_panel` внутри:
+/// закрытие обязано вернуть оверлею кликопрозрачность, а сделать это может
+/// только вызывающий код — у него есть карта мониторов. Обнуление поля прямо
+/// здесь оставляло бы оверлей навсегда перехватывающим мышь, и мимо панели
+/// стало бы нельзя кликнуть вообще ни во что.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GapPanelInput {
+    /// Событие разобрано панелью — в сцену его отдавать не надо.
+    consumed: bool,
+    /// Панель просит себя закрыть (кнопка `Close` или клик мимо).
+    close: bool,
+}
+
+fn handle_gap_panel_input(
+    edit: &mut EditState,
+    event: InputEvent,
+    scale: f64,
+    monitor_id: &MonitorId,
+) -> GapPanelInput {
+    let Some(state) = &mut edit.gap_panel else {
+        return GapPanelInput::default();
+    };
+    if state.monitor_id != *monitor_id {
+        return GapPanelInput::default();
+    }
+    // Координаты приходят в физических пикселях монитора, панель считает в
+    // DIP — тот же перевод, что у остальных панелей.
+    let to_dip = |p: rst_win32::input::Point| (f64::from(p.x) / scale, f64::from(p.y) / scale);
+    if let InputEvent::MouseDown { pos, .. }
+    | InputEvent::MouseMove { pos, .. }
+    | InputEvent::MouseUp { pos, .. } = event
+    {
+        state.last_pos = to_dip(pos);
+    }
+    match event {
+        InputEvent::MouseDown { pos, .. } => {
+            let pos = to_dip(pos);
+            if !state.panel.hit_test(pos) {
+                // Щелчок мимо закрывает панель: у окна без заголовка это
+                // единственный интуитивный выход помимо `Esc`.
+                return GapPanelInput {
+                    consumed: true,
+                    close: true,
+                };
+            }
+            GapPanelInput {
+                consumed: state
+                    .panel
+                    .pointer_event(PointerEvent::Down { pos })
+                    .consumed,
+                close: false,
+            }
+        }
+        InputEvent::MouseMove { pos, .. } => {
+            let pos = to_dip(pos);
+            GapPanelInput {
+                consumed: state
+                    .panel
+                    .pointer_event(PointerEvent::Move { pos })
+                    .consumed,
+                close: false,
+            }
+        }
+        InputEvent::MouseUp { pos, .. } => {
+            let pos = to_dip(pos);
+            let consumed = state.panel.pointer_event(PointerEvent::Up { pos }).consumed;
+            let close = state
+                .panel
+                .widget_mut::<Button>(gap_panel::BTN_CLOSE)
+                .is_some_and(Button::take_click);
+            GapPanelInput { consumed, close }
+        }
+        InputEvent::MouseWheel { notches } => {
+            // Колесо адресуется позиции курсора: поле реагирует, только если
+            // курсор над ним. Иначе прокрутка над пустым местом панели
+            // молча меняла бы число, которого пользователь не касался.
+            let pos = state.last_pos;
+            GapPanelInput {
+                consumed: state.panel.mouse_wheel(pos, notches).consumed,
+                close: false,
+            }
+        }
+        InputEvent::CaptureLost => {
+            // Захват отобрали посреди жеста: доводим виджет до отпускания,
+            // иначе кнопка осталась бы нажатой навсегда.
+            state.panel.pointer_event(PointerEvent::Up {
+                pos: state.last_pos,
+            });
+            GapPanelInput {
+                consumed: true,
+                close: false,
+            }
+        }
+    }
+}
+
+/// Применить новую величину зазора: сохранить, обновить меню трея и сразу
+/// переложить окна.
+///
+/// Ждать очередного снимка окон незачем — пользователь крутит колесо и
+/// смотрит на экран; зазор, появляющийся через секунду после жеста, читается
+/// как неработающий виджет.
+#[allow(clippy::too_many_arguments)]
+fn apply_snap_gap(
+    cfg: &mut Config,
+    config_path: &Path,
+    edit: &mut EditState,
+    window_pins: &WindowPins,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_snapshot: &[WindowInfo],
+    pct: u8,
+) {
+    cfg.settings.snap_shrink_pct = pct.min(pinned_window::SNAP_SHRINK_MAX_PCT);
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, "не удалось сохранить величину зазора");
+    }
+    // Величина видна в заголовке подменю трея — без пересборки там осталось
+    // бы прежнее число.
+    notify_tray_menu_changed(cfg, &edit.coordinator_tx);
+    enforce_pinned_geometry(
+        edit,
+        window_pins,
+        monitor_bounds,
+        cfg.settings.snap_shrink_pct,
+    );
+    if cfg.settings.snap_shrink_all_windows && cfg.settings.snap_shrink_pct > 0 {
+        enforce_snap_gap_on_free_windows(
+            edit,
+            window_pins,
+            window_snapshot,
+            cfg.settings.snap_shrink_pct,
+        );
+    }
+}
+
+/// Окно карточки под курсором, если он попал по карточке ленты.
+///
+/// Хит-тест идёт по кнопкам самих карточек, а не по прямоугольнику ленты:
+/// между карточками есть зазоры, и нажатие в зазор не должно начинать
+/// перетаскивание.
+fn card_under(panels: &GroupEditorPanels, pos: (f64, f64)) -> Option<usize> {
+    panels
+        .card_hwnds
+        .iter()
+        .enumerate()
+        .find(|(i, _)| {
+            panels
+                .strip
+                .panel
+                .widget::<Button>(group_strip::CARD_BASE + *i as WidgetId)
+                .is_some_and(|b| rst_render::box_contains(&b.bounds(), pos))
+        })
+        .map(|(_, hwnd)| *hwnd)
+}
+
+/// Слот раскладки под курсором.
+fn slot_under(panels: &GroupEditorPanels, pos: (f64, f64)) -> Option<&preset_strip::SlotTarget> {
+    panels
+        .presets
+        .slots
+        .iter()
+        .find(|t| rst_render::box_contains(&t.rect, pos))
+}
+
+/// Положить перетаскиваемую карточку в слот под курсором.
+///
+/// `true` — окно легло в слот. `false` — курсор был мимо слотов: жест просто
+/// пропадает, и это правильнее, чем класть окно в ближайший слот, — в лентах
+/// слоты мелкие, и «ближайший» слишком часто оказывался бы не тем.
+///
+/// Бросок в слот ЧУЖОЙ раскладки заодно выбирает эту раскладку: пользователь
+/// показал пальцем, куда он хочет, и требовать отдельного клика по миниатюре
+/// значило бы игнорировать уже сделанный выбор.
+fn drop_card_into_slot(
+    groups: &mut GroupsState,
+    panels: &GroupEditorPanels,
+    drag: &CardDrag,
+    pos: (f64, f64),
+) -> bool {
+    let Some(target) = slot_under(panels, pos) else {
+        return false;
+    };
+    let (preset, slot) = (target.preset, target.slot);
+    let Some(editor) = groups.editor_mut() else {
+        return false;
+    };
+    editor.set_preset(preset);
+    editor.assign_slot(slot, drag.hwnd)
+}
+
+/// Погасить нажатия, накопленные кнопками обеих лент.
+///
+/// Нужно после перетаскивания и отмены жеста: `Button` помнит нажатие до тех
+/// пор, пока его не заберут через `take_click`, и невзятое нажатие сработало
+/// бы при следующем `Up` — то есть окно, которое только что положили в слот,
+/// тут же снялось бы с отметки.
+fn clear_group_editor_clicks(panels: &mut GroupEditorPanels) {
+    for i in 0..panels.card_hwnds.len() {
+        if let Some(b) = panels
+            .strip
+            .panel
+            .widget_mut::<Button>(group_strip::CARD_BASE + i as WidgetId)
+        {
+            let _ = b.take_click();
+        }
+    }
+    for i in 0..panels.presets.thumbs.len() {
+        if let Some(b) = panels
+            .presets
+            .panel
+            .widget_mut::<Button>(preset_strip::THUMB_BASE + i as WidgetId)
+        {
+            let _ = b.take_click();
+        }
+    }
+    let slots: Vec<WidgetId> = panels
+        .presets
+        .slots
+        .iter()
+        .map(|t| {
+            preset_strip::SLOT_BASE + (t.preset * preset_strip::MAX_SLOTS + t.slot) as WidgetId
+        })
+        .collect();
+    for id in slots {
+        if let Some(b) = panels.presets.panel.widget_mut::<Button>(id) {
+            let _ = b.take_click();
+        }
+    }
+}
+
+/// Призрак перетаскиваемой карточки: прямоугольник под курсором и подсветка
+/// слота, куда она упадёт.
+///
+/// Рисуется поверх обеих лент, поэтому строится отдельно от них: панели
+/// собираются заранее и о жесте не знают.
+fn group_drag_overlay(panels: &GroupEditorPanels) -> Vec<Primitive> {
+    let Some(drag) = &panels.drag else {
+        return Vec::new();
+    };
+    if !drag.dragging {
+        return Vec::new();
+    }
+    let mut prims = Vec::new();
+    // Цель под курсором — подсвеченная рамка: без неё непонятно, попадёшь ли
+    // ты в слот, пока не отпустишь.
+    if let Some(target) = slot_under(panels, drag.now) {
+        prims.push(Primitive::Fill {
+            rect: target.rect,
+            color: DRAG_TARGET_COLOR,
+            opacity: 0.55,
+        });
+    }
+    // Сам призрак — маленький прямоугольник у курсора: точной копии карточки
+    // здесь не нужно, нужно ощущение, что нечто едет за мышью.
+    prims.push(Primitive::Fill {
+        rect: Box2D {
+            cx: drag.now.0,
+            cy: drag.now.1,
+            w: DRAG_GHOST_W,
+            h: DRAG_GHOST_H,
+            rotation: 0.0,
+        },
+        color: DRAG_GHOST_COLOR,
+        opacity: 0.8,
+    });
+    prims
+}
+
+/// Ширина призрака перетаскиваемой карточки, DIP.
+const DRAG_GHOST_W: f64 = 64.0;
+/// Высота призрака, DIP.
+const DRAG_GHOST_H: f64 = 44.0;
+/// Цвет призрака — светлый, чтобы читался и на тёмной ленте, и на светлом окне.
+const DRAG_GHOST_COLOR: [u8; 3] = [0xd8, 0xd8, 0xd8];
+/// Цвет подсветки слота-цели.
+const DRAG_TARGET_COLOR: [u8; 3] = [0x5a, 0x9b, 0xd5];
+
+/// Ввод мышью в меню редактирования групп. `true` — надо перерисовать.
+///
+/// Порядок опроса важен: сначала лента раскладок (она сверху и её слоты —
+/// цели перетаскивания), потом лента окон. Клик мимо обеих панелей меню НЕ
+/// закрывает: в отличие от маленькой панели зазора, здесь пользователь
+/// целится по карточкам через весь экран, и промах мимо ленты — обычное дело,
+/// а не намерение выйти. Выход — `Esc` или тот же хоткей.
+#[allow(clippy::too_many_arguments)]
+fn handle_group_editor_input(
+    groups: &mut GroupsState,
+    edit: &mut EditState,
+    event: InputEvent,
+    scale: f64,
+    monitor_id: &MonitorId,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    thumbs: &mut rst_win32::thumb_cache::ThumbCache,
+) -> bool {
+    let Some(panels) = &mut edit.group_editor else {
+        return false;
+    };
+    if panels.monitor_id != *monitor_id {
+        return false;
+    }
+    let to_dip = |p: rst_win32::input::Point| (f64::from(p.x) / scale, f64::from(p.y) / scale);
+    if let InputEvent::MouseDown { pos, .. }
+    | InputEvent::MouseMove { pos, .. }
+    | InputEvent::MouseUp { pos, .. } = event
+    {
+        panels.last_pos = to_dip(pos);
+    }
+
+    let mut dirty = false;
+    let mut rebuild = false;
+    // Галочка подтверждения: разбор нажатий поднимает флаг, а исполняет его
+    // цикл координатора — у него есть конфиг, мониторы и закрепления.
+    let mut confirm = false;
+    match event {
+        InputEvent::MouseDown { pos, .. } => {
+            let pos = to_dip(pos);
+            dirty |= panels
+                .presets
+                .panel
+                .pointer_event(PointerEvent::Down { pos })
+                .consumed;
+            dirty |= panels
+                .strip
+                .panel
+                .pointer_event(PointerEvent::Down { pos })
+                .consumed;
+            // Нажатие на карточку может оказаться и кликом, и началом
+            // перетаскивания — решит порог по расстоянию в `Move`.
+            if let Some(hwnd) = card_under(panels, pos) {
+                panels.drag = Some(CardDrag {
+                    hwnd,
+                    start: pos,
+                    now: pos,
+                    dragging: false,
+                });
+            }
+        }
+        InputEvent::MouseMove { pos, .. } => {
+            let pos = to_dip(pos);
+            dirty |= panels
+                .presets
+                .panel
+                .pointer_event(PointerEvent::Move { pos })
+                .consumed;
+            dirty |= panels
+                .strip
+                .panel
+                .pointer_event(PointerEvent::Move { pos })
+                .consumed;
+            if let Some(drag) = &mut panels.drag {
+                drag.now = pos;
+                if !drag.dragging {
+                    let dx = pos.0 - drag.start.0;
+                    let dy = pos.1 - drag.start.1;
+                    if dx.hypot(dy) >= CARD_DRAG_THRESHOLD_DIP {
+                        drag.dragging = true;
+                    }
+                }
+                if drag.dragging {
+                    dirty = true;
+                }
+            }
+        }
+        InputEvent::MouseUp { pos, .. } => {
+            let pos = to_dip(pos);
+            panels.presets.panel.pointer_event(PointerEvent::Up { pos });
+            panels.strip.panel.pointer_event(PointerEvent::Up { pos });
+            // Жест сначала: если карточку донесли до слота, это НЕ клик, и
+            // отдавать его кнопкам нельзя — окно и отметилось бы, и тут же
+            // снялось.
+            let dropped = match panels.drag.take() {
+                Some(drag) if drag.dragging => drop_card_into_slot(groups, panels, &drag, pos),
+                _ => false,
+            };
+            if dropped {
+                // Кнопки могли запомнить нажатие — гасим, чтобы клик по
+                // карточке не сработал вдогонку.
+                clear_group_editor_clicks(panels);
+                rebuild = true;
+            } else {
+                rebuild = take_group_editor_clicks(groups, panels, &mut confirm);
+            }
+            dirty = true;
+        }
+        InputEvent::MouseWheel { notches } => {
+            // Колесо над лентой раскладок крутит поле зазора, над лентой окон
+            // — саму ленту. Разделение по позиции курсора, а не по «активной»
+            // панели: активной здесь нет, обе видны одновременно.
+            let pos = panels.last_pos;
+            if panels.presets.panel.hit_test(pos) {
+                dirty |= panels.presets.panel.mouse_wheel(pos, notches).consumed;
+                if let Some(field) = panels
+                    .presets
+                    .panel
+                    .widget::<NumericField>(preset_strip::GAP_FIELD_ID)
+                    && let Some(editor) = groups.editor_mut()
+                {
+                    let value = field.value() as u8;
+                    if editor.gap_pct != value {
+                        editor.gap_pct = value;
+                        dirty = true;
+                    }
+                }
+            } else {
+                // Одна карточка на щелчок: шаг в три строки, как у списков,
+                // здесь означал бы прыжок через полленты.
+                let step = if notches > 0 { 1 } else { -1 };
+                let next = panels.scroll.saturating_add_signed(-step as isize);
+                if next != panels.scroll {
+                    panels.scroll = next;
+                    rebuild = true;
+                }
+            }
+        }
+        InputEvent::CaptureLost => {
+            // Захват отобрали посреди жеста: перетаскивание ОТМЕНЯЕТСЯ, а не
+            // завершается. Куда пользователь целился, мы не знаем, и
+            // положить окно наугад хуже, чем не положить вовсе.
+            let pos = panels.last_pos;
+            panels.presets.panel.pointer_event(PointerEvent::Up { pos });
+            panels.strip.panel.pointer_event(PointerEvent::Up { pos });
+            panels.drag = None;
+            clear_group_editor_clicks(panels);
+            dirty = true;
+        }
+    }
+
+    if confirm {
+        edit.pending_confirm_group = true;
+    }
+    if rebuild {
+        let (scroll, windows, number) = edit
+            .group_editor
+            .as_ref()
+            .map(|p| (p.scroll, p.windows.clone(), p.group_number))
+            .unwrap_or_default();
+        let now_ms = editor_clock_ms();
+        if let Some(rebuilt) = build_group_editor(
+            groups,
+            windows,
+            monitor_geometry,
+            thumbs,
+            now_ms,
+            scroll,
+            number,
+        ) {
+            edit.group_editor = Some(rebuilt);
+        }
+        dirty = true;
+    }
+    dirty
+}
+
+/// Разобрать нажатия внутри меню групп. `true` — состав или раскладка
+/// изменились и панели надо пересобрать.
+///
+/// Кнопка подтверждения здесь НЕ обрабатывается: подтверждение создаёт группу
+/// и трогает конфиг, а на это нужен доступ к половине координатора. Клик по
+/// ней превращается в тот же путь, что и хоткей, — через отложенный флаг.
+fn take_group_editor_clicks(
+    groups: &mut GroupsState,
+    panels: &mut GroupEditorPanels,
+    confirm: &mut bool,
+) -> bool {
+    let mut changed = false;
+    let Some(editor) = groups.editor_mut() else {
+        return false;
+    };
+
+    // Слоты раскладок: клик по слоту выбирает раскладку. Перетаскивание окна
+    // в слот — следующий шаг (жест `Down` на карточке, `Up` на слоте); пока
+    // одиночный клик по слоту работает как выбор самой раскладки, потому что
+    // слот принадлежит ей.
+    for target in &panels.presets.slots {
+        let id = preset_strip::SLOT_BASE
+            + (target.preset * preset_strip::MAX_SLOTS + target.slot) as WidgetId;
+        if panels
+            .presets
+            .panel
+            .widget_mut::<Button>(id)
+            .is_some_and(Button::take_click)
+        {
+            editor.set_preset(target.preset);
+            changed = true;
+        }
+    }
+    for i in 0..panels.presets.thumbs.len() {
+        let id = preset_strip::THUMB_BASE + i as WidgetId;
+        if panels
+            .presets
+            .panel
+            .widget_mut::<Button>(id)
+            .is_some_and(Button::take_click)
+        {
+            editor.set_preset(i);
+            changed = true;
+        }
+    }
+
+    // Галочка подтверждения: решение принимает координатор, здесь только
+    // поднимаем флаг.
+    // Галочка — СВОЙ виджет, а не `Button`: у кнопки движка нет неактивного
+    // состояния, а подтверждение обязано молчать, пока отмечено меньше двух
+    // окон. Искать её как `Button` (как было сначала) значит не найти
+    // никогда — ровно поэтому кнопка и не работала.
+    if panels
+        .strip
+        .panel
+        .widget_mut::<group_strip::ConfirmButton>(group_strip::BTN_CONFIRM)
+        .is_some_and(group_strip::ConfirmButton::take_click)
+    {
+        *confirm = true;
+    }
+
+    // Карточки окон: отметить или снять отметку. Идентификатор кодирует
+    // индекс в ПОЛНОМ списке карточек (не в видимом окне прокрутки), поэтому
+    // перебираем весь список — прокрученные карточки просто не найдутся в
+    // панели.
+    for (i, hwnd) in panels.card_hwnds.iter().enumerate() {
+        let id = group_strip::CARD_BASE + i as WidgetId;
+        if panels
+            .strip
+            .panel
+            .widget_mut::<Button>(id)
+            .is_some_and(Button::take_click)
+        {
+            editor.toggle_pick(*hwnd);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Открыть панель менеджера групп на мониторе панели у курсора.
+fn open_group_manager(
+    edit: &mut EditState,
+    cfg: &Config,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) {
+    let monitor_id = edit.cursor_monitor.clone();
+    let Some(&(w, h, scale)) = monitor_geometry.get(&monitor_id) else {
+        return;
+    };
+    let screen = screen_dip_rect((w, h), scale);
+    edit.group_manager = Some(GroupManagerState {
+        panel: group_manager::build(
+            &cfg.groups,
+            None,
+            group_manager_frame(&screen, cfg.groups.len(), 0),
+        ),
+        monitor_id,
+        expanded: None,
+    });
+}
+
+/// Рамка панели менеджера: по центру экрана, высота под текущий список.
+fn group_manager_frame(screen: &DipRect, groups: usize, expanded_members: usize) -> Box2D {
+    Box2D {
+        cx: screen.w / 2.0,
+        cy: screen.h / 2.0,
+        w: group_manager::WIDTH,
+        h: group_manager::height(groups, expanded_members),
+        rotation: 0.0,
+    }
+}
+
+/// Пересобрать открытую панель менеджера, сохранив раскрытую группу и
+/// черновик имени.
+///
+/// Зовётся после каждого действия внутри панели: список меняется, панель
+/// обязана его отразить, а состояние поля и раскрытия — пережить пересборку.
+fn rebuild_group_manager(
+    edit: &mut EditState,
+    cfg: &Config,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) {
+    let Some(state) = &edit.group_manager else {
+        return;
+    };
+    let Some(&(w, h, scale)) = monitor_geometry.get(&state.monitor_id) else {
+        return;
+    };
+    let screen = screen_dip_rect((w, h), scale);
+    // Раскрытая группа могла исчезнуть (её только что удалили) — тогда
+    // раскрывать нечего, и высота считается по свёрнутому списку.
+    let expanded = state.expanded.filter(|i| *i < cfg.groups.len());
+    let members = expanded.map_or(0, |i| cfg.groups[i].members.len());
+    let monitor_id = state.monitor_id.clone();
+    edit.group_manager = Some(GroupManagerState {
+        panel: group_manager::build(
+            &cfg.groups,
+            expanded,
+            group_manager_frame(&screen, cfg.groups.len(), members),
+        ),
+        monitor_id,
+        expanded,
+    });
+}
+
+/// Нажатие мыши в панели менеджера групп.
+///
+/// Отдельная функция, а не пара строк в `handle_input`: маршрутизация
+/// нажатия и есть то, что сломалось (репорт 2026-08-25 — «менюшка выглядит
+/// как png»). `handle_input` требует живого окна и рендерера, поэтому
+/// тестами он не покрывается, а эта функция покрывается.
+///
+/// Клик мимо панели закрывает её — обычная семантика попап-меню, та же, что
+/// у панели пресетов.
+fn group_manager_down(edit: &mut EditState, monitor_id: &MonitorId, pos: (f64, f64)) {
+    let Some(state) = &mut edit.group_manager else {
+        return;
+    };
+    let hit = state.monitor_id == *monitor_id
+        && state
+            .panel
+            .pointer_event(PointerEvent::Down { pos })
+            .consumed;
+    if !hit {
+        edit.group_manager = None;
+    }
+}
+
+/// Движение мыши в панели менеджера: подсветка строки под курсором.
+fn group_manager_move(edit: &mut EditState, monitor_id: &MonitorId, pos: (f64, f64)) {
+    if let Some(state) = &mut edit.group_manager
+        && state.monitor_id == *monitor_id
+    {
+        state.panel.pointer_event(PointerEvent::Move { pos });
+    }
+}
+
+/// Разобрать нажатия в панели менеджера групп после `Up`.
+///
+/// `true` — событие панель забрала себе (в сцену его отдавать не надо).
+fn handle_group_manager_up(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    pos: (f64, f64),
+) -> bool {
+    let Some(state) = &mut edit.group_manager else {
+        return false;
+    };
+    state.panel.pointer_event(PointerEvent::Up { pos });
+
+    if take_manager_click(state, group_manager::BTN_CLOSE) {
+        edit.group_manager = None;
+        return true;
+    }
+
+    // Удаление проверяется РАНЬШЕ раскрытия: кнопка «x» лежит в той же
+    // строке, и если сначала обработать строку, то клик по «x» ещё и
+    // раскрыл бы группу, которую только что удалили.
+    let mut deleted = None;
+    for i in 0..cfg.groups.len().min(group_manager::MAX_ROWS) {
+        if take_manager_click(state, group_manager::DELETE_BASE + i as WidgetId) {
+            deleted = Some(i);
+            break;
+        }
+    }
+    if let Some(i) = deleted {
+        cfg.groups.remove(i);
+        // Что открытая группа исчезла, координатор заметит сам
+        // (`forget_missing_group` в цикле): тащить сюда состояние групп ради
+        // одной проверки значило бы протянуть его через весь обработчик
+        // нажатий, который о группах больше ничего не знает.
+        // Раскрытие держится за ИНДЕКС, а список сдвинулся: раскрытая
+        // группа ниже удалённой уехала бы на соседнюю.
+        state.expanded = match state.expanded {
+            Some(e) if e == i => None,
+            Some(e) if e > i => Some(e - 1),
+            other => other,
+        };
+        save_groups(cfg, config_path, "удаление группы");
+        rebuild_group_manager(edit, cfg, monitor_geometry);
+        return true;
+    }
+
+    if take_manager_click(state, group_manager::BTN_NEW) {
+        edit.pending_open_group_editor = Some(None);
+        edit.group_manager = None;
+        return true;
+    }
+    if take_manager_click(state, group_manager::BTN_EDIT) {
+        edit.pending_open_group_editor = Some(state.expanded);
+        edit.group_manager = None;
+        return true;
+    }
+    let mut toggled = None;
+    for i in 0..cfg.groups.len().min(group_manager::MAX_ROWS) {
+        if take_manager_click(state, group_manager::ROW_BASE + i as WidgetId) {
+            toggled = Some(i);
+            break;
+        }
+    }
+    if let Some(i) = toggled {
+        // Повторный клик по раскрытой строке сворачивает её: раскрытие —
+        // переключатель, а не одностороннее действие.
+        state.expanded = if state.expanded == Some(i) {
+            None
+        } else {
+            Some(i)
+        };
+        rebuild_group_manager(edit, cfg, monitor_geometry);
+        return true;
+    }
+    true
+}
+
+/// Нажатие кнопки панели менеджера.
+fn take_manager_click(state: &mut GroupManagerState, id: WidgetId) -> bool {
+    state
+        .panel
+        .widget_mut::<Button>(id)
+        .is_some_and(Button::take_click)
+}
+
+/// Сохранить конфиг после изменения списка групп, залогировав отказ.
+fn save_groups(cfg: &Config, config_path: &Path, what: &str) {
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, what, "не удалось сохранить config.json");
+    }
+}
+
+/// Открыть меню редактирования групп на мониторе, где нажали хоткей.
+///
+/// Кликопрозрачность снимается тем же путём, что у панели зазора, и по той же
+/// причине: интерактивная панель поверх экрана НЕ требует режима
+/// редактирования стикеров. Включать ради неё `edit.active` нельзя — это
+/// затемнит экран, покажет скрытые стикеры, отключит маски окклюзии и снимет
+/// замки закреплённых окон (разбор:
+/// docs/research/groups/R_OVERLAY_INTERACTION.md, §4.1).
+#[allow(clippy::too_many_arguments)]
+fn open_group_editor(
+    groups: &mut GroupsState,
+    edit: &mut EditState,
+    cfg: &Config,
+    monitors_map: &HashMap<MonitorId, MonitorState>,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    windows: Vec<WindowInfo>,
+    thumbs: &mut rst_win32::thumb_cache::ThumbCache,
+    monitor_id: &MonitorId,
+) {
+    // Монитор берём тот, где курсор, а не тот, чьё окно поймало хоткей:
+    // глобальные хоткеи зарегистрированы на ОДНОМ окне (основного монитора),
+    // и без этого меню всегда открывалось бы на главном экране, где бы
+    // пользователь ни работал.
+    let monitor_id = if monitor_geometry.contains_key(&edit.cursor_monitor) {
+        edit.cursor_monitor.clone()
+    } else {
+        monitor_id.clone()
+    };
+    groups.open_editor(monitor_id.clone(), cfg.settings.snap_shrink_pct);
+    let now_ms = editor_clock_ms();
+    // Номер новой группы — первый свободный; все девять заняты, значит
+    // собирать нечего, и цифра 0 честнее случайной.
+    let number = u32::from(WindowGroup::next_number(&cfg.groups).unwrap_or(0));
+    edit.group_editor =
+        build_group_editor(groups, windows, monitor_geometry, thumbs, now_ms, 0, number);
+    if edit.group_editor.is_none() {
+        // Монитор пропал между нажатием и построением панелей — набор без
+        // ленты бессмыслен.
+        groups.close_editor();
+        return;
+    }
+    if !edit.active
+        && let Some(ms) = monitors_map.get(&monitor_id)
+    {
+        ms.overlay.set_click_through(false);
+    }
+}
+
+/// Закрыть меню редактирования групп, вернув оверлею кликопрозрачность.
+fn close_group_editor(
+    groups: &mut GroupsState,
+    edit: &mut EditState,
+    monitors_map: &HashMap<MonitorId, MonitorState>,
+) {
+    groups.close_editor();
+    let Some(panels) = edit.group_editor.take() else {
+        return;
+    };
+    if edit.active {
+        return;
+    }
+    if let Some(ms) = monitors_map.get(&panels.monitor_id) {
+        ms.overlay.set_click_through(true);
+        ms.overlay.force_release_capture();
+    }
+}
+
+/// Подтвердить набор: создать (или обновить) группу и разложить её окна.
+#[allow(clippy::too_many_arguments)]
+fn confirm_group_editor(
+    groups: &mut GroupsState,
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    monitors_map: &HashMap<MonitorId, MonitorState>,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    window_pins: &WindowPins,
+) {
+    // Раскладку считаем ДО подтверждения: `confirm` забирает состояние
+    // набора себе и закрывает меню, а слоты живут именно в нём.
+    let targets = groups
+        .editor()
+        .zip(work_area_of(
+            &groups.editor().map(|e| e.monitor.clone()),
+            monitor_bounds,
+        ))
+        .and_then(|(editor, work)| editor.layout_targets(work));
+
+    // Окна берём У САМОГО МЕНЮ, а не из снимка трекера: трекер работает
+    // только ради масок стикеров и без них молчит, оставляя снимок пустым.
+    // Именно поэтому подтверждение молча не срабатывало (репорт
+    // 2026-08-25: «выбрал окна, выбрал тайлинг и всё равно не работает
+    // кнопка конферма») — состав собирался из пустого списка.
+    let windows: Vec<WindowInfo> = edit
+        .group_editor
+        .as_ref()
+        .map(|p| p.windows.clone())
+        .unwrap_or_default();
+    // Окна в порядке слотов — ДО подтверждения: `confirm` забирает состояние
+    // набора себе, а именно этот порядок и стал порядком членов группы.
+    // Держим его, чтобы потом не опознавать окна заново по приметам.
+    let picked_hwnds: Vec<usize> = groups
+        .editor()
+        .map(|e| e.slot_assignment())
+        .unwrap_or_default();
+    let picked_windows: Vec<WindowInfo> = picked_hwnds
+        .iter()
+        .filter_map(|h| windows.iter().find(|w| w.hwnd == *h).cloned())
+        .collect();
+    let Some(mut group) = groups.confirm(&windows, &cfg.groups) else {
+        // Меню остаётся открытым — пользователь видит, что ничего не
+        // произошло, и не теряет набор. Но молчать нельзя: без строки в
+        // журнале причина отказа неотличима от «кнопка сломана».
+        tracing::info!(
+            picked = groups.editor().map(|e| e.picked().len()).unwrap_or(0),
+            windows = windows.len(),
+            groups = cfg.groups.len(),
+            "группа не создана: нужно минимум два живых окна и свободный номер"
+        );
+        return;
+    };
+
+    if let Some(targets) = targets {
+        let oversized = apply_group_layout(&targets, window_pins);
+        report_oversized_windows(&oversized, &windows, &edit.coordinator_tx);
+        // Места записываем ТЕ, ЧТО ОКНА РЕАЛЬНО ЗАНЯЛИ, а не те, что мы
+        // просили: чужое окно могло не подчиниться (права выше наших,
+        // собственный минимальный размер), и сохранить желаемое значило бы
+        // при следующем открытии группы снова гнать окно туда, куда оно не
+        // встаёт.
+        remember_actual_places(&mut group, &targets, monitor_bounds);
+    }
+
+    let (number, id) = (group.number, group.id);
+    if let Some(slot) = cfg.groups.iter_mut().find(|g| g.id == group.id) {
+        *slot = group;
+    } else {
+        cfg.groups.push(group);
+    }
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, "не удалось сохранить группу");
+    }
+
+    // Созданная группа сразу становится открытой и всплывает на экран
+    // (запрос пользователя 2026-08-26: «когда объединяю окна в группу, пусть
+    // сразу вылетают, а то приходится открывать её отдельно»). Пользователь
+    // только что назвал эти окна вместе — заставлять его после этого жать
+    // ещё и `Ctrl+Shift+<номер>` ради того, чтобы увидеть результат, значит
+    // просить подтвердить дважды.
+    //
+    // Через тот же `open_group`, что и хоткей, а не «поднять и забыть»: это
+    // ещё и делает группу активной, а значит удаление по
+    // `Ctrl+Alt+Shift+G` целится в неё, и новые места окон начинают
+    // запоминаться сразу.
+    if let Some(saved) = cfg.groups.iter().find(|g| g.id == id) {
+        // Опознаём среди ТЕХ ЖЕ окон, из которых группа только что собрана,
+        // и в том же порядке. Раньше сюда шёл общий снимок, и опознание по
+        // exe с похожестью заголовка иногда не находило одно из окон —
+        // группа из четырёх всплывала тремя (репорт 2026-08-26). Список
+        // членов построен ровно из этих окон, значит и совпасть обязан
+        // целиком.
+        let live: Vec<rst_core::group_match::LiveWindow> = picked_windows
+            .iter()
+            .map(|w| rst_core::group_match::LiveWindow {
+                hwnd: w.hwnd,
+                exe_path: w.exe_path.clone(),
+                title: w.title.clone(),
+                class: w.class.clone(),
+            })
+            .collect();
+        groups.open_group(saved, &live);
+        // Поднимаем ПОСЛЕ раскладки: порядок членов задаёт и порядок
+        // всплытия, поэтому слот 1 оказывается не под остальными.
+        raise_group_windows(groups, window_pins);
+    }
+    tracing::info!(number, "группа сохранена и показана");
+    close_group_editor(groups, edit, monitors_map);
+    let _ = monitor_geometry;
+}
+
+/// Открыть группу по номеру хоткея. `true` — что-то изменилось на экране.
+#[allow(clippy::too_many_arguments)]
+fn open_group_by_number(
+    groups: &mut GroupsState,
+    cfg: &mut Config,
+    config_path: &Path,
+    window_pins: &WindowPins,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    windows: &[WindowInfo],
+    number: u8,
+) -> bool {
+    let Some(index) = cfg.groups.iter().position(|g| g.number == number) else {
+        return false;
+    };
+    let live: Vec<rst_core::group_match::LiveWindow> = windows
+        .iter()
+        .map(|w| rst_core::group_match::LiveWindow {
+            hwnd: w.hwnd,
+            exe_path: w.exe_path.clone(),
+            title: w.title.clone(),
+            class: w.class.clone(),
+        })
+        .collect();
+    let placements = groups.open_group(&cfg.groups[index], &live);
+
+    // Ставим окна на их сохранённые места и поднимаем над остальными. Чужие
+    // окна при этом не трогаются вовсе: пользователь выбрал «группа просто
+    // всплывает сверху», а не «всё остальное прячется».
+    let mut targets = Vec::new();
+    for p in &placements {
+        let Some(bounds) = monitor_bounds.get(&p.place.monitor_id) else {
+            continue;
+        };
+        targets.push((p.hwnd, place_to_px(&p.place, bounds)));
+    }
+    let _ = apply_group_layout(&targets, window_pins);
+    raise_group_windows(groups, window_pins);
+
+    // Места могли не примениться в точности — запоминаем фактические, чтобы
+    // следующий снимок не считал группу «поехавшей» и не переписывал конфиг.
+    let mut group = cfg.groups[index].clone();
+    if remember_actual_places(&mut group, &targets, monitor_bounds) {
+        cfg.groups[index] = group;
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить места окон группы");
+        }
+    }
+    tracing::info!(number, windows = targets.len(), "группа открыта");
+    !placements.is_empty()
+}
+
+/// Уступить системному всплывающему меню Windows: снять «поверх всех» с
+/// закреплённых окон, пока меню показано, и вернуть, когда оно исчезнет.
+///
+/// Живой репорт 2026-08-26 со скриншотом: меню снап-раскладок (то, что
+/// Windows 11 показывает при наведении на кнопку разворачивания) оказывалось
+/// ПОД закреплённым окном. Системный интерфейс обязан быть выше
+/// пользовательских topmost-окон — иначе им нельзя пользоваться.
+///
+/// Только окна с полным «поверх всех»: у окон с правилами соседства topmost
+/// и так снимается по своим правилам, и вмешиваться в них отсюда значило бы
+/// драться двум механизмам за одно окно.
+///
+/// Возвращает `true`, если состояние изменилось.
+fn yield_pinned_to_shell(edit: &mut EditState, window_pins: &WindowPins) -> bool {
+    let showing = rst_win32::window_enum::is_shell_transient_visible();
+    if showing == edit.pinned_yielded_to_shell {
+        return false;
+    }
+    edit.pinned_yielded_to_shell = showing;
+    for pinned in &edit.pinned_windows {
+        if pinned.hosts.is_restricted() {
+            continue;
+        }
+        let hwnd = HWND(pinned.hwnd as *mut core::ffi::c_void);
+        if showing {
+            window_pins.drop_topmost(hwnd);
+        } else {
+            window_pins.reassert_topmost_if_needed(hwnd);
+        }
+    }
+    true
+}
+
+/// Поднять окна открытой группы наверх.
+///
+/// БЕЗ `HWND_TOPMOST`: этот флаг выставляет стиль `WS_EX_TOPMOST`, который
+/// остаётся на чужом окне навсегда. Живой репорт 2026-08-26: после открытия
+/// группы аудиоплеер и проводник висели поверх всех окон, хотя пользователь
+/// им этого не назначал, — снимать стиль было некому.
+///
+/// Закреплённые пользователем окна пропускаются: у них topmost стоит по его
+/// прямому выбору, и опускать их в обычную стопку значило бы отменять
+/// закрепление.
+fn raise_group_windows(groups: &GroupsState, window_pins: &WindowPins) {
+    for hwnd in groups.open().map(|g| g.windows()).unwrap_or_default() {
+        if window_pins.is_pinned(hwnd) {
+            continue;
+        }
+        window_pins.raise_without_topmost(HWND(hwnd as *mut core::ffi::c_void));
+    }
+}
+
+/// Допуск раскладки, физические пиксели: меньшее расхождение — округление,
+/// а не отказ окна ужаться.
+const LAYOUT_TOLERANCE_PX: i32 = 4;
+
+/// Поставить окна на заданные прямоугольники (физические пиксели).
+///
+/// Возвращает окна, которые НЕ влезли в свой слот, вместе с превышением по
+/// ширине и высоте.
+///
+/// Зачем возвращать: у приложения бывает собственный минимальный размер
+/// (`WM_GETMINMAXINFO`), меньше которого оно просто не становится. Измерено
+/// 2026-08-26: Spotify не ниже 600 px, OBS не уже 1018, Discord не уже 816.
+/// Если слот меньше, окно молча остаётся крупнее и НАЛЕЗАЕТ НА СОСЕДА — на
+/// схеме раскладки слоты соприкасаются, а на экране окна перекрываются
+/// (живой репорт со скриншотом). Сделать с этим ничего нельзя: чужой
+/// минимальный размер не наш. Но притворяться, что раскладка применилась,
+/// программа не должна — иначе пользователь ищет ошибку у себя.
+fn apply_group_layout(
+    targets: &[(usize, Rect)],
+    window_pins: &WindowPins,
+) -> Vec<(usize, i32, i32)> {
+    let mut oversized = Vec::new();
+    for (hwnd, rect) in targets {
+        if rst_win32::window_pin::is_user_dragging(*hwnd) {
+            // Спорить с рукой пользователя нельзя — тот же принцип, что в
+            // `enforce_pinned_geometry`.
+            continue;
+        }
+        let win = HWND(*hwnd as *mut core::ffi::c_void);
+        let target = RECT {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.w as i32,
+            bottom: rect.y + rect.h as i32,
+        };
+        window_pins.set_dwm_bounds(win, target);
+        if let Some(d) = window_pins.check_layout_discrepancy(win, target, LAYOUT_TOLERANCE_PX)
+            && d.exceeds_tolerance
+            && (d.dw > LAYOUT_TOLERANCE_PX || d.dh > LAYOUT_TOLERANCE_PX)
+        {
+            oversized.push((*hwnd, d.dw.max(0), d.dh.max(0)));
+        }
+    }
+    oversized
+}
+
+/// Сообщить, что окна не влезли в свои слоты.
+///
+/// В журнал — числами по каждому окну, чтобы причину можно было разобрать
+/// потом; пользователю — одним уведомлением с именем приложения, потому что
+/// увидеть он должен ровно одно: перекрытие не наша ошибка, а предел этой
+/// программы, и лечится выбором раскладки с более крупными слотами.
+fn report_oversized_windows(
+    oversized: &[(usize, i32, i32)],
+    windows: &[WindowInfo],
+    coordinator_tx: &Sender<CoordinatorRequest>,
+) {
+    let Some((hwnd, dw, dh)) = oversized.first().copied() else {
+        return;
+    };
+    for (h, dw, dh) in oversized {
+        let title = windows
+            .iter()
+            .find(|w| w.hwnd == *h)
+            .map(|w| w.title.as_str())
+            .unwrap_or("<окно>");
+        tracing::info!(title, dw, dh, "окно не ужалось до своего слота");
+    }
+    let title = windows
+        .iter()
+        .find(|w| w.hwnd == hwnd)
+        .map(|w| w.title.clone())
+        .unwrap_or_else(|| "Окно".to_string());
+    let body = if dw >= dh {
+        format!("{title}: окно не становится уже своего предела, слот меньше на {dw} px")
+    } else {
+        format!("{title}: окно не становится ниже своего предела, слот меньше на {dh} px")
+    };
+    let _ = coordinator_tx.send(CoordinatorRequest::ShowNotification {
+        title: "Раскладка применена не полностью".to_string(),
+        body,
+    });
+}
+
+/// Записать в группу фактическую геометрию окон. `true` — что-то изменилось.
+fn remember_actual_places(
+    group: &mut WindowGroup,
+    targets: &[(usize, Rect)],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> bool {
+    let mut changed = false;
+    for ((hwnd, _), member) in targets.iter().zip(group.members.iter_mut()) {
+        let Some(live) = rst_win32::window_enum::live_rect(*hwnd) else {
+            continue;
+        };
+        let Some((id, bounds)) = monitor_of_rect(&live, monitor_bounds) else {
+            continue;
+        };
+        let place = GroupPlace {
+            monitor_id: id,
+            x: f64::from(live.x - bounds.bounds_px.x) / bounds.scale,
+            y: f64::from(live.y - bounds.bounds_px.y) / bounds.scale,
+            w: f64::from(live.w) / bounds.scale,
+            h: f64::from(live.h) / bounds.scale,
+        };
+        if member.place.as_ref() != Some(&place) {
+            member.place = Some(place);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Где сейчас стоят окна, в DIP их мониторов — вход для
+/// [`GroupsState::note_places`].
+///
+/// Свёрнутые окна пропускаются: их прямоугольник мусорный, и записать его в
+/// группу значило бы при следующем открытии поставить окно неизвестно куда.
+fn live_group_places(
+    windows: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> HashMap<usize, GroupPlace> {
+    windows
+        .iter()
+        .filter(|w| !w.iconic)
+        .filter_map(|w| {
+            let (id, bounds) = monitor_of_rect(&w.rect, monitor_bounds)?;
+            Some((
+                w.hwnd,
+                GroupPlace {
+                    monitor_id: id,
+                    x: f64::from(w.rect.x - bounds.bounds_px.x) / bounds.scale,
+                    y: f64::from(w.rect.y - bounds.bounds_px.y) / bounds.scale,
+                    w: f64::from(w.rect.w) / bounds.scale,
+                    h: f64::from(w.rect.h) / bounds.scale,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Монитор, которому принадлежит прямоугольник окна (по его центру).
+fn monitor_of_rect<'a>(
+    rect: &WindowRect,
+    monitor_bounds: &'a HashMap<MonitorId, MonitorBounds>,
+) -> Option<(MonitorId, &'a MonitorBounds)> {
+    let cx = rect.x + rect.w / 2;
+    let cy = rect.y + rect.h / 2;
+    monitor_bounds
+        .iter()
+        .find(|(_, b)| {
+            cx >= b.bounds_px.x
+                && cy >= b.bounds_px.y
+                && cx < b.bounds_px.x + b.bounds_px.w as i32
+                && cy < b.bounds_px.y + b.bounds_px.h as i32
+        })
+        .map(|(id, b)| (id.clone(), b))
+}
+
+/// Место группы (DIP своего монитора) в физические пиксели десктопа.
+fn place_to_px(place: &GroupPlace, bounds: &MonitorBounds) -> Rect {
+    Rect {
+        x: bounds.bounds_px.x + (place.x * bounds.scale).round() as i32,
+        y: bounds.bounds_px.y + (place.y * bounds.scale).round() as i32,
+        w: (place.w * bounds.scale).round().max(0.0) as u32,
+        h: (place.h * bounds.scale).round().max(0.0) as u32,
+    }
+}
+
+/// Открытое меню редактирования групп: три панели одного монитора.
+///
+/// Панели держатся собранными между кадрами, а не строятся заново на каждую
+/// перерисовку: у ленты окон есть прокрутка, у поля зазора — каретка и
+/// набранный текст, и пересборка стирала бы их на каждом движении мыши.
+/// Пересобираются они только когда меняется то, что они показывают
+/// (`rebuild_group_editor`).
+struct GroupEditorPanels {
+    /// Монитор, на котором открыто меню и чей оверлей сделан интерактивным.
+    monitor_id: MonitorId,
+    /// Цифра монитора в левом верхнем углу — как «Определить» в параметрах
+    /// экрана Windows.
+    badge: Panel,
+    /// Лента открытых окон снизу.
+    strip: group_strip::StripPanel,
+    /// Лента раскладок сверху вместе с полем зазора.
+    presets: preset_strip::StripBuild,
+    /// Прокрутка ленты окон.
+    scroll: usize,
+    /// Окна карточек в порядке ленты: id карточки кодирует индекс в этом
+    /// списке, и без него клик не разобрать обратно в `HWND`.
+    card_hwnds: Vec<usize>,
+    /// Номер собираемой группы — та самая цифра в левом верхнем углу.
+    ///
+    /// Считается один раз при открытии и держится: для новой группы это
+    /// первый свободный номер, для правки существующей — её собственный.
+    /// Пересчитывать его на каждую пересборку нельзя — он бы прыгал.
+    group_number: u32,
+    /// Снимок окон, с которым меню открылось.
+    ///
+    /// Свой, а не общий `window_snapshot` координатора, по двум причинам.
+    /// Во-первых, тот наполняется трекером окон, а трекер работает ТОЛЬКО
+    /// когда нужен маскам стикеров (`set_mask_needed`): без правил
+    /// видимости хуки сняты, кэш пуст, и лента окон оказывалась пустой —
+    /// ровно это и увидел пользователь 2026-08-25. Во-вторых, список обязан
+    /// не меняться под рукой: id карточки кодирует индекс в нём, и окно,
+    /// открывшееся посреди набора, сдвинуло бы все отметки.
+    windows: Vec<WindowInfo>,
+    /// Идёт перетаскивание карточки в слот раскладки.
+    drag: Option<CardDrag>,
+    /// Последняя позиция курсора в DIP — `WM_MOUSEWHEEL` её не несёт.
+    last_pos: (f64, f64),
+}
+
+/// Собрать панели меню редактирования групп из текущего состояния набора.
+///
+/// Карточки берутся из снимка окон: показываем ровно то, что показал бы
+/// список закрепления, — окна, которые Windows считает настоящими
+/// (`window_enum::enumerate` уже отфильтровал невидимые, дочерние и
+/// служебные). Свои собственные окна выкидываем: собрать группу из оверлея
+/// нельзя, а карточка с ним только путала бы.
+#[allow(clippy::too_many_arguments)]
+fn build_group_editor(
+    groups: &GroupsState,
+    windows: Vec<WindowInfo>,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    thumbs: &mut rst_win32::thumb_cache::ThumbCache,
+    now_ms: u64,
+    scroll: usize,
+    group_number: u32,
+) -> Option<GroupEditorPanels> {
+    let editor = groups.editor()?;
+    let monitor_id = editor.monitor.clone();
+    let &(w, h, scale) = monitor_geometry.get(&monitor_id)?;
+    let screen = screen_dip_rect((w, h), scale);
+    let own_pid = std::process::id();
+
+    // Свёрнутые окна ПОКАЗЫВАЕМ (репорт 2026-08-26: «меню не видит всех
+    // окон»). Свёрнутое окно — такой же кандидат в группу, как любое
+    // другое: открытие группы его всё равно развернёт. Отбрасывать его
+    // значило бы требовать сначала развернуть все окна вручную, а потом
+    // собирать группу.
+    let cards: Vec<group_strip::StripCard> = windows
+        .iter()
+        .filter(|info| info.pid != own_pid)
+        .map(|info| group_strip::StripCard {
+            hwnd: info.hwnd,
+            title: info.title.clone(),
+            icon: info.icon.as_ref().map(|icon| group_strip::StripImage {
+                // Ключ текстуры — путь к exe: иконка у окон одного
+                // приложения общая, и грузить её в GPU по разу на окно
+                // незачем.
+                key: exe_texture_key(&info.exe_path),
+                width: icon.width,
+                height: icon.height,
+                rgba: icon.rgba.clone(),
+            }),
+            thumb: thumbs
+                .get(info.hwnd, GROUP_THUMB_MAX_SIDE, now_ms)
+                .map(|t| group_strip::StripImage {
+                    key: info.hwnd as u64,
+                    width: t.width,
+                    height: t.height,
+                    rgba: t.rgba.clone(),
+                }),
+            slot: editor.slot_of(info.hwnd),
+        })
+        .collect();
+
+    let screen_box = Box2D {
+        cx: screen.x + screen.w / 2.0,
+        cy: screen.y + screen.h / 2.0,
+        w: screen.w,
+        h: screen.h,
+        rotation: 0.0,
+    };
+    let card_hwnds: Vec<usize> = cards.iter().map(|c| c.hwnd).collect();
+    Some(GroupEditorPanels {
+        card_hwnds,
+        group_number,
+        windows,
+        drag: None,
+        // Цифра — номер СОБИРАЕМОЙ ГРУППЫ, а не монитора (уточнение
+        // пользователя 2026-08-25). Смысл заимствован у «Определить» в
+        // параметрах экрана Windows — крупная цифра в углу, — но отвечает
+        // она на другой вопрос: какую группу ты сейчас делаешь.
+        badge: monitor_badge::build(&screen, group_number),
+        strip: group_strip::build(&cards, scroll, screen_box),
+        presets: preset_strip::build(
+            editor.picked().len(),
+            editor.preset(),
+            &screen,
+            u32::from(editor.gap_pct),
+        ),
+        monitor_id,
+        scroll,
+        last_pos: (screen.x + screen.w / 2.0, screen.y + screen.h / 2.0),
+    })
+}
+
+/// Монотонные миллисекунды для кэша снимков окон.
+///
+/// Кэшу нужна только РАЗНОСТЬ времён (свежесть записи), поэтому точка отсчёта
+/// произвольна — берём момент первого обращения. Системные часы не годятся:
+/// перевод времени назад сделал бы все записи вечно свежими.
+fn editor_clock_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Рабочая область монитора в физических пикселях — там, где раскладка
+/// расставляет окна.
+///
+/// Рабочая, а не полные границы: раскладка не должна залезать под панель
+/// задач. Спрашиваем Windows по самому монитору, как и зазор снап-зон.
+fn work_area_of(
+    monitor_id: &Option<MonitorId>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> Option<Rect> {
+    let id = monitor_id.as_ref()?;
+    let bounds = monitor_bounds.get(id)?;
+    // Точка внутри монитора — по ней Windows найдёт его рабочую область тем
+    // же правилом, каким сама раскладывает окна.
+    rst_win32::monitors::work_area_at(
+        bounds.bounds_px.x + bounds.bounds_px.w as i32 / 2,
+        bounds.bounds_px.y + bounds.bounds_px.h as i32 / 2,
+    )
+}
+
+/// Перетаскивание карточки окна в слот раскладки.
+///
+/// Готового механизма drag-and-drop между виджетами в движке нет (виджеты
+/// знают только про свои собственные жесты — `Slider`, `ScrollBar`), поэтому
+/// жест собирается вручную из `Down`/`Move`/`Up`, ровно как перетаскивание
+/// стикеров в режиме редактирования.
+///
+/// Отличать перетаскивание от клика приходится по пройденному расстоянию:
+/// одиночный клик по карточке отмечает окно, и если считать перетаскиванием
+/// любое нажатие, обычная отметка перестала бы работать — палец всегда
+/// смещает мышь на пиксель-другой.
+#[derive(Debug, Clone)]
+struct CardDrag {
+    /// Окно, которое тащат.
+    hwnd: usize,
+    /// Где нажали, DIP: от этой точки считается порог.
+    start: (f64, f64),
+    /// Курсор сейчас, DIP — по нему рисуется призрак карточки.
+    now: (f64, f64),
+    /// Порог уже пройден: жест перестал быть кликом.
+    dragging: bool,
+}
+
+/// Насколько надо увести курсор, чтобы нажатие считалось перетаскиванием, DIP.
+///
+/// Меньше — и обычный клик по карточке иногда не отмечал бы окно (мышь
+/// дрожит под пальцем). Больше — и короткий бросок в соседний слот
+/// воспринимался бы как клик.
+const CARD_DRAG_THRESHOLD_DIP: f64 = 6.0;
+
+/// Наибольшая сторона снимка окна в карточке ленты.
+const GROUP_THUMB_MAX_SIDE: u32 = 128;
+
+/// Сколько снимков окон держим в кэше ленты: карточек на экране десятки,
+/// снимок 128x128 RGBA — около 64 КБ, запас памяти здесь ни к чему.
+const GROUP_THUMB_CACHE_ENTRIES: usize = 48;
+
+/// Сколько снимок считается свежим. Содержимое окна меняется постоянно;
+/// трёх секунд хватает, чтобы клики по ленте не били по `PrintWindow`, и
+/// мало, чтобы показать заведомо устаревшую картинку.
+const GROUP_THUMB_TTL_MS: u64 = 3_000;
+
+/// Ключ GPU-текстуры для иконки процесса: хэш пути к exe.
+///
+/// Окна одного приложения делят иконку, и общий ключ избавляет от повторной
+/// загрузки одного и того же растра по разу на окно.
+fn exe_texture_key(exe_path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    exe_path.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Открыть панель величины зазора на мониторе, где сейчас курсор.
+///
+/// Кликопрозрачность снимается через `set_click_through(false)`, а не
+/// `set_interactive(true)`: панель принимает не только мышь, но и цифры с
+/// клавиатуры, а для клавиатуры окну нужен фокус — его даёт только первый
+/// вызов (`SetForegroundWindow` внутри). Разбор различия:
+/// docs/research/groups/R_OVERLAY_INTERACTION.md, §1.3.
+fn open_gap_panel(
+    edit: &mut EditState,
+    cfg: &Config,
+    monitors_map: &HashMap<MonitorId, MonitorState>,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) {
+    let monitor_id = edit.cursor_monitor.clone();
+    let Some(&(w, h, scale)) = monitor_geometry.get(&monitor_id) else {
+        return;
+    };
+    let Some(ms) = monitors_map.get(&monitor_id) else {
+        return;
+    };
+    let screen = screen_dip_rect((w, h), scale);
+    let frame = Box2D {
+        cx: screen.w / 2.0,
+        cy: screen.h / 2.0,
+        w: gap_panel::WIDTH,
+        h: gap_panel::height(),
+        rotation: 0.0,
+    };
+    let pct = cfg.settings.snap_shrink_pct;
+    edit.gap_panel = Some(GapPanelState {
+        panel: gap_panel::build(pct, frame),
+        monitor_id,
+        applied_pct: pct,
+        last_pos: (frame.cx, frame.cy),
+    });
+    if !edit.active {
+        ms.overlay.set_click_through(false);
+    }
+}
+
+/// Закрыть панель величины зазора и вернуть оверлею кликопрозрачность.
+///
+/// Прозрачность возвращается только вне режима редактирования: в режиме её
+/// снял сам режим, и наше вмешательство погасило бы редактирование.
+fn close_gap_panel(edit: &mut EditState, monitors_map: &HashMap<MonitorId, MonitorState>) {
+    let Some(state) = edit.gap_panel.take() else {
+        return;
+    };
+    if edit.active {
+        return;
+    }
+    if let Some(ms) = monitors_map.get(&state.monitor_id) {
+        ms.overlay.set_click_through(true);
+        // Захват мыши мог остаться, если панель закрыли посреди жеста, —
+        // окно, которое ловит мышь, уже кликопрозрачно, и отпустить захват
+        // ему будет нечем.
+        ms.overlay.force_release_capture();
+    }
+}
+
+/// Применить величину зазора, набранную в панели.
+///
+/// Возвращает `true`, если значение изменилось: тогда координатор сохраняет
+/// конфиг, пересобирает меню трея (величина видна в заголовке подменю) и
+/// сразу двигает окна — ждать события трекера незачем, пользователь смотрит
+/// на экран прямо сейчас.
+fn take_gap_panel_value(edit: &mut EditState) -> Option<u8> {
+    let state = edit.gap_panel.as_mut()?;
+    let value = state
+        .panel
+        .widget::<NumericField>(gap_panel::FIELD_GAP)
+        .map(|f| f.value())? as u8;
+    if value == state.applied_pct {
+        return None;
+    }
+    state.applied_pct = value;
+    Some(value)
+}
+
 /// Открыть панель быстрого переключения пресетов (M7, клик по
 /// `cursor_panel::BTN_PRESETS` в `handle_cursor_panel_up` — только когда
 /// `cfg.presets` непусто, вызывающий код это уже проверил). Центрирована на
@@ -7981,7 +9981,7 @@ fn handle_preset_picker_up(
             tracing::warn!(preset = %id, error = %e, "не удалось удалить пресет из панели");
         }
         save_after_preset_change(cfg, config_path, "удаления пресета из панели");
-        notify_presets_changed(cfg, &edit.coordinator_tx);
+        notify_tray_menu_changed(cfg, &edit.coordinator_tx);
         rebuild_preset_picker(edit, cfg, monitor_geometry);
         return true;
     }
@@ -8002,7 +10002,7 @@ fn handle_preset_picker_up(
         let preset = presets::save_preset(cfg, name);
         cfg.presets.push(preset);
         save_after_preset_change(cfg, config_path, "сохранения пресета из панели");
-        notify_presets_changed(cfg, &edit.coordinator_tx);
+        notify_tray_menu_changed(cfg, &edit.coordinator_tx);
         if let Some(state) = &mut edit.preset_picker {
             state.name_draft.clear();
         }
@@ -8018,7 +10018,7 @@ fn handle_preset_picker_up(
                 Ok(preset) => {
                     tracing::info!(preset = %preset.id, "пресет импортирован из панели");
                     save_after_preset_change(cfg, config_path, "импорта пресета из панели");
-                    notify_presets_changed(cfg, &edit.coordinator_tx);
+                    notify_tray_menu_changed(cfg, &edit.coordinator_tx);
                 }
                 Err(e) => {
                     tracing::warn!(?path, error = %e, "не удалось импортировать пресет из панели");
@@ -8307,6 +10307,9 @@ fn maintain_pinned_windows(
     // Идёт Alt+Tab/Win+Tab/меню Пуск — на время переключения чужие окна не
     // трогаем вовсе (см. `rst_win32::window_enum::shell_switching`).
     let shell_switching = rst_win32::window_enum::shell_switching();
+    // Пока мы уступили системному меню, дожим topmost выключен — см.
+    // `yield_pinned_to_shell`.
+    let edit_yielded = edit.pinned_yielded_to_shell;
     // Монитор переднего окна: переключение на соседнем экране не должно
     // гасить закреплённое окно на этом (запрос пользователя 2026-08-22).
     let foreground_monitor = foreground.and_then(rst_win32::window_enum::monitor_of);
@@ -8381,10 +10384,15 @@ fn maintain_pinned_windows(
                     }
                 }
             }
-        } else {
+        } else if !edit_yielded {
             // Topmost-backstop (порт PowerToys «Always On Top», задача 1):
             // full-topmost пины — одноразовая реактивная коррекция снятого
             // WS_EX_TOPMOST (см. доккомент функции, пункт 4).
+            //
+            // Пока показано системное всплывающее меню, дожим ВЫКЛЮЧЕН: мы
+            // сами только что сняли topmost, чтобы уступить меню, и
+            // немедленно вернуть его значило бы драться с собственной
+            // уступкой (`yield_pinned_to_shell`).
             window_pins.reassert_topmost_if_needed(win_hwnd);
         }
         if pinned.lock_move {
@@ -8997,11 +11005,6 @@ fn handle_toolbar_up(
         }
         return true;
     }
-    if clicked(edit, toolbar::TB_TILE) {
-        // Решение принимает `run()`: там живёт состояние тайлинга.
-        edit.pending_tile_sticker = Some(id);
-        return true;
-    }
     if clicked(edit, toolbar::TB_EYE) {
         commit_undo_snapshot(edit, cfg.clone());
         let _ = ops::toggle_visibility(cfg, id);
@@ -9215,6 +11218,11 @@ fn handle_cursor_panel_up(
         edit.pending_open_pick_list = Some(monitor_id.clone());
         return true;
     }
+    if clicked(edit, cursor_panel::BTN_GROUPS) {
+        // Решение принимает `run()`: там виден `cfg.groups`.
+        edit.pending_open_group_manager = true;
+        return true;
+    }
     if clicked(edit, cursor_panel::BTN_PRESETS) {
         // Панель открывается ВСЕГДА, в том числе с пустым списком (репорт
         // пользователя 2026-08-23: «кнопка пресет ничего не делает»): в ней
@@ -9384,6 +11392,15 @@ fn handle_input(
                         pos: (dip_x, dip_y),
                     });
                 }
+                return true;
+            }
+            // Менеджер групп — модальный список действий, как панель
+            // пресетов ниже. Нажатие обязано доехать до панели: кнопка
+            // взводится именно на `Down`, и без него `take_click` на `Up`
+            // не сработает никогда — панель выглядит нарисованной картинкой
+            // (живой репорт 2026-08-25).
+            if edit.group_manager.is_some() {
+                group_manager_down(edit, monitor_id, (dip_x, dip_y));
                 return true;
             }
             // Панель быстрого переключения пресетов (M7): в отличие от
@@ -9696,6 +11713,12 @@ fn handle_input(
                         pos: (dip_x, dip_y),
                     });
                 }
+                return true;
+            }
+            // Менеджер групп: подсветка строк под курсором живёт движением
+            // мыши, как у панели пресетов ниже.
+            if edit.group_manager.is_some() {
+                group_manager_move(edit, monitor_id, (dip_x, dip_y));
                 return true;
             }
             // Панель пресетов (M7): та же модальная блокировка сцены, что у
@@ -10015,6 +12038,15 @@ fn handle_input(
                     edit.confirm = Some(confirm);
                 }
                 return true;
+            }
+            if edit.group_manager.is_some() {
+                return handle_group_manager_up(
+                    edit,
+                    cfg,
+                    config_path,
+                    monitor_geometry,
+                    (dip_x, dip_y),
+                );
             }
             if edit.preset_picker.is_some() {
                 return handle_preset_picker_up(
@@ -10995,19 +13027,6 @@ fn redraw(
             );
         }
     }
-    // M9: индикаторы тайлинга. Рисуются последними — поверх всего
-    // остального UI: рамка активной плитки и плашка режима отвечают на
-    // вопрос «что сейчас в фокусе и в каком я режиме», и перекрывать их
-    // нечем.
-    if let Some(overlay) = &edit.tiling_overlay {
-        let mut prims = Vec::new();
-        overlay.draw(monitor_id, &mut prims);
-        if !prims.is_empty() {
-            primitives_to_sprites(
-                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
-            );
-        }
-    }
 
     // Тултип (фидбэк пользователя 2026-08-10) — над тулбаром/панелью у
     // курсора (та кнопка, к которой он относится, уже нарисована выше),
@@ -11062,6 +13081,47 @@ fn redraw(
                 &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
             );
         }
+    }
+
+    // Меню редактирования групп — три панели одного монитора. Рисуется вне
+    // режима редактирования, как и панель зазора: его зовут глобальным
+    // хоткеем из любого места.
+    if let Some(panels) = &edit.group_editor
+        && panels.monitor_id == *monitor_id
+    {
+        let mut prims = Vec::new();
+        panels.badge.draw(&mut prims);
+        panels.presets.panel.draw(&mut prims);
+        panels.strip.panel.draw(&mut prims);
+        // Призрак — последним: он обязан лежать поверх обеих лент.
+        prims.extend(group_drag_overlay(panels));
+        primitives_to_sprites(
+            &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+        );
+    }
+
+    // Панель величины зазора — рисуется и ВНЕ режима редактирования (в
+    // этом её смысл: её зовут из трея), как и полоса перемотки видео выше.
+    if let Some(state) = &edit.gap_panel {
+        if state.monitor_id == *monitor_id {
+            let mut prims = Vec::new();
+            state.panel.draw(&mut prims);
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
+    }
+
+    // Менеджер групп — тот же уровень, что панель пресетов: модальный
+    // список действий, открытый кнопкой панели у курсора.
+    if let Some(state) = &edit.group_manager
+        && state.monitor_id == *monitor_id
+    {
+        let mut prims = Vec::new();
+        state.panel.draw(&mut prims);
+        primitives_to_sprites(
+            &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+        );
     }
 
     // Панель пресетов (M7) — модальна, как и модал подтверждения ниже,
@@ -11473,13 +13533,21 @@ fn placement_to_physical_rect(
     (x, y, w, h)
 }
 
-/// Сообщить main.rs, что `cfg.presets` изменился (для пересборки меню трея
-/// — M7 «быстрое переключение из трея», ROADMAP.md). Вызывается после
-/// успешных `SavePreset`/`RenamePreset`/`DeletePreset`/`ImportPreset` —
-/// `ApplyPreset` сам список не меняет, поэтому его не трогает.
-fn notify_presets_changed(cfg: &Config, coordinator_tx: &Sender<CoordinatorRequest>) {
-    let list = cfg.presets.iter().map(|p| (p.id, p.name.clone())).collect();
-    let _ = coordinator_tx.send(CoordinatorRequest::PresetsChanged(list));
+/// Попросить main.rs пересобрать меню трея из текущего `cfg`
+/// ([`CoordinatorRequest::TrayMenuChanged`]).
+///
+/// Вызывается после успешных `SavePreset`/`RenamePreset`/`DeletePreset`/
+/// `ImportPreset` (`ApplyPreset` сам список не меняет, поэтому его не
+/// трогает) и после смены отступа снап-зоны. Снимок собирается здесь целиком
+/// — вызывающему не приходится помнить, что в меню есть второе изменчивое
+/// поле помимо его собственного.
+fn notify_tray_menu_changed(cfg: &Config, coordinator_tx: &Sender<CoordinatorRequest>) {
+    let presets = cfg.presets.iter().map(|p| (p.id, p.name.clone())).collect();
+    let _ = coordinator_tx.send(CoordinatorRequest::TrayMenuChanged {
+        presets,
+        snap_shrink_pct: cfg.settings.snap_shrink_pct,
+        snap_shrink_all_windows: cfg.settings.snap_shrink_all_windows,
+    });
 }
 
 /// Добавить стикер из файла на диске. `pasted` — источник
@@ -12039,8 +14107,14 @@ mod tests {
             confirm: None,
             window_picker: None,
             preset_picker: None,
+            pinned_yielded_to_shell: false,
+            gap_panel: None,
+            group_editor: None,
+            group_manager: None,
+            pending_open_group_manager: false,
+            pending_confirm_group: false,
+            pending_open_group_editor: None,
             pending_open_picker: None,
-            pending_tile_sticker: None,
             pending_open_pick_list: None,
             window_pick_list: None,
             pinned_windows: Vec::new(),
@@ -12050,6 +14124,8 @@ mod tests {
             surfaced_pins: HashSet::new(),
             pin_flashes: Vec::new(),
             pinned_last_rects: HashMap::new(),
+            snap_gap_zones: HashMap::new(),
+            snap_gap_strikes: HashMap::new(),
             pinned_unmaximized_at: HashMap::new(),
             pinned_follow_until: None,
             banner: None,
@@ -12059,7 +14135,6 @@ mod tests {
             marquee_started: false,
             toolbar: None,
             cursor_panel: None,
-            tiling_overlay: None,
             cursor_panel_hovered: false,
             cursor_panel_slide: PanelSlide::fixed(1.0),
             settings_rect: None,
@@ -12533,6 +14608,1017 @@ mod tests {
     /// «я всё ещё могу расширять окно»). Проверяем реактивный путь
     /// `enforce_pinned_geometry`: окно растянули мимо нас — следующий снимок
     /// трекера возвращает его в лимит.
+    /// Рабочая область условного FullHD с панелью задач снизу.
+    fn snap_work() -> pinned_window::PxRect {
+        pinned_window::PxRect::from_xywh(0.0, 0.0, 1920.0, 1032.0)
+    }
+
+    fn wr(x: i32, y: i32, w: i32, h: i32) -> WindowRect {
+        WindowRect { x, y, w, h }
+    }
+
+    /// Прямоугольник цели как `WindowRect` — чтобы скармливать результат
+    /// обратно на следующий «снимок», как это делает координатор.
+    fn as_window_rect(r: pinned_window::PxRect) -> WindowRect {
+        WindowRect {
+            x: r.left.round() as i32,
+            y: r.top.round() as i32,
+            w: r.w().round() as i32,
+            h: r.h().round() as i32,
+        }
+    }
+
+    // ==== Подтверждение набора (живой репорт 2026-08-25) ====
+
+    #[test]
+    fn confirming_builds_the_group_from_the_menus_own_window_list() {
+        // Корень репорта «кнопка конферма не работает»: состав собирался из
+        // снимка трекера, а трекер живёт только ради масок стикеров и без
+        // них молчит — список был пуст, и подтверждение молча отказывало.
+        // Меню обязано опираться на СВОЙ список окон.
+        let (mut groups, mut edit, windows, geometry) = editor_harness(&[1, 2, 3], Some(0));
+        let mut cfg = Config::default();
+        let path = std::env::temp_dir().join(format!(
+            "resticker_confirm_{}_{}.json",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let monitors: HashMap<MonitorId, MonitorState> = HashMap::new();
+        let bounds: HashMap<MonitorId, MonitorBounds> = HashMap::new();
+        let pins = WindowPins::new();
+        // Снимок координатора НАМЕРЕННО пуст — ровно как у пользователя.
+        assert!(!windows.is_empty(), "у меню свой список окон");
+
+        confirm_group_editor(
+            &mut groups,
+            &mut edit,
+            &mut cfg,
+            &path,
+            &monitors,
+            &geometry,
+            &bounds,
+            &pins,
+        );
+
+        assert_eq!(cfg.groups.len(), 1, "группа обязана создаться");
+        assert_eq!(cfg.groups[0].members.len(), 3);
+        assert_eq!(cfg.groups[0].number, 1);
+        assert!(groups.editor().is_none(), "подтверждение закрывает меню");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_freshly_created_group_becomes_the_open_one_right_away() {
+        // Запрос пользователя 2026-08-26: собранная группа обязана сразу
+        // оказаться на экране, а не ждать отдельного `Ctrl+Shift+<номер>`.
+        // Признак этого — она стала ОТКРЫТОЙ: с неё же начинают
+        // запоминаться позиции и на неё целится удаление.
+        let (mut groups, mut edit, _w, geometry) = editor_harness(&[1, 2, 3], Some(0));
+        let mut cfg = Config::default();
+        let path = std::env::temp_dir().join(format!(
+            "resticker_open_after_confirm_{}_{}.json",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        assert_eq!(groups.active(), None, "до подтверждения открытых групп нет");
+
+        confirm_group_editor(
+            &mut groups,
+            &mut edit,
+            &mut cfg,
+            &path,
+            &HashMap::new(),
+            &geometry,
+            &HashMap::new(),
+            &WindowPins::new(),
+        );
+
+        let created = cfg.groups.first().expect("группа создана");
+        assert_eq!(
+            groups.active(),
+            Some(created.id),
+            "созданная группа обязана сразу стать открытой"
+        );
+        assert_eq!(
+            groups.open().expect("группа открыта").windows().len(),
+            3,
+            "все окна группы обязаны быть опознаны и подняты"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn confirming_one_window_keeps_the_menu_open_and_creates_nothing() {
+        // Отказ обязан быть безвредным: набор не теряется.
+        let (mut groups, mut edit, _w, geometry) = editor_harness(&[1], Some(0));
+        let mut cfg = Config::default();
+        let path = std::env::temp_dir().join("resticker_confirm_one.json");
+        confirm_group_editor(
+            &mut groups,
+            &mut edit,
+            &mut cfg,
+            &path,
+            &HashMap::new(),
+            &geometry,
+            &HashMap::new(),
+            &WindowPins::new(),
+        );
+        assert!(cfg.groups.is_empty());
+        assert!(groups.editor().is_some(), "меню остаётся открытым");
+    }
+
+    #[test]
+    fn the_confirm_button_raises_the_deferred_flag() {
+        // Кнопка-галочка обязана вести к тому же результату, что и хоткей.
+        // Раньше она не была подключена вовсе — клик не делал ничего.
+        let (mut groups, mut edit, _w, _geo) = editor_harness(&[1, 2], Some(0));
+        let panels = edit.group_editor.as_mut().expect("меню");
+        let b = panels
+            .strip
+            .panel
+            .widget::<group_strip::ConfirmButton>(group_strip::BTN_CONFIRM)
+            .map(rst_render::Widget::bounds)
+            .expect("галочка нарисована");
+        let pos = (b.cx, b.cy);
+        panels.strip.panel.pointer_event(PointerEvent::Down { pos });
+        panels.strip.panel.pointer_event(PointerEvent::Up { pos });
+        let mut confirm = false;
+        take_group_editor_clicks(&mut groups, panels, &mut confirm);
+        assert!(confirm, "клик по галочке обязан поднять флаг подтверждения");
+    }
+
+    #[test]
+    fn the_badge_shows_the_number_of_the_group_being_built() {
+        // Цифра в углу отвечает на вопрос «какую группу я сейчас делаю»,
+        // а не «на каком мониторе я нахожусь» (уточнение пользователя).
+        let (_g, edit, _w, _geo) = editor_harness(&[1, 2], None);
+        let panels = edit.group_editor.as_ref().expect("меню");
+        assert_eq!(panels.group_number, 1);
+        let mut prims = Vec::new();
+        panels.badge.draw(&mut prims);
+        assert!(!prims.is_empty(), "бейдж обязан что-то рисовать");
+    }
+
+    #[test]
+    fn the_layout_strip_follows_the_number_of_picked_windows() {
+        // Требование пользователя: пока не выбрано ни одного окна — только
+        // комбинации из двух; дальше лента меняется вслед за набором.
+        for (picked, expect) in [(0usize, 2usize), (2, 2), (3, 3), (5, 5)] {
+            let picks: Vec<usize> = (1..=picked).collect();
+            let (_g, edit, _w, _geo) = editor_harness(&picks, None);
+            let panels = edit.group_editor.as_ref().expect("меню");
+            assert_eq!(
+                panels.presets.thumbs.len(),
+                rst_core::group_layout::presets_for(expect).len(),
+                "при {picked} отмеченных обязан показываться набор для {expect} окон"
+            );
+        }
+    }
+
+    // ==== Перетаскивание карточки окна в слот раскладки ====
+
+    fn editor_window(hwnd: usize, title: &str) -> WindowInfo {
+        WindowInfo {
+            hwnd,
+            title: title.to_string(),
+            class: "Class".to_string(),
+            exe_path: PathBuf::from("app.exe"),
+            pid: std::process::id() + 1,
+            ..Default::default()
+        }
+    }
+
+    /// Открытое меню набора с `picked` отмеченными окнами и выбранной
+    /// раскладкой.
+    /// Обвязка тестов меню набора: состояние групп, состояние координатора,
+    /// снимок окон и геометрия мониторов.
+    type EditorHarness = (
+        GroupsState,
+        EditState,
+        Vec<WindowInfo>,
+        HashMap<MonitorId, (u32, u32, f32)>,
+    );
+
+    fn editor_harness(picked: &[usize], preset: Option<usize>) -> EditorHarness {
+        let mut edit = mask_gate_edit_state();
+        let monitor = edit.cursor_monitor.clone();
+        let mut geometry = HashMap::new();
+        geometry.insert(monitor.clone(), (2560u32, 1440u32, 1.0f32));
+        let windows: Vec<WindowInfo> = (1..=8)
+            .map(|i| editor_window(i, &format!("окно {i}")))
+            .collect();
+
+        let mut groups = GroupsState::new();
+        groups.open_editor(monitor, 5);
+        for hwnd in picked {
+            groups.editor_mut().expect("меню").toggle_pick(*hwnd);
+        }
+        if let Some(p) = preset {
+            groups.editor_mut().expect("меню").set_preset(p);
+        }
+        let mut thumbs = rst_win32::thumb_cache::ThumbCache::new(4, 1_000);
+        edit.group_editor =
+            build_group_editor(&groups, windows.clone(), &geometry, &mut thumbs, 0, 0, 1);
+        (groups, edit, windows, geometry)
+    }
+
+    /// Центр слота `slot` раскладки `preset` в DIP.
+    fn slot_center(edit: &EditState, preset: usize, slot: usize) -> (f64, f64) {
+        let panels = edit.group_editor.as_ref().expect("меню собрано");
+        let t = panels
+            .presets
+            .slots
+            .iter()
+            .find(|t| t.preset == preset && t.slot == slot)
+            .unwrap_or_else(|| panic!("нет слота {slot} раскладки {preset}"));
+        (t.rect.cx, t.rect.cy)
+    }
+
+    /// Центр карточки окна `hwnd` в DIP.
+    fn card_center(edit: &EditState, hwnd: usize) -> (f64, f64) {
+        let panels = edit.group_editor.as_ref().expect("меню собрано");
+        let i = panels
+            .card_hwnds
+            .iter()
+            .position(|h| *h == hwnd)
+            .unwrap_or_else(|| panic!("нет карточки окна {hwnd}"));
+        let b = panels
+            .strip
+            .panel
+            .widget::<Button>(group_strip::CARD_BASE + i as WidgetId)
+            .map(rst_render::Widget::bounds)
+            .expect("карточка нарисована");
+        (b.cx, b.cy)
+    }
+
+    #[test]
+    fn a_press_on_a_card_starts_a_possible_drag() {
+        let (_g, edit, _w, _geo) = editor_harness(&[1, 2], Some(0));
+        let pos = card_center(&edit, 1);
+        let panels = edit.group_editor.as_ref().expect("меню");
+        assert_eq!(card_under(panels, pos), Some(1));
+    }
+
+    #[test]
+    fn a_press_between_cards_starts_nothing() {
+        // Между карточками зазор, и нажатие в него не должно начинать жест.
+        let (_g, edit, _w, _geo) = editor_harness(&[1, 2], Some(0));
+        let panels = edit.group_editor.as_ref().expect("меню");
+        // Точка заведомо выше ленты — там карточек нет вовсе.
+        assert_eq!(card_under(panels, (10.0, 10.0)), None);
+    }
+
+    #[test]
+    fn dropping_a_card_on_a_slot_puts_that_window_in_that_slot() {
+        // Ключевое обещание перетаскивания: окно попадает ИМЕННО в тот слот,
+        // на который его отпустили, а не в следующий по очереди.
+        let (mut groups, edit, _w, _geo) = editor_harness(&[1, 2, 3], Some(0));
+        let panels = edit.group_editor.as_ref().expect("меню");
+        let pos = slot_center(&edit, 0, 2);
+        let drag = CardDrag {
+            hwnd: 3,
+            start: card_center(&edit, 3),
+            now: pos,
+            dragging: true,
+        };
+        assert!(drop_card_into_slot(&mut groups, panels, &drag, pos));
+        let slots = groups.editor().expect("меню").slot_assignment();
+        assert_eq!(slots[2], 3, "окно 3 обязано занять третий слот");
+    }
+
+    #[test]
+    fn dropping_a_card_past_every_slot_changes_nothing() {
+        // Слоты в миниатюрах мелкие; класть окно в «ближайший» слишком часто
+        // означало бы класть не туда. Промах — это промах.
+        let (mut groups, edit, _w, _geo) = editor_harness(&[1, 2], Some(0));
+        let panels = edit.group_editor.as_ref().expect("меню");
+        let before = groups.editor().expect("меню").slot_assignment();
+        let drag = CardDrag {
+            hwnd: 2,
+            start: (0.0, 0.0),
+            now: (5.0, 700.0),
+            dragging: true,
+        };
+        assert!(!drop_card_into_slot(
+            &mut groups,
+            panels,
+            &drag,
+            (5.0, 700.0)
+        ));
+        assert_eq!(groups.editor().expect("меню").slot_assignment(), before);
+    }
+
+    #[test]
+    fn dropping_into_another_layout_selects_that_layout_too() {
+        // Пользователь показал пальцем, куда он хочет; требовать отдельного
+        // клика по миниатюре значило бы проигнорировать уже сделанный выбор.
+        let (mut groups, edit, _w, _geo) = editor_harness(&[1, 2], Some(0));
+        let panels = edit.group_editor.as_ref().expect("меню");
+        let pos = slot_center(&edit, 2, 1);
+        let drag = CardDrag {
+            hwnd: 2,
+            start: card_center(&edit, 2),
+            now: pos,
+            dragging: true,
+        };
+        assert!(drop_card_into_slot(&mut groups, panels, &drag, pos));
+        assert_eq!(groups.editor().expect("меню").preset(), Some(2));
+    }
+
+    #[test]
+    fn dropping_an_unpicked_window_takes_it_into_the_group() {
+        // Перетащить окно в слот — это и есть «беру его в группу»; требовать
+        // дополнительного клика значило бы наказывать за более точное
+        // действие.
+        let (mut groups, edit, _w, _geo) = editor_harness(&[1, 2], Some(0));
+        let panels = edit.group_editor.as_ref().expect("меню");
+        let pos = slot_center(&edit, 0, 1);
+        let drag = CardDrag {
+            hwnd: 5,
+            start: card_center(&edit, 5),
+            now: pos,
+            dragging: true,
+        };
+        assert!(drop_card_into_slot(&mut groups, panels, &drag, pos));
+        assert!(groups.editor().expect("меню").picked().contains(&5));
+    }
+
+    #[test]
+    fn a_drag_that_never_passed_the_threshold_is_still_a_click() {
+        // Порог существует ровно ради этого: палец всегда смещает мышь на
+        // пиксель-другой, и без порога обычная отметка окна перестала бы
+        // работать.
+        let (_g, edit, _w, _geo) = editor_harness(&[1], Some(0));
+        let start = card_center(&edit, 2);
+        let mut drag = CardDrag {
+            hwnd: 2,
+            start,
+            now: start,
+            dragging: false,
+        };
+        let nudge = (start.0 + 2.0, start.1 + 2.0);
+        let dx = nudge.0 - drag.start.0;
+        let dy = nudge.1 - drag.start.1;
+        assert!(
+            dx.hypot(dy) < CARD_DRAG_THRESHOLD_DIP,
+            "дрожание руки не должно превращаться в перетаскивание"
+        );
+        drag.now = nudge;
+        assert!(!drag.dragging);
+    }
+
+    #[test]
+    fn clearing_clicks_stops_a_dropped_card_from_toggling_itself_off() {
+        // После броска кнопка карточки помнит нажатие. Не погасить его —
+        // значит на том же `Up` снять с окна отметку, которую только что
+        // поставили.
+        let (mut groups, mut edit, _w, _geo) = editor_harness(&[1, 2], Some(0));
+        let pos = card_center(&edit, 3);
+        {
+            let panels = edit.group_editor.as_mut().expect("меню");
+            panels.strip.panel.pointer_event(PointerEvent::Down { pos });
+            panels.strip.panel.pointer_event(PointerEvent::Up { pos });
+            clear_group_editor_clicks(panels);
+        }
+        let panels = edit.group_editor.as_mut().expect("меню");
+        assert!(
+            !take_group_editor_clicks(&mut groups, panels, &mut false),
+            "погашенное нажатие не должно срабатывать вдогонку"
+        );
+    }
+
+    #[test]
+    fn the_drag_ghost_appears_only_after_the_threshold() {
+        let (_g, mut edit, _w, _geo) = editor_harness(&[1], Some(0));
+        let panels = edit.group_editor.as_mut().expect("меню");
+        panels.drag = Some(CardDrag {
+            hwnd: 1,
+            start: (100.0, 100.0),
+            now: (101.0, 101.0),
+            dragging: false,
+        });
+        assert!(
+            group_drag_overlay(panels).is_empty(),
+            "до порога призрака быть не должно"
+        );
+        if let Some(d) = &mut panels.drag {
+            d.dragging = true;
+        }
+        assert!(
+            !group_drag_overlay(panels).is_empty(),
+            "после порога призрак обязан появиться"
+        );
+    }
+
+    #[test]
+    fn the_ghost_highlights_the_slot_under_the_cursor() {
+        let (_g, mut edit, _w, _geo) = editor_harness(&[1, 2], Some(0));
+        let pos = slot_center(&edit, 0, 0);
+        let panels = edit.group_editor.as_mut().expect("меню");
+        panels.drag = Some(CardDrag {
+            hwnd: 1,
+            start: (0.0, 0.0),
+            now: pos,
+            dragging: true,
+        });
+        // Призрак плюс подсветка цели — два примитива; над пустым местом
+        // остаётся только призрак.
+        assert_eq!(group_drag_overlay(panels).len(), 2);
+        if let Some(d) = &mut panels.drag {
+            d.now = (5.0, 5.0);
+        }
+        assert_eq!(group_drag_overlay(panels).len(), 1);
+    }
+
+    // ==== Менеджер групп: разбор нажатий (запрос пользователя 2026-08-25) ====
+
+    fn manager_group(number: u8, name: &str, members: usize) -> WindowGroup {
+        WindowGroup {
+            id: Uuid::new_v4(),
+            number,
+            name: name.to_string(),
+            members: (0..members)
+                .map(|i| rst_core::model::GroupMember {
+                    exe_path: PathBuf::from("app.exe"),
+                    title: format!("окно {i}"),
+                    class: "Class".to_string(),
+                    place: None,
+                })
+                .collect(),
+            gap_pct: 0,
+        }
+    }
+
+    /// Обвязка тестов менеджера: состояние, конфиг, путь и геометрия.
+    type ManagerHarness = (
+        EditState,
+        Config,
+        PathBuf,
+        HashMap<MonitorId, (u32, u32, f32)>,
+    );
+
+    /// Координатор с открытым менеджером групп и заданным списком.
+    fn manager_harness(groups: Vec<WindowGroup>) -> ManagerHarness {
+        let mut edit = mask_gate_edit_state();
+        let cfg = Config {
+            groups,
+            ..Default::default()
+        };
+        let mut geometry = HashMap::new();
+        geometry.insert(edit.cursor_monitor.clone(), (2560u32, 1440u32, 1.0f32));
+        open_group_manager(&mut edit, &cfg, &geometry);
+        let path = std::env::temp_dir().join(format!(
+            "resticker_group_mgr_{}_{}.json",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        (edit, cfg, path, geometry)
+    }
+
+    /// Нажать кнопку панели менеджера и прогнать разбор.
+    fn click_manager(
+        edit: &mut EditState,
+        cfg: &mut Config,
+        path: &Path,
+        geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+        id: WidgetId,
+    ) {
+        let pos = edit
+            .group_manager
+            .as_mut()
+            .and_then(|s| s.panel.widget::<Button>(id))
+            .map(|b| {
+                let r = rst_render::Widget::bounds(b);
+                (r.cx, r.cy)
+            })
+            .unwrap_or_else(|| panic!("в панели нет кнопки {id}"));
+        // Через ту же функцию, что и боевой путь: раньше тест сам слал
+        // нажатие в панель и потому не заметил, что в `handle_input`
+        // маршрутизации нажатия нет вовсе.
+        let monitor_id = edit.cursor_monitor.clone();
+        group_manager_down(edit, &monitor_id, pos);
+        handle_group_manager_up(edit, cfg, path, geometry, pos);
+    }
+
+    #[test]
+    fn a_press_on_a_manager_button_arms_it_so_the_release_registers_a_click() {
+        // Ровно то, что сломалось: панель рисовалась, но нажатие в неё не
+        // маршрутизировалось, кнопка не взводилась, и `take_click` на
+        // отпускании не срабатывал никогда — панель выглядела картинкой.
+        let (mut edit, mut cfg, path, geometry) =
+            manager_harness(vec![manager_group(1, "работа", 2)]);
+        let monitor_id = edit.cursor_monitor.clone();
+        let b = edit
+            .group_manager
+            .as_ref()
+            .and_then(|s| s.panel.widget::<Button>(group_manager::ROW_BASE))
+            .map(rst_render::Widget::bounds)
+            .expect("строка группы нарисована");
+        let pos = (b.cx, b.cy);
+
+        group_manager_down(&mut edit, &monitor_id, pos);
+        assert!(
+            edit.group_manager.is_some(),
+            "нажатие ПО панели не должно её закрывать"
+        );
+        handle_group_manager_up(&mut edit, &mut cfg, &path, &geometry, pos);
+        assert_eq!(
+            edit.group_manager.expect("менеджер открыт").expanded,
+            Some(0),
+            "после нажатия и отпускания строка обязана раскрыться"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_press_outside_the_manager_closes_it() {
+        // Обычная семантика попап-меню, та же, что у панели пресетов.
+        let (mut edit, _cfg, _p, _g) = manager_harness(vec![manager_group(1, "работа", 2)]);
+        let monitor_id = edit.cursor_monitor.clone();
+        group_manager_down(&mut edit, &monitor_id, (5.0, 5.0));
+        assert!(edit.group_manager.is_none());
+    }
+
+    #[test]
+    fn a_press_from_another_monitor_closes_the_manager_instead_of_hitting_buttons() {
+        // Панель нарисована только на своём мониторе. Координаты чужого
+        // могли бы случайно совпасть с кнопкой удаления — попадание туда
+        // было бы удалением группы, которого никто не просил.
+        let (mut edit, mut cfg, path, geometry) =
+            manager_harness(vec![manager_group(1, "работа", 2)]);
+        let b = edit
+            .group_manager
+            .as_ref()
+            .and_then(|s| s.panel.widget::<Button>(group_manager::DELETE_BASE))
+            .map(rst_render::Widget::bounds)
+            .expect("кнопка удаления нарисована");
+        let pos = (b.cx, b.cy);
+        group_manager_down(&mut edit, &MonitorId("другой".to_string()), pos);
+        assert!(edit.group_manager.is_none(), "панель закрывается");
+        assert_eq!(cfg.groups.len(), 1, "группа обязана уцелеть");
+        handle_group_manager_up(&mut edit, &mut cfg, &path, &geometry, pos);
+        assert_eq!(cfg.groups.len(), 1);
+    }
+
+    #[test]
+    fn moving_the_mouse_over_the_manager_does_not_close_it() {
+        let (mut edit, _cfg, _p, _g) = manager_harness(vec![manager_group(1, "работа", 2)]);
+        let monitor_id = edit.cursor_monitor.clone();
+        group_manager_move(&mut edit, &monitor_id, (5.0, 5.0));
+        assert!(
+            edit.group_manager.is_some(),
+            "движение мыши — не клик, панель остаётся"
+        );
+    }
+
+    #[test]
+    fn manager_opens_with_every_group_collapsed() {
+        let (edit, _cfg, _p, _g) = manager_harness(vec![manager_group(1, "работа", 2)]);
+        let state = edit.group_manager.expect("менеджер открыт");
+        assert_eq!(state.expanded, None);
+    }
+
+    #[test]
+    fn clicking_a_row_expands_it() {
+        let (mut edit, mut cfg, p, g) = manager_harness(vec![manager_group(1, "работа", 2)]);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::ROW_BASE);
+        let state = edit.group_manager.expect("менеджер открыт");
+        assert_eq!(state.expanded, Some(0));
+    }
+
+    #[test]
+    fn clicking_the_expanded_row_again_collapses_it() {
+        let (mut edit, mut cfg, p, g) = manager_harness(vec![manager_group(1, "работа", 2)]);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::ROW_BASE);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::ROW_BASE);
+        assert_eq!(
+            edit.group_manager.expect("менеджер").expanded,
+            None,
+            "раскрытие — переключатель, а не одностороннее действие"
+        );
+    }
+
+    #[test]
+    fn deleting_a_group_removes_it_from_the_config() {
+        let groups = vec![manager_group(1, "первая", 2), manager_group(2, "вторая", 2)];
+        let kept = groups[1].id;
+        let (mut edit, mut cfg, p, g) = manager_harness(groups);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::DELETE_BASE);
+        assert_eq!(cfg.groups.len(), 1);
+        assert_eq!(cfg.groups[0].id, kept);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn deleting_a_group_above_the_expanded_one_keeps_the_right_row_expanded() {
+        // Раскрытие держится за ИНДЕКС, а удаление сдвигает список: без
+        // поправки раскрытой оказалась бы соседняя группа.
+        let groups = vec![
+            manager_group(1, "первая", 2),
+            manager_group(2, "вторая", 3),
+            manager_group(3, "третья", 2),
+        ];
+        let expanded_id = groups[1].id;
+        let (mut edit, mut cfg, p, g) = manager_harness(groups);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::ROW_BASE + 1);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::DELETE_BASE);
+        let state = edit.group_manager.expect("менеджер");
+        assert_eq!(state.expanded, Some(0));
+        assert_eq!(
+            cfg.groups[0].id, expanded_id,
+            "раскрытой осталась та же группа"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn deleting_the_expanded_group_collapses_the_list() {
+        let groups = vec![manager_group(1, "первая", 2), manager_group(2, "вторая", 2)];
+        let (mut edit, mut cfg, p, g) = manager_harness(groups);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::ROW_BASE);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::DELETE_BASE);
+        assert_eq!(edit.group_manager.expect("менеджер").expanded, None);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn closing_the_manager_hides_the_panel() {
+        let (mut edit, mut cfg, p, g) = manager_harness(vec![manager_group(1, "работа", 2)]);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::BTN_CLOSE);
+        assert!(edit.group_manager.is_none());
+    }
+
+    #[test]
+    fn the_new_group_button_asks_the_coordinator_to_open_the_editor() {
+        let (mut edit, mut cfg, p, g) = manager_harness(vec![manager_group(1, "работа", 2)]);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::BTN_NEW);
+        assert_eq!(edit.pending_open_group_editor, Some(None));
+        assert!(
+            edit.group_manager.is_none(),
+            "менеджер уступает место меню набора"
+        );
+    }
+
+    #[test]
+    fn the_edit_button_names_the_expanded_group() {
+        let groups = vec![manager_group(1, "первая", 2), manager_group(2, "вторая", 2)];
+        let (mut edit, mut cfg, p, g) = manager_harness(groups);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::ROW_BASE + 1);
+        click_manager(&mut edit, &mut cfg, &p, &g, group_manager::BTN_EDIT);
+        assert_eq!(edit.pending_open_group_editor, Some(Some(1)));
+    }
+
+    #[test]
+    fn a_manager_without_an_expanded_group_has_no_edit_button() {
+        // Править нечего, пока не выбрана группа: кнопка появляется только
+        // вместе с раскрытием.
+        let (edit, _cfg, _p, _g) = manager_harness(vec![manager_group(1, "работа", 2)]);
+        let state = edit.group_manager.expect("менеджер");
+        assert!(
+            state
+                .panel
+                .widget::<Button>(group_manager::BTN_EDIT)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn snap_gap_shrinks_a_freshly_snapped_window() {
+        let mut zones = HashMap::new();
+        // Windows положила окно в левую половину.
+        let live = wr(0, 0, 960, 1032);
+        let got = snap_shrink_in_work_area(&mut zones, 1, &live, snap_work(), 20)
+            .expect("окно в снапе обязано получить отступ");
+        assert_eq!(got.w(), 768.0, "ширина ужимается на 20%");
+        // Сравнение с допуском: 1032 * 0.8 в двоичной плавающей точке —
+        // 825.5999999999999, и точное равенство здесь проверяло бы не
+        // формулу, а представление числа.
+        assert!(
+            (got.h() - 825.6).abs() < 1e-6,
+            "высота ужимается на те же 20%"
+        );
+        // Зазор одинаковый со всех сторон — окно по центру своей половины.
+        assert_eq!(got.left, 96.0);
+        assert_eq!(got.right, 864.0);
+    }
+
+    #[test]
+    fn snap_gap_leaves_a_free_window_alone() {
+        let mut zones = HashMap::new();
+        // Окно шириной в половину, но сдвинутое по вертикали — не снап.
+        let live = wr(0, 120, 960, 700);
+        assert_eq!(
+            snap_shrink_in_work_area(&mut zones, 1, &live, snap_work(), 20),
+            None
+        );
+        assert!(zones.is_empty(), "зону чужого окна запоминать нечего");
+    }
+
+    #[test]
+    fn snap_gap_converges_after_one_pass() {
+        // Ключевое свойство: применив отступ, следующий снимок обязан
+        // ХОТЕТЬ ТО ЖЕ САМОЕ. Иначе координатор двигал бы окно на каждом
+        // снимке окон — то есть постоянно.
+        let mut zones = HashMap::new();
+        let first = snap_shrink_in_work_area(&mut zones, 1, &wr(0, 0, 960, 1032), snap_work(), 20)
+            .expect("первый проход");
+        let live = as_window_rect(first);
+        let second = snap_shrink_in_work_area(&mut zones, 1, &live, snap_work(), 20)
+            .expect("ужатое окно обязано остаться узнанным");
+        assert_eq!(
+            second, first,
+            "цель не должна дрейфовать от прохода к проходу"
+        );
+        assert!(
+            !px_rect_differs(&second, &live, PINNED_GEOMETRY_EPS_PX),
+            "совпадение с фактической геометрией — это и есть «не двигать»"
+        );
+    }
+
+    #[test]
+    fn snap_gap_follows_a_changed_percentage() {
+        let mut zones = HashMap::new();
+        let at_20 = snap_shrink_in_work_area(&mut zones, 1, &wr(0, 0, 960, 1032), snap_work(), 20)
+            .expect("первый проход");
+        // Пользователь выбрал в меню другое значение: окно уже ужато и ни с
+        // какой зоной не совпадает — узнать его можно только по памяти.
+        let at_35 =
+            snap_shrink_in_work_area(&mut zones, 1, &as_window_rect(at_20), snap_work(), 35)
+                .expect("смена процента обязана дойти до уже ужатого окна");
+        assert_eq!(at_35.w(), 624.0);
+    }
+
+    #[test]
+    fn snap_gap_forgets_the_zone_when_the_window_leaves_the_snap() {
+        let mut zones = HashMap::new();
+        let shrunk = snap_shrink_in_work_area(&mut zones, 1, &wr(0, 0, 960, 1032), snap_work(), 20)
+            .expect("первый проход");
+        // Пользователь утащил окно на середину экрана.
+        let dragged = wr(600, 300, shrunk.w() as i32, shrunk.h() as i32);
+        assert_eq!(
+            snap_shrink_in_work_area(&mut zones, 1, &dragged, snap_work(), 20),
+            None
+        );
+        assert!(
+            zones.is_empty(),
+            "зону надо забыть, иначе окно утащит обратно на следующем снимке"
+        );
+    }
+
+    #[test]
+    fn snap_gap_off_clears_remembered_zones() {
+        let mut edit = mask_gate_edit_state();
+        edit.snap_gap_zones.insert(1, snap_work());
+        // `Off` не просто перестаёт двигать окно: память о зоне обязана
+        // уйти, иначе включение обратно утащило бы окно в зону, из которой
+        // пользователь давно его увёл.
+        assert_eq!(
+            snap_shrink_target(&mut edit, 1, &wr(0, 0, 960, 1032), 0),
+            None
+        );
+        assert!(edit.snap_gap_zones.is_empty());
+    }
+
+    #[test]
+    fn snap_gap_recognises_a_quarter_zone() {
+        let mut zones = HashMap::new();
+        let got = snap_shrink_in_work_area(&mut zones, 1, &wr(960, 516, 960, 516), snap_work(), 10)
+            .expect("правая нижняя четверть — тоже снап-зона");
+        assert!((got.w() - 864.0).abs() < 1e-6);
+        assert!((got.h() - 464.4).abs() < 1e-6);
+    }
+
+    /// Снимок из одного чужого окна с заданными видимыми границами.
+    fn free_window_snapshot(hwnd: usize, rect: WindowRect) -> Vec<WindowInfo> {
+        vec![WindowInfo {
+            hwnd,
+            rect,
+            pid: std::process::id() + 1, // «чужое» окно
+            exe_path: std::env::current_exe().expect("путь к exe теста"),
+            z_order: 0,
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn snap_gap_shrinks_an_ordinary_unpinned_window() {
+        use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNA, ShowWindow};
+
+        let wnd = DragSimWindow::create_resizable();
+        let hwnd = wnd.0.0 as usize;
+        // SAFETY: ShowWindow безопасен для своего окна; SW_SHOWNA не забирает фокус.
+        let _ = unsafe { ShowWindow(wnd.0, SW_SHOWNA) };
+
+        let work = rst_win32::monitors::work_area_for_window(hwnd).expect("рабочая область");
+        let half_w = work.w as i32 / 2;
+        let window_pins = WindowPins::new();
+        // Кладём окно в левую половину так же, как это делает Windows, — по
+        // ВИДИМОЙ кромке (см. соседний тест про закреплённое окно).
+        assert!(
+            window_pins.set_dwm_bounds(
+                wnd.0,
+                windows::Win32::Foundation::RECT {
+                    left: work.x,
+                    top: work.y,
+                    right: work.x + half_w,
+                    bottom: work.y + work.h as i32,
+                },
+            ),
+            "положить тестовое окно в левую половину"
+        );
+
+        let windows = free_window_snapshot(
+            hwnd,
+            WindowRect {
+                x: work.x,
+                y: work.y,
+                w: half_w,
+                h: work.h as i32,
+            },
+        );
+        let mut edit = mask_gate_edit_state();
+        // Окно НЕ закреплено — именно этот случай и добавляет галочка «все
+        // окна»: раньше проход по закреплённым его бы не увидел.
+        assert!(edit.pinned_windows.is_empty());
+
+        enforce_snap_gap_on_free_windows(&mut edit, &window_pins, &windows, 20);
+
+        let visible = rst_win32::window_enum::live_rect(hwnd).expect("живые границы окна");
+        let expected_w = (f64::from(half_w) * 0.8).round() as i32;
+        assert!(
+            (visible.w - expected_w).abs() <= PINNED_GEOMETRY_EPS_PX,
+            "окно должно было ужаться до {expected_w} px, а стало {}",
+            visible.w
+        );
+        let gap_left = visible.x - work.x;
+        let gap_right = (work.x + half_w) - (visible.x + visible.w);
+        assert!(
+            (gap_left - gap_right).abs() <= PINNED_GEOMETRY_EPS_PX,
+            "зазоры разъехались: слева {gap_left}, справа {gap_right}"
+        );
+    }
+
+    #[test]
+    fn snap_gap_gives_up_on_a_window_that_will_not_move() {
+        use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNA, ShowWindow};
+
+        let wnd = DragSimWindow::create_resizable();
+        let hwnd = wnd.0.0 as usize;
+        // SAFETY: ShowWindow безопасен для своего окна; SW_SHOWNA не забирает фокус.
+        let _ = unsafe { ShowWindow(wnd.0, SW_SHOWNA) };
+
+        let work = rst_win32::monitors::work_area_for_window(hwnd).expect("рабочая область");
+        let half_w = work.w as i32 / 2;
+        let zone = WindowRect {
+            x: work.x,
+            y: work.y,
+            w: half_w,
+            h: work.h as i32,
+        };
+        let windows = free_window_snapshot(hwnd, zone);
+        let mut edit = mask_gate_edit_state();
+        let window_pins = WindowPins::new();
+
+        // Окно каждый раз возвращаем в исходную зону — так ведёт себя
+        // приложение, которое навязывает себе собственную геометрию, и так
+        // же выглядит окно с правами выше наших, где `SetWindowPos` молча
+        // не срабатывает.
+        for _ in 0..(SNAP_GAP_MAX_ATTEMPTS + 2) {
+            assert!(
+                window_pins.set_dwm_bounds(
+                    wnd.0,
+                    windows::Win32::Foundation::RECT {
+                        left: zone.x,
+                        top: zone.y,
+                        right: zone.x + zone.w,
+                        bottom: zone.y + zone.h,
+                    },
+                ),
+                "вернуть окно в зону"
+            );
+            enforce_snap_gap_on_free_windows(&mut edit, &window_pins, &windows, 20);
+        }
+
+        assert_eq!(
+            edit.snap_gap_strikes.get(&(hwnd as isize)).copied(),
+            Some(SNAP_GAP_MAX_ATTEMPTS),
+            "после трёх безуспешных попыток окно надо оставить в покое, а не долбить его вечно"
+        );
+    }
+
+    #[test]
+    fn snap_gap_forgets_a_window_that_disappeared() {
+        let mut edit = mask_gate_edit_state();
+        edit.snap_gap_zones.insert(42, snap_work());
+        edit.snap_gap_strikes.insert(42, 2);
+        // Окна 42 в снимке нет — оно закрыто.
+        prune_snap_gap_state(&mut edit, &[]);
+        assert!(edit.snap_gap_zones.is_empty());
+        assert!(edit.snap_gap_strikes.is_empty());
+    }
+
+    #[test]
+    fn snap_gap_keeps_state_for_a_window_still_in_the_snapshot() {
+        let mut edit = mask_gate_edit_state();
+        edit.snap_gap_zones.insert(42, snap_work());
+        prune_snap_gap_state(&mut edit, &free_window_snapshot(42, wr(0, 0, 960, 1032)));
+        assert_eq!(
+            edit.snap_gap_zones.len(),
+            1,
+            "живое окно теряться не должно"
+        );
+    }
+
+    #[test]
+    fn snap_gap_ignores_our_own_windows() {
+        let mut edit = mask_gate_edit_state();
+        let window_pins = WindowPins::new();
+        // Оверлеи и окно настроек — наши собственные: двигать их этим
+        // проходом нельзя ни при каких настройках.
+        let mine = vec![WindowInfo {
+            hwnd: 42,
+            rect: wr(0, 0, 960, 1032),
+            pid: std::process::id(),
+            exe_path: std::env::current_exe().expect("путь к exe теста"),
+            z_order: 0,
+            ..Default::default()
+        }];
+        enforce_snap_gap_on_free_windows(&mut edit, &window_pins, &mine, 20);
+        assert!(edit.snap_gap_zones.is_empty());
+        assert!(edit.snap_gap_strikes.is_empty());
+    }
+
+    #[test]
+    fn enforce_pinned_geometry_adds_a_gap_to_a_snapped_window() {
+        use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNA, ShowWindow};
+
+        let (_cfg, _config_path, _snapshot, monitor_bounds, wnd) = pin_flow_harness();
+        let hwnd = wnd.0.0 as usize;
+        // См. соседние тесты: без видимого окна `live_rect` ничего не отдаст.
+        // SAFETY: ShowWindow безопасен для своего окна; SW_SHOWNA не забирает фокус.
+        let _ = unsafe { ShowWindow(wnd.0, SW_SHOWNA) };
+
+        // Рабочая область берётся у РЕАЛЬНОГО монитора: именно её видит
+        // `snap_shrink_target`, и синтетический прямоугольник харнесса тут
+        // не подошёл бы — распознавание зоны шло бы по чужим числам.
+        let work = rst_win32::monitors::work_area_for_window(hwnd).expect("рабочая область");
+        let half_w = work.w as i32 / 2;
+        let snapshot = vec![WindowInfo {
+            hwnd,
+            rect: wr(work.x, work.y, half_w, work.h as i32),
+            pid: std::process::id() + 1,
+            exe_path: std::env::current_exe().expect("путь к exe теста"),
+            z_order: 0,
+            ..Default::default()
+        }];
+        let mut edit = mask_gate_edit_state();
+        let mut window_pins = WindowPins::new();
+        assert!(pin_window(
+            &mut edit,
+            &snapshot,
+            &monitor_bounds,
+            &mut window_pins,
+            hwnd
+        ));
+
+        // Windows положила окно в левую половину рабочей области. Ставим
+        // через `set_dwm_bounds`, а не `SetWindowPos`: снап выравнивает по
+        // ВИДИМОЙ кромке окна, и `GetWindowRect` у обычного окна Win11
+        // выходит за неё на невидимые поля ресайза (около 7 px). Позиция,
+        // выставленная напрямую, разошлась бы со снап-зоной ровно на эту
+        // рамку — и распознавание зоны, справедливо, не сработало бы.
+        assert!(
+            window_pins.set_dwm_bounds(
+                wnd.0,
+                windows::Win32::Foundation::RECT {
+                    left: work.x,
+                    top: work.y,
+                    right: work.x + half_w,
+                    bottom: work.y + work.h as i32,
+                },
+            ),
+            "не удалось положить тестовое окно в левую половину"
+        );
+
+        enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds, 20);
+
+        let visible = rst_win32::window_enum::live_rect(hwnd).expect("живые границы окна");
+        let expected_w = (f64::from(half_w) * 0.8).round() as i32;
+        assert!(
+            (visible.w - expected_w).abs() <= PINNED_GEOMETRY_EPS_PX,
+            "окно должно было ужаться до {expected_w} px, а стало {}",
+            visible.w
+        );
+        // Зазор слева и справа одинаковый: окно по центру своей половины.
+        let gap_left = visible.x - work.x;
+        let gap_right = (work.x + half_w) - (visible.x + visible.w);
+        assert!(
+            (gap_left - gap_right).abs() <= PINNED_GEOMETRY_EPS_PX,
+            "зазоры разъехались: слева {gap_left}, справа {gap_right}"
+        );
+        assert!(gap_left > 0, "зазор слева обязан быть ненулевым");
+    }
+
     #[test]
     fn enforce_pinned_geometry_caps_window_grown_by_user() {
         use windows::Win32::UI::WindowsAndMessaging::{
@@ -12584,7 +15670,7 @@ mod tests {
         }
         .expect("растянуть тестовое окно");
 
-        enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds);
+        enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds, 0);
 
         // Меряем ВИДИМЫЕ границы (DWM), а не `GetWindowRect`: последний
         // включает невидимые поля ресайза Win11 (около 7 px по бокам и
@@ -12636,7 +15722,7 @@ mod tests {
             hwnd
         ));
         // Первый проход запоминает исходную геометрию.
-        enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds);
+        enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds, 0);
 
         // Пользователь перетащил окно почти в угол и отпустил.
         // SAFETY: окно живо; флаги исключают активацию и смену z-order.
@@ -12653,7 +15739,7 @@ mod tests {
         }
         .expect("подвинуть тестовое окно к углу");
 
-        enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds);
+        enforce_pinned_geometry(&mut edit, &window_pins, &monitor_bounds, 0);
 
         // Магнит ставит вплотную ВИДИМУЮ кромку окна (DWM-границы) — именно
         // её видит пользователь; `GetWindowRect` показал бы «минус рамка».
@@ -14624,8 +17710,8 @@ mod tests {
     use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSEXW, WS_OVERLAPPED,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WINDOW_STYLE,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSEXW, WS_OVERLAPPED, WS_THICKFRAME,
     };
     use windows::core::w;
 
@@ -14636,6 +17722,19 @@ mod tests {
 
     impl DragSimWindow {
         fn create() -> Self {
+            Self::create_with(WS_OVERLAPPED)
+        }
+
+        /// Окно с рамкой ресайза (`WS_THICKFRAME`) — такое, какое Windows
+        /// вообще соглашается снапить, а `window_enum::is_resizable`
+        /// пропускает дальше. Нужно тестам прохода по обычным окнам:
+        /// обычный `create()` даёт нерастягиваемое окно, и проход,
+        /// справедливо, отказался бы его трогать.
+        fn create_resizable() -> Self {
+            Self::create_with(WS_OVERLAPPED | WS_THICKFRAME)
+        }
+
+        fn create_with(style: WINDOW_STYLE) -> Self {
             // SAFETY: GetModuleHandleW(None) — хэндл текущего модуля.
             let hinstance = unsafe { GetModuleHandleW(None) }.expect("хэндл модуля");
             let wc = WNDCLASSEXW {
@@ -14659,7 +17758,7 @@ mod tests {
                     Default::default(),
                     w!("resticker_drag_sim_test"),
                     w!("test"),
-                    WS_OVERLAPPED,
+                    style,
                     0,
                     0,
                     100,
@@ -14726,8 +17825,14 @@ mod tests {
             confirm: None,
             window_picker: None,
             preset_picker: None,
+            pinned_yielded_to_shell: false,
+            gap_panel: None,
+            group_editor: None,
+            group_manager: None,
+            pending_open_group_manager: false,
+            pending_confirm_group: false,
+            pending_open_group_editor: None,
             pending_open_picker: None,
-            pending_tile_sticker: None,
             pending_open_pick_list: None,
             window_pick_list: None,
             pinned_windows: Vec::new(),
@@ -14737,6 +17842,8 @@ mod tests {
             surfaced_pins: HashSet::new(),
             pin_flashes: Vec::new(),
             pinned_last_rects: HashMap::new(),
+            snap_gap_zones: HashMap::new(),
+            snap_gap_strikes: HashMap::new(),
             pinned_unmaximized_at: HashMap::new(),
             pinned_follow_until: None,
             banner: None,
@@ -14746,7 +17853,6 @@ mod tests {
             marquee_started: false,
             toolbar: None,
             cursor_panel: None,
-            tiling_overlay: None,
             cursor_panel_hovered: false,
             cursor_panel_slide: PanelSlide::fixed(1.0),
             settings_rect: None,

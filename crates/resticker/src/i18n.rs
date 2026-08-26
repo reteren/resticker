@@ -27,12 +27,34 @@ pub fn tray_toggle_visible() -> &'static str {
     "Show/hide all stickers"
 }
 
-/// Пункт меню трея «Включить/выключить тайлинг» (M9).
-pub fn tray_toggle_tiling() -> &'static str {
-    "Toggle tiling"
+/// Заголовок подменю «Пресеты» в трее.
+/// Заголовок подменю отступа закреплённого окна в снап-зоне Windows.
+/// «Snap gap», а не «Snap shrink»: пользователь выбирает величину ЗАЗОРА
+/// вокруг окна — это то, что он видит на экране, а «ужатие» описывает
+/// внутренний механизм.
+/// Пункт трея «режим редактирования».
+///
+/// Дублирует хоткей: если его перехватывает чужая программа, войти в режим
+/// иначе нельзя, а без режима недоступны и стикеры, и менеджер групп.
+pub fn tray_edit_mode() -> &'static str {
+    "Edit mode"
 }
 
-/// Заголовок подменю «Пресеты» в трее.
+pub fn tray_snap_gap_submenu() -> &'static str {
+    "Snap gap"
+}
+
+/// Пункт, открывающий панель с полем ввода зазора. Многоточие — обычное
+/// соглашение: пункт не выполняет действие, а открывает что-то ещё.
+pub fn tray_snap_gap_set() -> &'static str {
+    "Set value…"
+}
+
+/// Пункт-галочка «применять отступ и к обычным окнам» в подменю отступа.
+pub fn tray_snap_gap_all_windows() -> &'static str {
+    "All windows, not just pinned"
+}
+
 pub fn tray_presets_submenu() -> &'static str {
     "Presets"
 }
@@ -87,8 +109,11 @@ mod tests {
     fn tray_labels_are_english() {
         assert_eq!(tray_open_settings(), "Open settings");
         assert_eq!(tray_toggle_visible(), "Show/hide all stickers");
-        assert_eq!(tray_toggle_tiling(), "Toggle tiling");
         assert_eq!(tray_presets_submenu(), "Presets");
+        assert_eq!(tray_snap_gap_submenu(), "Snap gap");
+        assert_eq!(tray_edit_mode(), "Edit mode");
+        assert_eq!(tray_snap_gap_set(), "Set value…");
+        assert_eq!(tray_snap_gap_all_windows(), "All windows, not just pinned");
         assert_eq!(tray_exit(), "Exit");
     }
 

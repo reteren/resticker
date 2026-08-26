@@ -9,6 +9,9 @@
 pub mod animation_clock;
 pub mod config;
 mod error;
+pub mod group_layout;
+pub mod group_match;
+pub mod group_visibility;
 pub mod hittest;
 pub mod migration;
 pub mod model;
@@ -21,7 +24,6 @@ pub mod presets;
 pub mod selection_set;
 pub mod sizing;
 pub mod snap;
-pub mod tiling;
 pub mod transform_ops;
 pub mod undo;
 

@@ -3,6 +3,8 @@
 use rst_core::config;
 use rst_core::model::*;
 use serde_json::{Value, json};
+use std::path::PathBuf;
+use uuid::Uuid;
 
 /// Разобрать фикстуру тем же путём, что и боевой load: Value → migrate → Config.
 fn parse_fixture(raw: &str) -> Config {
@@ -337,4 +339,170 @@ fn zdbg_pasted_source() {
     eprintln!("value: {v}");
     let cfg: Result<Config, _> = serde_json::from_value(v);
     eprintln!("config parse: {cfg:?}");
+}
+
+// ==== Группы окон (запрос пользователя 2026-08-25) ====
+fn group(number: u8) -> WindowGroup {
+    WindowGroup {
+        id: Uuid::new_v4(),
+        number,
+        name: number.to_string(),
+        members: Vec::new(),
+        gap_pct: 0,
+    }
+}
+
+#[test]
+fn first_group_takes_number_one() {
+    assert_eq!(WindowGroup::next_number(&[]), Some(1));
+}
+
+#[test]
+fn new_group_fills_the_hole_left_by_a_deleted_one() {
+    // Удалили группу 2 — следующая новая обязана занять именно двойку,
+    // иначе Ctrl+Shift+2 перестал бы открывать хоть что-нибудь, пока
+    // номера уползают вверх.
+    let existing = vec![group(1), group(3)];
+    assert_eq!(WindowGroup::next_number(&existing), Some(2));
+}
+
+#[test]
+fn nine_groups_leave_no_free_number() {
+    let existing: Vec<WindowGroup> = (1..=MAX_GROUP_NUMBER).map(group).collect();
+    assert_eq!(
+        WindowGroup::next_number(&existing),
+        None,
+        "цифровых хоткеев всего девять — десятая группа не открывалась бы ничем"
+    );
+}
+
+#[test]
+fn config_without_groups_field_reads_as_empty() {
+    // Старые config.json поля `groups` не содержат: миграция схемы не
+    // нужна, значение приходит из `#[serde(default)]`.
+    let raw = r#"{"schema_version":1,"stickers":[]}"#;
+    let cfg: Config = serde_json::from_str(raw).expect("конфиг без groups обязан читаться");
+    assert!(cfg.groups.is_empty());
+}
+
+#[test]
+fn group_survives_a_round_trip_through_json() {
+    let mut g = group(4);
+    g.gap_pct = 12;
+    g.members.push(GroupMember {
+        exe_path: PathBuf::from("C:/Windows/explorer.exe"),
+        title: "Проводник".to_string(),
+        class: "CabinetWClass".to_string(),
+        place: Some(GroupPlace {
+            monitor_id: MonitorId("mon-1".to_string()),
+            x: 10.0,
+            y: 20.0,
+            w: 800.0,
+            h: 600.0,
+        }),
+    });
+    let json = serde_json::to_string(&g).expect("сериализация группы");
+    let back: WindowGroup = serde_json::from_str(&json).expect("разбор группы");
+    assert_eq!(back, g);
+}
+
+#[test]
+fn member_without_a_saved_place_reads_back_as_none() {
+    // Только что собранная группа мест ещё не знает — это не ошибка и не
+    // повод писать в файл нули, которые потом уедут в левый верхний угол.
+    let raw = r#"{"exe_path":"a.exe","title":"t","class":"c"}"#;
+    let m: GroupMember = serde_json::from_str(raw).expect("член без места");
+    assert_eq!(m.place, None);
+}
+
+// ==== Хоткеи групп (T5) ====
+#[test]
+fn group_hotkey_defaults_are_exactly_the_spec_combos() {
+    let h = Hotkeys::default();
+    assert_eq!(h.edit_groups_menu.as_deref(), Some("Ctrl+Alt+G"));
+    assert_eq!(h.delete_open_group.as_deref(), Some("Ctrl+Alt+Shift+G"));
+    for n in 1..=9 {
+        assert_eq!(
+            h.open_group(n),
+            Some(format!("Ctrl+Shift+{n}").as_str()),
+            "группа {n} открывается по Ctrl+Shift+{n}"
+        );
+    }
+}
+
+#[test]
+fn old_config_without_t5_fields_gains_group_hotkey_defaults() {
+    // Старый config.json (без T5-полей) читается без миграции схемы:
+    // недостающие поля достраиваются из `Hotkeys::default()` — тот же
+    // прецедент, что `pin_focused_window` (тест
+    // `denylist_and_pin_hotkey_defaults_for_old_configs` выше).
+    let cfg: Config = serde_json::from_value(json!({
+        "schema_version": 1,
+        "hotkeys": { "edit_mode": "Ctrl+Alt+S" }
+    }))
+    .unwrap();
+
+    assert_eq!(cfg.hotkeys.edit_mode.as_deref(), Some("Ctrl+Alt+S"));
+    assert_eq!(cfg.hotkeys.edit_groups_menu.as_deref(), Some("Ctrl+Alt+G"));
+    assert_eq!(
+        cfg.hotkeys.delete_open_group.as_deref(),
+        Some("Ctrl+Alt+Shift+G")
+    );
+    let expected: Vec<Option<String>> = (1..=9).map(|n| Some(format!("Ctrl+Shift+{n}"))).collect();
+    assert_eq!(cfg.hotkeys.open_group_by_number, expected);
+}
+
+#[test]
+fn fixture_v1_gains_group_hotkey_defaults() {
+    // Боевой старый формат: фикстура v1 с тремя хоткеями — после чтения
+    // новые поля приходят дефолтами, а старые не теряются.
+    let cfg = parse_fixture(include_str!("fixtures/config_v1_example.json"));
+    assert_eq!(
+        cfg.hotkeys.toggle_all_stickers.as_deref(),
+        Some("Ctrl+Alt+H")
+    );
+    assert_eq!(cfg.hotkeys.edit_groups_menu.as_deref(), Some("Ctrl+Alt+G"));
+    assert_eq!(cfg.hotkeys.open_group_by_number.len(), 9);
+}
+
+#[test]
+fn open_group_by_number_roundtrips_with_nulls() {
+    // Смешанная конфигурация: назначенные хоткеи — строками, неназначенные
+    // — null; позиция в массиве = номер группы минус один.
+    let mut h = Hotkeys::default();
+    h.open_group_by_number[2] = None; // группа 3
+    h.open_group_by_number[8] = None; // группа 9
+    let v = serde_json::to_value(&h).unwrap();
+    assert_eq!(
+        v["open_group_by_number"],
+        json!([
+            "Ctrl+Shift+1",
+            "Ctrl+Shift+2",
+            null,
+            "Ctrl+Shift+4",
+            "Ctrl+Shift+5",
+            "Ctrl+Shift+6",
+            "Ctrl+Shift+7",
+            "Ctrl+Shift+8",
+            null
+        ])
+    );
+    let back: Hotkeys = serde_json::from_value(v).unwrap();
+    assert_eq!(back.open_group_by_number, h.open_group_by_number);
+}
+
+#[test]
+fn open_group_accessor_rejects_out_of_range_and_short_vecs() {
+    let h = Hotkeys::default();
+    assert_eq!(h.open_group(1), Some("Ctrl+Shift+1"));
+    assert_eq!(h.open_group(9), Some("Ctrl+Shift+9"));
+    assert_eq!(h.open_group(0), None, "номера групп начинаются с 1");
+    assert_eq!(h.open_group(10), None, "номеров больше девяти нет");
+
+    // Хвост короче девяти читается как «не назначен», а не как ошибка
+    // конфигурации: настройки могут сохранить частичный список.
+    let mut short = Hotkeys::default();
+    short.open_group_by_number.truncate(3);
+    assert_eq!(short.open_group(3), Some("Ctrl+Shift+3"));
+    assert_eq!(short.open_group(4), None);
 }

@@ -23,7 +23,7 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
     let mut canvas = Canvas::new(size_px, color_of(icon));
     match icon {
         Icon::Layers => draw_layers(&mut canvas, s),
-        Icon::Tile => draw_tile(&mut canvas, s),
+        Icon::Groups => draw_groups(&mut canvas, s),
         Icon::Eye => draw_eye(&mut canvas, s),
         Icon::EyeOff => draw_eye_off(&mut canvas, s),
         Icon::OrderUp => draw_order_up(&mut canvas, s),
@@ -135,7 +135,7 @@ fn color_of(icon: Icon) -> [u8; 3] {
         // сама по себе этого не сообщает.
         Icon::Delete => [0xe0, 0x76, 0x76],
         Icon::Layers
-        | Icon::Tile
+        | Icon::Groups
         | Icon::Eye
         | Icon::OrderUp
         | Icon::OrderDown
@@ -297,6 +297,19 @@ fn draw_layers(cv: &mut Canvas, s: f64) {
     fill_rect(cv, 0.36 * s, 0.28 * s, 0.60 * s, 0.52 * s);
 }
 
+/// «Группы окон»: сетка два на два — плитки с зазором, тот же образ, что у
+/// раскладок в ленте меню редактирования групп.
+fn draw_groups(cv: &mut Canvas, s: f64) {
+    let pad = 0.26 * s;
+    let cell = 0.20 * s;
+    let gap = 0.08 * s;
+    for (col, row) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        let x = pad + f64::from(col) * (cell + gap);
+        let y = pad + f64::from(row) * (cell + gap);
+        fill_rect(cv, x, y, x + cell, y + cell);
+    }
+}
+
 /// «Глаз»: эллипс с точкой-зрачком.
 fn draw_eye(cv: &mut Canvas, s: f64) {
     stroke_ellipse(cv, 0.5 * s, 0.5 * s, 0.33 * s, 0.21 * s, 0.10 * s);
@@ -334,19 +347,6 @@ fn draw_order_down(cv: &mut Canvas, s: f64) {
 fn draw_duplicate(cv: &mut Canvas, s: f64) {
     stroke_rect(cv, 0.42 * s, 0.42 * s, 0.72 * s, 0.72 * s, 0.10 * s);
     stroke_rect(cv, 0.28 * s, 0.28 * s, 0.58 * s, 0.58 * s, 0.10 * s);
-}
-
-/// «В раскладку»: сетка два на два — плитки с зазором между ними, тот же
-/// образ, что у самой раскладки.
-fn draw_tile(cv: &mut Canvas, s: f64) {
-    let pad = 0.26 * s;
-    let cell = 0.20 * s;
-    let gap = 0.08 * s;
-    for (col, row) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-        let x = pad + col as f64 * (cell + gap);
-        let y = pad + row as f64 * (cell + gap);
-        fill_rect(cv, x, y, x + cell, y + cell);
-    }
 }
 
 /// «Удалить»: крестик.

@@ -50,8 +50,10 @@ pub fn box_contains(r: &Box2D, pos: Point) -> bool {
 pub enum Icon {
     /// «Слои видимости» — панель выбора окон (SPEC 3.6, п. 3).
     Layers,
-    /// «В раскладку» — отдать стикер тайлингу и забрать обратно (M9).
-    Tile,
+    /// «Группы окон» — менеджер групп (запрос пользователя 2026-08-25).
+    /// Сетка два на два: тот же образ, что у раскладок тайлинга в ленте
+    /// меню редактирования групп.
+    Groups,
     /// «Глаз» — показать/скрыть стикер (SPEC 3.7).
     Eye,
     /// «Глаз закрытый» — стикер скрыт.
@@ -119,7 +121,7 @@ impl Icon {
     /// и тестов генератора `icon_rgba`.
     pub const ALL: [Icon; 25] = [
         Icon::Layers,
-        Icon::Tile,
+        Icon::Groups,
         Icon::Eye,
         Icon::EyeOff,
         Icon::OrderUp,
@@ -675,6 +677,9 @@ pub enum PointerEvent {
     Move { pos: Point },
     /// Кнопка отпущена.
     Up { pos: Point },
+    /// Прокрутка колесом мыши (`notches` — число дискретных шагов/щелчков:
+    /// >0 вверх/вперёд, <0 вниз/назад; `pos` — позиция курсора в DIP).
+    Wheel { pos: Point, notches: i32 },
 }
 
 /// Клавиши, понятные виджетам (перевод из `WM_KEYDOWN` — у вызывающего
@@ -936,7 +941,7 @@ impl Widget for Button {
                 }
                 true
             }
-            PointerEvent::Move { .. } => false,
+            PointerEvent::Move { .. } | PointerEvent::Wheel { .. } => false,
         }
     }
 
@@ -1193,6 +1198,7 @@ impl Widget for Slider {
             }
             PointerEvent::Move { pos } => self.dragging && self.set_from_x(pos.0),
             PointerEvent::Up { .. } => std::mem::replace(&mut self.dragging, false),
+            PointerEvent::Wheel { .. } => false,
         }
     }
 
@@ -1305,9 +1311,10 @@ impl Widget for ScrollBar {
     }
 }
 
-/// Числовое поле прозрачности (SPEC 3.6, п. 2; M2_UI_NOTES §8, пункт 4):
+/// Числовое поле прозрачности/процентов зазора (SPEC 3.6, п. 2; M2_UI_NOTES §8, пункт 4):
 /// только цифры, `Backspace`, `Enter` — принять, `Esc` — отменить,
-/// `Ctrl+V` — только цифры, каретка рисованная.
+/// `Ctrl+V` — только цифры, каретка рисованная, поддержка изменения значения
+/// колесом мыши с заданным шагом.
 ///
 /// Текст в буфере — всегда ASCII-цифры, поэтому позиция каретки считается
 /// и в символах, и в байтах. Пока поле не в фокусе, текст зеркалит
@@ -1319,6 +1326,8 @@ pub struct NumericField {
     max: u32,
     max_len: usize,
     value: u32,
+    /// Шаг изменения значения при прокрутке колесом мыши.
+    step: u32,
     /// Редактируемый текст (в фокусе); вне фокуса == value.to_string().
     text: String,
     /// Каретка: индекс символа 0..=len (курсор ПЕРЕД ним).
@@ -1339,8 +1348,17 @@ impl NumericField {
         self
     }
 
+    /// Задать шаг изменения значения при прокрутке колесом мыши
+    /// (значение меньше 1 приводится к 1).
+    pub fn with_step(mut self, step: u32) -> Self {
+        self.step = step.max(1);
+        self
+    }
+
     /// Поле диапазона `min..=max`. `max_len` ограничивает ввод (для 1–100
-    /// достаточно трёх символов). Паника при `min >= max`.
+    /// достаточно трёх символов). Шаг прокрутки колесом по умолчанию равен 1
+    /// (настраивается через [`NumericField::with_step`]).
+    /// Паника при `min >= max`.
     pub fn new(
         id: WidgetId,
         bounds: Box2D,
@@ -1359,6 +1377,7 @@ impl NumericField {
             max,
             max_len,
             value,
+            step: 1,
             caret: text.len(),
             original: text.clone(),
             text,
@@ -1387,9 +1406,83 @@ impl NumericField {
         )
     }
 
+    /// Поле процентов зазора 0–35 (снап-зоны окон, значение по умолчанию 5, шаг 1)
+    /// с центром в `(cx, cy)`, шириной `w`.
+    pub fn snap_gap(id: WidgetId, cx: f64, cy: f64, w: f64) -> Self {
+        Self::new(
+            id,
+            Box2D {
+                cx,
+                cy,
+                w,
+                h: theme::FIELD_HEIGHT,
+                rotation: 0.0,
+            },
+            0,
+            35,
+            2,
+            5,
+        )
+    }
+
+    /// Псевдоним [`NumericField::snap_gap`] для удобства.
+    pub fn gap(id: WidgetId, cx: f64, cy: f64, w: f64) -> Self {
+        Self::snap_gap(id, cx, cy, w)
+    }
+
+    /// Шаг изменения значения при прокрутке колесом мыши.
+    pub fn step(&self) -> u32 {
+        self.step
+    }
+
     /// Текущее принятое значение.
     pub fn value(&self) -> u32 {
         self.value
+    }
+
+    /// Изменить значение прокруткой колеса мыши на `notches * step`.
+    ///
+    /// # Поведение в фокусе (режим ручного текстового ввода)
+    ///
+    /// Если поле находится в фокусе (`self.focused == true`), прокрутка
+    /// колеса мыши **полностью игнорируется** (возвращает `false`), оставляя
+    /// редактируемый текст `self.text`, каретку `self.caret` и значение
+    /// `self.value` нетронутыми.
+    ///
+    /// **Почему именно так (обоснование):**
+    /// 1. **Защита от случайной потери данных**: когда пользователь набирает
+    ///    число с клавиатуры (например, стёр старое значение и набрал первую
+    ///    цифру "2" из желаемого "25", либо очистил поле до пустой строки),
+    ///    случайное касание тачпада или колеса мыши не должно затирать
+    ///    незавершённый ввод и превращать "2" в "3" или перезаписывать буфер.
+    /// 2. **Разделение режимов взаимодействия**: наведение курсора и вращение
+    ///    колеса — это быстрый жест инкремента без клика (hover adjustment);
+    ///    клик и фокус — переход в режим точного посимвольного набора, где
+    ///    хозяином ввода является исключительно клавиатура.
+    /// 3. **Отсутствие неоднозначности парсинга**: промежуточный буфер может
+    ///    быть пустым или временно содержать недопустимое число — попытка
+    ///    применить дельту к неполному тексту привела бы либо к непредсказуемому
+    ///    скачку значения, либо к сбросу каретки.
+    ///
+    /// Чтобы изменить значение колесом, достаточно либо крутить его без клика
+    /// (поле вне фокуса), либо завершить ввод нажатием `Enter`/`Esc`/кликом вне поля.
+    pub fn mouse_wheel(&mut self, notches: i32) -> bool {
+        if self.focused || notches == 0 {
+            return false;
+        }
+        let delta = (notches as i64).saturating_mul(self.step as i64);
+        let new_value = (self.value as i64)
+            .saturating_add(delta)
+            .clamp(self.min as i64, self.max as i64) as u32;
+        if new_value == self.value {
+            return false;
+        }
+        self.value = new_value;
+        self.text = new_value.to_string();
+        self.caret = self.text.len();
+        self.original.clone_from(&self.text);
+        self.submitted = Some(new_value);
+        true
     }
 
     /// Установить значение извне (синхронизация с ползунком). В фокусе
@@ -1402,7 +1495,7 @@ impl NumericField {
         }
     }
 
-    /// Принятое по `Enter` значение с прошлого опроса (сбрасывается).
+    /// Принятое по `Enter` или прокрутке колеса значение с прошлого опроса (сбрасывается).
     pub fn take_submitted(&mut self) -> Option<u32> {
         self.submitted.take()
     }
@@ -1574,18 +1667,26 @@ impl Widget for NumericField {
     }
 
     fn pointer_event(&mut self, ev: PointerEvent) -> bool {
-        let PointerEvent::Down { pos } = ev else {
-            return false;
-        };
-        if !self.hit_test(pos) {
-            return false;
+        match ev {
+            PointerEvent::Down { pos } => {
+                if !self.hit_test(pos) {
+                    return false;
+                }
+                if !self.focused {
+                    self.focused = true;
+                    self.original.clone_from(&self.text);
+                }
+                self.caret = self.caret_from_x(pos.0);
+                true
+            }
+            PointerEvent::Wheel { pos, notches } => {
+                if !self.hit_test(pos) {
+                    return false;
+                }
+                self.mouse_wheel(notches)
+            }
+            PointerEvent::Move { .. } | PointerEvent::Up { .. } => false,
         }
-        if !self.focused {
-            self.focused = true;
-            self.original.clone_from(&self.text);
-        }
-        self.caret = self.caret_from_x(pos.0);
-        true
     }
 
     fn key_event(&mut self, key: Key) -> bool {
@@ -2263,7 +2364,7 @@ impl Widget for Checkbox {
                 }
                 true
             }
-            PointerEvent::Move { .. } => false,
+            PointerEvent::Move { .. } | PointerEvent::Wheel { .. } => false,
         }
     }
 
@@ -2578,7 +2679,31 @@ impl Panel {
                     redraw: false,
                 }
             }
+            PointerEvent::Wheel { pos, notches } => {
+                if notches == 0 {
+                    return EventResult::default();
+                }
+                if let Some(i) = self.top_at(pos) {
+                    let redraw = self.widgets[i].pointer_event(ev);
+                    return EventResult {
+                        consumed: true,
+                        redraw,
+                    };
+                }
+                if box_contains(&self.frame, pos) {
+                    return EventResult {
+                        consumed: true,
+                        redraw: false,
+                    };
+                }
+                EventResult::default()
+            }
         }
+    }
+
+    /// Прокрутка колесом мыши в точке `pos` (DIP).
+    pub fn mouse_wheel(&mut self, pos: Point, notches: i32) -> EventResult {
+        self.pointer_event(PointerEvent::Wheel { pos, notches })
     }
 
     /// Клавиша: уходит сфокусированному виджету; без фокуса панель клавиши
@@ -3455,6 +3580,131 @@ mod tests {
         assert!(rect.w < 1.1 && rect.h > 8.0);
     }
 
+    #[test]
+    fn field_wheel_up_increases_by_step() {
+        let mut f = field(50);
+        assert!(f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: 1,
+        }));
+        assert_eq!(f.value(), 51);
+        assert_eq!(f.take_submitted(), Some(51));
+    }
+
+    #[test]
+    fn field_wheel_down_decreases_by_step() {
+        let mut f = field(50);
+        assert!(f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: -1,
+        }));
+        assert_eq!(f.value(), 49);
+        assert_eq!(f.take_submitted(), Some(49));
+    }
+
+    #[test]
+    fn field_wheel_clamps_at_upper_and_lower_bounds() {
+        let mut f = field(100);
+        assert!(!f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: 1,
+        }));
+        assert_eq!(f.value(), 100);
+        assert_eq!(f.take_submitted(), None);
+
+        let mut f_min = field(1);
+        assert!(!f_min.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: -1,
+        }));
+        assert_eq!(f_min.value(), 1);
+        assert_eq!(f_min.take_submitted(), None);
+    }
+
+    #[test]
+    fn field_wheel_multiple_notches_accumulate_delta() {
+        let mut f = field(50);
+        assert!(f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: 3,
+        }));
+        assert_eq!(f.value(), 53);
+        assert_eq!(f.take_submitted(), Some(53));
+
+        assert!(f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: -5,
+        }));
+        assert_eq!(f.value(), 48);
+        assert_eq!(f.take_submitted(), Some(48));
+    }
+
+    #[test]
+    fn field_wheel_with_custom_step() {
+        let mut f = field(50).with_step(5);
+        assert_eq!(f.step(), 5);
+        assert!(f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: 2,
+        }));
+        assert_eq!(f.value(), 60);
+        assert_eq!(f.take_submitted(), Some(60));
+    }
+
+    #[test]
+    fn field_wheel_ignored_when_focused_to_preserve_manual_input() {
+        let mut f = field(50);
+        // Входим в режим редактирования (фокус).
+        assert!(f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) }));
+        assert!(f.has_focus());
+        // Пользователь стёр цифру и набрал '7'.
+        f.key_event(Key::Backspace);
+        f.key_event(Key::Digit(7));
+        // Колесо не должно затирать введённые символы или менять значение.
+        assert!(!f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: 1,
+        }));
+        assert_eq!(f.value(), 50, "значение поля не изменилось");
+        assert_eq!(f.take_submitted(), None, "никакого submit не произошло");
+        assert!(f.has_focus(), "фокус остался у поля");
+        // Завершаем ввод по Enter — применяется то, что набрал пользователь ("57" -> 57).
+        f.key_event(Key::Enter);
+        assert_eq!(f.take_submitted(), Some(57));
+        assert!(!f.has_focus());
+    }
+
+    #[test]
+    fn field_snap_gap_defaults_and_bounds() {
+        let mut f = NumericField::snap_gap(ID_FIELD, 100.0, 50.0, 48.0);
+        assert_eq!(f.value(), 5, "значение по умолчанию 5%");
+        assert_eq!(f.step(), 1, "шаг по умолчанию 1%");
+
+        // Крутим вверх на 3 шага.
+        assert!(f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: 3,
+        }));
+        assert_eq!(f.value(), 8);
+        assert_eq!(f.take_submitted(), Some(8));
+
+        // Крутим вниз до нуля.
+        assert!(f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: -20,
+        }));
+        assert_eq!(f.value(), 0, "нижняя граница зазора 0%");
+        assert_eq!(f.take_submitted(), Some(0));
+
+        // Крутим вверх до максимума 35.
+        assert!(f.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 50.0),
+            notches: 50,
+        }));
+        assert_eq!(f.value(), 35, "верхняя граница зазора 35%");
+        assert_eq!(f.take_submitted(), Some(35));
+    }
+
     /// Чекбокс 16×16 с центром в (50, 50).
     fn checkbox(checked: bool) -> Checkbox {
         Checkbox::standard(ID_CHECK, 50.0, 50.0, checked)
@@ -3714,6 +3964,66 @@ mod tests {
         assert!(p.widget::<Button>(ID_BTN).is_some());
         assert!(p.widget::<Slider>(ID_BTN).is_none(), "тип не совпал");
         assert!(p.widget::<Button>(999).is_none(), "id не найден");
+    }
+
+    #[test]
+    fn panel_routes_wheel_to_hovered_numeric_field() {
+        let mut p = Panel::new(0, rect(100.0, 100.0, 200.0, 100.0));
+        p.add_widget(NumericField::snap_gap(ID_FIELD, 100.0, 100.0, 48.0));
+
+        let res = p.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 100.0),
+            notches: 2,
+        });
+        assert!(res.consumed, "событие колеса поглощено панелью");
+        assert!(res.redraw, "требуется перерисовка");
+        assert_eq!(
+            p.widget_mut::<NumericField>(ID_FIELD)
+                .unwrap()
+                .take_submitted(),
+            Some(7)
+        );
+
+        // Также проверяем удобный метод mouse_wheel.
+        let res2 = p.mouse_wheel((100.0, 100.0), -1);
+        assert!(res2.consumed);
+        assert!(res2.redraw);
+        assert_eq!(
+            p.widget_mut::<NumericField>(ID_FIELD)
+                .unwrap()
+                .take_submitted(),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn panel_wheel_on_empty_frame_consumed_without_redraw() {
+        let mut p = Panel::new(0, rect(100.0, 100.0, 200.0, 100.0));
+        p.add_widget(NumericField::snap_gap(ID_FIELD, 100.0, 100.0, 48.0));
+
+        // Колесо над фоном панели вдали от виджета.
+        let res = p.pointer_event(PointerEvent::Wheel {
+            pos: (180.0, 140.0),
+            notches: 1,
+        });
+        assert!(res.consumed, "фон панели поглощает колесо");
+        assert!(!res.redraw, "перерисовка не требуется");
+    }
+
+    #[test]
+    fn panel_wheel_outside_frame_not_consumed() {
+        let mut p = Panel::new(0, rect(100.0, 100.0, 200.0, 100.0));
+        p.add_widget(NumericField::snap_gap(ID_FIELD, 100.0, 100.0, 48.0));
+
+        let res = p.pointer_event(PointerEvent::Wheel {
+            pos: (500.0, 500.0),
+            notches: 1,
+        });
+        assert_eq!(
+            res,
+            EventResult::default(),
+            "вне панели событие не поглощается"
+        );
     }
 
     // --- Индикатор interact-lock (SPEC «закрепление окон») ---

@@ -345,6 +345,7 @@ impl Widget for VideoTimeline {
                 }
             }
             PointerEvent::Up { .. } => std::mem::replace(&mut self.dragging, false),
+            PointerEvent::Wheel { .. } => false,
         }
     }
 

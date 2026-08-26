@@ -295,6 +295,21 @@ body {
   max-width: 60px;
 }
 
+/* Родные стрелки-крутилки у type=number приходят из движка и не знают ни
+   одной переменной темы: на тёмном фоне это две светлые кнопки, которых
+   никто не рисовал. Поле и так с потолком (`max`) и правится клавиатурой —
+   стрелки убираем целиком. */
+.numberInput::-webkit-outer-spin-button,
+.numberInput::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.numberInput[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
 .textInput {
   min-width: 0;
 }

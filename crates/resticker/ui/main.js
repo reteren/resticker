@@ -83,6 +83,7 @@ function renderGeneral() {
     !!draftSettings.never_overlap_taskbar;
   document.getElementById('outline-pinned-windows').checked =
     !!draftSettings.outline_pinned_windows;
+  document.getElementById('snap-shrink-pct').value = draftSettings.snap_shrink_pct ?? 0;
   const fps = draftSettings.battery_fps_limit ?? 30;
   document.getElementById('battery-fps-limit').value = fps;
   document.getElementById('battery-fps-limit-value').textContent = String(fps);
@@ -104,6 +105,25 @@ for (const [elId, key] of GENERAL_CHECKBOXES) {
   });
 }
 
+// Отступ в снап-зоне (SPEC 12, «Snap gap»): в отличие от подменю трея с его
+// шагом в 5%, здесь значение вписывается числом — от этого и `type=number`,
+// а не слайдер. Потолок держится и здесь, и в ядре: атрибут `max` умеет
+// обойти любой, кто наберёт значение с клавиатуры и нажмёт Enter.
+const snapGapInput = document.getElementById('snap-shrink-pct');
+const SNAP_GAP_MAX = 35;
+snapGapInput.addEventListener('input', () => {
+  const raw = Number(snapGapInput.value);
+  // Пустое поле и мусор — это 0, а не NaN: NaN уехал бы в конфиг и вернулся
+  // бы оттуда `null`, обнулив настройку молча и не там, где её меняли.
+  const pct = Number.isFinite(raw) ? Math.min(Math.max(Math.round(raw), 0), SNAP_GAP_MAX) : 0;
+  draftSettings.snap_shrink_pct = pct;
+});
+// Правку показываем только после ухода из поля: подставлять кламп прямо во
+// время набора значит вырывать курсор из-под пальцев на каждой цифре.
+snapGapInput.addEventListener('blur', () => {
+  snapGapInput.value = draftSettings.snap_shrink_pct ?? 0;
+});
+
 const fpsSlider = document.getElementById('battery-fps-limit');
 const fpsValue = document.getElementById('battery-fps-limit-value');
 fpsSlider.addEventListener('input', () => {
@@ -118,11 +138,38 @@ const HOTKEY_FIELDS = [
   ['hotkey-toggle-all', 'toggle_all_stickers'],
   ['hotkey-mute-all', 'mute_all'],
   ['hotkey-pin', 'pin_focused_window'],
+  ['hotkey-unpin-all', 'unpin_all'],
+  ['hotkey-groups-menu', 'edit_groups_menu'],
+  ['hotkey-delete-group', 'delete_open_group'],
+  // Открытие группы — девять хоткеев, по одному на цифру, но настраивается
+  // ОДНИМ полем: пользователь задаёт модификаторы, цифры подставляются сами.
+  // Девять отдельных полей были бы стеной одинаковых строк, а разные
+  // модификаторы у разных цифр никому не нужны.
+  ['hotkey-open-group', 'open_group_by_number'],
 ];
+
+// Поле открытия группы хранит МАССИВ из девяти строк, а не одну.
+const OPEN_GROUP_FIELD = 'hotkey-open-group';
+const GROUP_SLOTS = 9;
+
+// Показать значение поля: массив цифровых хоткеев сворачивается в первую
+// строку — остальные отличаются только цифрой.
+function hotkeyFieldValue(key, value) {
+  if (key !== 'open_group_by_number') return value ?? '';
+  const first = Array.isArray(value) ? value.find((v) => v) : null;
+  return first ?? '';
+}
+
+// Раздать одни и те же модификаторы всем девяти цифрам.
+function spreadDigits(combo) {
+  const mods = combo.split('+').slice(0, -1);
+  if (mods.length === 0) return null;
+  return Array.from({ length: GROUP_SLOTS }, (_, i) => [...mods, String(i + 1)].join('+'));
+}
 
 function renderControl() {
   for (const [elId, key] of HOTKEY_FIELDS) {
-    document.getElementById(elId).value = draftHotkeys[key] ?? '';
+    document.getElementById(elId).value = hotkeyFieldValue(key, draftHotkeys[key]);
   }
   const volume = draftSettings.pin_sound_volume ?? 100;
   document.getElementById('pin-sound-volume').value = volume;
@@ -140,13 +187,6 @@ pinVolumeSlider.addEventListener('input', () => {
   draftSettings.pin_sound_volume = Number(pinVolumeSlider.value);
 });
 
-function codeToKeyToken(code) {
-  if (code.startsWith('Key') && code.length === 4) return code.slice(3);
-  if (code.startsWith('Digit') && code.length === 6) return code.slice(5);
-  if (/^F([1-9]|1\d|2[0-4])$/.test(code)) return code;
-  return null;
-}
-
 // Отменить запись текущего поля: вернуть его значение из draftHotkeys (а не
 // оставить плейсхолдер "Нажмите комбинацию…" висеть) и снять .recording.
 // Общий путь для Esc И для клика по ДРУГОМУ полю хоткея, пока это ещё
@@ -155,8 +195,11 @@ function codeToKeyToken(code) {
 function cancelRecording() {
   if (!recordingField) return;
   const [, key] = HOTKEY_FIELDS.find(([id]) => id === recordingField);
-  document.getElementById(recordingField).value = draftHotkeys[key] ?? '';
-  document.getElementById(recordingField).classList.remove('recording');
+  const input = document.getElementById(recordingField);
+  if (input) {
+    input.value = hotkeyFieldValue(key, draftHotkeys[key]);
+    input.classList.remove('recording');
+  }
   recordingField = null;
 }
 
@@ -170,40 +213,107 @@ for (const [elId] of HOTKEY_FIELDS) {
   });
 }
 
-document.addEventListener('keydown', (e) => {
-  if (!recordingField) return;
-  e.preventDefault();
-  if (e.code === 'Escape') {
-    cancelRecording();
-    return;
-  }
-  const keyToken = codeToKeyToken(e.code);
-  if (!keyToken) return; // ждём буквенно-цифровую клавишу или F1-F24
-  const parts = [];
-  if (e.ctrlKey) parts.push('Ctrl');
-  if (e.altKey) parts.push('Alt');
-  if (e.shiftKey) parts.push('Shift');
-  if (e.metaKey) parts.push('Win');
-  if (parts.length === 0) return; // HotkeyCombo::parse требует хотя бы один модификатор
-  parts.push(keyToken);
-  const combo = parts.join('+');
+// Захватываем keydown/keyup в capture-фазе (третий аргумент true), чтобы
+// системные или браузерные акселераторы и внутренние элементы не уводили фокус
+// и события.
+window.addEventListener(
+  'keydown',
+  (e) => {
+    if (!recordingField) return;
+    e.preventDefault();
+    e.stopPropagation();
 
-  const [, key] = HOTKEY_FIELDS.find(([id]) => id === recordingField);
-  draftHotkeys[key] = combo;
-  document.getElementById(recordingField).value = combo;
-  document.getElementById(recordingField).classList.remove('recording');
-  recordingField = null;
+    if (e.code === 'Escape' || e.key === 'Escape') {
+      cancelRecording();
+      return;
+    }
+
+    // Если пользователь держит/нажимает модификаторы — показываем живой превью
+    // ("Alt + Shift + …"), подтверждая, что клавиши распознаны и поле ждёт букву.
+    if (isModifierKey(e.code, e.key)) {
+      const mods = getModifiersFromEvent(e);
+      const input = document.getElementById(recordingField);
+      if (input) input.value = formatHoldingModifiers(mods, t('control.recording'));
+      return;
+    }
+
+    const keyToken = codeToKeyToken(e.code, e.key);
+    if (!keyToken) {
+      // Пользователь нажал неподдерживаемую клавишу (Space, Tab, Enter, стрелки и т.п.)
+      const keyName = e.key && e.key.length === 1 ? e.key : e.code || e.key || '?';
+      setStatus(t('control.unsupportedKey', { key: keyName }));
+      return;
+    }
+
+    const mods = getModifiersFromEvent(e);
+    const res = buildHotkeyCombo(mods, keyToken);
+    if (!res.success) {
+      // Пользователь нажал клавишу без модификаторов — говорим об этом прямо
+      if (res.error === 'modifier_required') {
+        setStatus(t('control.modifierRequired'));
+      }
+      return;
+    }
+
+    const combo = res.combo;
+    const [, key] = HOTKEY_FIELDS.find(([id]) => id === recordingField);
+    if (recordingField === OPEN_GROUP_FIELD) {
+      // Цифра из набранного сочетания не важна: пользователь задаёт
+      // модификаторы, а цифру каждой группе присваиваем сами.
+      const spread = spreadDigits(combo);
+      if (!spread) return;
+      draftHotkeys[key] = spread;
+    } else {
+      draftHotkeys[key] = combo;
+    }
+    const input = document.getElementById(recordingField);
+    if (input) {
+      input.value = combo;
+      input.classList.remove('recording');
+    }
+    recordingField = null;
+    setStatus('');
+  },
+  true
+);
+
+window.addEventListener(
+  'keyup',
+  (e) => {
+    if (!recordingField) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const mods = getModifiersFromEvent(e);
+    const input = document.getElementById(recordingField);
+    if (input) {
+      input.value = formatHoldingModifiers(mods, t('control.recording'));
+    }
+  },
+  true
+);
+
+// Отмена записи при клике мимо полей хоткеев или потере фокуса окном
+document.addEventListener('click', (e) => {
+  if (recordingField && !e.target.closest('.hotkeyInput')) {
+    cancelRecording();
+  }
+});
+window.addEventListener('blur', () => {
+  cancelRecording();
 });
 
 document.getElementById('clear-hotkey-toggle-all').addEventListener('click', () => {
+  cancelRecording();
   draftHotkeys.toggle_all_stickers = null;
   document.getElementById('hotkey-toggle-all').value = '';
 });
 document.getElementById('clear-hotkey-mute-all').addEventListener('click', () => {
+  cancelRecording();
   draftHotkeys.mute_all = null;
   document.getElementById('hotkey-mute-all').value = '';
 });
 document.getElementById('clear-hotkey-pin').addEventListener('click', () => {
+  cancelRecording();
   draftHotkeys.pin_focused_window = null;
   document.getElementById('hotkey-pin').value = '';
 });

@@ -21,12 +21,12 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW,
-    GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    EnumWindows, FindWindowExW, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor,
+    GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT,
+    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
-use windows::core::{BOOL, PWSTR};
+use windows::core::{BOOL, PCWSTR, PWSTR};
 
 use crate::window_icon;
 
@@ -92,13 +92,6 @@ pub struct WindowInfo {
     /// Окно свёрнуто: не оклюдер (прямоугольник мусорный), но показывается
     /// в панели выбора (M4_PREP_NOTES §2.2).
     pub iconic: bool,
-    /// У окна есть рамка изменения размера (`WS_THICKFRAME`).
-    ///
-    /// Тайлинг двигает только такие окна: плитка обязана принять заданный
-    /// размер, а окно фиксированного размера его молча проигнорирует и
-    /// вылезет за гэпы (docs/TILING_DESIGN.md §Р2). Такие окна уходят в
-    /// floating, а не ломают сетку.
-    pub resizable: bool,
     /// Место под иконку окна (панель выбора M4): заполняется [`window_icon`]
     /// при перечислении; `None` — у окна нет exe-пути (protected process),
     /// извлечение не удалось или иконки нет (панель рисует плейсхолдер).
@@ -151,7 +144,6 @@ struct WindowFlags {
     app_window: bool,
     has_owner: bool,
     iconic: bool,
-    resizable: bool,
 }
 
 /// Фильтр «реальных окон» дословно по ARCHITECTURE.md 3.3 и
@@ -178,50 +170,23 @@ fn is_real_window(f: &WindowFlags) -> bool {
     true
 }
 
-/// Окно, которое тайлинг имеет право поставить в плитку
-/// (docs/TILING_DESIGN.md §Р2).
+/// Окно можно менять в размерах — у него есть рамка ресайза
+/// (`WS_THICKFRAME`, она же `WS_SIZEBOX`).
 ///
-/// Строго уже, чем [`is_real_window`]: тот отвечает на вопрос «показывать ли
-/// окно пользователю в списке», а этот — «можно ли им РАСПОРЯЖАТЬСЯ». Разница
-/// в четырёх пунктах, и каждый — из чужого опыта (docs/research/tiling/R3 §1):
+/// Тот же признак, по которому решает сама Windows: снап работает только над
+/// окнами с этим стилем, а фиксированные диалоги остаются как есть. Поэтому
+/// проверка нужна перед тем, как двигать ЧУЖОЕ незакреплённое окно: без неё
+/// мы бы раз за разом просили `SetWindowPos` изменить размер окна, которое
+/// его изменить не может, и получали бы тихий отказ на каждом снимке.
 ///
-/// * свёрнутое окно в раскладке не участвует — у него и прямоугольник
-///   мусорный; вернётся в сетку, когда его развернут;
-/// * без `WS_THICKFRAME` окно не примет размер плитки (см.
-///   [`WindowInfo::resizable`]);
-/// * окно с владельцем — это диалог, палитра или сплэш; затайленный диалог
-///   сохранения файла бесит сразу и заслуженно;
-/// * окна шелла (панель задач, Task View, меню Пуск) трогать нельзя вовсе —
-///   тот же список, что защищает переключатель в [`shell_switching`].
-///
-/// Чего здесь ЕЩЁ нет и что честно оставлено на потом: минимальный размер
-/// окна (`WM_GETMINMAXINFO`). Он требует синхронного запроса в чужой процесс,
-/// а перечисление окон — горячий путь координатора; спрашивать его нужно
-/// точечно, в момент постановки окна в плитку, а не на каждом снимке.
-pub fn is_tileable(info: &WindowInfo) -> bool {
-    tileable(info.iconic, info.resizable, &info.class)
+/// Мёртвый `hwnd` — `false`: `GetWindowLongW` вернёт 0, и стиля в нём нет.
+pub fn is_resizable(hwnd: usize) -> bool {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: GetWindowLongW принимает любой HWND, в т.ч. уже уничтоженный,
+    // и возвращает 0 вместо падения.
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+    style & WS_THICKFRAME.0 != 0
 }
-
-/// Чистая часть [`is_tileable`] — тестируется без окон, как и
-/// [`is_real_window`].
-fn tileable(iconic: bool, resizable: bool, class: &str) -> bool {
-    if iconic {
-        return false;
-    }
-    if !resizable {
-        return false;
-    }
-    if SHELL_TRANSIENT_CLASSES.contains(&class) || DESKTOP_CLASSES.contains(&class) {
-        return false;
-    }
-    true
-}
-
-/// Классы окон рабочего стола: подложка Explorer и её слой с обоями.
-///
-/// Формально это обычные видимые top-level окна, и `is_real_window` их
-/// пропускает — но «затайлить рабочий стол» означает развалить оболочку.
-const DESKTOP_CLASSES: [&str; 2] = ["Progman", "WorkerW"];
 
 /// Контекст колбэка `EnumWindows`: `raw_index` считает **все** окна из
 /// сырого перечисления (даже отфильтрованные) — так `WindowInfo::z_order`
@@ -288,7 +253,6 @@ fn collect_window(hwnd: HWND, z_order: u32) -> Option<WindowInfo> {
         class: window_class(hwnd),
         z_order,
         iconic: flags.iconic,
-        resizable: flags.resizable,
         icon,
     })
 }
@@ -300,8 +264,6 @@ fn window_flags(hwnd: HWND) -> WindowFlags {
         let visible = IsWindowVisible(hwnd).as_bool();
         let iconic = IsIconic(hwnd).as_bool();
         let is_root = GetAncestor(hwnd, GA_ROOT) == hwnd;
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let resizable = style & WS_THICKFRAME.0 != 0;
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
         let no_activate = ex_style & WS_EX_NOACTIVATE.0 != 0;
         let tool_window = ex_style & WS_EX_TOOLWINDOW.0 != 0;
@@ -326,7 +288,6 @@ fn window_flags(hwnd: HWND) -> WindowFlags {
             app_window,
             has_owner,
             iconic,
-            resizable,
         }
     }
 }
@@ -343,9 +304,31 @@ fn window_flags(hwnd: HWND) -> WindowFlags {
 /// Пока такое окно на переднем плане, «активного приложения» фактически нет:
 /// пользователь ещё выбирает. Любое вмешательство в чужие окна в этот момент
 /// ломает сам переключатель — см. [`shell_switching`].
-const SHELL_TRANSIENT_CLASSES: [&str; 8] = [
-    "MultitaskingViewFrame",        // Win10 Task View / Alt+Tab
-    "XamlExplorerHostIslandWindow", // Win11 Alt+Tab и Win+Tab
+/// Классы окон, которые шелл показывает НА ВРЕМЯ переключения или своего
+/// меню: переключатель Alt+Tab и Win+Tab, меню снап-раскладок Windows 11
+/// (Snap Layouts flyout), меню переполнения трея, меню Пуск, поиск, панель задач.
+///
+/// Пока такое окно на переднем плане или видимо на экране, «активного приложения»
+/// фактически нет: пользователь выбирает действие в системном UI. Любое
+/// вмешательство в чужие окна в этот момент ломает сам переключатель или закрывает
+/// всплывающее меню — см. [`shell_switching`] и [`is_shell_transient_visible`].
+///
+/// Измерено на Windows 11 Build 26200 (2026-08-26):
+/// - `XamlExplorerHostIslandWindow`: хост XAML-островков в explorer.exe, используется
+///   для Alt+Tab, Win+Tab и всплывающего меню снап-раскладок (поток `SnapFlyoutHost Thread`
+///   в `twinui.pcshell.dll`).
+/// - `TopLevelWindowForOverflowXamlIsland`: всплывающее меню области уведомлений (трея).
+/// - `SnapFlyout`: резервный класс всплывающего меню снап-раскладок.
+/// - `Windows.UI.Core.CoreWindow`: меню Пуск, поиск, системные панели.
+/// - `MultitaskingViewFrame`: переключатель задач Windows 10.
+/// - `TaskSwitcherWnd`, `TaskSwitcherOverlayWnd`: классический переключатель Alt+Tab.
+/// - `ForegroundStaging`: промежуточное окно переключения.
+/// - `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`: панели задач.
+pub const SHELL_TRANSIENT_CLASSES: [&str; 10] = [
+    "MultitaskingViewFrame",               // Win10 Task View / Alt+Tab
+    "XamlExplorerHostIslandWindow", // Win11 Alt+Tab, Win+Tab и Snap Layouts Flyout (SnapFlyoutHost)
+    "TopLevelWindowForOverflowXamlIsland", // Win11 меню переполнения трея
+    "SnapFlyout",                   // Резервный класс меню снап-раскладок
     "TaskSwitcherWnd",              // классический Alt+Tab
     "TaskSwitcherOverlayWnd",       // его оверлей
     "ForegroundStaging",            // промежуточное окно переключения
@@ -354,25 +337,90 @@ const SHELL_TRANSIENT_CLASSES: [&str; 8] = [
     "Shell_SecondaryTrayWnd",       // панель задач на втором мониторе
 ];
 
-/// Пользователь ПРЯМО СЕЙЧАС переключается между окнами средствами шелла
-/// (Alt+Tab, Win+Tab, меню Пуск, клик по панели задач).
+/// Проверяет, принадлежит ли имя класса к системным всплывающим/переключающим классам шелла.
+pub fn is_shell_transient_class(class_name: &str) -> bool {
+    SHELL_TRANSIENT_CLASSES
+        .iter()
+        .any(|known| class_name.eq_ignore_ascii_case(known))
+}
+
+/// Проверяет, показано ли прямо сейчас системное всплывающее окно
+/// шелла (Snap Layouts flyout, меню переполнения трея, Alt+Tab и др.).
+///
+/// Зачем: всплывающее меню снап-раскладок Windows 11 (`XamlExplorerHostIslandWindow`,
+/// `SnapFlyout`) не всегда забирает фокус ввода (GetForegroundWindow остаётся на
+/// окне с кнопкой разворачивания). Без прямой проверки видимости окна шелла
+/// закреплённое окно с `WS_EX_TOPMOST` перекрывает всплывающее системное меню
+/// (живой репорт 2026-08-26 со скриншотом).
+///
+/// Если окно не найдено или система другой сборки — безопасно возвращает `false`
+/// без паник и без побочных эффектов.
+pub fn is_shell_transient_visible() -> bool {
+    for &known in &SHELL_TRANSIENT_CLASSES {
+        // Пропускаем панели задач — они постоянные элементы интерфейса, а не всплывающие меню
+        if known.eq_ignore_ascii_case("Shell_TrayWnd")
+            || known.eq_ignore_ascii_case("Shell_SecondaryTrayWnd")
+        {
+            continue;
+        }
+
+        let mut curr_hwnd = HWND::default();
+        let class_wide: Vec<u16> = known.encode_utf16().chain(std::iter::once(0)).collect();
+        let pcwstr = PCWSTR(class_wide.as_ptr());
+
+        while let Ok(hwnd) = unsafe { FindWindowExW(None, Some(curr_hwnd), pcwstr, None) } {
+            if hwnd.0.is_null() {
+                break;
+            }
+            curr_hwnd = hwnd;
+            unsafe {
+                if !IsWindow(Some(hwnd)).as_bool()
+                    || !IsWindowVisible(hwnd).as_bool()
+                    || IsIconic(hwnd).as_bool()
+                {
+                    continue;
+                }
+                let mut cloaked: u32 = 0;
+                let _ = DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAKED,
+                    (&raw mut cloaked).cast(),
+                    size_of::<u32>() as u32,
+                );
+                if cloaked != 0 {
+                    continue;
+                }
+                let rect = extended_frame_bounds(hwnd);
+                if rect.w > 0 && rect.h > 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Пользователь ПРЯМО СЕЙЧАС взаимодействует со системным UI шелла
+/// (Alt+Tab, Win+Tab, меню снап-раскладок Snap Layouts, меню Пуск, клик по панели задач).
 ///
 /// Зачем: правила «показывать только на этих окнах» решают судьбу
 /// закреплённого окна по активному окну и при неподходящем активном окне
-/// сворачивают его. Во время Alt+Tab активным становится сам переключатель,
-/// и наивная логика немедленно сворачивала/разворачивала окно прямо под
-/// рукой пользователя — переключатель ломался, Alt+Tab переставал работать
-/// до перехода в другое приложение через панель задач (критический репорт
-/// пользователя 2026-08-22).
+/// сворачивают его. Во время Alt+Tab или показа меню снап-раскладок активным
+/// становится либо сам переключатель, либо фокус остаётся у приложения, пока
+/// поверх висит системный XAML-островок. Любая смена z-order / сокрытие
+/// в этот момент ломает переключатель или закрывает меню под рукой пользователя
+/// (критический репорт 2026-08-22 и 2026-08-26).
 ///
-/// Два независимых признака, любой достаточен:
+/// Три независимых признака, любой достаточен:
 /// * зажат Alt или Win — то есть комбинация переключения ещё удерживается;
-/// * переднее окно принадлежит шеллу ([`SHELL_TRANSIENT_CLASSES`]).
+/// * переднее окно принадлежит шеллу ([`SHELL_TRANSIENT_CLASSES`]);
+/// * всплывающее окно шелла (Snap Layouts flyout, меню переполнения) видимо
+///   прямо сейчас ([`is_shell_transient_visible`]).
 ///
 /// Пока это верно, координатор обязан НИЧЕГО не делать с чужими окнами:
-/// решение примется само, когда пользователь отпустит клавиши и шелл отдаст
-/// передний план настоящему окну.
+/// решение примется само, когда пользователь закончит взаимодействие с шеллом.
 pub fn shell_switching() -> bool {
+    // 1. Зажаты клавиши переключения (Alt или Win).
     // SAFETY: GetAsyncKeyState — потокобезопасное чтение состояния ввода.
     let keys_held = unsafe {
         GetAsyncKeyState(VK_MENU.0 as i32) < 0
@@ -382,15 +430,19 @@ pub fn shell_switching() -> bool {
     if keys_held {
         return true;
     }
+
+    // 2. Переднее окно принадлежит шеллу.
     // SAFETY: GetForegroundWindow — чтение состояния десктопа.
     let fg = unsafe { GetForegroundWindow() };
-    if fg.0.is_null() {
-        return false;
+    if !fg.0.is_null() {
+        let class = window_class(fg);
+        if is_shell_transient_class(&class) {
+            return true;
+        }
     }
-    let class = window_class(fg);
-    SHELL_TRANSIENT_CLASSES
-        .iter()
-        .any(|known| class.eq_ignore_ascii_case(known))
+
+    // 3. Системное всплывающее окно шелла (Snap Layouts flyout и др.) видимо на экране.
+    is_shell_transient_visible()
 }
 
 /// Прямоугольник окна ПРЯМО СЕЙЧАС, мимо кэша трекера (те же
@@ -671,45 +723,6 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_resizable_window_is_tileable() {
-        assert!(tileable(false, true, "Chrome_WidgetWin_1"));
-    }
-
-    #[test]
-    fn minimized_window_is_not_tileable() {
-        // Свёрнутое окно не занимает плитку: вернётся, когда его развернут.
-        assert!(!tileable(true, true, "Chrome_WidgetWin_1"));
-    }
-
-    #[test]
-    fn fixed_size_window_is_not_tileable() {
-        // Без WS_THICKFRAME окно молча проигнорирует размер плитки.
-        assert!(!tileable(false, false, "#32770"));
-    }
-
-    #[test]
-    fn shell_windows_are_never_tileable() {
-        for class in ["Shell_TrayWnd", "XamlExplorerHostIslandWindow"] {
-            assert!(!tileable(false, true, class), "{class} — окно шелла");
-        }
-    }
-
-    #[test]
-    fn the_desktop_itself_is_not_tileable() {
-        for class in ["Progman", "WorkerW"] {
-            assert!(!tileable(false, true, class), "{class} — рабочий стол");
-        }
-    }
-
-    #[test]
-    fn tileable_is_stricter_than_is_real_window() {
-        // Окно фиксированного размера — «реальное» для списка, но
-        // неуправляемое для тайлинга. Эта пара и есть смысл двух фильтров.
-        assert!(is_real_window(&flags(|_| {})));
-        assert!(!tileable(false, false, "#32770"));
-    }
-
-    #[test]
     fn plain_visible_root_window_is_real() {
         assert!(is_real_window(&flags(|_| {})));
     }
@@ -853,5 +866,37 @@ mod tests {
             with_icon > 0,
             "хотя бы одно окно с иконкой на реальном десктопе"
         );
+    }
+
+    /// Классы системных меню и переключателей шелла (включая всплывающее меню
+    /// Snap Layouts Windows 11 `XamlExplorerHostIslandWindow`, меню переполнения
+    /// `TopLevelWindowForOverflowXamlIsland`, резервный класс `SnapFlyout`)
+    /// обязаны распознаваться без учёта регистра (репорты 2026-08-22 и 2026-08-26).
+    #[test]
+    fn shell_transient_classes_recognize_windows11_snap_layouts() {
+        assert!(is_shell_transient_class("XamlExplorerHostIslandWindow"));
+        assert!(is_shell_transient_class("xamlexplorerhostislandwindow"));
+        assert!(is_shell_transient_class(
+            "TopLevelWindowForOverflowXamlIsland"
+        ));
+        assert!(is_shell_transient_class("SnapFlyout"));
+        assert!(is_shell_transient_class("Windows.UI.Core.CoreWindow"));
+        assert!(is_shell_transient_class("MultitaskingViewFrame"));
+        assert!(is_shell_transient_class("TaskSwitcherWnd"));
+        assert!(is_shell_transient_class("Shell_TrayWnd"));
+
+        // Обычные прикладные окна не должны ложно определяться как шелл
+        assert!(!is_shell_transient_class("CabinetWClass"));
+        assert!(!is_shell_transient_class("Chrome_WidgetWin_1"));
+        assert!(!is_shell_transient_class("Notepad"));
+        assert!(!is_shell_transient_class(""));
+    }
+
+    /// Проверка видимости системных всплывающих окон шелла обязана безопасно
+    /// деградировать и не паниковать в любой среде (включая CI и сборки Windows без меню).
+    #[test]
+    fn is_shell_transient_visible_degrades_gracefully() {
+        let _ = is_shell_transient_visible();
+        let _ = shell_switching();
     }
 }

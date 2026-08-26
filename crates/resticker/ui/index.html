@@ -137,6 +137,65 @@
                 <button class="button compact" id="clear-hotkey-pin">×</button>
               </div>
 
+              <label class="inputGroup">
+                <p class="inputLabel" data-i18n="control.unpinAll">Unpin all windows</p>
+                <input
+                  type="text"
+                  class="textInput hotkeyInput"
+                  id="hotkey-unpin-all"
+                  readonly
+                  placeholder="Not set"
+                  data-i18n-placeholder="control.notSet"
+                  style="max-width: 160px"
+                />
+                <button class="button compact" id="clear-hotkey-unpin-all">×</button>
+              </label>
+
+              <label class="inputGroup">
+                <p class="inputLabel" data-i18n="control.groupsMenu">Window groups menu</p>
+                <input
+                  type="text"
+                  class="textInput hotkeyInput"
+                  id="hotkey-groups-menu"
+                  readonly
+                  placeholder="Not set"
+                  data-i18n-placeholder="control.notSet"
+                  style="max-width: 160px"
+                />
+                <button class="button compact" id="clear-hotkey-groups-menu">×</button>
+              </label>
+
+              <label class="inputGroup">
+                <p class="inputLabel" data-i18n="control.openGroup">Open group (digit 1-9)</p>
+                <input
+                  type="text"
+                  class="textInput hotkeyInput"
+                  id="hotkey-open-group"
+                  readonly
+                  placeholder="Not set"
+                  data-i18n-placeholder="control.notSet"
+                  style="max-width: 160px"
+                />
+                <button class="button compact" id="clear-hotkey-open-group">×</button>
+              </label>
+              <p class="hint" data-i18n="control.openGroupHint">
+                Press the combination with any digit — the same modifiers apply to digits 1 through 9, one per group.
+              </p>
+
+              <label class="inputGroup">
+                <p class="inputLabel" data-i18n="control.deleteGroup">Delete open group</p>
+                <input
+                  type="text"
+                  class="textInput hotkeyInput"
+                  id="hotkey-delete-group"
+                  readonly
+                  placeholder="Not set"
+                  data-i18n-placeholder="control.notSet"
+                  style="max-width: 160px"
+                />
+                <button class="button compact" id="clear-hotkey-delete-group">×</button>
+              </label>
+
               <div class="inputGroup">
                 <p class="inputLabel" data-i18n="control.pinSoundVolume">Pin sound volume</p>
                 <input
@@ -205,6 +264,21 @@
               </label>
               <p class="hint" data-i18n="general.outlinePinnedHint">
                 Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.
+              </p>
+
+              <label class="inputGroup">
+                <p class="inputLabel" data-i18n="general.snapGap">Snap gap, %</p>
+                <input
+                  type="number"
+                  class="textInput numberInput"
+                  id="snap-shrink-pct"
+                  min="0"
+                  max="35"
+                  step="1"
+                />
+              </label>
+              <p class="hint" data-i18n="general.snapGapHint">
+                Shrinks a window snapped by Windows to a half, quarter or third of the screen by this much on every side, leaving an even gap around it. 0 turns it off. Also available in the tray menu, where you can extend it to unpinned windows.
               </p>
 
               <label class="checkboxWrapper">
@@ -293,6 +367,7 @@
     </section>
 
     <script src="i18n.js"></script>
+    <script src="hotkey_util.js"></script>
     <script src="main.js"></script>
   </body>
 </html>

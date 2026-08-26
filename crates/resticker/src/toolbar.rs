@@ -18,13 +18,6 @@ pub const TB_PANEL: WidgetId = 0;
 pub const TB_SLIDER: WidgetId = 1;
 pub const TB_FIELD: WidgetId = 2;
 pub const TB_LAYERS: WidgetId = 8;
-/// «В раскладку»: отдать стикер тайлингу или забрать обратно (M9).
-///
-/// Живёт в тулбаре стикера, а не среди биндов тайлинга: бинды работают над
-/// сфокусированным ОКНОМ, а стикер выбирается мышью в режиме редактирования —
-/// то есть вопрос «этот стикер в раскладку?» задаётся ровно там, где стикер
-/// уже выделен.
-pub const TB_TILE: WidgetId = 13;
 pub const TB_EYE: WidgetId = 3;
 pub const TB_ORDER_UP: WidgetId = 4;
 pub const TB_ORDER_DOWN: WidgetId = 5;
@@ -179,7 +172,6 @@ pub fn build_toolbar(
 
     let buttons = [
         (TB_LAYERS, Icon::Layers),
-        (TB_TILE, Icon::Tile),
         (TB_EYE, Icon::Eye),
         (TB_ORDER_UP, Icon::OrderUp),
         (TB_ORDER_DOWN, Icon::OrderDown),
@@ -403,7 +395,6 @@ mod tests {
         let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), Some(1.0), None, SCREEN_H);
         let expected = [
             (TB_LAYERS, Icon::Layers),
-            (TB_TILE, Icon::Tile),
             (TB_EYE, Icon::Eye),
             (TB_ORDER_UP, Icon::OrderUp),
             (TB_ORDER_DOWN, Icon::OrderDown),
@@ -453,7 +444,6 @@ mod tests {
         // Тот же порядок слева направо, без слайдера/поля слева.
         let centers: Vec<f64> = [
             TB_LAYERS,
-            TB_TILE,
             TB_EYE,
             TB_ORDER_UP,
             TB_ORDER_DOWN,

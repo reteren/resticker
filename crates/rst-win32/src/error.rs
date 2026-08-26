@@ -18,10 +18,6 @@ pub enum Win32Error {
     OverlayWindowCreateFailed,
     #[error("the overlay thread exited before initialization")]
     OverlayThreadCrashed,
-    #[error("could not install the keyboard hook: tiling shortcuts will not work")]
-    KeyboardHookFailed,
-    #[error("the keyboard-guard thread exited before initialization")]
-    KeyboardGuardThreadCrashed,
     #[error("could not create the window-tracker window")]
     WindowTrackerWindowCreateFailed,
     #[error("the window-tracker thread exited before initialization")]

@@ -94,13 +94,24 @@ const STRINGS = {
   'control.editMode': 'Edit mode',
   'control.toggleAll': 'Show/hide all stickers',
   'control.muteAll': 'Mute all',
+  'control.unpinAll': 'Unpin all windows',
+  'control.groupsMenu': 'Window groups menu',
+  'control.openGroup': 'Open group (digit 1-9)',
+  'control.openGroupHint':
+    'Press the combination with any digit — the same modifiers apply to digits 1 through 9, one per group.',
+  'control.deleteGroup': 'Delete open group',
   'control.pinFocusedWindow': 'Pin focused window',
   'control.pinSoundVolume': 'Pin sound volume',
+  'general.snapGap': 'Snap gap, %',
+  'general.snapGapHint':
+    'Shrinks a window snapped by Windows to a half, quarter or third of the screen by this much on every side, leaving an even gap around it. 0 turns it off. Also available in the tray menu, where you can extend it to unpinned windows.',
   'general.outlinePinned': 'Outline on pinned window',
   'general.outlinePinnedHint':
     'Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.',
   'control.notSet': 'Not set',
   'control.recording': 'Press a combination…',
+  'control.modifierRequired': 'At least one modifier is required (Ctrl, Alt, Shift, or Win).',
+  'control.unsupportedKey': 'Key "{key}" is not supported. Use A-Z, 0-9, or F1-F24.',
   'control.hintClick': 'Click a field, then press a key combination.',
   'control.hintRestart': 'Hotkey changes apply after restarting resticker.',
   'control.hintRequired':

@@ -13,10 +13,10 @@
 //! даёт тот же device interface path, но не нужен — не подключаем.
 
 use tracing::warn;
-use windows::Win32::Foundation::{LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
-    MONITORINFO, MONITORINFOEXW,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, MonitorFromWindow,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -45,20 +45,6 @@ pub struct MonitorInfo {
     /// Границы в физических пикселях виртуального десктопа; у неосновных
     /// мониторов `x`/`y` могут быть отрицательными.
     pub bounds_px: Rect,
-    /// Рабочая область (`MONITORINFO::rcWork`) — те же координаты, что и
-    /// [`Self::bounds_px`], но без панели задач и прочих закреплённых
-    /// AppBar'ов.
-    ///
-    /// Нужна тайлингу (docs/TILING_DESIGN.md §T0): гэп «до края экрана»,
-    /// отмеренный от `bounds_px`, положил бы плитки ПОД панель задач.
-    /// Стикеры этой областью не пользуются — им панель задач видна как
-    /// обычный окклюдер (`rst_core::occluders`), поэтому до M9 её никто и
-    /// не читал.
-    ///
-    /// Меняется на лету (панель задач с автоскрытием, смена её стороны или
-    /// размера), а события на это Windows не шлёт — значение верно на момент
-    /// снимка, обновляется следующим [`enumerate`].
-    pub work_area_px: Rect,
     /// Точки на дюйм (96 = 100%); масштаб = `dpi / 96.0`.
     pub dpi: u32,
     /// Основной монитор (`MONITORINFOF_PRIMARY`).
@@ -123,10 +109,65 @@ fn monitor_info(hmonitor: HMONITOR) -> Result<MonitorInfo, Win32Error> {
         id: MonitorId(id),
         friendly_name,
         bounds_px: rect_px(mi.rcMonitor),
-        work_area_px: rect_px(mi.rcWork),
         dpi: effective_dpi(hmonitor),
         is_primary: mi.dwFlags & MONITORINFOF_PRIMARY != 0,
     })
+}
+
+/// Рабочая область (`rcWork`) монитора, на котором сейчас стоит окно, —
+/// в физических пикселях виртуального десктопа.
+///
+/// Отдельный запрос к ОС, а не поле в [`MonitorInfo`], по двум причинам.
+/// Во-первых, монитор ищет сама Windows (`MONITOR_DEFAULTTONEAREST`) — то же
+/// правило, по которому она решала, в какую снап-зону класть окно, так что
+/// расхождения с ней быть не может по построению. Во-вторых, вызов нужен
+/// лишь горстке закреплённых окон на снимок, и раздувать ради него снапшот
+/// мониторов (плюс каждое место его сборки) незачем.
+///
+/// Рабочая область, а не `rcMonitor`: снап Windows считает именно от неё —
+/// окно в левой половине не залезает под панель задач.
+///
+/// `None` — окна уже нет или `GetMonitorInfoW` отказал.
+pub fn work_area_for_window(hwnd: usize) -> Option<Rect> {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: `MonitorFromWindow` принимает любой HWND, в т.ч. мёртвый, и
+    // возвращает нулевой хендл вместо падения.
+    let hmonitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if hmonitor.is_invalid() {
+        return None;
+    }
+    work_area_of_monitor(hmonitor)
+}
+
+/// Рабочая область монитора по его сессионному хендлу.
+fn work_area_of_monitor(hmonitor: HMONITOR) -> Option<Rect> {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` — валидный буфер с выставленным cbSize; хендл проверен.
+    if unsafe { GetMonitorInfoW(hmonitor, &raw mut info) }.as_bool() {
+        Some(rect_px(info.rcWork))
+    } else {
+        None
+    }
+}
+
+/// Рабочая область монитора, содержащего точку `(x, y)` виртуального
+/// десктопа, в физических пикселях.
+///
+/// Сестра [`work_area_for_window`] для случая, когда окна ещё нет: раскладка
+/// групп считает места ДО того, как окна туда встанут. Монитор ищет сама
+/// Windows (`MONITOR_DEFAULTTONEAREST`) — тем же правилом, каким она решает,
+/// на каком экране показать окно.
+pub fn work_area_at(x: i32, y: i32) -> Option<Rect> {
+    // SAFETY: MonitorFromPoint принимает любую точку и возвращает ближайший
+    // монитор либо нулевой хендл вместо падения.
+    let hmonitor = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
+    if hmonitor.is_invalid() {
+        return None;
+    }
+    work_area_of_monitor(hmonitor)
 }
 
 /// Прочитать `DISPLAY_DEVICEW` для GDI-имени с заданными флагами. Отдельный

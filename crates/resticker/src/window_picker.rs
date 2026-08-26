@@ -721,7 +721,6 @@ mod tests {
             class: String::new(),
             z_order: z,
             iconic: false,
-            resizable: true,
             icon: None,
         }
     }

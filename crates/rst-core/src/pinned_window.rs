@@ -425,8 +425,239 @@ pub fn host_action(ctx: &HostContext) -> HostAction {
     }
 }
 
+/// Наибольший отступ, на который можно ужать окно внутри его снап-зоны,
+/// проценты (запрос пользователя 2026-08-25: «поставить процентное
+/// соотношение ДО 35%»). Потолок не косметический: зона половины экрана,
+/// ужатая сильнее, перестаёт вмещать полезное содержимое, а смысл функции
+/// — зазор вокруг окна, а не превращение половины экрана в марку.
+pub const SNAP_SHRINK_MAX_PCT: u8 = 35;
+
+/// Шаг процента в меню трея: 0, 5, …, 35 — восемь пунктов.
+///
+/// Меню трея не имеет ползунка (это `HMENU`, пункты дискретны), поэтому шаг
+/// задаёт и сам набор пунктов, и цену промаха: 5% на половине FullHD — это
+/// 48 px, заметно, но не грубо.
+pub const SNAP_SHRINK_STEP_PCT: u8 = 5;
+
+/// Допуск сопоставления окна со снап-зоной, физические пиксели.
+///
+/// Windows делит рабочую область пополам с округлением (1921 → 960 + 961),
+/// а у части окон DWM-границы отличаются от расчётных на пиксель-другой из-за
+/// собственных ограничений минимального размера. Допуск заведомо меньше
+/// половины расстояния между соседними кандидатами (треть экрана против
+/// половины — сотни пикселей), поэтому перепутать зоны он не может.
+pub const SNAP_ZONE_EPS_PX: f64 = 6.0;
+
+/// Наименьшая сторона окна после ужатия, физические пиксели: страховка от
+/// вырожденной зоны (монитор-«полоска», рабочая область в пару десятков
+/// пикселей). При штатных размерах не срабатывает никогда.
+const SNAP_SHRINK_MIN_PX: f64 = 120.0;
+
+/// Все зоны, в которые Windows кладёт окно при снапе рабочей области `work`.
+///
+/// Публичного способа спросить «это окно в снапе?» у Windows нет: снап — это
+/// поведение оболочки, а не свойство окна, и `GetWindowPlacement` о нём
+/// молчит. Поэтому зона распознаётся по геометрии — совпадением границ с
+/// одним из кандидатов ниже.
+///
+/// Состав повторяет раскладки Windows 10/11: половины по обеим осям,
+/// четверти и колонки-трети (Snap Layouts на широком мониторе, включая
+/// «две трети + треть»). Рабочая область целиком в список НЕ входит:
+/// это развёрнутое окно, у него своё обращение в координаторе
+/// (`is_window_maximized`), и спорить с ним отступом значило бы драться с
+/// самим `ShowWindow(SW_MAXIMIZE)`.
+pub fn snap_zones(work: PxRect) -> Vec<PxRect> {
+    let (x, y, w, h) = (work.left, work.top, work.w(), work.h());
+    if w <= 0.0 || h <= 0.0 {
+        return Vec::new();
+    }
+    let (hw, hh) = (w / 2.0, h / 2.0);
+    let third = w / 3.0;
+    vec![
+        // Половины.
+        PxRect::from_xywh(x, y, hw, h),
+        PxRect::from_xywh(x + hw, y, w - hw, h),
+        PxRect::from_xywh(x, y, w, hh),
+        PxRect::from_xywh(x, y + hh, w, h - hh),
+        // Четверти.
+        PxRect::from_xywh(x, y, hw, hh),
+        PxRect::from_xywh(x + hw, y, w - hw, hh),
+        PxRect::from_xywh(x, y + hh, hw, h - hh),
+        PxRect::from_xywh(x + hw, y + hh, w - hw, h - hh),
+        // Колонки-трети.
+        PxRect::from_xywh(x, y, third, h),
+        PxRect::from_xywh(x + third, y, third, h),
+        PxRect::from_xywh(x + 2.0 * third, y, w - 2.0 * third, h),
+        // Две трети слева и справа.
+        PxRect::from_xywh(x, y, 2.0 * third, h),
+        PxRect::from_xywh(x + third, y, w - third, h),
+    ]
+}
+
+/// Снап-зона, которую занимает `rect`, — или `None`, если окно стоит само
+/// по себе.
+///
+/// Совпадать обязаны все четыре кромки: окно ровно в половину ширины, но
+/// сдвинутое по вертикали, снапом не является, и трогать его нельзя.
+pub fn snap_zone_of(rect: PxRect, work: PxRect, eps: f64) -> Option<PxRect> {
+    snap_zones(work)
+        .into_iter()
+        .find(|zone| edges_within(rect, *zone, eps))
+}
+
+/// Ужать зону на `pct` процентов ПО КАЖДОЙ СТОРОНЕ, оставив окно по центру
+/// зоны: зазор появляется со всех четырёх сторон одинаковый.
+///
+/// Проценты режутся о [`SNAP_SHRINK_MAX_PCT`] здесь, а не только в UI:
+/// значение приходит из config.json, который пользователь правит руками.
+pub fn shrink_in_zone(zone: PxRect, pct: u8) -> PxRect {
+    let k = 1.0 - f64::from(pct.min(SNAP_SHRINK_MAX_PCT)) / 100.0;
+    let w = (zone.w() * k).max(SNAP_SHRINK_MIN_PX.min(zone.w()));
+    let h = (zone.h() * k).max(SNAP_SHRINK_MIN_PX.min(zone.h()));
+    PxRect::from_xywh(
+        zone.left + (zone.w() - w) / 2.0,
+        zone.top + (zone.h() - h) / 2.0,
+        w,
+        h,
+    )
+}
+
+/// `rect` — это результат нашего же ужатия зоны `zone`?
+///
+/// Нужно, чтобы отступ пережил собственное применение. Ужатое окно больше не
+/// совпадает ни с одной снап-зоной, и без этой проверки следующий же снимок
+/// счёл бы его «просто окном» и забыл зону — отступ действовал бы ровно один
+/// кадр, а смена процента вообще не доходила бы до окна.
+///
+/// Признак — центр в центре зоны и рамка внутри зоны. Конкретный процент не
+/// проверяется намеренно: тогда смена значения в меню перестала бы узнавать
+/// окно, ужатое предыдущим значением.
+pub fn is_shrunk_in_zone(rect: PxRect, zone: PxRect, eps: f64) -> bool {
+    let centered = ((rect.left + rect.right) - (zone.left + zone.right)).abs() <= 2.0 * eps
+        && ((rect.top + rect.bottom) - (zone.top + zone.bottom)).abs() <= 2.0 * eps;
+    let inside = rect.left >= zone.left - eps
+        && rect.top >= zone.top - eps
+        && rect.right <= zone.right + eps
+        && rect.bottom <= zone.bottom + eps;
+    centered && inside
+}
+
+/// Все четыре кромки совпадают с точностью до `eps`.
+fn edges_within(a: PxRect, b: PxRect, eps: f64) -> bool {
+    (a.left - b.left).abs() <= eps
+        && (a.top - b.top).abs() <= eps
+        && (a.right - b.right).abs() <= eps
+        && (a.bottom - b.bottom).abs() <= eps
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Рабочая область условного FullHD с панелью задач снизу.
+    fn work() -> PxRect {
+        PxRect::from_xywh(0.0, 0.0, 1920.0, 1032.0)
+    }
+
+    #[test]
+    fn snap_zone_recognises_left_half() {
+        let left = PxRect::from_xywh(0.0, 0.0, 960.0, 1032.0);
+        assert_eq!(
+            snap_zone_of(left, work(), SNAP_ZONE_EPS_PX),
+            Some(left),
+            "левая половина обязана распознаваться"
+        );
+    }
+
+    #[test]
+    fn snap_zone_tolerates_rounding_of_odd_width() {
+        // Windows делит 1921 как 960 + 961: окно правой половины начинается
+        // не в 960.5, а в 960 или 961 — допуск обязан это пережить.
+        let work = PxRect::from_xywh(0.0, 0.0, 1921.0, 1032.0);
+        let right = PxRect::from_xywh(961.0, 0.0, 960.0, 1032.0);
+        assert!(
+            snap_zone_of(right, work, SNAP_ZONE_EPS_PX).is_some(),
+            "округление половины не должно ломать распознавание"
+        );
+    }
+
+    #[test]
+    fn snap_zone_recognises_quarter_and_third() {
+        let quarter = PxRect::from_xywh(960.0, 516.0, 960.0, 516.0);
+        assert!(snap_zone_of(quarter, work(), SNAP_ZONE_EPS_PX).is_some());
+        let third = PxRect::from_xywh(640.0, 0.0, 640.0, 1032.0);
+        assert!(snap_zone_of(third, work(), SNAP_ZONE_EPS_PX).is_some());
+    }
+
+    #[test]
+    fn snap_zone_rejects_free_window() {
+        // Ширина как у половины, но окно сдвинуто по вертикали — не снап.
+        let free = PxRect::from_xywh(0.0, 120.0, 960.0, 700.0);
+        assert_eq!(snap_zone_of(free, work(), SNAP_ZONE_EPS_PX), None);
+    }
+
+    #[test]
+    fn snap_zone_ignores_whole_work_area() {
+        // Развёрнутое окно — не снап-зона: им занимается отдельная ветка
+        // координатора, отступ туда лезть не должен.
+        assert_eq!(snap_zone_of(work(), work(), SNAP_ZONE_EPS_PX), None);
+    }
+
+    #[test]
+    fn shrink_keeps_window_centred_in_zone() {
+        let zone = PxRect::from_xywh(0.0, 0.0, 1000.0, 800.0);
+        let got = shrink_in_zone(zone, 20);
+        assert_eq!(got.w(), 800.0);
+        assert_eq!(got.h(), 640.0);
+        // Зазор одинаковый со всех сторон.
+        assert_eq!(got.left - zone.left, zone.right - got.right);
+        assert_eq!(got.top - zone.top, zone.bottom - got.bottom);
+    }
+
+    #[test]
+    fn shrink_is_capped_at_max_pct() {
+        let zone = PxRect::from_xywh(0.0, 0.0, 1000.0, 1000.0);
+        // Значение из руками правленого config.json потолок обязан срезать.
+        assert_eq!(
+            shrink_in_zone(zone, 90),
+            shrink_in_zone(zone, SNAP_SHRINK_MAX_PCT)
+        );
+    }
+
+    #[test]
+    fn shrink_by_zero_returns_the_zone() {
+        let zone = PxRect::from_xywh(10.0, 20.0, 900.0, 700.0);
+        assert_eq!(shrink_in_zone(zone, 0), zone);
+    }
+
+    #[test]
+    fn shrunk_window_is_recognised_as_belonging_to_its_zone() {
+        let zone = PxRect::from_xywh(0.0, 0.0, 960.0, 1032.0);
+        for pct in [5, 15, 35] {
+            let shrunk = shrink_in_zone(zone, pct);
+            assert!(
+                is_shrunk_in_zone(shrunk, zone, SNAP_ZONE_EPS_PX),
+                "ужатое на {pct}% окно обязано узнаваться в своей зоне"
+            );
+        }
+    }
+
+    #[test]
+    fn window_dragged_out_of_zone_is_not_recognised() {
+        let zone = PxRect::from_xywh(0.0, 0.0, 960.0, 1032.0);
+        let shrunk = shrink_in_zone(zone, 20);
+        // Пользователь утащил окно вправо: центр уехал — зона больше не наша.
+        let moved = PxRect::from_xywh(shrunk.left + 300.0, shrunk.top, shrunk.w(), shrunk.h());
+        assert!(!is_shrunk_in_zone(moved, zone, SNAP_ZONE_EPS_PX));
+    }
+
+    #[test]
+    fn shrink_never_collapses_a_degenerate_zone() {
+        // Вырожденная рабочая область (гонка переподключения монитора):
+        // окно обязано остаться не шире зоны и не выродиться в ноль.
+        let zone = PxRect::from_xywh(0.0, 0.0, 40.0, 30.0);
+        let got = shrink_in_zone(zone, SNAP_SHRINK_MAX_PCT);
+        assert_eq!((got.w(), got.h()), (40.0, 30.0));
+    }
     use super::*;
 
     fn mon() -> PxRect {
@@ -596,6 +827,28 @@ mod tests {
         // Переключение закончилось — решение принимается как обычно.
         c.shell_switching = false;
         assert_eq!(host_action(&c), HostAction::Show);
+    }
+
+    /// Пока активно системное всплывающее меню снап-раскладок Windows 11 (Snap Layouts),
+    /// закреплённые окна не должны прятаться или менять z-order (репорт 2026-08-26).
+    #[test]
+    fn host_action_freezes_during_snap_layouts_flyout() {
+        let rules = only(&["explorer.exe"]);
+        let mut c = ctx(&rules, Some("explorer.exe"));
+        c.shell_switching = true;
+        assert_eq!(
+            host_action(&c),
+            HostAction::None,
+            "не трогаем окно при показе Snap Layouts"
+        );
+
+        let mut c2 = ctx(&rules, Some("notepad.exe"));
+        c2.shell_switching = true;
+        assert_eq!(
+            host_action(&c2),
+            HostAction::None,
+            "не скрываем окно при показе Snap Layouts"
+        );
     }
 
     /// Без правил фича молчит: обычное закрепление ведёт себя как раньше.

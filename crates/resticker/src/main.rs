@@ -15,12 +15,21 @@
 
 mod confirm_dialog;
 mod cursor_panel;
+mod gap_panel;
+mod group_manager;
+mod group_strip;
+mod groups;
 mod i18n;
+// Бейдж номера монитора (T7). `dead_code`: бейдж подключает координатор в
+// `overlay_manager.rs` отдельной задачей, и до этого момента модуль никто
+// не вызывает — а удалять его нельзя, это готовый API для координатора;
+// предупреждение снимется само при первом использовании.
 mod logging;
+#[allow(dead_code)]
+mod monitor_badge;
 mod overlay_manager;
 mod preset_picker;
-mod tiling;
-mod tiling_ui;
+mod preset_strip;
 mod toolbar;
 /// Оффскрин-превью панелей в PNG — инструмент разработки оформления.
 #[cfg(test)]
@@ -42,10 +51,9 @@ use rst_win32::tray::{self, MenuItem, TrayEvent, TrayIcon};
 const MENU_OPEN_SETTINGS: u32 = 1;
 const MENU_TOGGLE_VISIBLE: u32 = 2;
 const MENU_EXIT: u32 = 3;
-/// Переключатель тайлинга (M9). Отдельный пункт меню, а не настройка в окне:
-/// включение переставляет чужие окна, и это должно быть однозначным
-/// действием пользователя (докком `OverlayCommand::ToggleTiling`).
-const MENU_TOGGLE_TILING: u32 = 4;
+/// «Режим редактирования» — дубль глобального хоткея на случай, когда его
+/// перехватывает чужая программа.
+const MENU_EDIT_MODE: u32 = 4;
 /// Первый id пункта меню трея под пресет (M7, «быстрое переключение из
 /// трея» — ROADMAP.md). `WM_COMMAND` несёт id только в младшем слове
 /// `wParam` (Win32-соглашение, `tray.rs::wndproc` берёт `wparam.0 & 0xffff`)
@@ -53,6 +61,16 @@ const MENU_TOGGLE_TILING: u32 = 4;
 /// списке на момент последней пересборки меню; обратное соответствие —
 /// `preset_ids` ниже.
 const MENU_PRESET_BASE: u32 = 100;
+/// Пункт «задать величину зазора»: открывает панель с полем ввода поверх
+/// экрана. Значение вписывается числом или крутится колесом мыши — списком
+/// готовых процентов пользователь пользоваться отказался.
+///
+/// Номер с запасом от `MENU_PRESET_BASE`: пункты пресетов растут вверх от
+/// 100 по числу пресетов, и пересечение диапазонов означало бы, что клик по
+/// зазору применяет пресет.
+const MENU_SNAP_GAP_OPEN: u32 = 1000;
+/// Пункт-галочка «отступ и для обычных окон» в том же подменю.
+const MENU_SNAP_GAP_ALL: u32 = 1100;
 
 /// Собрать пункты меню трея из текущего списка пресетов (M7, «быстрое
 /// переключение из трея» — ROADMAP.md; SPEC.md §12: «пресеты (подменю)») —
@@ -62,12 +80,26 @@ const MENU_PRESET_BASE: u32 = 100;
 /// `id == MENU_PRESET_BASE + i` (см. `MENU_PRESET_BASE`).
 /// Подписи пунктов — английские, единственный язык нативного слоя
 /// (`crates/resticker/src/i18n.rs`, доккомент модуля).
-fn build_tray_menu(presets: &[(Uuid, String)]) -> (Vec<MenuItem>, Vec<Uuid>) {
+fn build_tray_menu(
+    presets: &[(Uuid, String)],
+    snap_gap_pct: u8,
+    snap_gap_all_windows: bool,
+) -> (Vec<MenuItem>, Vec<Uuid>) {
+    // Текущее значение вынесено в ЗАГОЛОВОК подменю, а не только в галочку
+    // пункта: процент можно вписать руками в настройках, и произвольное
+    // число (17%) не совпадёт ни с одним пунктом списка — без заголовка
+    // подменю выглядело бы так, будто отступ выключен.
+    let snap_gap_title = if snap_gap_pct == 0 {
+        i18n::tray_snap_gap_submenu().to_string()
+    } else {
+        format!("{} ({snap_gap_pct}%)", i18n::tray_snap_gap_submenu())
+    };
     let mut items = vec![
         MenuItem::new(MENU_OPEN_SETTINGS, i18n::tray_open_settings()),
         tray::separator(),
+        MenuItem::new(MENU_EDIT_MODE, i18n::tray_edit_mode()),
         MenuItem::new(MENU_TOGGLE_VISIBLE, i18n::tray_toggle_visible()),
-        MenuItem::new(MENU_TOGGLE_TILING, i18n::tray_toggle_tiling()),
+        MenuItem::submenu(snap_gap_title, snap_gap_items(snap_gap_all_windows)),
     ];
     let ids: Vec<Uuid> = presets.iter().map(|(id, _)| *id).collect();
     if !ids.is_empty() {
@@ -82,6 +114,34 @@ fn build_tray_menu(presets: &[(Uuid, String)]) -> (Vec<MenuItem>, Vec<Uuid>) {
     items.push(tray::separator());
     items.push(MenuItem::new(MENU_EXIT, i18n::tray_exit()));
     (items, ids)
+}
+
+/// Пункты подменю «Snap gap»: открыть виджет с числом и переключить область
+/// действия.
+///
+/// Раньше здесь был список готовых значений (`Off`, `5%`, `10%`, …), и
+/// пользователь пожаловался на него прямо: «мне не нравится, что я не могу
+/// сам вписать число». Список ушёл целиком — вписать произвольный процент
+/// пунктами `HMENU` невозможно в принципе (Windows не кладёт в меню поле
+/// ввода), поэтому величину задаёт панель поверх экрана, а меню её только
+/// открывает. Само значение видно в ЗАГОЛОВКЕ подменю.
+///
+/// Галочка области действия помечается точкой: `MenuItem` не поддерживает
+/// `MF_CHECKED` — меню рисуется владельцем (`MF_OWNERDRAW`, см. `tray.rs`),
+/// и состояние пункта до отрисовки не доезжает.
+fn snap_gap_items(all_windows: bool) -> Vec<MenuItem> {
+    vec![
+        MenuItem::new(MENU_SNAP_GAP_OPEN, i18n::tray_snap_gap_set()),
+        tray::separator(),
+        MenuItem::new(
+            MENU_SNAP_GAP_ALL,
+            if all_windows {
+                format!("• {}", i18n::tray_snap_gap_all_windows())
+            } else {
+                format!("   {}", i18n::tray_snap_gap_all_windows())
+            },
+        ),
+    ]
 }
 
 /// Добавить стикер по пути, выбранному в диалоге настроек (M1).
@@ -380,6 +440,34 @@ fn list_open_processes() -> Vec<(String, String)> {
     result
 }
 
+/// Отключить системные акселераторы браузера (Edge/WebView2) для окна настроек.
+///
+/// Зачем: по умолчанию WebView2 перехватывает встроенные акселераторы Edge
+/// (`Alt+Shift+S` для Visual Search, `Ctrl+Shift+S` для Web Capture, `Ctrl+S`,
+/// `F5`, `Ctrl+F` и др.) на уровне браузерного движка ДО того, как `keydown`
+/// дойдёт до JavaScript в DOM. Из-за этого пользователь не мог назначить
+/// `Alt+Shift+S` в поле хоткеев — событие просто не долетало до вебвью.
+#[cfg(windows)]
+fn disable_browser_accelerators(window: &tauri::WebviewWindow) {
+    let _ = window.with_webview(|webview| {
+        // SAFETY: прямое обращение к COM-интерфейсам WebView2 в соответствии
+        // с контрактом WebView2 SDK.
+        unsafe {
+            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+            use windows_core_61::Interface;
+
+            let controller = webview.controller();
+            if let Ok(core) = controller.CoreWebView2() {
+                if let Ok(settings) = core.Settings() {
+                    if let Ok(settings3) = settings.cast::<ICoreWebView2Settings3>() {
+                        let _ = settings3.SetAreBrowserAcceleratorKeysEnabled(false);
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Строка после trim; пустая/пробельная — `None` (поля-критерии правила
 /// денй-листа не хранят пустые значения: `""` матчил бы заголовок `""`).
 fn trim_non_empty(s: String) -> Option<String> {
@@ -481,7 +569,11 @@ fn main() -> anyhow::Result<()> {
 
     let initial_presets: Vec<(Uuid, String)> =
         cfg.presets.iter().map(|p| (p.id, p.name.clone())).collect();
-    let (initial_menu, initial_preset_ids) = build_tray_menu(&initial_presets);
+    let (initial_menu, initial_preset_ids) = build_tray_menu(
+        &initial_presets,
+        cfg.settings.snap_shrink_pct,
+        cfg.settings.snap_shrink_all_windows,
+    );
     // Меню трея рисуем сами и той же гарнитурой, что оверлей (запрос
     // пользователя 2026-08-23 — «сделай менюшку в трее в стилистику
     // приложения»): GDI умеет только зарегистрированные шрифты.
@@ -490,7 +582,7 @@ fn main() -> anyhow::Result<()> {
         TrayIcon::new("resticker", initial_menu).context("инициализация иконки трея")?;
     // Индекс пункта меню → id пресета (см. `MENU_PRESET_BASE`) — общий между
     // потоком трея (читает при клике) и потоком координатора (пишет при
-    // `CoordinatorRequest::PresetsChanged`).
+    // `CoordinatorRequest::TrayMenuChanged`).
     let preset_ids = Arc::new(Mutex::new(initial_preset_ids));
 
     let silent_start = cfg.settings.silent_start;
@@ -533,6 +625,11 @@ fn main() -> anyhow::Result<()> {
             list_open_processes,
         ])
         .setup(move |app| {
+            #[cfg(windows)]
+            if let Some(w) = app.get_webview_window("settings") {
+                disable_browser_accelerators(&w);
+            }
+
             if !silent_start {
                 show_settings_window(app);
             }
@@ -545,21 +642,41 @@ fn main() -> anyhow::Result<()> {
                         TrayEvent::MenuItem(MENU_OPEN_SETTINGS) | TrayEvent::Activate => {
                             show_settings_window(&handle);
                         }
+                        TrayEvent::MenuItem(MENU_EDIT_MODE) => {
+                            handle
+                                .state::<OverlayHandle>()
+                                .send(OverlayCommand::ToggleEditMode);
+                        }
                         TrayEvent::MenuItem(MENU_TOGGLE_VISIBLE) => {
                             handle
                                 .state::<OverlayHandle>()
                                 .send(OverlayCommand::ToggleAllStickers);
-                        }
-                        TrayEvent::MenuItem(MENU_TOGGLE_TILING) => {
-                            handle
-                                .state::<OverlayHandle>()
-                                .send(OverlayCommand::ToggleTiling);
                         }
                         TrayEvent::MenuItem(MENU_EXIT) => handle.exit(0),
                         // M7: клик по пункту пресета в меню трея — id несёт
                         // только индекс в списке на момент последней
                         // пересборки меню (`build_tray_menu`), сам `Uuid`
                         // ищем в общем с координатор-потоком `preset_ids`.
+                        // Область действия отступа — галочка без значения,
+                        // поэтому и без диапазона: сравнение точное, и стоять
+                        // оно обязано выше обеих «>=»-веток ниже.
+                        TrayEvent::MenuItem(MENU_SNAP_GAP_ALL) => {
+                            // Переключатель без значения: текущее состояние
+                            // знает координатор (это его `cfg`), и держать
+                            // здесь вторую копию флага значило бы завести
+                            // второй источник правды ради одной галочки.
+                            handle
+                                .state::<OverlayHandle>()
+                                .send(OverlayCommand::ToggleSnapGapAllWindows);
+                        }
+                        // Величина зазора: панель поверх экрана. Ветка стоит
+                        // ВЫШЕ пресетов — их условие `id >= MENU_PRESET_BASE`
+                        // накрывает и этот номер тоже.
+                        TrayEvent::MenuItem(MENU_SNAP_GAP_OPEN) => {
+                            handle
+                                .state::<OverlayHandle>()
+                                .send(OverlayCommand::OpenGapPanel);
+                        }
                         TrayEvent::MenuItem(id) if id >= MENU_PRESET_BASE => {
                             let target = {
                                 let ids = preset_ids_for_tray
@@ -611,8 +728,16 @@ fn main() -> anyhow::Result<()> {
                         // M7: список пресетов изменился — пересобираем меню
                         // трея целиком (`TrayIcon::set_menu`) и обновляем
                         // общий с потоком трея id→Uuid список.
-                        CoordinatorRequest::PresetsChanged(list) => {
-                            let (items, ids) = build_tray_menu(&list);
+                        CoordinatorRequest::TrayMenuChanged {
+                            presets,
+                            snap_shrink_pct,
+                            snap_shrink_all_windows,
+                        } => {
+                            let (items, ids) = build_tray_menu(
+                                &presets,
+                                snap_shrink_pct,
+                                snap_shrink_all_windows,
+                            );
                             *preset_ids_for_coordinator
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner()) = ids;
