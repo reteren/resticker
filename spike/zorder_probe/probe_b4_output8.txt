@@ -1,0 +1,260 @@
+warning: unnecessary `unsafe` block
+   --> src\main.rs:213:24
+    |
+213 |             Anonymous: unsafe {
+    |                        ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> src\main.rs:227:24
+    |
+227 |             Anonymous: unsafe {
+    |                        ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+   --> src\main.rs:550:9
+    |
+550 |     let mut mk = |name: &str| -> HWND {
+    |         ----^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\main.rs:610:9
+    |
+610 |     let mut counter = 0usize;
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\main.rs:763:9
+    |
+763 |     let mut mk = |name: &str| -> HWND {
+    |         ----^^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused variable: `c3`
+   --> src\main.rs:888:9
+    |
+888 |     let c3 = spawn_child_ex("JC3SELF", false, Some(400));
+    |         ^^ help: if this is intentional, prefix it with an underscore: `_c3`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `test_h_timing` is never used
+   --> src\main.rs:685:4
+    |
+685 | fn test_h_timing() {
+    |    ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `test_i_isolate` is never used
+   --> src\main.rs:751:4
+    |
+751 | fn test_i_isolate() {
+    |    ^^^^^^^^^^^^^^
+
+warning: function `test_j_cap` is never used
+   --> src\main.rs:848:4
+    |
+848 | fn test_j_cap() {
+    |    ^^^^^^^^^^
+
+warning: unused `Result` that must be used
+   --> src\main.rs:542:9
+    |
+542 |         ProcessIdToSessionId(user_pid, &mut user_session);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this `Result` may be an `Err` variant, which should be handled
+    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+    |
+542 |         let _ = ProcessIdToSessionId(user_pid, &mut user_session);
+    |         +++++++
+
+warning: `zorder-probe` (bin "zorder-probe") generated 10 warnings (run `cargo fix --bin "zorder-probe" -p zorder-probe` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running `target\debug\zorder-probe.exe`
+=== B4: Z-╨┐╨╛╤А╤П╨┤╨╛╨║ ╨┐╤А╨╕ ╨┐╨╛╨┤╤К╤С╨╝╨╡ ╨╜╨╡╤Б╨║╨╛╨╗╤М╨║╨╕╤Е ╨╛╨║╨╛╨╜ (╤Б╨▓╨╛╨╕ ╨╛╨║╨╜╨░, ╤З╤Г╨╢╨╕╨╡ ╨╜╨╡ ╤В╤А╨╛╨│╨░╨╡╨╝) ===
+╤А╨░╨╜╨│╨╕ [n] тАФ ╨┐╨╛╨╖╨╕╤Ж╨╕╤П ╨╛╨║╨╜╨░ ╤Б╤А╨╡╨┤╨╕ ╨Т╨б╨Х╨е ╨▓╨╕╨┤╨╕╨╝╤Л╤Е top-level ╨╛╨║╨╛╨╜ (1 = ╤Б╨░╨╝╤Л╨╣ ╨▓╨╡╤А╤Е)
+
+=== A. ╨С╨Х╨Ч ╨┐╤А╨░╨▓╨░ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ (╨░╨║╤В╨╕╨▓╨╜╨╛ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П) ===
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 0x960908 (pid 25720)
+  ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░: A-USER-FG[6] > A-F[7] > AG4[8] > AG3[9] > AG2[10] > AG1[11]
+  ╨┐╨╛╤Б╨╗╨╡ HWND_TOP-╨┐╨╛╨┤╤К╤С╨╝╨░ 4 ╨╛╨║╨╛╨╜: A-USER-FG[6] > A-F[7] > AG4[8] > AG3[9] > AG2[10] > AG1[11]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: false
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+
+=== B. ╨б ╨┐╤А╨░╨▓╨╛╨╝ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ (SendInput Alt = ┬л╨┐╨╛╨╗╤Г╤З╨╕╨╗ ╤Е╨╛╤В╨║╨╡╨╣┬╗) ===
+  ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╨┐╨╛╨┤╤К╤С╨╝ ╨┐╤А╤П╨╝╤Л╨╝ ╨┐╨╛╤А╤П╨┤╨║╨╛╨╝: G1 тЖТ G2 тЖТ G3 тЖТ G4
+  ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨┐╤А╤П╨╝╨╛╨│╨╛ ╨┐╨╛╤А╤П╨┤╨║╨░: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: false
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+  ╤З╨╡╤А╨╡╨╖ 300 ╨╝╤Б: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╤З╨╡╤А╨╡╨╖ 1500 ╨╝╤Б: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╤З╨╡╤А╨╡╨╖ 4000 ╨╝╤Б: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╨╛╨▒╤А╨░╤В╨╜╤Л╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║: G4 тЖТ G3 тЖТ G2 тЖТ G1
+  ╨┤╨╛ (F ╤Б╨╜╨╛╨▓╨░ ╨╜╨░╨▓╨╡╤А╤Е╤Г): B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╨┐╨╛╤Б╨╗╨╡ ╨╛╨▒╤А╨░╤В╨╜╨╛╨│╨╛ ╨┐╨╛╤А╤П╨┤╨║╨░: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+
+=== C. ╨Я╨╛╨┤╤К╤С╨╝ (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║) + SetForegroundWindow(G1) ===
+  ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ ╨┐╤А╤П╨╝╤Л╨╝ ╨┐╨╛╤А╤П╨┤╨║╨╛╨╝ (╨┤╨╛ ╤Д╨╛╨║╤Г╤Б╨░): C-USER-FG[7] > C-F[7] > CG4[8] > CG3[9] > CG2[10] > CG1[11]
+  SetForegroundWindow(G1): true
+  ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╤Д╨╛╨║╤Г╤Б╨░ ╨╜╨░ G1: CG1[7] > C-USER-FG[8] > C-F[8] > CG4[9] > CG3[10] > CG2[11]
+  ╤З╨╡╤А╨╡╨╖ ~1 ╤Б ╨┐╨╛╤Б╨╗╨╡ ╤Д╨╛╨║╤Г╤Б╨░: CG1[7] > C-USER-FG[8] > C-F[8] > CG4[9] > CG3[10] > CG2[11]
+  ╨╛╤Б╤В╨░╨╗╤М╨╜╤Л╨╡ 3 ╨╛╨║╨╜╨░ ╨▓╤Б╤С ╨╡╤Й╤С ╨▓╤Л╤И╨╡ F: false
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П ╨╜╨╡ ╨▓╨╡╤А╨╜╤Г╨╗╨╛╤Б╤М ╨╜╨░╨▓╨╡╤А╤Е: false
+
+=== D. ╨Я╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┤╤А╤Г╨│╨╛╨│╨╛ ╨┐╤А╨╛╤Ж╨╡╤Б╤Б╨░ ===
+  ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╨╛╨╡ (pid 15752) ╨░╨║╤В╨╕╨▓╨╜╨╛: SetForegroundWindow ╨╜╨░╨┐╤А╤П╨╝╤Г╤О; ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨╕╨╢╨╡? true
+  --- D1: ╨С╨Х╨Ч ╨┐╤А╨░╨▓╨░ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ ---
+  ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨░╨┤ ╨░╨║╤В╨╕╨▓╨╜╤Л╨╝ ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╤Л╨╝: false
+  --- D2: ╨б ╨┐╤А╨░╨▓╨╛╨╝ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ ---
+  ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨░╨┤ ╨░╨║╤В╨╕╨▓╨╜╤Л╨╝ ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╤Л╨╝: false
+  --- D3: ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╨╛╨╡ ╨▓ topmost-╨┐╨╛╨╗╨╛╤Б╨╡ ---
+  ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨░╨┤ ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╤Л╨╝ (topmost): false
+
+=== E. ╨а╨╡╨░╨╗╤М╨╜╤Л╨╣ ╤Ж╨╕╨║╨╗: ╨▓╤Б╨╡ ╤Б╨▓╤С╤А╨╜╤Г╤В╤Л тЖТ ╤А╨░╨╖╨▓╨╡╤А╨╜╤Г╤В╤М тЖТ ╨┐╨╛╨┤╨╜╤П╤В╤М ===
+  ╨▓╤Б╨╡ ╤Б╨▓╤С╤А╨╜╤Г╤В╤Л: true
+  ╨┐╨╛╤Б╨╗╨╡ ╤А╨░╨╖╨▓╨╛╤А╨╛╤В╨░+╨┐╨╛╨┤╤К╤С╨╝╨░ (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║): E-F[31] > EG4[32] > EG3[33] > EG2[34] > EG1[35]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+
+=== F. ╨з╨╡╤В╤Л╤А╨╡ ╨╛╨║╨╜╨░ ╨╛╨┤╨╜╨╛╨│╨╛ ╨┐╤А╨╛╤Ж╨╡╤Б╤Б╨░ + ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨╡ ╨┤╤А╤Г╨│╨╛╨│╨╛ ===
+  ╨┤╨╛ (╨┐╨╛╤А╤П╨┤╨╛╨║ ╤Б╨╛╨╖╨┤╨░╨╜╨╕╤П): FF[7] > own4[8] > own3[9] > own2[10] > own1[11]
+  ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║): FF[7] > own4[8] > own3[9] > own2[10] > own1[11]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+
+=== G. ╨б╨░╨╜╨╕╤В╨░╤А╨╕╤П: SetWindowPos ╨▓ ╤Н╤В╨╛╨╣ ╤Б╤А╨╡╨┤╨╡ ===
+  ╤Б╨╡╤Б╤Б╨╕╤П ╨┐╤А╨╛╨▒╤Л: 1 (ok=true); ╤Б╨╡╤Б╤Б╨╕╤П ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 1 (pid 25720)
+  ╨╛╨║╨╜╨░: A=0x2A0BFE, B=0x1E081A
+    A (╤Б╨╛╨╖╨┤╨░╨╜╨╛ ╨┐╨╡╤А╨▓╤Л╨╝): ╨╜╨░╨┤ 0x2A0BFE=Some(1968154), ╨┐╨╛╨┤ =Some(265134), ╤А╨░╨╜╨│=8
+    B (╤Б╨╛╨╖╨┤╨░╨╜╨╛ ╨▓╤В╨╛╤А╤Л╨╝): ╨╜╨░╨┤ 0x1E081A=Some(1051188), ╨┐╨╛╨┤ =Some(2755582), ╤А╨░╨╜╨│=7
+  ╨║╤А╨╛╤Б╤Б-╨┐╤А╨╛╨▓╨╡╤А╨║╨░ EnumWindows: A = 0-╨╣ top-level (GetWindow-╤А╨░╨╜╨│ 8)
+  --- op1: SetWindowPos(A, HWND_TOP, NOACTIVATE) ---
+    ╤А╨╡╨╖╤Г╨╗╤М╤В╨░╤В: None
+    A ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨▓╤Л╨╖╨╛╨▓╨░ (t=0): ╨╜╨░╨┤ 0x2A0BFE=Some(1051188), ╨┐╨╛╨┤ =Some(1968154), ╤А╨░╨╜╨│=7
+    A ╤З╨╡╤А╨╡╨╖ 50 ╨╝╤Б: ╨╜╨░╨┤ 0x2A0BFE=Some(1051188), ╨┐╨╛╨┤ =Some(1968154), ╤А╨░╨╜╨│=7
+    A ╤З╨╡╤А╨╡╨╖ ~450 ╨╝╤Б: ╨╜╨░╨┤ 0x2A0BFE=Some(1051188), ╨┐╨╛╨┤ =Some(1968154), ╤А╨░╨╜╨│=7
+  --- op2: SetWindowPos(A, ╨╜╨░╨┤ B, NOACTIVATE) тАФ ╨┐╨╛╨┤╤К╤С╨╝ ╨╜╨░╨┤ ╨║╨╛╨╜╨║╤А╨╡╤В╨╜╤Л╨╝ ╤Б╨╛╤Б╨╡╨┤╨╛╨╝ ---
+    ╤А╨╡╨╖╤Г╨╗╤М╤В╨░╤В: None
+    A ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨▓╤Л╨╖╨╛╨▓╨░ (t=0): ╨╜╨░╨┤ 0x2A0BFE=Some(1968154), ╨┐╨╛╨┤ =Some(265134), ╤А╨░╨╜╨│=8
+    A ╤З╨╡╤А╨╡╨╖ 150 ╨╝╤Б: ╨╜╨░╨┤ 0x2A0BFE=Some(1968154), ╨┐╨╛╨┤ =Some(265134), ╤А╨░╨╜╨│=8
+  --- op3: SetWindowPos(A, HWND_TOP, ╨С╨Х╨Ч NOACTIVATE) ---
+    ╤А╨╡╨╖╤Г╨╗╤М╤В╨░╤В: None
+    A ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨▓╤Л╨╖╨╛╨▓╨░ (t=0): ╨╜╨░╨┤ 0x2A0BFE=Some(1051188), ╨┐╨╛╨┤ =Some(1968154), ╤А╨░╨╜╨│=7
+    A ╤З╨╡╤А╨╡╨╖ 150 ╨╝╤Б: ╨╜╨░╨┤ 0x2A0BFE=Some(1051188), ╨┐╨╛╨┤ =Some(1968154), ╤А╨░╨╜╨│=7
+    ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╤Б╤В╨░╨╗╨╛ A? false
+
+=== K. ╨Я╤А╨░╨▓╨╛ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜: ╨┐╨╛╨┤╤К╤С╨╝ ╨╜╨░╨┤ ╨░╨║╤В╨╕╨▓╨╜╤Л╨╝ ╨╛╨║╨╜╨╛╨╝ ===
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 0x960908 (pid 25720)
+  K1: C1 ╤Б╨╛╨╖╨┤╨░╨╜ (╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛), ╨С╨Х╨Ч ╨┐╤А╨░╨▓╨░: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     7. 0x00960908 'ClickTheButton' [Engine]
+     8. 0x00090BC2 '' [Tao Thread Event Target]
+  K1: ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ (t=0): ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     7. 0x00960908 'ClickTheButton' [Engine]
+     8. 0x00090BC2 '' [Tao Thread Event Target]
+  K1 ╤З╨╡╤А╨╡╨╖ 50 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     7. 0x00960908 'ClickTheButton' [Engine]
+     8. 0x00090BC2 '' [Tao Thread Event Target]
+  K1 ╤З╨╡╤А╨╡╨╖ 200 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     7. 0x00960908 'ClickTheButton' [Engine]
+     8. 0x00090BC2 '' [Tao Thread Event Target]
+  K1 ╤З╨╡╤А╨╡╨╖ 600 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     7. 0x00960908 'ClickTheButton' [Engine]
+     8. 0x00090BC2 '' [Tao Thread Event Target]
+  K2: C2 ╤Б╨╛╨╖╨┤╨░╨╜ (╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛): ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x002C0BFE 'zorder-KC2' [zorder_KC2]
+     7. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     8. 0x00960908 'ClickTheButton' [Engine]
+  K2: ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ ╨б ╨Я╨а╨Р╨Т╨Ю╨Ь (t=0): ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x002C0BFE 'zorder-KC2' [zorder_KC2]
+     7. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     8. 0x00960908 'ClickTheButton' [Engine]
+  K2 ╤З╨╡╤А╨╡╨╖ 50 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x002C0BFE 'zorder-KC2' [zorder_KC2]
+     7. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     8. 0x00960908 'ClickTheButton' [Engine]
+  K2 ╤З╨╡╤А╨╡╨╖ 200 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x002C0BFE 'zorder-KC2' [zorder_KC2]
+     7. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     8. 0x00960908 'ClickTheButton' [Engine]
+  K2 ╤З╨╡╤А╨╡╨╖ 600 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x002C0BFE 'zorder-KC2' [zorder_KC2]
+     7. 0x001F081A 'zorder-KC1' [zorder_KC1]
+     8. 0x00960908 'ClickTheButton' [Engine]
+
+=== L. ╨Я╤А╨╛╨╕╨╖╨▓╨╛╨┤╤Б╤В╨▓╨╡╨╜╨╜╨░╤П ╨┐╨╛╤Б╨╗╨╡╨┤╨╛╨▓╨░╤В╨╡╨╗╤М╨╜╨╛╤Б╤В╤М: 4 ╨╛╨║╨╜╨░ + ╤Д╨╛╨║╤Г╤Б, ╨┐╤А╨╛╤В╨╕╨▓ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╤З╤Г╨╢╨╛╨│╨╛ ===
+  ╨┤╨╛: ╨┐╨╛╤А╤П╨┤╨╛╨║ ╤Б╨╛╨╖╨┤╨░╨╜╨╕╤П: L-F[6] > L-USER(╨╕╨│╤А╨░)[6] > LG4[7] > LG3[8] > LG2[9] > LG1[10]
+  ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ ╨▓╤Б╨╡╤Е (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║): L-F[6] > L-USER(╨╕╨│╤А╨░)[6] > LG4[7] > LG3[8] > LG2[9] > LG1[10]
+  SetForegroundWindow(G1): true
+  ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╤Д╨╛╨║╤Г╤Б╨░: LG1[6] > L-F[7] > L-USER(╨╕╨│╤А╨░)[7] > LG4[8] > LG3[9] > LG2[10]
+  ╤З╨╡╤А╨╡╨╖ 400 ╨╝╤Б: LG1[6] > L-F[7] > L-USER(╨╕╨│╤А╨░)[7] > LG4[8] > LG3[9] > LG2[10]
+  ╤З╨╡╤А╨╡╨╖ 1200 ╨╝╤Б: LG1[6] > L-F[7] > L-USER(╨╕╨│╤А╨░)[7] > LG4[8] > LG3[9] > LG2[10]
+  ╤З╨╡╤А╨╡╨╖ 3000 ╨╝╤Б: LG1[7] > L-F[8] > L-USER(╨╕╨│╤А╨░)[8] > LG4[9] > LG3[10] > LG2[11]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╤З╤Г╨╢╨╛╨│╨╛ F: false
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░: false
+
+╨У╨╛╤В╨╛╨▓╨╛.

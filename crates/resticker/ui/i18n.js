@@ -115,7 +115,7 @@ const STRINGS = {
   'control.modifierRequired': 'At least one modifier is required (Ctrl, Alt, Shift, or Win).',
   'control.unsupportedKey': 'Key "{key}" is not supported. Use A-Z, 0-9, or F1-F24.',
   'control.hintClick': 'Click a field, then press a key combination.',
-  'control.hintRestart': 'Hotkey changes apply after restarting resticker.',
+  'control.hintRestart': 'Hotkey changes apply immediately after saving.',
   'control.hintRequired':
     '"Edit mode" is required (cannot be cleared). The others are optional.',
 

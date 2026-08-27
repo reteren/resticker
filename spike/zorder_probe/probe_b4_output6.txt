@@ -1,0 +1,310 @@
+warning: unnecessary `unsafe` block
+   --> src\main.rs:213:24
+    |
+213 |             Anonymous: unsafe {
+    |                        ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> src\main.rs:227:24
+    |
+227 |             Anonymous: unsafe {
+    |                        ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+   --> src\main.rs:550:9
+    |
+550 |     let mut mk = |name: &str| -> HWND {
+    |         ----^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\main.rs:610:9
+    |
+610 |     let mut counter = 0usize;
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\main.rs:763:9
+    |
+763 |     let mut mk = |name: &str| -> HWND {
+    |         ----^^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused `Result` that must be used
+   --> src\main.rs:542:9
+    |
+542 |         ProcessIdToSessionId(user_pid, &mut user_session);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this `Result` may be an `Err` variant, which should be handled
+    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+    |
+542 |         let _ = ProcessIdToSessionId(user_pid, &mut user_session);
+    |         +++++++
+
+warning: `zorder-probe` (bin "zorder-probe") generated 6 warnings (run `cargo fix --bin "zorder-probe" -p zorder-probe` to apply 3 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running `target\debug\zorder-probe.exe`
+=== B4: Z-╨┐╨╛╤А╤П╨┤╨╛╨║ ╨┐╤А╨╕ ╨┐╨╛╨┤╤К╤С╨╝╨╡ ╨╜╨╡╤Б╨║╨╛╨╗╤М╨║╨╕╤Е ╨╛╨║╨╛╨╜ (╤Б╨▓╨╛╨╕ ╨╛╨║╨╜╨░, ╤З╤Г╨╢╨╕╨╡ ╨╜╨╡ ╤В╤А╨╛╨│╨░╨╡╨╝) ===
+╤А╨░╨╜╨│╨╕ [n] тАФ ╨┐╨╛╨╖╨╕╤Ж╨╕╤П ╨╛╨║╨╜╨░ ╤Б╤А╨╡╨┤╨╕ ╨Т╨б╨Х╨е ╨▓╨╕╨┤╨╕╨╝╤Л╤Е top-level ╨╛╨║╨╛╨╜ (1 = ╤Б╨░╨╝╤Л╨╣ ╨▓╨╡╤А╤Е)
+
+=== A. ╨С╨Х╨Ч ╨┐╤А╨░╨▓╨░ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ (╨░╨║╤В╨╕╨▓╨╜╨╛ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П) ===
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 0x960908 (pid 25720)
+  ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░: A-USER-FG[4] > A-F[5] > AG4[6] > AG3[7] > AG2[8] > AG1[9]
+  ╨┐╨╛╤Б╨╗╨╡ HWND_TOP-╨┐╨╛╨┤╤К╤С╨╝╨░ 4 ╨╛╨║╨╛╨╜: A-USER-FG[4] > A-F[5] > AG4[6] > AG3[7] > AG2[8] > AG1[9]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: false
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+
+=== B. ╨б ╨┐╤А╨░╨▓╨╛╨╝ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ (SendInput Alt = ┬л╨┐╨╛╨╗╤Г╤З╨╕╨╗ ╤Е╨╛╤В╨║╨╡╨╣┬╗) ===
+  ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░: B-USER-FG[4] > B-F[5] > BG4[6] > BG3[7] > BG2[8] > BG1[9]
+  ╨┐╨╛╨┤╤К╤С╨╝ ╨┐╤А╤П╨╝╤Л╨╝ ╨┐╨╛╤А╤П╨┤╨║╨╛╨╝: G1 тЖТ G2 тЖТ G3 тЖТ G4
+  ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨┐╤А╤П╨╝╨╛╨│╨╛ ╨┐╨╛╤А╤П╨┤╨║╨░: B-USER-FG[4] > B-F[5] > BG4[6] > BG3[7] > BG2[8] > BG1[9]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: false
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+  ╤З╨╡╤А╨╡╨╖ 300 ╨╝╤Б: B-USER-FG[4] > B-F[5] > BG4[6] > BG3[7] > BG2[8] > BG1[9]
+  ╤З╨╡╤А╨╡╨╖ 1500 ╨╝╤Б: B-USER-FG[4] > B-F[5] > BG4[6] > BG3[7] > BG2[8] > BG1[9]
+  ╤З╨╡╤А╨╡╨╖ 4000 ╨╝╤Б: B-USER-FG[4] > B-F[5] > BG4[6] > BG3[7] > BG2[8] > BG1[9]
+  ╨╛╨▒╤А╨░╤В╨╜╤Л╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║: G4 тЖТ G3 тЖТ G2 тЖТ G1
+  ╨┤╨╛ (F ╤Б╨╜╨╛╨▓╨░ ╨╜╨░╨▓╨╡╤А╤Е╤Г): B-USER-FG[4] > B-F[5] > BG4[6] > BG3[7] > BG2[8] > BG1[9]
+  ╨┐╨╛╤Б╨╗╨╡ ╨╛╨▒╤А╨░╤В╨╜╨╛╨│╨╛ ╨┐╨╛╤А╤П╨┤╨║╨░: B-USER-FG[4] > B-F[5] > BG4[6] > BG3[7] > BG2[8] > BG1[9]
+
+=== C. ╨Я╨╛╨┤╤К╤С╨╝ (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║) + SetForegroundWindow(G1) ===
+  ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ ╨┐╤А╤П╨╝╤Л╨╝ ╨┐╨╛╤А╤П╨┤╨║╨╛╨╝ (╨┤╨╛ ╤Д╨╛╨║╤Г╤Б╨░): C-USER-FG[5] > C-F[5] > CG4[6] > CG3[7] > CG2[8] > CG1[9]
+  SetForegroundWindow(G1): true
+  ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╤Д╨╛╨║╤Г╤Б╨░ ╨╜╨░ G1: CG1[5] > C-USER-FG[7] > C-F[7] > CG4[8] > CG3[9] > CG2[10]
+  ╤З╨╡╤А╨╡╨╖ ~1 ╤Б ╨┐╨╛╤Б╨╗╨╡ ╤Д╨╛╨║╤Г╤Б╨░: CG1[5] > C-USER-FG[6] > C-F[6] > CG4[7] > CG3[8] > CG2[9]
+  ╨╛╤Б╤В╨░╨╗╤М╨╜╤Л╨╡ 3 ╨╛╨║╨╜╨░ ╨▓╤Б╤С ╨╡╤Й╤С ╨▓╤Л╤И╨╡ F: false
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П ╨╜╨╡ ╨▓╨╡╤А╨╜╤Г╨╗╨╛╤Б╤М ╨╜╨░╨▓╨╡╤А╤Е: false
+
+=== D. ╨Я╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┤╤А╤Г╨│╨╛╨│╨╛ ╨┐╤А╨╛╤Ж╨╡╤Б╤Б╨░ ===
+  ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╨╛╨╡ (pid 23256) ╨░╨║╤В╨╕╨▓╨╜╨╛: SetForegroundWindow ╨╜╨░╨┐╤А╤П╨╝╤Г╤О; ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨╕╨╢╨╡? true
+  --- D1: ╨С╨Х╨Ч ╨┐╤А╨░╨▓╨░ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ ---
+  ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨░╨┤ ╨░╨║╤В╨╕╨▓╨╜╤Л╨╝ ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╤Л╨╝: false
+  --- D2: ╨б ╨┐╤А╨░╨▓╨╛╨╝ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ ---
+  ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨░╨┤ ╨░╨║╤В╨╕╨▓╨╜╤Л╨╝ ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╤Л╨╝: false
+  --- D3: ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╨╛╨╡ ╨▓ topmost-╨┐╨╛╨╗╨╛╤Б╨╡ ---
+  ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨░╨┤ ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╤Л╨╝ (topmost): false
+
+=== E. ╨а╨╡╨░╨╗╤М╨╜╤Л╨╣ ╤Ж╨╕╨║╨╗: ╨▓╤Б╨╡ ╤Б╨▓╤С╤А╨╜╤Г╤В╤Л тЖТ ╤А╨░╨╖╨▓╨╡╤А╨╜╤Г╤В╤М тЖТ ╨┐╨╛╨┤╨╜╤П╤В╤М ===
+  ╨▓╤Б╨╡ ╤Б╨▓╤С╤А╨╜╤Г╤В╤Л: true
+  ╨┐╨╛╤Б╨╗╨╡ ╤А╨░╨╖╨▓╨╛╤А╨╛╤В╨░+╨┐╨╛╨┤╤К╤С╨╝╨░ (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║): E-F[29] > EG4[30] > EG3[31] > EG2[32] > EG1[33]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+
+=== F. ╨з╨╡╤В╤Л╤А╨╡ ╨╛╨║╨╜╨░ ╨╛╨┤╨╜╨╛╨│╨╛ ╨┐╤А╨╛╤Ж╨╡╤Б╤Б╨░ + ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨╡ ╨┤╤А╤Г╨│╨╛╨│╨╛ ===
+  ╨┤╨╛ (╨┐╨╛╤А╤П╨┤╨╛╨║ ╤Б╨╛╨╖╨┤╨░╨╜╨╕╤П): FF[5] > own4[7] > own3[8] > own2[9] > own1[10]
+  ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║): FF[5] > own4[7] > own3[8] > own2[9] > own1[10]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+
+=== G. ╨б╨░╨╜╨╕╤В╨░╤А╨╕╤П: SetWindowPos ╨▓ ╤Н╤В╨╛╨╣ ╤Б╤А╨╡╨┤╨╡ ===
+  ╤Б╨╡╤Б╤Б╨╕╤П ╨┐╤А╨╛╨▒╤Л: 1 (ok=true); ╤Б╨╡╤Б╤Б╨╕╤П ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 1 (pid 25720)
+  ╨╛╨║╨╜╨░: A=0xC0BA0, B=0xE0B84
+    A (╤Б╨╛╨╖╨┤╨░╨╜╨╛ ╨┐╨╡╤А╨▓╤Л╨╝): ╨╜╨░╨┤ 0xC0BA0=Some(920452), ╨┐╨╛╨┤ =Some(1180888), ╤А╨░╨╜╨│=6
+    B (╤Б╨╛╨╖╨┤╨░╨╜╨╛ ╨▓╤В╨╛╤А╤Л╨╝): ╨╜╨░╨┤ 0xE0B84=Some(592818), ╨┐╨╛╨┤ =Some(789408), ╤А╨░╨╜╨│=5
+  ╨║╤А╨╛╤Б╤Б-╨┐╤А╨╛╨▓╨╡╤А╨║╨░ EnumWindows: A = 0-╨╣ top-level (GetWindow-╤А╨░╨╜╨│ 6)
+  --- op1: SetWindowPos(A, HWND_TOP, NOACTIVATE) ---
+    ╤А╨╡╨╖╤Г╨╗╤М╤В╨░╤В: None
+    A ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨▓╤Л╨╖╨╛╨▓╨░ (t=0): ╨╜╨░╨┤ 0xC0BA0=Some(592818), ╨┐╨╛╨┤ =Some(920452), ╤А╨░╨╜╨│=5
+    A ╤З╨╡╤А╨╡╨╖ 50 ╨╝╤Б: ╨╜╨░╨┤ 0xC0BA0=Some(592818), ╨┐╨╛╨┤ =Some(920452), ╤А╨░╨╜╨│=5
+    A ╤З╨╡╤А╨╡╨╖ ~450 ╨╝╤Б: ╨╜╨░╨┤ 0xC0BA0=Some(592818), ╨┐╨╛╨┤ =Some(920452), ╤А╨░╨╜╨│=5
+  --- op2: SetWindowPos(A, ╨╜╨░╨┤ B, NOACTIVATE) тАФ ╨┐╨╛╨┤╤К╤С╨╝ ╨╜╨░╨┤ ╨║╨╛╨╜╨║╤А╨╡╤В╨╜╤Л╨╝ ╤Б╨╛╤Б╨╡╨┤╨╛╨╝ ---
+    ╤А╨╡╨╖╤Г╨╗╤М╤В╨░╤В: None
+    A ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨▓╤Л╨╖╨╛╨▓╨░ (t=0): ╨╜╨░╨┤ 0xC0BA0=Some(920452), ╨┐╨╛╨┤ =Some(1180888), ╤А╨░╨╜╨│=6
+    A ╤З╨╡╤А╨╡╨╖ 150 ╨╝╤Б: ╨╜╨░╨┤ 0xC0BA0=Some(920452), ╨┐╨╛╨┤ =Some(1180888), ╤А╨░╨╜╨│=6
+  --- op3: SetWindowPos(A, HWND_TOP, ╨С╨Х╨Ч NOACTIVATE) ---
+    ╤А╨╡╨╖╤Г╨╗╤М╤В╨░╤В: None
+    A ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨▓╤Л╨╖╨╛╨▓╨░ (t=0): ╨╜╨░╨┤ 0xC0BA0=Some(592818), ╨┐╨╛╨┤ =Some(920452), ╤А╨░╨╜╨│=5
+    A ╤З╨╡╤А╨╡╨╖ 150 ╨╝╤Б: ╨╜╨░╨┤ 0xC0BA0=Some(592818), ╨┐╨╛╨┤ =Some(920452), ╤А╨░╨╜╨│=5
+    ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╤Б╤В╨░╨╗╨╛ A? false
+
+=== H. ╨в╨░╨╣╨╝╨╕╨╜╨│ ╨┐╨╛╨┤╤К╤С╨╝╨░: t=0 тАж t=1000 ===
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 0x960908 (pid 25720)
+  ╨┤╨╛ ╤Б╨╛╨╖╨┤╨░╨╜╨╕╤П: ╨┐╨╡╤А╨▓╤Л╨╡ 6 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     6. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+  ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░: ╤А╨░╨╜╨│╨╕ ╨╕╨╖ ╨╛╨┤╨╜╨╛╨│╨╛ ╤Б╨╜╨╕╨╝╨║╨░: G1=6, F=5, USER=7
+  ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░ (╨║╤В╨╛ ╨▓╤Л╤И╨╡): ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00010128 '' [Shell_TrayWnd]
+     5. 0x000D0B9C 'zorder-HF' [zorder_HF]
+     6. 0x000F0B84 'zorder-HG1' [zorder_HG1]
+     7. 0x00960908 'ClickTheButton' [Engine]
+     8. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+  t=0: G1=6 F=5 USER=7
+  t=5: G1=6 F=5 USER=7
+  t=15: G1=6 F=5 USER=7
+  t=40: G1=6 F=5 USER=7
+  t=100: G1=6 F=5 USER=7
+  t=300: G1=6 F=5 USER=4
+  t=1000: G1=6 F=5 USER=4
+  ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ ╨╕ ╨╛╨╢╨╕╨┤╨░╨╜╨╕╤П (╨║╤В╨╛ ╨▓╤Л╤И╨╡ G1): ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000D0B9C 'zorder-HF' [zorder_HF]
+     6. 0x000F0B84 'zorder-HG1' [zorder_HG1]
+     7. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     8. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+  --- ╤З╨╡╤В╤Л╤А╨╡ ╨╛╨║╨╜╨░: ╨┐╨╛╨┤╤К╤С╨╝ G2тЖТG3тЖТG4 (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║), ╨╖╨░╨╝╨╡╤А╤Л ---
+  ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ 3 ╨┐╨╛╨┤╤К╤С╨╝╨╛╨▓ (t=0): G2=7 G3=6 G4=5 F=8 USER=4
+  ╤З╨╡╤А╨╡╨╖ 500 ╨╝╤Б: G2=7 G3=6 G4=5 F=8 USER=4
+
+=== I. ╨Ш╨╖╨╛╨╗╤П╤Ж╨╕╤П: same-process / cross-process / self-raise ===
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 0x960908 (pid 25720)
+  ╤Б╤В╨░╤А╤В: ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     6. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+     7. 0x000403C8 'com.cmrdevs.nemora-siw' [com.cmrdevs.nemora-sic]
+     8. 0x000403C4 '' [Tao Thread Event Target]
+     9. 0x000E07B8 '╨Э╨░╤Б╤В╤А╨╛╨╣╨║╨╕' [Windows.UI.Core.CoreWindow]
+    10. 0x00020850 '╨Я╨░╤А╨░╨╝╨╡╤В╤А╤Л' [ApplicationFrameWindow]
+  I1: same-process: A=0xB0BB2 B=0xE0BA0
+  I1 ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░ A: ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000E0BA0 'zorder-ib' [zorder_ib]
+     6. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     7. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     8. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+     9. 0x000403C8 'com.cmrdevs.nemora-siw' [com.cmrdevs.nemora-sic]
+    10. 0x000403C4 '' [Tao Thread Event Target]
+  I1 ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ A (t=0): ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     6. 0x000E0BA0 'zorder-ib' [zorder_ib]
+     7. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     8. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+     9. 0x000403C8 'com.cmrdevs.nemora-siw' [com.cmrdevs.nemora-sic]
+    10. 0x000403C4 '' [Tao Thread Event Target]
+  I1 ╤З╨╡╤А╨╡╨╖ 400 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     6. 0x000E0BA0 'zorder-ib' [zorder_ib]
+     7. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     8. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+     9. 0x000403C8 'com.cmrdevs.nemora-siw' [com.cmrdevs.nemora-sic]
+    10. 0x000403C4 '' [Tao Thread Event Target]
+  I2: cross-process: C1=0xE0B9C
+  I2 ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░ C1: ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000E0B9C 'zorder-IC1' [zorder_IC1]
+     6. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     7. 0x000E0BA0 'zorder-ib' [zorder_ib]
+     8. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     9. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+    10. 0x000403C8 'com.cmrdevs.nemora-siw' [com.cmrdevs.nemora-sic]
+  I2 ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ C1 (t=0): ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000E0B9C 'zorder-IC1' [zorder_IC1]
+     6. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     7. 0x000E0BA0 'zorder-ib' [zorder_ib]
+     8. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     9. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+    10. 0x000403C8 'com.cmrdevs.nemora-siw' [com.cmrdevs.nemora-sic]
+  I2 ╤З╨╡╤А╨╡╨╖ 400 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000E0B9C 'zorder-IC1' [zorder_IC1]
+     6. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     7. 0x000E0BA0 'zorder-ib' [zorder_ib]
+     8. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     9. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+    10. 0x000403C8 'com.cmrdevs.nemora-siw' [com.cmrdevs.nemora-sic]
+  I3: self-raise: C2=0xC0B94
+  I3 ╨┤╨╛ self-raise C2: ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00010128 '' [Shell_TrayWnd]
+     5. 0x000C0B94 'zorder-IC2SELF' [zorder_IC2SELF]
+     6. 0x00960908 'ClickTheButton' [Engine]
+     7. 0x000E0B9C 'zorder-IC1' [zorder_IC1]
+     8. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     9. 0x000E0BA0 'zorder-ib' [zorder_ib]
+    10. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+
+thread 'main' (35476) panicked at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library\std\src\io\stdio.rs:1166:9:
+failed printing to stdout: ╨Ш╨┤╨╡╤В ╨╖╨░╨║╤А╤Л╤В╨╕╨╡ ╨║╨░╨╜╨░╨╗╨░. (os error 232)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+  I3 ╨┐╨╛╤Б╨╗╨╡ self-raise C2 (600 ╨╝╤Б): ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00960908 'ClickTheButton' [Engine]
+     5. 0x000E0B9C 'zorder-IC1' [zorder_IC1]
+     6. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     7. 0x000E0BA0 'zorder-ib' [zorder_ib]
+     8. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     9. 0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]
+    10. 0x000403C8 'com.cmrdevs.nemora-siw' [com.cmrdevs.nemora-sic]
+  I4: cross-process ╤Б ╨╗╨╛╨║╨╛╨╝: C3=0xB0BCE
+  I4 ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░ C3: ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00010128 '' [Shell_TrayWnd]
+     5. 0x000B0BCE 'zorder-IC3LOCK' [zorder_IC3LOCK]
+     6. 0x00960908 'ClickTheButton' [Engine]
+     7. 0x000E0B9C 'zorder-IC1' [zorder_IC1]
+     8. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     9. 0x000E0BA0 'zorder-ib' [zorder_ib]
+    10. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+  I4 ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ C3 (t=0): ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00010128 '' [Shell_TrayWnd]
+     5. 0x000B0BCE 'zorder-IC3LOCK' [zorder_IC3LOCK]
+     6. 0x00960908 'ClickTheButton' [Engine]
+     7. 0x000E0B9C 'zorder-IC1' [zorder_IC1]
+     8. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     9. 0x000E0BA0 'zorder-ib' [zorder_ib]
+    10. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+  I4 ╤З╨╡╤А╨╡╨╖ 400 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 10 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x00010128 '' [Shell_TrayWnd]
+     5. 0x000B0BCE 'zorder-IC3LOCK' [zorder_IC3LOCK]
+     6. 0x00960908 'ClickTheButton' [Engine]
+     7. 0x000E0B9C 'zorder-IC1' [zorder_IC1]
+     8. 0x000B0BB2 'zorder-ia' [zorder_ia]
+     9. 0x000E0BA0 'zorder-ib' [zorder_ib]
+    10. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+
+╨У╨╛╤В╨╛╨▓╨╛.

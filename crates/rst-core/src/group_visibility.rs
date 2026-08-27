@@ -199,9 +199,22 @@ pub fn decide_visibility(
     }
 }
 
-/// Решения по хоткею: каждое окно приводится к желаемой видимости, но
-/// только если фактическое состояние отличается — уже показанное не
-/// трогаем (правило 6 «уже показанное не трогаем»), уже спрятанное тоже.
+/// Решения по хоткею: каждое окно приводится к желаемой видимости.
+///
+/// ПОКАЗ ПОДНИМАЕТ ВСЕХ, а не только свёрнутых. Это стоило живого бага
+/// (репорт 2026-08-26: «выбрал 4 окна, а вылетело только одно»): раньше
+/// показанному члену выдавалось «не трогать», потому что он и так видим, —
+/// но «видим» и «на переднем плане» разные вещи. Окна группы обычно никто не
+/// сворачивал, они просто лежали под другими окнами, и хоткей честно не
+/// трогал ни одно из них; наверх выходило единственное, которому
+/// координатор отдельно отдавал фокус. «Показать группу» означает поднять
+/// её ЦЕЛИКОМ — иначе группы на экране не появляется.
+///
+/// Правило 6 («уже открытое не трогаем») этим не нарушено: оно про то, что
+/// хоткей не переоткрывает и не дёргает окно, которое пользователь вызвал
+/// сам, — а поднять его вместе с остальной группой как раз и значит собрать
+/// группу воедино. Сокрытие по-прежнему щадит уже спрятанное: там «не
+/// трогать» осмысленно, потому что второй раз свернуть нечего.
 ///
 /// Хоткей — хозяин группы, и он НЕ щадит закреплённые окна: «по повторному
 /// нажатию вся группа прячется, включая закреплённые» (запрос пользователя
@@ -225,9 +238,9 @@ fn hotkey_decisions(members: &[MemberFacts], state: GroupVisibilityState) -> Vec
                 // окно одновременно закреплено «поверх всех», приоритет у
                 // правил соседства — это более сильное ограничение
                 // (доккомент [`MemberFacts::has_host_rules`]).
-                if want_visible && !m.visible {
+                if want_visible {
                     WindowAction::ShowTopmost
-                } else if !want_visible && m.visible {
+                } else if m.visible {
                     WindowAction::RestoreBetweenWindows
                 } else {
                     WindowAction::None
@@ -237,16 +250,16 @@ fn hotkey_decisions(members: &[MemberFacts], state: GroupVisibilityState) -> Vec
                 // всеми (см. докфункцию). Показ касается его только когда
                 // оно невидимо (пользователь свернул его вручную) — хоткей
                 // возвращает его вместе со всеми.
-                if want_visible && !m.visible {
+                if want_visible {
                     WindowAction::ShowTopmost
-                } else if !want_visible && m.visible {
+                } else if m.visible {
                     WindowAction::Hide
                 } else {
                     WindowAction::None
                 }
-            } else if want_visible && !m.visible {
+            } else if want_visible {
                 WindowAction::ShowTopmost
-            } else if !want_visible && m.visible {
+            } else if m.visible {
                 WindowAction::Hide
             } else {
                 WindowAction::None
@@ -275,7 +288,15 @@ fn pin_toggle_decisions(
     members
         .iter()
         .map(|m| {
-            let action = if want_pinned && !m.pinned {
+            let action = if m.has_host_rules {
+                // Окно «между окнами» живёт по своей машине соседства, и
+                // закрепление группы его не касается (доккомент
+                // [`MemberFacts::has_host_rules`]: приоритет у правил).
+                // Снимать его пин тем более нельзя: `UnpinTopmost` в
+                // координаторе удаляет пин целиком — вместе с правилами
+                // соседства, которые создал пользователь отдельно.
+                WindowAction::None
+            } else if want_pinned && !m.pinned {
                 WindowAction::PinTopmost
             } else if !want_pinned && m.pinned {
                 WindowAction::UnpinTopmost
@@ -310,18 +331,24 @@ fn foreign_foreground_decisions(
     members
         .iter()
         .map(|m| {
-            let action = if m.pinned {
-                // Правило 4: закреплённое «поверх всех» от Alt+Tab не
-                // прячется — это его прямое назначение.
-                WindowAction::None
-            } else if m.has_host_rules {
+            let action = if m.has_host_rules {
                 // Правило 7: окно с правилами соседства не исчезает
                 // совсем, а возвращается на своё место между окнами.
+                //
+                // Ветка стоит ПЕРВОЙ намеренно, как в [`hotkey_decisions`]:
+                // координатор выставляет факты так, что пин с правилами
+                // всегда `pinned=true`, и ветка `m.pinned` ниже иначе
+                // съела бы его — окно осталось бы висеть там, где его
+                // подняла группа, вместо возврата между окнами.
                 if m.visible {
                     WindowAction::RestoreBetweenWindows
                 } else {
                     WindowAction::None
                 }
+            } else if m.pinned {
+                // Правило 4: закреплённое «поверх всех» от Alt+Tab не
+                // прячется — это его прямое назначение.
+                WindowAction::None
             } else if m.visible {
                 // Правило 3: обычное окно группы прячется.
                 WindowAction::Hide
@@ -650,14 +677,14 @@ mod tests {
             vec![
                 WindowDecision {
                     window: 1,
-                    action: WindowAction::None,
+                    action: WindowAction::ShowTopmost,
                 },
                 WindowDecision {
                     window: 2,
                     action: WindowAction::ShowTopmost,
                 },
             ],
-            "первый хоткей показывает остальные, уже показанное не трогая"
+            "первый хоткей собирает группу целиком: свёрнутое разворачивается,              уже открытое поднимается вместе с ним"
         );
 
         // На втором нажатии оба окна видимы — прячем всё.
@@ -705,6 +732,34 @@ mod tests {
             actions(&decisions),
             WindowAction::RestoreBetweenWindows,
             "окно с правилами не прячется совсем, а возвращается на место"
+        );
+    }
+
+    /// РЕАЛЬНЫЕ факты против теста выше: `group_member_facts` выставляет
+    /// `pinned=true` ЛЮБОМУ пину, и `has_host_rules=true` — пину с правилами.
+    /// Окно «между окнами» в жизни всегда приходит как `pinned=true` +
+    /// `has_host_rules=true`, и ветка `m.pinned` в
+    /// `foreign_foreground_decisions` стоит ПЕРВОЙ — правило 7 для него
+    /// недостижимо: уход на постороннее окно оставляет его висеть, где
+    /// подняла группа, вместо возврата между окнами.
+    #[test]
+    fn foreign_switch_with_real_facts_returns_host_rules_window_between_windows() {
+        let mut a = member(1);
+        a.pinned = true; // так факты выставляет координатор: пин с правилами
+        a.has_host_rules = true;
+        a.visible = true;
+        let (_, decisions) = decide_visibility(
+            GroupVisibilityEvent::ForegroundChanged,
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
+            &[a],
+        );
+        assert_eq!(
+            actions(&decisions),
+            WindowAction::RestoreBetweenWindows,
+            "окно с правилами обязано вернуться между окнами и с реальными фактами"
         );
     }
 
@@ -848,14 +903,15 @@ mod tests {
         a.visible = true; // открыто пользователем вручную, группа спрятана
         let hidden = GroupVisibilityState::default();
 
-        // Первый хоткей: показывать нечего — окно уже видимо.
+        // Первый хоткей: окно уже видимо, но группу всё равно надо собрать
+        // на переднем плане — «видимо» не значит «сверху».
         let (shown, decisions) =
             decide_visibility(GroupVisibilityEvent::HotkeyPressed, hidden, &[a]);
         assert!(shown.shown);
         assert_eq!(
             actions(&decisions),
-            WindowAction::None,
-            "уже показанное не трогаем при показе группы"
+            WindowAction::ShowTopmost,
+            "показ группы поднимает и то окно, которое пользователь открыл сам"
         );
 
         // Второй хоткей: прячем всё, включая закреплённое.
@@ -998,6 +1054,32 @@ mod tests {
             actions(&decisions),
             WindowAction::PinTopmost,
             "закрепление не поднимает и не прячет — только ставит стиль"
+        );
+    }
+
+    /// Окно «между окнами» снимать закрепление группы НЕ имеет права:
+    /// его пин с правилами соседства создал пользователь отдельно, и
+    /// `UnpinTopmost` в координаторе удаляет пин целиком — вместе с
+    /// правилами. Доккомент [`MemberFacts::has_host_rules`] отдаёт
+    /// приоритет правилам соседства, и переключатель обязан их щадить.
+    #[test]
+    fn pin_toggle_unpin_spares_host_rules_window() {
+        let mut a = member(1);
+        a.pinned = true; // реальные факты: пин с правилами всегда pinned
+        a.has_host_rules = true;
+        let (state, decisions) = decide_visibility(
+            GroupVisibilityEvent::PinTogglePressed,
+            GroupVisibilityState {
+                shown: false,
+                pinned: true,
+            },
+            &[a],
+        );
+        assert!(!state.pinned);
+        assert_eq!(
+            actions(&decisions),
+            WindowAction::None,
+            "снятие закрепления группы не должно трогать пин «между окнами»"
         );
     }
 

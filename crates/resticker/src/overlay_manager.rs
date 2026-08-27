@@ -35,6 +35,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use rst_audio::{AudioMixer, AudioSource};
 use rst_core::AnimationClock;
 use rst_core::config;
+use rst_core::group_fit;
 use rst_core::group_visibility::{
     GroupVisibilityEvent, MemberFacts, WindowAction, WindowDecision, decide_visibility,
 };
@@ -76,7 +77,8 @@ use rst_win32::window_tracker::{WindowEvent as TrackerWindowEvent, WindowTracker
 use uuid::Uuid;
 
 use crate::{
-    confirm_dialog, cursor_panel, gap_panel, group_manager, group_strip, groups::GroupsState,
+    confirm_dialog, cursor_panel, gap_panel, group_manager, group_strip,
+    groups::{self, GroupEditor, GroupsState},
     monitor_badge, preset_picker, preset_strip, toolbar, window_pick_list, window_picker,
 };
 
@@ -3707,6 +3709,7 @@ fn run(
                             f64::from(scale),
                             &monitor_id,
                             &monitor_geometry,
+                            &monitor_bounds,
                             &mut group_thumbs,
                         )
                     {
@@ -3895,6 +3898,7 @@ fn run(
                         &cfg,
                         &monitors_map,
                         &monitor_geometry,
+                        &monitor_bounds,
                         rst_win32::window_enum::enumerate(),
                         &mut group_thumbs,
                         &monitor_id,
@@ -4117,6 +4121,10 @@ fn run(
                     // Перерисовка не нужна: снимок трекера всё равно её
                     // запрашивает в конце ветки — трогали мы чужие окна или
                     // нет, на нашем кадре это не сказывается.
+                    // Сперва довести показ (окна могли только что
+                    // развернуться), и лишь потом решать, не пора ли прятать:
+                    // иначе полупоказанная группа успела бы спрятаться.
+                    finish_group_raise(&mut groups, &cfg, &window_pins, &window_snapshot);
                     maintain_group_visibility(
                         &mut groups,
                         &cfg,
@@ -4802,6 +4810,7 @@ fn run(
                 &groups,
                 rst_win32::window_enum::enumerate(),
                 &monitor_geometry,
+                &monitor_bounds,
                 &mut group_thumbs,
                 now_ms,
                 0,
@@ -8805,6 +8814,7 @@ fn handle_group_editor_input(
     scale: f64,
     monitor_id: &MonitorId,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     thumbs: &mut rst_win32::thumb_cache::ThumbCache,
 ) -> bool {
     let Some(panels) = &mut edit.group_editor else {
@@ -8954,6 +8964,7 @@ fn handle_group_editor_input(
             groups,
             windows,
             monitor_geometry,
+            monitor_bounds,
             thumbs,
             now_ms,
             scroll,
@@ -9253,6 +9264,7 @@ fn open_group_editor(
     cfg: &Config,
     monitors_map: &HashMap<MonitorId, MonitorState>,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     windows: Vec<WindowInfo>,
     thumbs: &mut rst_win32::thumb_cache::ThumbCache,
     monitor_id: &MonitorId,
@@ -9267,12 +9279,41 @@ fn open_group_editor(
         monitor_id.clone()
     };
     groups.open_editor(monitor_id.clone(), cfg.settings.snap_shrink_pct);
+    // Минимальные размеры окон снимаем ОДИН раз, здесь. Каждый запрос —
+    // сообщение в чужой процесс с таймаутом; делать это на кадре ленты или
+    // на каждый клик по карточке значило бы платить за одно и то же снова и
+    // снова. Список окон ленты заморожен на этот момент, так что ключи
+    // больше не изменятся.
+    if let Some(editor) = groups.editor_mut() {
+        let sizes: HashMap<usize, (u32, u32)> = windows
+            .iter()
+            .filter_map(|w| {
+                let min = rst_win32::window_enum::min_window_size(w.hwnd)?;
+                (min.w > 0 || min.h > 0)
+                    .then_some((w.hwnd, (min.w.max(0) as u32, min.h.max(0) as u32)))
+            })
+            .collect();
+        tracing::debug!(
+            known = sizes.len(),
+            total = windows.len(),
+            "минимумы окон сняты"
+        );
+        editor.set_min_sizes(sizes);
+    }
     let now_ms = editor_clock_ms();
     // Номер новой группы — первый свободный; все девять заняты, значит
     // собирать нечего, и цифра 0 честнее случайной.
     let number = u32::from(WindowGroup::next_number(&cfg.groups).unwrap_or(0));
-    edit.group_editor =
-        build_group_editor(groups, windows, monitor_geometry, thumbs, now_ms, 0, number);
+    edit.group_editor = build_group_editor(
+        groups,
+        windows,
+        monitor_geometry,
+        monitor_bounds,
+        thumbs,
+        now_ms,
+        0,
+        number,
+    );
     if edit.group_editor.is_none() {
         // Монитор пропал между нажатием и построением панелей — набор без
         // ленты бессмыслен.
@@ -9361,7 +9402,27 @@ fn confirm_group_editor(
         return;
     };
 
-    if let Some(targets) = targets {
+    if let Some(mut targets) = targets {
+        // Слоты подгоняются под минимальные размеры окон ДО применения.
+        //
+        // Живой репорт со скриншотом 2026-08-26: «все пресеты, где окна не
+        // одинакового размера, сломаны — маленькие окна налезают друг на
+        // друга». Причина не в таблице раскладок (её проверили исчерпывающе),
+        // а в том, что у приложения есть свой минимальный размер: замер того
+        // же дня — Discord не уже 816, Spotify не уже 800 и не ниже 600,
+        // Steam не уже 1010. Слот меньше этого предела приложение молча
+        // игнорирует и остаётся крупнее, накрывая соседа.
+        //
+        // Решатель двигает ОБЩИЕ границы слотов, а не сами слоты по
+        // отдельности: раскладка — это разбиение экрана прямыми линиями, и
+        // сдвиг линии меняет размер сразу обоим соседям, поэтому щелей и
+        // перекрытий не возникает по построению.
+        fit_targets_to_window_minimums(
+            &mut targets,
+            &groups.editor().map(|e| e.monitor.clone()),
+            monitor_bounds,
+            &edit.coordinator_tx,
+        );
         // Свёрнутые окна разворачиваем ДО раскладки. Свёрнутое окно нельзя
         // ни поставить на место, ни измерить: `SetWindowPos` меняет ему лишь
         // «нормальный» прямоугольник, а границы от DWM у него мусорные
@@ -9423,6 +9484,17 @@ fn confirm_group_editor(
     // Опознаём среди ТЕХ ЖЕ окон, из которых группа только что собрана: их
     // список построен ровно из этих окон, значит совпасть обязан целиком, и
     // общий снимок трекера тут только добавил бы неоднозначности.
+    //
+    // Перед показом объявляем группу спрятанной. `toggle_group_by_number` —
+    // ПЕРЕКЛЮЧАТЕЛЬ, и для только что созданной группы он и так показывает
+    // (её состояние по умолчанию — «спрятана»), а вот при правке УЖЕ
+    // ПОКАЗАННОЙ группы он бы её спрятал: пользователь нажал галочку и увидел
+    // бы, как окна сворачиваются (найдено ревью 2026-08-26). Подтверждение
+    // всегда означает «покажи, что получилось», а не «переключи».
+    groups.set_visibility(
+        id,
+        rst_core::group_visibility::GroupVisibilityState::default(),
+    );
     toggle_group_by_number(
         groups,
         cfg,
@@ -9499,6 +9571,12 @@ fn group_member_facts(
     (0..group.members.len())
         .filter_map(|index| {
             let hwnd = open.window_of(index)?;
+            // Окна нет в перечислении — оно скрыто `SW_HIDE`, живёт на другом
+            // виртуальном рабочем столе или свёрнуто в трей. Судить о его
+            // видимости нам нечем, а решать за него — тем более: сокрытие
+            // группы вытащило бы такое окно в панель задач, хотя пользователь
+            // его туда не звал (найдено ревью 2026-08-26).
+            let live = windows.iter().find(|w| w.hwnd == hwnd)?;
             let pin = edit.pinned_windows.iter().find(|p| p.hwnd == hwnd as isize);
             Some(MemberFacts {
                 id: hwnd as u64,
@@ -9507,10 +9585,7 @@ fn group_member_facts(
                 // Свёрнутое окно — единственная форма «не на экране», в
                 // которой мы прячем чужие окна: скрытое `SW_HIDE` пропало бы
                 // из Alt+Tab, а пользователь потребовал обратного.
-                visible: !windows
-                    .iter()
-                    .find(|w| w.hwnd == hwnd)
-                    .is_some_and(|w| w.iconic),
+                visible: !live.iconic,
                 is_foreground: foreground == Some(hwnd),
             })
         })
@@ -9652,15 +9727,18 @@ fn toggle_group_by_number(
     let changed =
         apply_visibility_decisions(&decisions, cfg, edit, window_pins, monitor_bounds, windows);
 
-    // Фокус отдаётся окну первого слота: показ группы — это переход к ней,
-    // а не фоновое всплытие. Заодно это единственное, что удерживает группу
-    // на экране: механика «ушёл на постороннее окно — группа прячется»
-    // иначе сработала бы на первом же снимке трекера, потому что активным
-    // осталось бы то окно, с которого пользователь нажал хоткей.
-    if next.shown
-        && let Some((hwnd, _)) = targets.first()
-    {
-        rst_win32::window_visibility::focus_group_window(HWND(*hwnd as *mut core::ffi::c_void));
+    // Довести подъём пробуем сразу же: если ни одно окно группы не было
+    // свёрнуто (обычный случай), ждать нечего и группа всплывает целиком в
+    // тот же миг. Если кто-то разворачивается — подъём доведёт ближайший
+    // снимок трекера ([`finish_group_raise`]).
+    //
+    // Фокус ставится там же: показ группы — это переход к ней, а не фоновое
+    // всплытие. Заодно фокус удерживает группу на экране: механика «ушёл на
+    // постороннее окно — группа прячется» иначе сработала бы на первом же
+    // снимке, потому что активным осталось бы то окно, с которого нажали
+    // хоткей.
+    if next.shown {
+        finish_group_raise(groups, cfg, window_pins, windows);
     }
 
     if next.shown && !targets.is_empty() {
@@ -9724,6 +9802,82 @@ fn toggle_group_pin(
     changed
 }
 
+/// Довести показ группы: поднять её окна на передний план, когда они уже
+/// развернулись.
+///
+/// Отдельный шаг, а не часть `toggle_group_by_number`, потому что
+/// разворачивание чужого свёрнутого окна асинхронно (см.
+/// [`GroupsState::raise_pending`]). Замер 2026-08-26: из четырёх окон группы
+/// наверх выходило одно, а два, только что развёрнутых из свёрнутого
+/// состояния, оставались под посторонним окном — их подняли, пока они ещё
+/// были свёрнуты, и всплыли они потом уже сами по себе.
+///
+/// Порядок подъёма ОБРАТНЫЙ порядку слотов: каждый `HWND_TOP` кладёт окно
+/// поверх предыдущих, поэтому последним поднятым оказывается окно первого
+/// слота — то, которому отдан фокус. При прямом порядке фокусное окно
+/// накрывалось бы соседями.
+///
+/// Возвращает `true`, если что-то подняли.
+fn finish_group_raise(
+    groups: &mut GroupsState,
+    cfg: &Config,
+    window_pins: &WindowPins,
+    windows: &[WindowInfo],
+) -> bool {
+    if !groups.raise_pending() {
+        return false;
+    }
+    let Some(id) = groups.active() else {
+        groups.finish_raise();
+        return false;
+    };
+    let Some(group) = cfg.groups.iter().find(|g| g.id == id) else {
+        groups.finish_raise();
+        return false;
+    };
+    let members: Vec<usize> = (0..group.members.len())
+        .filter_map(|index| groups.open().and_then(|open| open.window_of(index)))
+        .collect();
+    let deadline = groups.raise_deadline_passed();
+    let still_minimized = members.iter().any(|hwnd| {
+        rst_win32::window_visibility::is_minimized(HWND(*hwnd as *mut core::ffi::c_void))
+    });
+    if still_minimized && !deadline {
+        // Ждём следующего снимка: разворачивание чужого окна ещё в пути.
+        return false;
+    }
+    if still_minimized {
+        tracing::warn!(
+            number = group.number,
+            "часть окон группы не развернулась вовремя — поднимаем что есть"
+        );
+    }
+    for hwnd in members.iter().rev() {
+        let win = HWND(*hwnd as *mut core::ffi::c_void);
+        // Закреплённое пользователем окно и так поверх всех: опускать его в
+        // обычную стопку значило бы отменять его закрепление.
+        if window_pins.is_pinned(*hwnd) {
+            continue;
+        }
+        rst_win32::window_visibility::raise_group_window(win);
+    }
+    if let Some(first) = members.first() {
+        // Запоминаем, у кого забираем фокус: если впереди снова окажется
+        // ровно оно, значит переключения не было — приложение вернуло себе
+        // своё (см. `GroupsState::is_shown_over`).
+        groups.note_shown_over(rst_win32::window_enum::foreground_hwnd());
+        rst_win32::window_visibility::focus_group_window(HWND(*first as *mut core::ffi::c_void));
+    }
+    groups.finish_raise();
+    let _ = windows;
+    tracing::info!(
+        number = group.number,
+        raised = members.len(),
+        "показ группы доведён"
+    );
+    true
+}
+
 /// Сменился передний план: группа, показанная хоткеем, прячется, если
 /// пользователь ушёл на постороннее окно.
 ///
@@ -9759,6 +9913,12 @@ fn maintain_group_visibility(
     if groups.just_shown() {
         return false;
     }
+    // Показ ещё не доведён: часть окон разворачивается. Спрятать группу,
+    // которую мы сами не успели показать, — худший из возможных исходов:
+    // пользователь нажал хоткей и не увидел ничего.
+    if groups.raise_pending() {
+        return false;
+    }
     let foreground = rst_win32::window_enum::foreground_hwnd();
     // Передний план, которого нет в перечислении окон, — не окно
     // пользователя: так выглядят наши собственные оверлеи (они `no_activate`
@@ -9768,6 +9928,15 @@ fn maintain_group_visibility(
         return false;
     };
     if !windows.iter().any(|w| w.hwnd == foreground_hwnd) {
+        return false;
+    }
+    // Впереди то же окно, что и до показа группы, — переключения не было.
+    // Либо пользователь никуда не уходил, либо приложение вернуло себе фокус
+    // само (замер 2026-08-26: Steam делает это через 1.1 секунды и повторно,
+    // если фокус отобрать). Ни то ни другое не повод прятать группу: «уход» —
+    // это СМЕНА переднего плана после показа, а не сам факт, что впереди не
+    // член группы.
+    if groups.is_shown_over(foreground_hwnd) {
         return false;
     }
     let facts = group_member_facts(&group, groups, edit, windows, foreground);
@@ -9828,6 +9997,72 @@ fn yield_pinned_to_shell(edit: &mut EditState, window_pins: &WindowPins) -> bool
 /// а не отказ окна ужаться.
 const LAYOUT_TOLERANCE_PX: i32 = 4;
 
+/// Подогнать слоты раскладки под минимальные размеры окон, которые в них
+/// поедут.
+///
+/// Минимум спрашивается у самого окна (`WM_GETMINMAXINFO`) с коротким
+/// таймаутом: запрос идёт в чужой процесс, и зависшее приложение не должно
+/// задерживать нас дольше, чем на этот таймаут. Не ответившее окно просто
+/// остаётся без требования — подгонка тогда учитывает остальных.
+///
+/// Если минимумы не влезают в экран физически (четыре окна по 800 px на
+/// 2560 px — арифметика, а не наша ошибка), слоты остаются как были, а
+/// пользователю говорят, чего и сколько не хватает: выбрать раскладку с
+/// более крупными слотами он может только зная это.
+fn fit_targets_to_window_minimums(
+    targets: &mut [(usize, Rect)],
+    monitor: &Option<MonitorId>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    coordinator_tx: &Sender<CoordinatorRequest>,
+) {
+    let Some(work) = work_area_of(monitor, monitor_bounds) else {
+        return;
+    };
+    let slots: Vec<Rect> = targets.iter().map(|(_, rect)| *rect).collect();
+    let minimums: Vec<Option<group_fit::MinSize>> = targets
+        .iter()
+        .map(|(hwnd, _)| {
+            rst_win32::window_enum::min_window_size(*hwnd).map(|m| group_fit::MinSize {
+                width: m.w.max(0) as u32,
+                height: m.h.max(0) as u32,
+            })
+        })
+        .collect();
+    match group_fit::fit_slots(&slots, work, &minimums) {
+        group_fit::FitOutcome::Placed(fitted) => {
+            let moved = fitted.iter().zip(&slots).filter(|(a, b)| a != b).count();
+            for ((_, rect), fitted) in targets.iter_mut().zip(fitted) {
+                *rect = fitted;
+            }
+            if moved > 0 {
+                tracing::info!(moved, "раскладка подогнана под минимальные размеры окон");
+            }
+        }
+        group_fit::FitOutcome::Impossible {
+            deficit_x,
+            deficit_y,
+        } => {
+            tracing::warn!(
+                deficit_x,
+                deficit_y,
+                slots = slots.len(),
+                "минимальные размеры окон не влезают в экран — раскладка оставлена как есть"
+            );
+            let short = if deficit_x >= deficit_y {
+                format!("по ширине не хватает {deficit_x} px")
+            } else {
+                format!("по высоте не хватает {deficit_y} px")
+            };
+            let _ = coordinator_tx.send(CoordinatorRequest::ShowNotification {
+                title: "Окна не помещаются в эту раскладку".to_string(),
+                body: format!(
+                    "{short}: приложения не становятся меньше своего предела.                      Выберите раскладку с более крупными слотами или уберите одно окно."
+                ),
+            });
+        }
+    }
+}
+
 /// Поставить окна на заданные прямоугольники (физические пиксели).
 ///
 /// Возвращает окна, которые НЕ влезли в свой слот, вместе с превышением по
@@ -9880,13 +10115,17 @@ fn apply_group_layout(
         // Прежнее место замеряем ДО того, как двигать: без него исход
         // «окно не сдвинулось вовсе» не отличить от «встало не туда», а это
         // разные болезни с разными причинами.
-        let Some(previous) = rst_win32::window_enum::live_rect(*hwnd) else {
-            continue;
-        };
+        //
+        // Его отсутствие — НЕ повод пропустить окно. У свёрнутого окна живых
+        // границ нет, и ранний выход здесь означал бы, что свёрнутому члену
+        // группы геометрия не ставится вовсе; ровно так он и оказывался не в
+        // своём слоте (найдено ревью 2026-08-26). Геометрию ставим всегда,
+        // а без прежнего места просто не судим, «сдвинулось ли».
+        let previous = rst_win32::window_enum::live_rect(*hwnd);
         window_pins.set_dwm_bounds(win, target);
-        let Some(d) =
+        let Some(d) = previous.and_then(|previous| {
             window_pins.check_layout_discrepancy(win, previous, target, LAYOUT_TOLERANCE_PX)
-        else {
+        }) else {
             continue;
         };
         match d.kind {
@@ -10122,6 +10361,7 @@ fn build_group_editor(
     groups: &GroupsState,
     windows: Vec<WindowInfo>,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     thumbs: &mut rst_win32::thumb_cache::ThumbCache,
     now_ms: u64,
     scroll: usize,
@@ -10131,6 +10371,29 @@ fn build_group_editor(
     let monitor_id = editor.monitor.clone();
     let &(w, h, scale) = monitor_geometry.get(&monitor_id)?;
     let screen = screen_dip_rect((w, h), scale);
+    // Раскладки считаются ОДИН раз и отдаются и ленте, и вердиктам: это тот
+    // же список, из которого потом возьмут выбранную при подтверждении
+    // ([`GroupEditor::current_presets`]).
+    let work = work_area_of(&Some(monitor_id.clone()), monitor_bounds);
+    let layouts = match work {
+        Some(work) => editor.current_presets(work),
+        // Рабочая область неизвестна (монитор пропал между открытием меню и
+        // перерисовкой) — подобрать раскладки под минимумы нечем: подбор идёт
+        // от размера экрана. Показываем классический набор: он не хуже, чем
+        // ничего, а лента без миниатюр выглядит сломанной.
+        None => groups::StripLayouts {
+            presets: rst_core::group_layout::presets_for(
+                editor
+                    .picked()
+                    .len()
+                    .max(rst_core::model::MIN_GROUP_MEMBERS),
+            )
+            .to_vec(),
+            adaptive_first: false,
+        },
+    };
+    let presets = layouts.presets;
+    let adaptive_first = layouts.adaptive_first;
     let own_pid = std::process::id();
 
     // Свёрнутые окна ПОКАЗЫВАЕМ (репорт 2026-08-26: «меню не видит всех
@@ -10185,15 +10448,59 @@ fn build_group_editor(
         badge: monitor_badge::build(&screen, group_number),
         strip: group_strip::build(&cards, scroll, screen_box),
         presets: preset_strip::build(
-            editor.picked().len(),
+            &presets,
+            adaptive_first,
             editor.preset(),
             &screen,
             u32::from(editor.gap_pct),
+            &layout_fit_verdicts(editor, &presets, monitor_bounds),
         ),
         monitor_id,
         scroll,
         last_pos: (screen.x + screen.w / 2.0, screen.y + screen.h / 2.0),
     })
+}
+
+/// Какие раскладки НЕ поместят отмеченные окна.
+///
+/// Вердикт совещательный: выбрать помеченную раскладку пользователю никто не
+/// запрещает — он вправе получить перекрытие сознательно. Но узнавать об этом
+/// по результату он не должен (живой репорт со скриншотом 2026-08-26: «все
+/// пресеты, где окна не одинакового размера, сломаны»).
+///
+/// Считается тем же кодом, что и применение (`group_fit::layout_fits` внутри
+/// зовёт ту же `group_layout::apply` и тот же решатель), поэтому лента и
+/// экран не могут разойтись во мнении.
+///
+/// Пустой список означает «вердиктов нет, не помечать ничего»: так и должно
+/// быть, пока отмечено меньше двух окон (лента показывает витрину для двух,
+/// а слотов-фантомов в настоящей группе нет) и когда ни одно приложение не
+/// сообщило своего предела.
+fn layout_fit_verdicts(
+    editor: &GroupEditor,
+    presets: &[rst_core::group_layout::Preset],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> Vec<preset_strip::ThumbFit> {
+    if editor.picked().len() < rst_core::model::MIN_GROUP_MEMBERS {
+        return Vec::new();
+    }
+    let Some(work) = work_area_of(&Some(editor.monitor.clone()), monitor_bounds) else {
+        return Vec::new();
+    };
+    let minimums = editor.slot_minimums();
+    if minimums.iter().all(Option::is_none) {
+        return Vec::new();
+    }
+    presets
+        .iter()
+        .map(|preset| {
+            let gap = editor.gap_px_for(preset, work);
+            match group_fit::layout_fits(preset, work, gap, &minimums) {
+                group_fit::LayoutFits::Fits => preset_strip::ThumbFit::Fits,
+                group_fit::LayoutFits::DoesNotFit => preset_strip::ThumbFit::Overflows,
+            }
+        })
+        .collect()
 }
 
 /// Монотонные миллисекунды для кэша снимков окон.
@@ -15456,8 +15763,16 @@ mod tests {
             groups.editor_mut().expect("меню").set_preset(p);
         }
         let mut thumbs = rst_win32::thumb_cache::ThumbCache::new(4, 1_000);
-        edit.group_editor =
-            build_group_editor(&groups, windows.clone(), &geometry, &mut thumbs, 0, 0, 1);
+        edit.group_editor = build_group_editor(
+            &groups,
+            windows.clone(),
+            &geometry,
+            &HashMap::new(),
+            &mut thumbs,
+            0,
+            0,
+            1,
+        );
         (groups, edit, windows, geometry)
     }
 

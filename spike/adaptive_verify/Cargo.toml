@@ -1,0 +1,39 @@
+[workspace]
+members = ["."]
+resolver = "3"
+# Примечание: локальный workspace пробы — только сама проба. rst-core и
+# rst-win32 подключаются как ПУТЕВЫЕ зависимости из основного workspace.
+
+[package]
+name = "adaptive-verify-probe"
+version = "0.1.0"
+edition = "2024"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[dependencies]
+rst-core = { path = "../../crates/rst-core" }
+rst-win32 = { path = "../../crates/rst-win32" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }

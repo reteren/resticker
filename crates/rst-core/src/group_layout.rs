@@ -50,79 +50,129 @@ macro_rules! rect {
     };
 }
 
-/// Равные колонки: `n` слотов одинаковой ширины на всю высоту.
-fn columns(n: usize) -> Preset {
-    let w = 1.0 / n as f64;
-    Preset {
-        slots: (0..n).map(|i| rect!(i as f64 * w, 0.0, w, 1.0)).collect(),
-    }
-}
-
-/// Равные ряды: `n` слотов одинаковой высоты на всю ширину.
-fn rows(n: usize) -> Preset {
-    let h = 1.0 / n as f64;
-    Preset {
-        slots: (0..n).map(|i| rect!(0.0, i as f64 * h, 1.0, h)).collect(),
-    }
-}
-
-/// «Главное + стопка»: главный слот слева на всю высоту, остальные `n - 1` —
-/// равными рядами в правой колонке.
-fn stack_right(n: usize) -> Preset {
+/// Равные колонки с переносом: `n` слотов в `cols` колонках, заполняемых
+/// сверху вниз.
+///
+/// При `cols == n` получается исходная идея «колонка на каждое окно» —
+/// прежнее поведение. Меньшее число колонок переносит окна по колонкам:
+/// при `n = 4`, `cols = 2` выходит два столбца по два окна — идея колонок
+/// сохранена, а раскладка стала выполнимой для окон, которым тесно в одну
+/// колонку на окно.
+///
+/// Окна распределяются по колонкам поровну, остаток — в первые колонки:
+/// пустой колонки не бывает, и у каждого окна есть слот.
+pub(crate) fn columns(n: usize, cols: usize) -> Preset {
+    let cols = cols.clamp(1, n);
+    let (q, r) = (n / cols, n % cols);
+    // Ширина и позиция считаются как раньше: единая ширина `1/cols`,
+    // позиция — умножением. Так при `cols == n` прямоугольники битово
+    // совпадают с прежней таблицей (тест `slot_one_is_never_smaller`),
+    // а расхождение границ соседей на долю пикселя съедает округление
+    // в `apply`.
+    let w = 1.0 / cols as f64;
     let mut slots = Vec::with_capacity(n);
-    slots.push(rect!(0.0, 0.0, 0.5, 1.0));
-    let h = 1.0 / (n - 1) as f64;
-    for i in 0..n - 1 {
-        slots.push(rect!(0.5, i as f64 * h, 0.5, h));
+    for c in 0..cols {
+        let size = q + usize::from(c < r);
+        let h = 1.0 / size as f64;
+        for k in 0..size {
+            slots.push(rect!(c as f64 * w, k as f64 * h, w, h));
+        }
     }
     Preset { slots }
 }
 
-/// Зеркально `stack_right`: равные ряды в левой колонке, главное справа.
+/// Равные ряды с переносом: `n` слотов в `row_count` рядах, заполняемых
+/// слева направо. Зеркально [`columns`]: при `row_count == n` — ряд на окно
+/// (прежнее поведение), меньше рядов переносит окна по строкам.
+pub(crate) fn rows(n: usize, row_count: usize) -> Preset {
+    let rows = row_count.clamp(1, n);
+    let (q, r) = (n / rows, n % rows);
+    let h = 1.0 / rows as f64;
+    let mut slots = Vec::with_capacity(n);
+    for row in 0..rows {
+        let size = q + usize::from(row < r);
+        let w = 1.0 / size as f64;
+        for k in 0..size {
+            slots.push(rect!(k as f64 * w, row as f64 * h, w, h));
+        }
+    }
+    Preset { slots }
+}
+
+/// «Главное + стопка»: главный слот слева на всю высоту, остальные `n - 1` —
+/// колонками с переносом в правой половине.
+///
+/// При `stack_cols == 1` — прежнее поведение: одна колонка стопки. Большее
+/// число колонок укорачивает стопку по высоте: три окна по 500 px не встают
+/// в одну колонку на экране 1400 px, а в две колонки (2 + 1) встают —
+/// идея «главное и стопка справа» сохранена.
+pub(crate) fn stack_right(n: usize, stack_cols: usize) -> Preset {
+    let cols = stack_cols.clamp(1, n - 1);
+    let mut slots = Vec::with_capacity(n);
+    slots.push(rect!(0.0, 0.0, 0.5, 1.0));
+    // Стопка — те же колонки с переносом, сдвинутые в правую половину:
+    // распределение окон по колонкам не должно отличаться от «колонок».
+    for s in &columns(n - 1, cols).slots {
+        slots.push(rect!(0.5 + s.x * 0.5, s.y, s.w * 0.5, s.h));
+    }
+    Preset { slots }
+}
+
+/// Зеркально `stack_right`: колонки с переносом в левой половине, главное
+/// справа.
 ///
 /// Отдельная функция, а не «перевёрнутый» пресет: порядок слотов — порядок
 /// выбора окон, и слот 1 обязан оставаться главным и тут — главное всегда
 /// кладётся в `slots[0]`, независимо от того, слева оно или справа.
-fn stack_left(n: usize) -> Preset {
+pub(crate) fn stack_left(n: usize, stack_cols: usize) -> Preset {
+    let cols = stack_cols.clamp(1, n - 1);
     let mut slots = Vec::with_capacity(n);
     slots.push(rect!(0.5, 0.0, 0.5, 1.0));
-    let h = 1.0 / (n - 1) as f64;
-    for i in 0..n - 1 {
-        slots.push(rect!(0.0, i as f64 * h, 0.5, h));
+    for s in &columns(n - 1, cols).slots {
+        slots.push(rect!(s.x * 0.5, s.y, s.w * 0.5, s.h));
     }
     Preset { slots }
 }
 
 /// «Главное + ряд»: главный слот сверху на всю ширину (высоты `main_h`),
-/// остальные `n - 1` — равными колонками в ряду снизу.
-fn top_row(n: usize, main_h: f64) -> Preset {
+/// остальные `n - 1` — рядами с переносом в нижней полосе.
+///
+/// При `row_count == 1` — прежнее поведение: один ряд снизу. Большее число
+/// рядов переносит окна ряда по строкам: четыре окна по 800 px не встают
+/// в один ряд на экране 2560 px, а в два ряда (2 + 2) встают.
+pub(crate) fn top_row(n: usize, main_h: f64, row_count: usize) -> Preset {
+    let row_total = row_count.clamp(1, n - 1);
     let mut slots = Vec::with_capacity(n);
     slots.push(rect!(0.0, 0.0, 1.0, main_h));
-    let w = 1.0 / (n - 1) as f64;
-    for i in 0..n - 1 {
-        slots.push(rect!(i as f64 * w, main_h, w, 1.0 - main_h));
+    for s in &rows(n - 1, row_total).slots {
+        slots.push(rect!(
+            s.x,
+            main_h + s.y * (1.0 - main_h),
+            s.w,
+            s.h * (1.0 - main_h)
+        ));
     }
     Preset { slots }
 }
 
-/// Зеркально `top_row`: равные колонки в ряду сверху, главное снизу.
+/// Зеркально `top_row`: ряды с переносом в верхней полосе, главное снизу.
 ///
 /// Как и в `stack_left`, главное кладётся в `slots[0]`, а не в последний
 /// слот, — слот 1 получает окно, выбранное первым, и оно должно быть
 /// главным. Высота главного — `main_h`, как и в `top_row`: оба пресета
 /// одной пары зеркальны по вертикали.
-fn bottom_row(n: usize, main_h: f64) -> Preset {
+pub(crate) fn bottom_row(n: usize, main_h: f64, row_count: usize) -> Preset {
+    let row_total = row_count.clamp(1, n - 1);
     let mut slots = Vec::with_capacity(n);
     slots.push(rect!(0.0, 1.0 - main_h, 1.0, main_h));
-    let w = 1.0 / (n - 1) as f64;
-    for i in 0..n - 1 {
-        slots.push(rect!(i as f64 * w, 0.0, w, 1.0 - main_h));
+    for s in &rows(n - 1, row_total).slots {
+        slots.push(rect!(s.x, s.y * (1.0 - main_h), s.w, s.h * (1.0 - main_h)));
     }
     Preset { slots }
 }
 
 /// Сетка `rows × cols` одинаковых ячеек.
-fn grid(rows: usize, cols: usize) -> Preset {
+pub(crate) fn grid(rows: usize, cols: usize) -> Preset {
     let mut slots = Vec::with_capacity(rows * cols);
     let (cw, ch) = (1.0 / cols as f64, 1.0 / rows as f64);
     for r in 0..rows {
@@ -137,7 +187,7 @@ fn grid(rows: usize, cols: usize) -> Preset {
 ///
 /// Размеры ячеек в рядах разные, поэтому глаз читает раскладку как «кирпич»,
 /// а не как сетку, — лента получает ещё один осмысленный силуэт.
-fn brick(top: usize, bottom: usize) -> Preset {
+pub(crate) fn brick(top: usize, bottom: usize) -> Preset {
     let mut slots = Vec::with_capacity(top + bottom);
     for c in 0..top {
         slots.push(rect!(c as f64 / top as f64, 0.0, 1.0 / top as f64, 0.5));
@@ -160,7 +210,7 @@ fn brick(top: usize, bottom: usize) -> Preset {
 /// восемь окон — на одно больше, чем в группе из восьми. Свободный угол
 /// выглядел бы как поломка, поэтому центр обстраивается колоннами и панелью
 /// (1 + 3 + 3 + 1 = 8) — читается как «главное в центре», а не как сетка.
-fn main_center_eight() -> Preset {
+pub(crate) fn main_center_eight() -> Preset {
     let third = 1.0 / 3.0;
     Preset {
         slots: vec![
@@ -175,7 +225,6 @@ fn main_center_eight() -> Preset {
         ],
     }
 }
-
 /// Таблица раскладок для 2..8 окон, индекс — `count - 2`.
 ///
 /// Ленивая инициализация ([`OnceLock`]) — не ради экономии, а потому что
@@ -233,12 +282,12 @@ fn build_table() -> [[Preset; 7]; 7] {
         [
             // 3 окна: «главное + стопка» и «главное + ряд» в обе стороны,
             // колонки, ряды, главное по центру с боковинами.
-            stack_right(3),
-            stack_left(3),
-            top_row(3, 2.0 / 3.0),
-            bottom_row(3, 2.0 / 3.0),
-            columns(3),
-            rows(3),
+            stack_right(3, 1),
+            stack_left(3, 1),
+            top_row(3, 2.0 / 3.0, 1),
+            bottom_row(3, 2.0 / 3.0, 1),
+            columns(3, 3),
+            rows(3, 3),
             Preset {
                 slots: vec![
                     rect!(0.25, 0.125, 0.5, 0.75),
@@ -249,23 +298,23 @@ fn build_table() -> [[Preset; 7]; 7] {
         ],
         [
             // 4 окна: те же «главное + …», сетка 2×2, колонки, ряды.
-            stack_right(4),
-            stack_left(4),
-            top_row(4, 2.0 / 3.0),
-            bottom_row(4, 2.0 / 3.0),
-            columns(4),
-            rows(4),
+            stack_right(4, 1),
+            stack_left(4, 1),
+            top_row(4, 2.0 / 3.0, 1),
+            bottom_row(4, 2.0 / 3.0, 1),
+            columns(4, 4),
+            rows(4, 4),
             grid(2, 2),
         ],
         [
             // 5 окон: «главное + …», колонки, ряды, главное по центру
             // с четырьмя углами.
-            stack_right(5),
-            stack_left(5),
-            top_row(5, 0.5),
-            bottom_row(5, 0.5),
-            columns(5),
-            rows(5),
+            stack_right(5, 1),
+            stack_left(5, 1),
+            top_row(5, 0.5, 1),
+            bottom_row(5, 0.5, 1),
+            columns(5, 5),
+            rows(5, 5),
             Preset {
                 slots: vec![
                     rect!(0.3, 0.25, 0.4, 0.5),
@@ -278,32 +327,32 @@ fn build_table() -> [[Preset; 7]; 7] {
         ],
         [
             // 6 окон: «главное + …», колонки, ряды, сетка 2×3.
-            stack_right(6),
-            stack_left(6),
-            top_row(6, 0.5),
-            bottom_row(6, 0.5),
-            columns(6),
-            rows(6),
+            stack_right(6, 1),
+            stack_left(6, 1),
+            top_row(6, 0.5, 1),
+            bottom_row(6, 0.5, 1),
+            columns(6, 6),
+            rows(6, 6),
             grid(2, 3),
         ],
         [
             // 7 окон: «главное + …», колонки, ряды, «кирпич» 3+4.
-            stack_right(7),
-            stack_left(7),
-            top_row(7, 0.5),
-            bottom_row(7, 0.5),
-            columns(7),
-            rows(7),
+            stack_right(7, 1),
+            stack_left(7, 1),
+            top_row(7, 0.5, 1),
+            bottom_row(7, 0.5, 1),
+            columns(7, 7),
+            rows(7, 7),
             brick(3, 4),
         ],
         [
             // 8 окон: «главное + …», колонки, ряды, главное по центру.
-            stack_right(8),
-            stack_left(8),
-            top_row(8, 1.0 / 3.0),
-            bottom_row(8, 1.0 / 3.0),
-            columns(8),
-            rows(8),
+            stack_right(8, 1),
+            stack_left(8, 1),
+            top_row(8, 1.0 / 3.0, 1),
+            bottom_row(8, 1.0 / 3.0, 1),
+            columns(8, 8),
+            rows(8, 8),
             main_center_eight(),
         ],
     ]

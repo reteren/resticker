@@ -156,7 +156,23 @@ pub fn raise_group_window(hwnd: HWND) -> bool {
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return false;
     }
-    WindowPins::new().raise_without_topmost(hwnd);
+    // Пара TOPMOST -> NOTOPMOST, а НЕ простой HWND_TOP.
+    //
+    // Замер spike/zorder_probe (B4, 2026-08-26): `SetWindowPos(HWND_TOP,
+    // SWP_NOACTIVATE)` у ЧУЖОГО обычного окна не меняет его ранг вовсе, пока
+    // наверху полосы стоит активное окно пользователя, — ни сразу, ни через
+    // секунды, ни с правом на передний план, ни с повышенным токеном.
+    // Поднималось ровно одно окно — то, которому отдавали фокус: это
+    // дословно симптом пользователя «выбрал 4 окна, а вылетело одно».
+    //
+    // Пара с временным `HWND_TOPMOST` блокировку обходит: окно поднимается
+    // над активным и там остаётся (замер: четыре окна выше постороннего,
+    // устойчиво 3 секунды). Липкого стиля не остаётся — второй вызов
+    // снимает `WS_EX_TOPMOST` немедленно, и это проверено чтением
+    // `GWL_EXSTYLE` до и после.
+    let pins = WindowPins::new();
+    pins.surface_topmost_temporarily(hwnd);
+    pins.drop_topmost(hwnd);
     true
 }
 

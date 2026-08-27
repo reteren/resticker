@@ -21,8 +21,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use rst_core::group_fit;
 use rst_core::group_layout;
 use rst_core::group_match::{self, LiveWindow, MemberKey};
+use rst_core::group_shape;
 use rst_core::group_visibility::GroupVisibilityState;
 use rst_core::model::{
     GroupMember, GroupPlace, MAX_GROUP_MEMBERS, MIN_GROUP_MEMBERS, MonitorId, Rect, WindowGroup,
@@ -69,6 +71,36 @@ pub struct GroupEditor {
     /// здесь нет, достаётся следующему неразложенному окну.
     manual: HashMap<usize, usize>,
     target: EditorTarget,
+    /// Минимальный размер каждого окна ленты, физические пиксели в
+    /// координатах DWM.
+    ///
+    /// Снимается ОДИН раз при открытии меню и дальше не пересчитывается:
+    /// запрос идёт сообщением в чужой процесс, а список окон ленты заморожен
+    /// на момент открытия — ключи не меняются, пока меню живо. Отметить или
+    /// снять отметку можно сколько угодно раз, вердикты пересчитываются из
+    /// этого кэша чистой арифметикой.
+    ///
+    /// Окна нет в карте — приложение не ответило или у него нет предела;
+    /// это не повод считать раскладку негодной (см. `group_fit::layout_fits`).
+    min_sizes: HashMap<usize, (u32, u32)>,
+}
+
+/// Раскладки для ленты: список и признак, что первая в нём — сочинённая
+/// «adaptive».
+///
+/// Признак возвращается ВМЕСТЕ со списком, а не отдельным запросом: сочинение
+/// раскладки — самая дорогая операция здесь (замер 2026-08-27), и звать её
+/// дважды ради одного булева значения значило бы удвоить цену каждой
+/// пересборки ленты. Заодно признак не может разойтись со списком.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StripLayouts {
+    pub presets: Vec<group_layout::Preset>,
+    /// Первая раскладка списка — сочинённая под эти окна.
+    ///
+    /// Отдельный признак, а не сдвиг номеров: номер выбранной раскладки — это
+    /// индекс в списке, и любой сдвиг означал бы, что пользователь выбрал
+    /// одно, а применилось другое.
+    pub adaptive_first: bool,
 }
 
 /// Рантайм-состояние групп.
@@ -102,6 +134,46 @@ pub struct GroupsState {
     /// ответа. Без паузы группа успевала спрятаться через полсекунды после
     /// того, как её показали (замер на живом приложении 2026-08-26).
     shown_at: Option<Instant>,
+    /// Показ группы объявлен, но окна ещё не подняты на передний план.
+    ///
+    /// Разворачивание чужого свёрнутого окна асинхронно: `ShowWindowAsync`
+    /// лишь кладёт сообщение в очередь ЧУЖОГО потока, и пока тот его не
+    /// разберёт, окно остаётся свёрнутым. Поднимать свёрнутое окно
+    /// бессмысленно — оно всплывёт туда, где было, уже после нашего подъёма.
+    ///
+    /// Замер 2026-08-26 на живом приложении: из четырёх окон группы наверх
+    /// выходило одно (то, которому отдавали фокус), а два развёрнутых из
+    /// свёрнутого состояния оставались глубоко внизу, под посторонним окном.
+    /// Поэтому подъём откладывается до снимка, на котором окна уже не
+    /// свёрнуты.
+    raise_pending: bool,
+    /// Окно, которое было на переднем плане в момент показа группы.
+    ///
+    /// Отвечает на вопрос «ушёл ли пользователь на другое окно». Уход — это
+    /// СМЕНА переднего плана после показа, а не сам факт, что впереди не
+    /// член группы: если человек ничего не нажимал, впереди по-прежнему то
+    /// же окно, что и было, и прятать группу не за что.
+    ///
+    /// Без этого различия группа гасла сама. Замер 2026-08-26: после показа
+    /// фокус держался на окне группы 1.1 секунды, после чего Steam забирал
+    /// его себе обратно — и группа пряталась, хотя пользователь не трогал
+    /// ничего. Драться с таким приложением за фокус бессмысленно (проверено:
+    /// оно забирает снова), а вот отличить его возврат от настоящего
+    /// переключения — просто, потому что возвращается оно ровно туда, откуда
+    /// мы фокус и забрали.
+    shown_over: Option<usize>,
+    /// Где окна группы стояли на ПРОШЛОМ снимке трекера.
+    ///
+    /// Нужно, чтобы не записывать в группу переходные кадры. Разворачивание
+    /// окна из свёрнутого состояния — анимация: за неё окно проходит через
+    /// десяток промежуточных прямоугольников, и снимок трекера ловит их так
+    /// же охотно, как настоящее место. Замер 2026-08-26: в конфиг попал
+    /// прямоугольник 464,429 — не слот и не то, куда окно в итоге встало;
+    /// потом он же сменился на 22,24, тоже случайный. Место окна становится
+    /// местом группы только после того, как повторилось на двух снимках
+    /// подряд — анимация такой проверки не проходит, а рука пользователя,
+    /// отпустившая окно, проходит сразу.
+    seen_places: HashMap<usize, GroupPlace>,
 }
 
 impl GroupEditor {
@@ -220,6 +292,97 @@ impl GroupEditor {
         out.into_iter().flatten().collect()
     }
 
+    /// Запомнить минимальные размеры окон ленты (при открытии меню).
+    pub fn set_min_sizes(&mut self, sizes: HashMap<usize, (u32, u32)>) {
+        self.min_sizes = sizes;
+    }
+
+    /// Минимальные размеры по номерам слотов — вход для
+    /// [`rst_core::group_fit`]. Порядок тот же, что у [`Self::slot_assignment`].
+    pub fn slot_minimums(&self) -> Vec<Option<group_fit::MinSize>> {
+        self.slot_assignment()
+            .into_iter()
+            .map(|hwnd| {
+                self.min_sizes
+                    .get(&hwnd)
+                    .map(|(width, height)| group_fit::MinSize {
+                        width: *width,
+                        height: *height,
+                    })
+            })
+            .collect()
+    }
+
+    /// Раскладки, предлагаемые для ТЕКУЩЕГО набора окон.
+    ///
+    /// Единственный источник: и лента миниатюр, и применение при
+    /// подтверждении берут список отсюда. Два независимых вычисления
+    /// разошлись бы при первом же расхождении входов, и выбранный номер
+    /// раскладки означал бы в ленте одно, а на экране другое — ровно тот
+    /// класс ошибки, который эта функция и предотвращает.
+    ///
+    /// Список СЧИТАЕТСЯ, а не берётся из таблицы: число полос по каждой оси
+    /// подбирается под минимальные размеры отмеченных окон (запрос
+    /// пользователя 2026-08-26, вариант B). Четыре колонки, в которые окна
+    /// не влезают, не предлагаются вовсе — вместо них то же семейство
+    /// «колонки» в выполнимом виде.
+    ///
+    /// Пока отмечено меньше двух окон, показывается витрина — классический
+    /// набор для двух окон: пустая лента выглядит сломанной, а по витрине
+    /// понятно, что здесь будет (живой репорт 2026-08-25 «не вижу ни
+    /// пресетов, ни окон»). Выбранная в витрине раскладка всё равно
+    /// сбрасывается, когда состав меняется.
+    pub fn current_presets(&self, work_area: Rect) -> StripLayouts {
+        if self.picked.len() < MIN_GROUP_MEMBERS {
+            return StripLayouts {
+                presets: group_layout::presets_for(MIN_GROUP_MEMBERS).to_vec(),
+                adaptive_first: false,
+            };
+        }
+        let minimums = self.slot_minimums();
+        let mut presets = Vec::new();
+        // «adaptive» идёт ПЕРВОЙ: это ответ на вопрос «просто сделай, чтобы
+        // влезло», и искать его в конце ленты пользователю незачем. Она не
+        // принадлежит ни одному семейству — раскладка сочиняется под
+        // конкретные окна рекурсивным разрезанием экрана, и находит решение
+        // там, где не находит ни одно семейство (замер 2026-08-27: для
+        // восьми окон пользователя выполнимых семейств ноль, а `adaptive`
+        // раскладку нашла).
+        //
+        // Её может не быть: если не помещается вообще ничто, карточки нет
+        // (притворяться, что решение найдено, хуже, чем его отсутствие).
+        if let Some(adaptive) =
+            group_shape::adaptive_layout(self.picked.len(), work_area, self.gap_pct, &minimums)
+        {
+            presets.push(adaptive);
+        }
+        let adaptive_first = !presets.is_empty();
+        presets.extend(group_shape::adaptive_presets(
+            self.picked.len(),
+            work_area,
+            self.gap_pct,
+            &minimums,
+        ));
+        StripLayouts {
+            presets,
+            adaptive_first,
+        }
+    }
+
+    /// Зазор в пикселях для конкретной раскладки.
+    ///
+    /// Правило одно на всё приложение и живёт здесь: процент берётся от
+    /// САМОГО ТЕСНОГО слота этой раскладки при нулевом зазоре. Считать его
+    /// по долям вручную значило бы повторить округление из
+    /// [`group_layout::apply`] и рано или поздно с ним разойтись — а
+    /// разойтись нельзя: по этому же числу лента решает, влезет ли раскладка,
+    /// и если оно разное, лента и применение скажут разное.
+    pub fn gap_px_for(&self, preset: &group_layout::Preset, work_area: Rect) -> i32 {
+        let bare = group_layout::apply(preset, work_area, 0);
+        let smallest = bare.iter().map(|r| r.w.min(r.h)).min().unwrap_or(0);
+        (u32::from(self.gap_pct) * smallest / 100) as i32
+    }
+
     /// Набрано достаточно окон, чтобы группа имела смысл.
     pub fn can_confirm(&self) -> bool {
         self.picked.len() >= MIN_GROUP_MEMBERS
@@ -258,6 +421,7 @@ impl GroupsState {
             preset: None,
             gap_pct,
             manual: HashMap::new(),
+            min_sizes: HashMap::new(),
             target: EditorTarget::New,
         });
     }
@@ -270,6 +434,7 @@ impl GroupsState {
             preset: None,
             gap_pct: group.gap_pct,
             manual: HashMap::new(),
+            min_sizes: HashMap::new(),
             target: EditorTarget::Existing(group.id),
         });
     }
@@ -366,17 +531,26 @@ impl GroupEditor {
     /// долей даже самого тесного окна.
     pub fn layout_targets(&self, work_area: Rect) -> Option<Vec<(usize, Rect)>> {
         let windows = self.slot_assignment();
-        let preset = group_layout::presets_for(windows.len()).get(self.preset?)?;
-        // Первый проход без зазора — только чтобы узнать размер самого
-        // тесного слота. Считать его по долям вручную значило бы повторить
-        // здесь округление из `apply` и рано или поздно с ним разойтись.
-        let bare = group_layout::apply(preset, work_area, 0);
-        let smallest = bare.iter().map(|r| r.w.min(r.h)).min().unwrap_or(0);
-        let gap = (u32::from(self.gap_pct) * smallest / 100) as i32;
+        // Тот же список, что видит пользователь в ленте: номер раскладки —
+        // это индекс в нём, и брать раскладку откуда-то ещё значило бы
+        // применить не то, что он выбрал.
+        let presets = self.current_presets(work_area).presets;
+        let preset = presets.get(self.preset?)?;
+        let gap = self.gap_px_for(preset, work_area);
         let rects = group_layout::apply(preset, work_area, gap);
         Some(windows.into_iter().zip(rects).collect())
     }
 }
+
+/// Сколько ждать, пока чужие окна разберут наше «развернись», прежде чем
+/// поднимать их как есть.
+///
+/// Замер 2026-08-26: отзывчивое приложение разворачивается за единицы
+/// миллисекунд, но окно занятого приложения (идёт загрузка, открыт модальный
+/// диалог) может не ответить и за секунду. Полторы секунды — это и запас на
+/// такое окно, и предел, после которого пользователь уже считает, что
+/// хоткей не сработал.
+const GROUP_RAISE_DEADLINE: Duration = Duration::from_millis(1500);
 
 /// Сколько показ группы считается «ещё не улёгшимся».
 ///
@@ -507,8 +681,45 @@ impl GroupsState {
         let was_shown = self.visibility(group).shown;
         if state.shown && !was_shown {
             self.shown_at = Some(Instant::now());
+            self.raise_pending = true;
+        }
+        if !state.shown {
+            self.raise_pending = false;
         }
         self.visibility.insert(group, state);
+    }
+
+    /// Запомнить, какое окно было впереди, когда группу показали.
+    pub fn note_shown_over(&mut self, foreground: Option<usize>) {
+        self.shown_over = foreground;
+    }
+
+    /// Это то самое окно, у которого группа забрала передний план при показе.
+    ///
+    /// Значит переключения не было: либо пользователь никуда не уходил, либо
+    /// приложение вернуло себе фокус само — см. [`Self::shown_over`].
+    pub fn is_shown_over(&self, foreground: usize) -> bool {
+        self.shown_over == Some(foreground)
+    }
+
+    /// Показ объявлен, но окна ещё не подняты — см. [`Self::raise_pending`].
+    pub fn raise_pending(&self) -> bool {
+        self.raise_pending
+    }
+
+    /// Подъём доведён до конца (или ждать больше нечего).
+    pub fn finish_raise(&mut self) {
+        self.raise_pending = false;
+    }
+
+    /// Ждать разворачивания окон больше нельзя: чужое приложение может не
+    /// разобрать очередь сообщений сколь угодно долго (зависло, грузится,
+    /// показывает свой диалог), а группа не должна из-за него застревать
+    /// в полупоказанном виде навсегда. По истечении срока поднимаем что
+    /// есть — это честнее, чем не поднять ничего.
+    pub fn raise_deadline_passed(&self) -> bool {
+        self.shown_at
+            .is_some_and(|at| at.elapsed() >= GROUP_RAISE_DEADLINE)
     }
 
     /// Группу показали только что, и залп её окон ещё не улёгся.
@@ -562,17 +773,19 @@ impl GroupsState {
     /// Возвращает `true`, если хоть одно место изменилось, — это сигнал
     /// координатору сохранить конфиг.
     pub fn note_places(
-        &self,
+        &mut self,
         group: &mut WindowGroup,
         live_places: &HashMap<usize, GroupPlace>,
     ) -> bool {
         let Some(open) = &self.active else {
+            self.seen_places.clear();
             return false;
         };
         if open.id != group.id {
             return false;
         }
         let mut changed = false;
+        let mut seen_now: HashMap<usize, GroupPlace> = HashMap::new();
         for (i, member) in group.members.iter_mut().enumerate() {
             let Some(hwnd) = open.window_of(i) else {
                 continue;
@@ -580,12 +793,24 @@ impl GroupsState {
             let Some(now) = live_places.get(&hwnd) else {
                 continue;
             };
+            seen_now.insert(hwnd, now.clone());
             if member.place.as_ref().is_some_and(|p| same_place(p, now)) {
+                continue;
+            }
+            // Место засчитывается только если окно стоит там же, где стояло
+            // на прошлом снимке. Иначе мы записывали бы кадры анимации
+            // разворачивания — см. [`Self::seen_places`].
+            let steady = self
+                .seen_places
+                .get(&hwnd)
+                .is_some_and(|before| same_place(before, now));
+            if !steady {
                 continue;
             }
             member.place = Some(now.clone());
             changed = true;
         }
+        self.seen_places = seen_now;
         changed
     }
 }
@@ -629,6 +854,83 @@ mod tests {
             st.editor_mut().expect("меню открыто").toggle_pick(*h);
         }
         st
+    }
+
+    /// Рабочая область главного монитора пользователя — числа настоящие,
+    /// чтобы тест говорил о его экране, а не о выдуманном.
+    fn user_work_area() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: 2560,
+            h: 1392,
+        }
+    }
+
+    #[test]
+    fn adaptive_layout_comes_first_in_the_strip() {
+        // «adaptive» — ответ на «просто сделай, чтобы влезло», и искать его в
+        // конце ленты незачем. Проверяем и признак, и позицию: они обязаны
+        // говорить одно и то же, иначе подпись окажется не на той карточке.
+        let mut st = editor_with(&[11, 22, 33, 44]);
+        let editor = st.editor_mut().expect("меню открыто");
+        // Минимумы с машины пользователя: при них четыре колонки невозможны.
+        editor.set_min_sizes(HashMap::from([
+            (11, (946, 653)),
+            (22, (786, 593)),
+            (33, (686, 493)),
+            (44, (586, 493)),
+        ]));
+        let work = user_work_area();
+        let layouts = editor.current_presets(work);
+        assert!(
+            layouts.adaptive_first,
+            "раскладка сочинилась и стоит первой"
+        );
+        assert!(
+            layouts.presets.len() > 1,
+            "кроме неё в ленте есть и семейства"
+        );
+        let composed = rst_core::group_shape::adaptive_layout(
+            4,
+            work,
+            editor.gap_pct,
+            &editor.slot_minimums(),
+        )
+        .expect("раскладка сочинилась");
+        assert_eq!(
+            layouts.presets[0], composed,
+            "сочинённая раскладка стоит первой в списке"
+        );
+        assert!(
+            layouts.presets.iter().all(|p| p.slots.len() == 4),
+            "у каждой раскладки ровно столько слотов, сколько окон"
+        );
+    }
+
+    #[test]
+    fn the_layout_applied_is_the_one_picked_in_the_strip() {
+        // Номер раскладки — это индекс в списке из `current_presets`. Если
+        // применение возьмёт раскладку из другого источника, пользователь
+        // выберет одно, а получит другое; так уже случалось.
+        let mut st = editor_with(&[11, 22, 33, 44]);
+        let work = user_work_area();
+        {
+            let editor = st.editor_mut().expect("меню открыто");
+            editor.set_min_sizes(HashMap::from([
+                (11, (946, 653)),
+                (22, (786, 593)),
+                (33, (686, 493)),
+                (44, (586, 493)),
+            ]));
+            editor.set_preset(1);
+        }
+        let editor = st.editor().expect("меню открыто");
+        let chosen = editor.current_presets(work).presets[1].clone();
+        let expected = group_layout::apply(&chosen, work, editor.gap_px_for(&chosen, work));
+        let targets = editor.layout_targets(work).expect("раскладка выбрана");
+        let got: Vec<Rect> = targets.into_iter().map(|(_, rect)| rect).collect();
+        assert_eq!(got, expected, "применяется ровно выбранная раскладка");
     }
 
     fn place(x: f64, y: f64) -> GroupPlace {
@@ -737,8 +1039,12 @@ mod tests {
         now.insert(22, place(0.0, 0.0));
         now.insert(11, place(950.0, 40.0)); // пользователь подвинул браузер
         assert!(
+            !st.note_places(&mut g, &now),
+            "первый снимок нового места только запоминает его: так же выглядит              кадр анимации разворачивания, и записывать его нельзя"
+        );
+        assert!(
             st.note_places(&mut g, &now),
-            "сдвиг обязан попасть в группу"
+            "окно постояло на месте два снимка подряд — это перемещение, а не              анимация; сдвиг обязан попасть в группу"
         );
         assert_eq!(g.members[1].place.as_ref().expect("место").x, 950.0);
         assert_eq!(g.members[0].place.as_ref().expect("место").x, 0.0);
@@ -805,12 +1111,49 @@ mod tests {
     }
 
     #[test]
+    fn animation_frames_never_become_the_place_of_a_group_member() {
+        // Разворачивание окна из свёрнутого состояния — анимация: снимки
+        // трекера ловят десяток разных прямоугольников подряд. Ни один из них
+        // не место окна. Замер 2026-08-26: в конфиг пользователя попало
+        // 464,429 — не слот и не то, куда окно в итоге встало.
+        let mut g = saved_group(vec![
+            member("редактор", Some(place(0.0, 0.0))),
+            member("браузер", Some(place(900.0, 0.0))),
+        ]);
+        let mut st = GroupsState::new();
+        st.open_group(&g, &[live(11, "браузер"), live(22, "редактор")]);
+
+        for x in [300.0, 500.0, 700.0, 850.0] {
+            let mut frame = HashMap::new();
+            frame.insert(22, place(0.0, 0.0));
+            frame.insert(11, place(x, 0.0));
+            assert!(
+                !st.note_places(&mut g, &frame),
+                "кадр анимации не становится местом окна"
+            );
+        }
+        assert_eq!(
+            g.members[1].place.as_ref().expect("место").x,
+            900.0,
+            "после всей анимации место осталось прежним"
+        );
+
+        // Окно доехало и стоит: два одинаковых снимка подряд — это место.
+        let mut settled = HashMap::new();
+        settled.insert(22, place(0.0, 0.0));
+        settled.insert(11, place(950.0, 0.0));
+        assert!(!st.note_places(&mut g, &settled));
+        assert!(st.note_places(&mut g, &settled));
+        assert_eq!(g.members[1].place.as_ref().expect("место").x, 950.0);
+    }
+
+    #[test]
     fn note_places_does_nothing_when_no_group_is_open() {
         let mut g = saved_group(vec![
             member("редактор", Some(place(0.0, 0.0))),
             member("браузер", Some(place(900.0, 0.0))),
         ]);
-        let st = GroupsState::new();
+        let mut st = GroupsState::new();
         let mut now = HashMap::new();
         now.insert(22, place(500.0, 500.0));
         assert!(!st.note_places(&mut g, &now));
@@ -830,6 +1173,10 @@ mod tests {
         let mut now = HashMap::new();
         now.insert(22, moved);
         now.insert(11, place(900.0, 0.0));
+        assert!(
+            !st.note_places(&mut g, &now),
+            "первый снимок только запоминает"
+        );
         assert!(
             st.note_places(&mut g, &now),
             "смена монитора — это перемещение"

@@ -9,8 +9,10 @@
 pub mod animation_clock;
 pub mod config;
 mod error;
+pub mod group_fit;
 pub mod group_layout;
 pub mod group_match;
+pub mod group_shape;
 pub mod group_visibility;
 pub mod hittest;
 pub mod migration;

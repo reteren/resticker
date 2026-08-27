@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_SUCCESS, GetLastError, HWND, LPARAM, RECT, SetLastError, TRUE, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
@@ -22,9 +24,10 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor,
-    GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT,
-    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MINMAXINFO, SMTO_ABORTIFHUNG,
+    SendMessageTimeoutW, WM_GETMINMAXINFO, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
@@ -186,6 +189,143 @@ pub fn is_resizable(hwnd: usize) -> bool {
     // и возвращает 0 вместо падения.
     let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
     style & WS_THICKFRAME.0 != 0
+}
+
+/// Минимальный размер окна в **физических** пикселях DWM-границ
+/// (`DWMWA_EXTENDED_FRAME_BOUNDS`) — той же системе координат, в которой
+/// живёт раскладка (`WindowRect`/`WindowInfo::rect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowMinSize {
+    pub w: i32,
+    pub h: i32,
+}
+
+/// Таймаут кросс-поточного запроса минимума (мс), [`min_window_size`].
+///
+/// Выбран ЗАМЕРОМ, а не на глаз — `spike/min_size_probe` (2026-08-26):
+/// * живые приложения пользователя (Chrome-семейство, Spotify, Discord,
+///   Steam, Nemora, Проводник, Настройки) отвечают на `WM_GETMINMAXINFO`
+///   за 13–242 мкс (типично <100 мкс); собственные окна пробы с помпом —
+///   до 1.6 мс (там доминирует гранулярность помпа, не приложение);
+/// * зависшее окно `SMTO_ABORTIFHUNG` НЕ обрывает сразу: замер показал
+///   ожидание ровно в течение таймаута + ~5–14 мс накладных (таймауты
+///   10/50/200/500/2000 мс — фактическое ожидание 24.6/62/204/513/2000 мс,
+///   ошибка 1460 ERROR_TIMEOUT).
+///
+/// Итог: 25 мс — 15-кратный запас над худшим измеренным живым ответом
+/// (1.6 мс) при неощутимой цене зависшего окна (вызов вернётся через
+/// ~30–40 мс, и раскладка честно пойдёт без минимума).
+pub const MIN_SIZE_FETCH_TIMEOUT_MS: u32 = 25;
+
+/// Смещение `GetWindowRect` → DWM-границы (dx, dy, dw, dh) — те же четыре
+/// числа, что считает `WindowPins::set_dwm_bounds` (window_pin.rs): у окон
+/// Win11 между системами ~7 px невидимых полей ресайза с боков и снизу, и
+/// складывать пространства напрямую нельзя. Смещение от позиции не зависит
+/// (метрики рамки постоянны), поэтому достаточно текущего состояния окна.
+///
+/// `(0, 0, 0, 0)` — окно свёрнуто или система не отдала границы: перевода
+/// нет, вызывающий получает «сырое» значение в GetWindowRect-пространстве.
+fn dwm_frame_offset(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let mut gwr = RECT::default();
+    // SAFETY: GetWindowRect — чтение экранного прямоугольника, безопасно
+    // и для чужих, и для мёртвых окон (вернёт ошибку).
+    let gwr_ok = unsafe { GetWindowRect(hwnd, &mut gwr) }.is_ok();
+    let dwm = extended_frame_bounds(hwnd);
+    if !gwr_ok || dwm.w == 0 || dwm.h == 0 {
+        return (0, 0, 0, 0);
+    }
+    (
+        dwm.x - gwr.left,
+        dwm.y - gwr.top,
+        dwm.w - (gwr.right - gwr.left),
+        dwm.h - (gwr.bottom - gwr.top),
+    )
+}
+
+/// Перевести заявленный приложением минимум (GetWindowRect-пространство)
+/// в DWM-пространство: прибавить рамку `dw`/`dh`. Отрицательный результат
+/// (приложение не объявляет минимума, а рамка «съедает» его в минус)
+/// схлопывается в ноль — «минимума нет».
+fn to_dwm_min(pt_x: i32, pt_y: i32, offset: (i32, i32, i32, i32)) -> WindowMinSize {
+    WindowMinSize {
+        w: (pt_x + offset.2).max(0),
+        h: (pt_y + offset.3).max(0),
+    }
+}
+
+/// Минимальный размер ЧУЖОГО окна — до которого его реально ужимает Windows
+/// (`WM_GETMINMAXINFO`, поле `ptMinTrackSize`), в DWM-координатах
+/// [`WindowInfo::rect`].
+///
+/// Зачем: некоторые приложения (Spotify, Discord, OBS, Steam — живой репорт
+/// 2026-08-26 со скриншотом) не дают ужать окно ниже собственного минимума;
+/// если слот раскладки меньше этого предела, окно молча остаётся крупнее
+/// и НАЛЕЗАЕТ НА СОСЕДА. Число отсюда — то, чем раскладка обязана
+/// ограничить слот заранее, а не по факту (`check_layout_discrepancy` в
+/// window_pin.rs ловит уже случившееся).
+///
+/// Почему `SendMessageTimeoutW`, а не `SendMessageW`: запрос идёт в ЧУЖОЙ
+/// процесс, и блокирующий вызов на зависшем приложении повис бы вместе
+/// с ним — а это координаторский поток, на котором живёт весь интерфейс.
+/// `SMTO_ABORTIFHUNG` + [`MIN_SIZE_FETCH_TIMEOUT_MS`] ограничивают ожидание
+/// сверху (замер пробы: зависшее окно держит вызов ровно таймаут). Окно, не
+/// ответившее в срок, — НЕ ошибка: `None`, раскладка обойдётся без минимума
+/// (и наверстает его discrepancy-проверкой, если окно всё-таки не влезет).
+///
+/// Ноль в ответе (`w == 0 && h == 0`): приложение НЕ объявляет минимум —
+/// обработчик не переопределяет системные значения. Это не значит, что окно
+/// можно ужать до нуля: для рамковых окон остаётся системный пол
+/// `SM_CXMINTRACK`/`SM_CYMINTRACK` (замер на своём окне: 136x60, проба
+/// 2026-08-26), который в числе не отражён — пол маленький и раскладку не
+/// ломает, но и ноль не следует трактовать как «свободно».
+///
+/// Свёрнутое окно: `WM_GETMINMAXINFO` доходит, но DWM не отдаёт границы —
+/// перевод в DWM-пространство невозможен, возвращается «сырое» значение
+/// в GetWindowRect-пространстве (свёрнутые окна раскладка и так не строит).
+pub fn min_window_size(hwnd: usize) -> Option<WindowMinSize> {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: IsWindow безопасен для любых значений, включая мёртвые.
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return None;
+    }
+    let mut mmi = MINMAXINFO::default();
+    let mut delivered: usize = 0;
+    // SAFETY: SetLastError — потоковый регистр ошибки; сброс обязателен:
+    // SendMessageTimeoutW возвращает результат СООБЩЕНИЯ, а для
+    // WM_GETMINMAXINFO это 0 (данные — в структуре), поэтому «доставлено»
+    // от «таймаута» отличает только код ошибки.
+    unsafe {
+        SetLastError(ERROR_SUCCESS);
+    }
+    // SAFETY: hwnd проверен IsWindow выше; mmi — валидный буфер под структуру
+    // (система заполняет её до вызова обработчика); SMTO_ABORTIFHUNG обрывает
+    // зависшие потоки, таймаут ограничивает живые, но занятые.
+    let result = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            WPARAM(0),
+            LPARAM((&raw mut mmi) as isize),
+            SMTO_ABORTIFHUNG,
+            MIN_SIZE_FETCH_TIMEOUT_MS,
+            Some(&mut delivered),
+        )
+    };
+    // SAFETY: GetLastError — потоковый регистр ошибки.
+    let err = unsafe { GetLastError() };
+    // Ненулевой результат — сообщение доставлено (обработчик что-то вернул);
+    // нулевой — доставлено с результатом 0 (норма для WM_GETMINMAXINFO) или
+    // таймаут — различает код ошибки, сброшенный выше.
+    let ok = result.0 != 0 || err == ERROR_SUCCESS;
+    if !ok {
+        return None;
+    }
+    let offset = dwm_frame_offset(hwnd);
+    Some(to_dwm_min(
+        mmi.ptMinTrackSize.x,
+        mmi.ptMinTrackSize.y,
+        offset,
+    ))
 }
 
 /// Контекст колбэка `EnumWindows`: `raw_index` считает **все** окна из
@@ -609,11 +749,13 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::thread::{self, JoinHandle};
-    use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, LRESULT};
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, LRESULT, POINT};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WNDCLASSEXW,
-        WS_OVERLAPPED,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
+        PeekMessageW, RegisterClassExW, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+        TranslateMessage, WM_GETMINMAXINFO, WNDCLASSEXW, WS_OVERLAPPED, WS_THICKFRAME, WS_VISIBLE,
     };
     use windows::core::w;
 
@@ -702,6 +844,115 @@ mod tests {
     }
 
     impl Drop for HungWindow {
+        fn drop(&mut self) {
+            if let Some(k) = self.kill.take() {
+                let _ = k.send(());
+            }
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Wndproc с собственным `WM_GETMINMAXINFO` (минимум 400x300) — как у
+    /// приложений, которые не дают ужать окно (Spotify/Discord/OBS).
+    unsafe extern "system" fn minmax_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_GETMINMAXINFO {
+            // SAFETY: lparam — указатель на MINMAXINFO, заполненный системой.
+            let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+            mmi.ptMinTrackSize = POINT { x: 400, y: 300 };
+            return LRESULT(0);
+        }
+        // SAFETY: делегирование системному обработчику.
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    /// «Чужое» окно с минимумом: живёт на своём помп-потоке и отвечает на
+    /// `WM_GETMINMAXINFO` (400x300). Снаружи — ровно та ситуация, в которой
+    /// живёт координатор (запрос с другого потока в чужой процесс).
+    struct MinMaxWindow {
+        hwnd: HWND,
+        thread: Option<JoinHandle<()>>,
+        kill: Option<mpsc::Sender<()>>,
+    }
+
+    impl MinMaxWindow {
+        fn create() -> Self {
+            let (ready_tx, ready_rx) = mpsc::channel::<SendHwnd>();
+            let (kill_tx, kill_rx) = mpsc::channel::<()>();
+            let thread = thread::spawn(move || {
+                // SAFETY: GetModuleHandleW(None) — хэндл текущего модуля.
+                let hinstance = unsafe { GetModuleHandleW(None) }.expect("хэндл модуля");
+                let wc = WNDCLASSEXW {
+                    cbSize: size_of::<WNDCLASSEXW>() as u32,
+                    lpfnWndProc: Some(minmax_wndproc),
+                    hInstance: hinstance.into(),
+                    lpszClassName: w!("resticker_window_enum_minmax"),
+                    ..Default::default()
+                };
+                // SAFETY: wc заполнена корректно; повторная регистрация
+                // (параллельные тесты) — не ошибка.
+                if unsafe { RegisterClassExW(&wc) } == 0 {
+                    let err = unsafe { GetLastError() };
+                    assert_eq!(err, ERROR_CLASS_ALREADY_EXISTS);
+                }
+                // SAFETY: все аргументы — валидные константы/только что
+                // зарегистрированный класс.
+                let hwnd = unsafe {
+                    CreateWindowExW(
+                        Default::default(),
+                        w!("resticker_window_enum_minmax"),
+                        w!("minmax test"),
+                        WS_OVERLAPPED | WS_THICKFRAME | WS_VISIBLE,
+                        100,
+                        100,
+                        700,
+                        500,
+                        None,
+                        None,
+                        Some(hinstance.into()),
+                        None,
+                    )
+                }
+                .expect("создание тестового окна");
+                let _ = ready_tx.send(SendHwnd(hwnd));
+                // Помп: кросс-поточные сообщения (WM_GETMINMAXINFO,
+                // WM_WINDOWPOSCHANGING от SetWindowPos) обязаны доходить.
+                loop {
+                    if kill_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    let mut msg = MSG::default();
+                    // SAFETY: msg — валидный буфер; None — сообщения любых окон потока.
+                    while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                        // SAFETY: msg пришёл из PeekMessageW.
+                        unsafe {
+                            let _ = TranslateMessage(&msg);
+                            let _ = DispatchMessageW(&msg);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // SAFETY: окно создано этим же потоком.
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            });
+            let hwnd = ready_rx.recv().expect("поток тестового окна не упал").0;
+            Self {
+                hwnd,
+                thread: Some(thread),
+                kill: Some(kill_tx),
+            }
+        }
+    }
+
+    impl Drop for MinMaxWindow {
         fn drop(&mut self) {
             if let Some(k) = self.kill.take() {
                 let _ = k.send(());
@@ -898,5 +1149,137 @@ mod tests {
     fn is_shell_transient_visible_degrades_gracefully() {
         let _ = is_shell_transient_visible();
         let _ = shell_switching();
+    }
+
+    // --- минимальный размер окна ([`min_window_size`]) ---
+
+    /// Перевод заявленного минимума из GetWindowRect-пространства в
+    /// DWM-пространство: рамка `dw`/`dh` прибавляется, отрицательный
+    /// результат («минимума нет» + рамка) схлопывается в ноль.
+    #[test]
+    fn min_window_size_translates_claim_from_gwr_to_dwm_space() {
+        // Заявленный (400,300) + рамка (-14,-7) → (386,293): ровно случай,
+        // измеренный пробой spike/min_size_probe на своём окне.
+        assert_eq!(
+            to_dwm_min(400, 300, (7, 0, -14, -7)),
+            WindowMinSize { w: 386, h: 293 }
+        );
+        // Приложение без минимума (0,0): рамка уводит в минус — схлопываем в ноль.
+        assert_eq!(
+            to_dwm_min(0, 0, (7, 0, -14, -7)),
+            WindowMinSize { w: 0, h: 0 }
+        );
+        // Custom-chrome окно (рамка 0, как Discord/Spotify): минимум как есть.
+        assert_eq!(
+            to_dwm_min(800, 600, (0, 0, 0, 0)),
+            WindowMinSize { w: 800, h: 600 }
+        );
+    }
+
+    /// Мёртвый hwnd — `None` без единого кросс-поточного вызова: окна нет,
+    /// спрашивать нечего (и не о ком).
+    #[test]
+    fn min_window_size_of_dead_window_is_none() {
+        // SAFETY: GetModuleHandleW(None) — хэндл текущего модуля.
+        let hinstance = unsafe { GetModuleHandleW(None) }.expect("хэндл модуля");
+        let wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(test_wndproc),
+            hInstance: hinstance.into(),
+            lpszClassName: w!("resticker_window_enum_plain"),
+            ..Default::default()
+        };
+        // SAFETY: wc заполнена корректно; повторная регистрация — не ошибка.
+        if unsafe { RegisterClassExW(&wc) } == 0 {
+            let err = unsafe { GetLastError() };
+            assert_eq!(err, ERROR_CLASS_ALREADY_EXISTS);
+        }
+        // SAFETY: валидные константы и зарегистрированный класс.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("resticker_window_enum_plain"),
+                w!("plain"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                200,
+                150,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+        }
+        .expect("создание тестового окна");
+        let dead = hwnd.0 as usize;
+        // SAFETY: окно создано этим же потоком.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        assert_eq!(min_window_size(dead), None);
+    }
+
+    /// Заявленный минимум совпадает с ФАКТИЧЕСКИМ пределом ужатия чужого
+    /// окна: просим ужаться до 60x60, а окно (как и обещало в
+    /// WM_GETMINMAXINFO) останавливается ровно на 400x300 в
+    /// GetWindowRect-пространстве, то есть на заявленном минимуме в
+    /// DWM-пространстве. Это главная проверка доверия к числу.
+    #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 window_enum -- --ignored"]
+    fn min_window_size_matches_actual_shrink_limit_of_foreign_window() {
+        let win = MinMaxWindow::create();
+        let queried = min_window_size(win.hwnd.0 as usize).expect("живое окно отвечает");
+        let (_, _, dw, dh) = dwm_frame_offset(win.hwnd);
+        assert_eq!(
+            queried,
+            to_dwm_min(400, 300, (0, 0, dw, dh)),
+            "запрос обязан вернуть заявленный обработчиком минимум с рамкой"
+        );
+        // SAFETY: окно живо; SetWindowPos без z-order/активации.
+        let _ = unsafe {
+            SetWindowPos(
+                win.hwnd,
+                None,
+                100,
+                100,
+                60,
+                60,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut actual = WindowRect::default();
+        while Instant::now() < deadline {
+            actual = extended_frame_bounds(win.hwnd);
+            if actual.w == queried.w && actual.h == queried.h {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            (actual.w, actual.h),
+            (queried.w, queried.h),
+            "фактический предел ужатия обязан совпасть с заявленным минимумом"
+        );
+    }
+
+    /// Зависшее окно (поток не пампит) не держит запрос минимума дольше
+    /// таймаута и возвращает `None` — раскладка обойдётся без минимума,
+    /// а не повиснет вместе с приложением.
+    #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 window_enum -- --ignored"]
+    fn hung_window_min_size_query_is_bounded_and_none() {
+        let win = HungWindow::create();
+        let started = Instant::now();
+        let min = min_window_size(win.hwnd.0 as usize);
+        let elapsed = started.elapsed();
+        assert_eq!(min, None, "зависшее окно не даёт минимума");
+        // 3 с — запас на планировщик, на порядок меньше системного умолчания
+        // SendMessage (~5 с); фактический таймаут — 25 мс + накладные.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "запрос минимума зависшего окна занял {elapsed:?}"
+        );
     }
 }

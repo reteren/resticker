@@ -1,0 +1,120 @@
+warning: unused import: `CloseHandle`
+  --> src\main.rs:29:5
+   |
+29 |     CloseHandle, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `IsWindow`
+  --> src\main.rs:36:84
+   |
+36 |     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GWL_STYLE, IsWindow,
+   |                                                                                    ^^^^^^^^
+
+warning: unused variable: `dx`
+   --> src\main.rs:407:18
+    |
+407 |             let (dx, dy, dw, dh) = dwm_offset(hwnd);
+    |                  ^^ help: if this is intentional, prefix it with an underscore: `_dx`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `dy`
+   --> src\main.rs:407:22
+    |
+407 |             let (dx, dy, dw, dh) = dwm_offset(hwnd);
+    |                      ^^ help: if this is intentional, prefix it with an underscore: `_dy`
+
+warning: unused variable: `dw`
+   --> src\main.rs:407:26
+    |
+407 |             let (dx, dy, dw, dh) = dwm_offset(hwnd);
+    |                          ^^ help: if this is intentional, prefix it with an underscore: `_dw`
+
+warning: unused variable: `dh`
+   --> src\main.rs:407:30
+    |
+407 |             let (dx, dy, dw, dh) = dwm_offset(hwnd);
+    |                              ^^ help: if this is intentional, prefix it with an underscore: `_dh`
+
+warning: `min-size-probe` (bin "min-size-probe") generated 6 warnings (run `cargo fix --bin "min-size-probe" -p min-size-probe` to apply 6 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running `target\debug\min-size-probe.exe`
+=== C1: ╨╝╨╕╨╜╨╕╨╝╨░╨╗╤М╨╜╤Л╨╣ ╤А╨░╨╖╨╝╨╡╤А ╤З╤Г╨╢╨╛╨│╨╛ ╨╛╨║╨╜╨░ (WM_GETMINMAXINFO) ===
+--- 1. ╨Ы╨░╤В╨╡╨╜╤В╨╜╨╛╤Б╤В╤М ╨╛╤В╨▓╨╡╤В╨░ ╨╜╨░ WM_GETMINMAXINFO ---
+  ╤Б╨▓╨╛╤С: Default        min=1.034ms avg=1.302ms max=1.577ms  (query: Some(POINT { x: 0, y: 0 }))
+  ╤Б╨▓╨╛╤С: CustomMin      min=48.800┬╡s avg=1.006ms max=1.562ms  (query: Some(POINT { x: 400, y: 300 }))
+  ╤Б╨▓╨╛╤С: FixedSize      min=520.700┬╡s avg=1.342ms max=1.614ms  (query: Some(POINT { x: 0, y: 0 }))
+  ╨╢╨╕╨▓╤Л╨╡ ╨┐╤А╨╕╨╗╨╛╨╢╨╡╨╜╨╕╤П (╤В╨╛╨╗╤М╨║╨╛ ╤З╤В╨╡╨╜╨╕╨╡):
+  0x001D0ABC '' [ThumbnailDeviceHelperWnd]                                          min=0x0  ╨╛╤В╨║╨╗╨╕╨║=293.500┬╡s err=0 thickframe=false
+  0x00EA0A4C '' [ThumbnailDeviceHelperWnd]                                          min=0x0  ╨╛╤В╨║╨╗╨╕╨║=482.200┬╡s err=0 thickframe=false
+  0x000B078A '' [ThumbnailDeviceHelperWnd]                                          min=0x0  ╨╛╤В╨║╨╗╨╕╨║=95.000┬╡s err=0 thickframe=false
+  0x000D0BAA 'resticker_overlay_wnd' [resticker_overlay]                            min=0x0  ╨╛╤В╨║╨╗╨╕╨║=30.500┬╡s err=0 thickframe=false
+  0x00120B9C 'resticker_overlay_wnd' [resticker_overlay]                            min=0x0  ╨╛╤В╨║╨╗╨╕╨║=45.100┬╡s err=0 thickframe=false
+  0x015F0960 'min-size probe' [msp_fixed]                                           min=0x0  ╨╛╤В╨║╨╗╨╕╨║=943.200┬╡s err=0 thickframe=false
+  0x00BC0AE2 'min-size probe' [msp_custom]                                          min=400x300  ╨╛╤В╨║╨╗╨╕╨║=497.600┬╡s err=0 thickframe=true
+  0x02100BF2 'min-size probe' [msp_default]                                         min=0x0  ╨╛╤В╨║╨╗╨╕╨║=989.400┬╡s err=0 thickframe=true
+  0x0001057A 'Orca' [Chrome_WidgetWin_1]                                            min=616x408  ╨╛╤В╨║╨╗╨╕╨║=63.500┬╡s err=0 thickframe=true
+  0x00080830 'exe - ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В╤Л ╨┐╨╛╨╕╤Б╨║╨░ ╨▓ "Reshot" тАФ ╨┐╤А╨╛╨▓╨╛╨┤╨╜╨╕╨║' [CabinetWClass]       min=161x243  ╨╛╤В╨║╨╗╨╕╨║=55.500┬╡s err=0 thickframe=true
+  0x0004074E 'Claude' [Chrome_WidgetWin_1]                                          min=616x408  ╨╛╤В╨║╨╗╨╕╨║=58.000┬╡s err=0 thickframe=true
+  0x00020992 'Upscayl' [Chrome_WidgetWin_1]                                         min=600x500  ╨╛╤В╨║╨╗╨╕╨║=59.800┬╡s err=0 thickframe=true
+  0x001609BA 'GitHub Desktop' [Chrome_WidgetWin_1]                                  min=960x660  ╨╛╤В╨║╨╗╨╕╨║=45.400┬╡s err=0 thickframe=true
+  0x000104CC '╨Я╨╛╨╢╨░╤А - YouTube - Opera' [Chrome_WidgetWin_1]                         min=676x326  ╨╛╤В╨║╨╗╨╕╨║=52.400┬╡s err=0 thickframe=true
+  0x00A9085C '' [Tao Thread Event Target]                                           min=0x0  ╨╛╤В╨║╨╗╨╕╨║=25.600┬╡s err=0 thickframe=false
+  0x000403C8 'com.cmrdevs.nemora-siw' [com.cmrdevs.nemora-sic]                      min=0x0  ╨╛╤В╨║╨╗╨╕╨║=25.100┬╡s err=0 thickframe=false
+  0x000403C4 '' [Tao Thread Event Target]                                           min=0x0  ╨╛╤В╨║╨╗╨╕╨║=28.200┬╡s err=0 thickframe=false
+  0x000E07B8 '╨Э╨░╤Б╤В╤А╨╛╨╣╨║╨╕' [Windows.UI.Core.CoreWindow]                               min=0x0  ╨╛╤В╨║╨╗╨╕╨║=2.500┬╡s err=0 thickframe=false
+  0x00020850 '╨Я╨░╤А╨░╨╝╨╡╤В╤А╤Л' [ApplicationFrameWindow]                                   min=362x336  ╨╛╤В╨║╨╗╨╕╨║=241.800┬╡s err=0 thickframe=true
+  0x00020350 'NVIDIA GeForce Overlay' [CEF-OSC-WIDGET]                              min=0x0  ╨╛╤В╨║╨╗╨╕╨║=39.300┬╡s err=0 thickframe=false
+  0x000101E2 '' [DummyDWMListenerWindow]                                            min=0x0  ╨╛╤В╨║╨╗╨╕╨║=27.500┬╡s err=0 thickframe=false
+  0x000101A2 '' [DummyDWMListenerWindow]                                            min=0x0  ╨╛╤В╨║╨╗╨╕╨║=19.400┬╡s err=0 thickframe=false
+  0x000101A0 '' [DummyDWMListenerWindow]                                            min=0x0  ╨╛╤В╨║╨╗╨╕╨║=13.400┬╡s err=0 thickframe=false
+  0x0001019E '' [DummyDWMListenerWindow]                                            min=0x0  ╨╛╤В╨║╨╗╨╕╨║=18.400┬╡s err=0 thickframe=false
+  0x0001019C '' [DummyDWMListenerWindow]                                            min=0x0  ╨╛╤В╨║╨╗╨╕╨║=13.600┬╡s err=0 thickframe=false
+  0x00010422 '╨Ш╨╜╤В╨╡╤А╤Д╨╡╨╣╤Б ╨▓╨▓╨╛╨┤╨░ Windows' [Windows.UI.Core.CoreWindow]                 min=0x0  ╨╛╤В╨║╨╗╨╕╨║=49.700┬╡s err=0 thickframe=false
+  0x0007032C '' [Shell_SecondaryTrayWnd]                                            min=0x0  ╨╛╤В╨║╨╗╨╕╨║=41.500┬╡s err=0 thickframe=false
+  0x00010128 '' [Shell_TrayWnd]                                                     min=4x4  ╨╛╤В╨║╨╗╨╕╨║=39.600┬╡s err=0 thickframe=false
+  0x00020662 'Steam' [SDL_app]                                                      min=1010x600  ╨╛╤В╨║╨╗╨╕╨║=36.900┬╡s err=0 thickframe=true
+  0x00020400 'Nemora' [Tauri Window]                                                min=700x500  ╨╛╤В╨║╨╗╨╕╨║=60.800┬╡s err=0 thickframe=true
+  0x0001073C 'Spotify Free' [Chrome_WidgetWin_1]                                    min=800x600  ╨╛╤В╨║╨╗╨╕╨║=122.600┬╡s err=0 thickframe=true
+  0x000206E8 '@Chakar++ - Discord' [Chrome_WidgetWin_1]                             min=816x508  ╨╛╤В╨║╨╗╨╕╨║=88.000┬╡s err=0 thickframe=true
+  0x0001015E 'Program Manager' [Progman]                                            min=0x0  ╨╛╤В╨║╨╗╨╕╨║=27.300┬╡s err=0 thickframe=false
+
+--- 2. ╨б╨╛╨▓╨┐╨░╨┤╨╡╨╜╨╕╨╡ ╨╖╨░╨┐╤А╨╛╤Б╨░ ╨╕ ╤Д╨░╨║╤В╨░ (╤Б╨▓╨╛╨╕ ╨╛╨║╨╜╨░) ---
+  Default:
+    ╨╖╨░╨┐╤А╨╛╤Б ptMinTrackSize = Some(POINT { x: 0, y: 0 })
+    ╤Б╨╝╨╡╤Й╨╡╨╜╨╕╨╡ GWRтЖТDWM: dx=7 dy=0 dw=-14 dh=-7 (╨┤╨╛: gwr 700x500)
+    ╨┐╨╛╤Б╨╗╨╡ SetWindowPos(60x60): gwr 136x60  dwm 122x53
+    ╨╝╨╕╨╜╨╕╨╝╤Г╨╝ ╨▓ DWM-╨┐╤А╨╛╤Б╤В╤А╨░╨╜╤Б╤В╨▓╨╡ (ptMin + dw/dh): -14x-7
+  CustomMin 400x300:
+    ╨╖╨░╨┐╤А╨╛╤Б ptMinTrackSize = Some(POINT { x: 400, y: 300 })
+    ╤Б╨╝╨╡╤Й╨╡╨╜╨╕╨╡ GWRтЖТDWM: dx=7 dy=0 dw=-14 dh=-7 (╨┤╨╛: gwr 700x500)
+    ╨┐╨╛╤Б╨╗╨╡ SetWindowPos(60x60): gwr 400x300  dwm 386x293
+    ╨╝╨╕╨╜╨╕╨╝╤Г╨╝ ╨▓ DWM-╨┐╤А╨╛╤Б╤В╤А╨░╨╜╤Б╤В╨▓╨╡ (ptMin + dw/dh): 386x293
+  Lying 100x100/500x400:
+    ╨╖╨░╨┐╤А╨╛╤Б ptMinTrackSize = Some(POINT { x: 100, y: 100 })
+    ╤Б╨╝╨╡╤Й╨╡╨╜╨╕╨╡ GWRтЖТDWM: dx=7 dy=0 dw=-14 dh=-7 (╨┤╨╛: gwr 700x500)
+    ╨┐╨╛╤Б╨╗╨╡ SetWindowPos(60x60): gwr 500x400  dwm 486x393
+    ╨╝╨╕╨╜╨╕╨╝╤Г╨╝ ╨▓ DWM-╨┐╤А╨╛╤Б╤В╤А╨░╨╜╤Б╤В╨▓╨╡ (ptMin + dw/dh): 86x93
+
+--- 3. ╨Ю╨║╨╜╨╛ ╨▒╨╡╨╖ WS_THICKFRAME ---
+  ╨╛╨║╨╜╨╛ ╨▒╨╡╨╖ WS_THICKFRAME: ╨╖╨░╨┐╤А╨╛╤Б = Some(POINT { x: 0, y: 0 }) ╨╖╨░ 198.700┬╡s (err=0); ╤Б╨╕╤Б╤В╨╡╨╝╨╜╤Л╨╡ ╤Г╨╝╨╛╨╗╤З╨░╨╜╨╕╤П SM_CXMINTRACK/SM_CYMINTRACK = 136x39
+
+--- 4. ╨з╨╡╤Б╤В╨╜╨╛╤Б╤В╤М ╤З╨╕╤Б╨╗╨░ ---
+  ╤Б╨▓╨╛╤С ┬л╨▓╤А╤Г╤Й╨╡╨╡┬╗ ╨╛╨║╨╜╨╛: ╨╖╨░╨┐╤А╨╛╤Б = Some(POINT { x: 100, y: 100 }), ╤Д╨░╨║╤В ╨┐╨╛╤Б╨╗╨╡ SetWindowPos(60x60) = 500x400 (gwr) тАФ ╤А╨░╤Б╤Е╨╛╨╢╨┤╨╡╨╜╨╕╨╡ Some((400, 300))
+  ╨╢╨╕╨▓╤Л╨╡ ╨┐╤А╨╕╨╗╨╛╨╢╨╡╨╜╨╕╤П: ╨╝╨╕╨╜╨╕╨╝╤Г╨╝ (DWM) vs ╤В╨╡╨║╤Г╤Й╨╕╨╣ ╤А╨░╨╖╨╝╨╡╤А:
+  0x00020662 'Steam' [SDL_app]                                            ╨╝╨╕╨╜(DWM) 1010x600 vs ╨в╨Х╨Ъ╨г╨й╨Ш╨Щ 160x28  <-- ╨Ю╨Ъ╨Э╨Ю ╨г╨Ц╨Х ╨Ь╨Х╨Э╨м╨и╨Х ╨Ч╨Р╨п╨Т╨Ы╨Х╨Э╨Э╨Ю╨У╨Ю ╨Ь╨Ш╨Э╨Ш╨Ь╨г╨Ь╨Р
+  0x00020400 'Nemora' [Tauri Window]                                      ╨╝╨╕╨╜(DWM) 686x493 vs ╨в╨Х╨Ъ╨г╨й╨Ш╨Щ 146x21  <-- ╨Ю╨Ъ╨Э╨Ю ╨г╨Ц╨Х ╨Ь╨Х╨Э╨м╨и╨Х ╨Ч╨Р╨п╨Т╨Ы╨Х╨Э╨Э╨Ю╨У╨Ю ╨Ь╨Ш╨Э╨Ш╨Ь╨г╨Ь╨Р
+  0x0001073C 'Spotify Free' [Chrome_WidgetWin_1]                          ╨╝╨╕╨╜(DWM) 800x600 vs ╨в╨Х╨Ъ╨г╨й╨Ш╨Щ 160x28  <-- ╨Ю╨Ъ╨Э╨Ю ╨г╨Ц╨Х ╨Ь╨Х╨Э╨м╨и╨Х ╨Ч╨Р╨п╨Т╨Ы╨Х╨Э╨Э╨Ю╨У╨Ю ╨Ь╨Ш╨Э╨Ш╨Ь╨г╨Ь╨Р
+  0x000206E8 '@Chakar++ - Discord' [Chrome_WidgetWin_1]                   ╨╝╨╕╨╜(DWM) 802x501 vs ╨в╨Х╨Ъ╨г╨й╨Ш╨Щ 146x21  <-- ╨Ю╨Ъ╨Э╨Ю ╨г╨Ц╨Х ╨Ь╨Х╨Э╨м╨и╨Х ╨Ч╨Р╨п╨Т╨Ы╨Х╨Э╨Э╨Ю╨У╨Ю ╨Ь╨Ш╨Э╨Ш╨Ь╨г╨Ь╨Р
+  (╤Б╤В╤А╨╛╨║ ╨▓╤Л╤И╨╡ ╨╜╨╡╤В тАФ ╨▓╤Б╨╡ ╨╢╨╕╨▓╤Л╨╡ ╨╛╨║╨╜╨░ тЙе ╨╖╨░╤П╨▓╨╗╨╡╨╜╨╜╨╛╨│╨╛ ╨╝╨╕╨╜╨╕╨╝╤Г╨╝╨░)
+
+--- 5. ╨Ч╨░╨▓╨╕╤Б╤И╨╡╨╡ ╨╛╨║╨╜╨╛ ---
+  ╤В╨░╨╣╨╝╨░╤Г╤В=  10 ╨╝╤Б: ╨╖╨░╨╜╤П╨╗╨╛ 24.6271ms  (╨╖╨░╨┐╤А╨╛╤И╨╡╨╜╨╛ 10 ╨╝╤Б, ╨▓╤Л╨╖╨╛╨▓ ╨Ю╨в╨а╨Р╨С╨Ю╨в╨Р╨Ы ╨Я╨Ю ╨в╨Р╨Щ╨Ь╨Р╨г╨в╨г)  result=None err=1460
+  ╤В╨░╨╣╨╝╨░╤Г╤В=  50 ╨╝╤Б: ╨╖╨░╨╜╤П╨╗╨╛ 61.991ms  (╨╖╨░╨┐╤А╨╛╤И╨╡╨╜╨╛ 50 ╨╝╤Б, ╨▓╤Л╨╖╨╛╨▓ ╨Ю╨в╨а╨Р╨С╨Ю╨в╨Р╨Ы ╨Я╨Ю ╨в╨Р╨Щ╨Ь╨Р╨г╨в╨г)  result=None err=1460
+  ╤В╨░╨╣╨╝╨░╤Г╤В= 200 ╨╝╤Б: ╨╖╨░╨╜╤П╨╗╨╛ 203.724ms  (╨╖╨░╨┐╤А╨╛╤И╨╡╨╜╨╛ 200 ╨╝╤Б, ╨▓╤Л╨╖╨╛╨▓ ╨Ю╨в╨а╨Р╨С╨Ю╨в╨Р╨Ы ╨Я╨Ю ╨в╨Р╨Щ╨Ь╨Р╨г╨в╨г)  result=None err=1460
+  ╤В╨░╨╣╨╝╨░╤Г╤В= 500 ╨╝╤Б: ╨╖╨░╨╜╤П╨╗╨╛ 513.4786ms  (╨╖╨░╨┐╤А╨╛╤И╨╡╨╜╨╛ 500 ╨╝╤Б, ╨▓╤Л╨╖╨╛╨▓ ╨Ю╨в╨а╨Р╨С╨Ю╨в╨Р╨Ы ╨Я╨Ю ╨в╨Р╨Щ╨Ь╨Р╨г╨в╨г)  result=None err=1460
+  ╤В╨░╨╣╨╝╨░╤Г╤В=2000 ╨╝╤Б: ╨╖╨░╨╜╤П╨╗╨╛ 2.0000327s  (╨╖╨░╨┐╤А╨╛╤И╨╡╨╜╨╛ 2000 ╨╝╤Б, ╨▓╤Л╨╖╨╛╨▓ ╨Ю╨в╨а╨Р╨С╨Ю╨в╨Р╨Ы ╨Я╨Ю ╨в╨Р╨Щ╨Ь╨Р╨г╨в╨г)  result=None err=1460
+
+╨У╨╛╤В╨╛╨▓╨╛.

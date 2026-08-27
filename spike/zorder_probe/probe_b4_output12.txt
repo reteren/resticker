@@ -1,0 +1,245 @@
+warning: unnecessary `unsafe` block
+   --> src\main.rs:214:24
+    |
+214 |             Anonymous: unsafe {
+    |                        ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> src\main.rs:228:24
+    |
+228 |             Anonymous: unsafe {
+    |                        ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+   --> src\main.rs:551:9
+    |
+551 |     let mut mk = |name: &str| -> HWND {
+    |         ----^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\main.rs:611:9
+    |
+611 |     let mut counter = 0usize;
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\main.rs:764:9
+    |
+764 |     let mut mk = |name: &str| -> HWND {
+    |         ----^^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused variable: `c3`
+   --> src\main.rs:889:9
+    |
+889 |     let c3 = spawn_child_ex("JC3SELF", false, Some(400));
+    |         ^^ help: if this is intentional, prefix it with an underscore: `_c3`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `test_h_timing` is never used
+   --> src\main.rs:686:4
+    |
+686 | fn test_h_timing() {
+    |    ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `test_i_isolate` is never used
+   --> src\main.rs:752:4
+    |
+752 | fn test_i_isolate() {
+    |    ^^^^^^^^^^^^^^
+
+warning: function `test_j_cap` is never used
+   --> src\main.rs:849:4
+    |
+849 | fn test_j_cap() {
+    |    ^^^^^^^^^^
+
+warning: function `test_k_lock` is never used
+   --> src\main.rs:903:4
+    |
+903 | fn test_k_lock() {
+    |    ^^^^^^^^^^^
+
+warning: function `test_l_production` is never used
+   --> src\main.rs:941:4
+    |
+941 | fn test_l_production() {
+    |    ^^^^^^^^^^^^^^^^^
+
+warning: function `test_m_final` is never used
+   --> src\main.rs:994:4
+    |
+994 | fn test_m_final() {
+    |    ^^^^^^^^^^^^
+
+warning: unused `Result` that must be used
+   --> src\main.rs:543:9
+    |
+543 |         ProcessIdToSessionId(user_pid, &mut user_session);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this `Result` may be an `Err` variant, which should be handled
+    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+    |
+543 |         let _ = ProcessIdToSessionId(user_pid, &mut user_session);
+    |         +++++++
+
+warning: `zorder-probe` (bin "zorder-probe") generated 13 warnings (run `cargo fix --bin "zorder-probe" -p zorder-probe` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running `target\debug\zorder-probe.exe`
+=== B4: Z-╨┐╨╛╤А╤П╨┤╨╛╨║ ╨┐╤А╨╕ ╨┐╨╛╨┤╤К╤С╨╝╨╡ ╨╜╨╡╤Б╨║╨╛╨╗╤М╨║╨╕╤Е ╨╛╨║╨╛╨╜ (╤Б╨▓╨╛╨╕ ╨╛╨║╨╜╨░, ╤З╤Г╨╢╨╕╨╡ ╨╜╨╡ ╤В╤А╨╛╨│╨░╨╡╨╝) ===
+╤А╨░╨╜╨│╨╕ [n] тАФ ╨┐╨╛╨╖╨╕╤Ж╨╕╤П ╨╛╨║╨╜╨░ ╤Б╤А╨╡╨┤╨╕ ╨Т╨б╨Х╨е ╨▓╨╕╨┤╨╕╨╝╤Л╤Е top-level ╨╛╨║╨╛╨╜ (1 = ╤Б╨░╨╝╤Л╨╣ ╨▓╨╡╤А╤Е)
+
+=== A. ╨С╨Х╨Ч ╨┐╤А╨░╨▓╨░ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ (╨░╨║╤В╨╕╨▓╨╜╨╛ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П) ===
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 0x960908 (pid 25720)
+  ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░: A-USER-FG[6] > A-F[7] > AG4[8] > AG3[9] > AG2[10] > AG1[11]
+  ╨┐╨╛╤Б╨╗╨╡ HWND_TOP-╨┐╨╛╨┤╤К╤С╨╝╨░ 4 ╨╛╨║╨╛╨╜: A-USER-FG[6] > A-F[7] > AG4[8] > AG3[9] > AG2[10] > AG1[11]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: false
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+
+=== B. ╨б ╨┐╤А╨░╨▓╨╛╨╝ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ (SendInput Alt = ┬л╨┐╨╛╨╗╤Г╤З╨╕╨╗ ╤Е╨╛╤В╨║╨╡╨╣┬╗) ===
+  ╨┤╨╛ ╨┐╨╛╨┤╤К╤С╨╝╨░: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╨┐╨╛╨┤╤К╤С╨╝ ╨┐╤А╤П╨╝╤Л╨╝ ╨┐╨╛╤А╤П╨┤╨║╨╛╨╝: G1 тЖТ G2 тЖТ G3 тЖТ G4
+  ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨┐╤А╤П╨╝╨╛╨│╨╛ ╨┐╨╛╤А╤П╨┤╨║╨░: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: false
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+  ╤З╨╡╤А╨╡╨╖ 300 ╨╝╤Б: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╤З╨╡╤А╨╡╨╖ 1500 ╨╝╤Б: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╤З╨╡╤А╨╡╨╖ 4000 ╨╝╤Б: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╨╛╨▒╤А╨░╤В╨╜╤Л╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║: G4 тЖТ G3 тЖТ G2 тЖТ G1
+  ╨┤╨╛ (F ╤Б╨╜╨╛╨▓╨░ ╨╜╨░╨▓╨╡╤А╤Е╤Г): B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+  ╨┐╨╛╤Б╨╗╨╡ ╨╛╨▒╤А╨░╤В╨╜╨╛╨│╨╛ ╨┐╨╛╤А╤П╨┤╨║╨░: B-USER-FG[6] > B-F[7] > BG4[8] > BG3[9] > BG2[10] > BG1[11]
+
+=== C. ╨Я╨╛╨┤╤К╤С╨╝ (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║) + SetForegroundWindow(G1) ===
+  ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ ╨┐╤А╤П╨╝╤Л╨╝ ╨┐╨╛╤А╤П╨┤╨║╨╛╨╝ (╨┤╨╛ ╤Д╨╛╨║╤Г╤Б╨░): C-USER-FG[6] > C-F[7] > CG4[8] > CG3[9] > CG2[10] > CG1[11]
+  SetForegroundWindow(G1): true
+  ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╤Д╨╛╨║╤Г╤Б╨░ ╨╜╨░ G1: C-USER-FG[6] > CG1[7] > C-F[8] > CG4[9] > CG3[10] > CG2[11]
+  ╤З╨╡╤А╨╡╨╖ ~1 ╤Б ╨┐╨╛╤Б╨╗╨╡ ╤Д╨╛╨║╤Г╤Б╨░: C-USER-FG[6] > CG1[7] > C-F[8] > CG4[9] > CG3[10] > CG2[11]
+  ╨╛╤Б╤В╨░╨╗╤М╨╜╤Л╨╡ 3 ╨╛╨║╨╜╨░ ╨▓╤Б╤С ╨╡╤Й╤С ╨▓╤Л╤И╨╡ F: false
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П ╨╜╨╡ ╨▓╨╡╤А╨╜╤Г╨╗╨╛╤Б╤М ╨╜╨░╨▓╨╡╤А╤Е: false
+
+=== D. ╨Я╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┤╤А╤Г╨│╨╛╨│╨╛ ╨┐╤А╨╛╤Ж╨╡╤Б╤Б╨░ ===
+  ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╨╛╨╡ (pid 36164) ╨░╨║╤В╨╕╨▓╨╜╨╛: SetForegroundWindow ╨╜╨░╨┐╤А╤П╨╝╤Г╤О; ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨╕╨╢╨╡? true
+  --- D1: ╨С╨Х╨Ч ╨┐╤А╨░╨▓╨░ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ ---
+  ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨░╨┤ ╨░╨║╤В╨╕╨▓╨╜╤Л╨╝ ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╤Л╨╝: false
+  --- D2: ╨б ╨┐╤А╨░╨▓╨╛╨╝ ╨╜╨░ ╨┐╨╡╤А╨╡╨┤╨╜╨╕╨╣ ╨┐╨╗╨░╨╜ ---
+  ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨░╨┤ ╨░╨║╤В╨╕╨▓╨╜╤Л╨╝ ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╤Л╨╝: true
+  --- D3: ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╨╛╨╡ ╨▓ topmost-╨┐╨╛╨╗╨╛╤Б╨╡ ---
+  ╨╜╨░╤И╨╡ ╨╛╨║╨╜╨╛ ╨╜╨░╨┤ ╨┐╨╛╨╗╨╜╨╛╤Н╨║╤А╨░╨╜╨╜╤Л╨╝ (topmost): false
+
+=== E. ╨а╨╡╨░╨╗╤М╨╜╤Л╨╣ ╤Ж╨╕╨║╨╗: ╨▓╤Б╨╡ ╤Б╨▓╤С╤А╨╜╤Г╤В╤Л тЖТ ╤А╨░╨╖╨▓╨╡╤А╨╜╤Г╤В╤М тЖТ ╨┐╨╛╨┤╨╜╤П╤В╤М ===
+  ╨▓╤Б╨╡ ╤Б╨▓╤С╤А╨╜╤Г╤В╤Л: true
+  ╨┐╨╛╤Б╨╗╨╡ ╤А╨░╨╖╨▓╨╛╤А╨╛╤В╨░+╨┐╨╛╨┤╤К╤С╨╝╨░ (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║): E-F[32] > EG4[33] > EG3[34] > EG2[35] > EG1[36]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+
+=== F. ╨з╨╡╤В╤Л╤А╨╡ ╨╛╨║╨╜╨░ ╨╛╨┤╨╜╨╛╨│╨╛ ╨┐╤А╨╛╤Ж╨╡╤Б╤Б╨░ + ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨╡ ╨┤╤А╤Г╨│╨╛╨│╨╛ ===
+  ╨┤╨╛ (╨┐╨╛╤А╤П╨┤╨╛╨║ ╤Б╨╛╨╖╨┤╨░╨╜╨╕╤П): FF[7] > own4[9] > own3[10] > own2[11] > own1[12]
+  ╨┐╨╛╤Б╨╗╨╡ ╨┐╨╛╨┤╤К╤С╨╝╨░ (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║): FF[7] > own4[9] > own3[10] > own2[11] > own1[12]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨┐╨╛╤Б╤В╨╛╤А╨╛╨╜╨╜╨╡╨│╨╛ F: false
+
+=== G. ╨б╨░╨╜╨╕╤В╨░╤А╨╕╤П: SetWindowPos ╨▓ ╤Н╤В╨╛╨╣ ╤Б╤А╨╡╨┤╨╡ ===
+  ╤Б╨╡╤Б╤Б╨╕╤П ╨┐╤А╨╛╨▒╤Л: 1 (ok=true); ╤Б╨╡╤Б╤Б╨╕╤П ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 1 (pid 17632)
+  ╨╛╨║╨╜╨░: A=0x530A60, B=0x4B0BE4
+    A (╤Б╨╛╨╖╨┤╨░╨╜╨╛ ╨┐╨╡╤А╨▓╤Л╨╝): ╨╜╨░╨┤ 0x530A60=Some(4918244), ╨┐╨╛╨┤ =Some(11733730), ╤А╨░╨╜╨│=9
+    B (╤Б╨╛╨╖╨┤╨░╨╜╨╛ ╨▓╤В╨╛╤А╤Л╨╝): ╨╜╨░╨┤ 0x4B0BE4=Some(5180414), ╨┐╨╛╨┤ =Some(5442144), ╤А╨░╨╜╨│=8
+  ╨║╤А╨╛╤Б╤Б-╨┐╤А╨╛╨▓╨╡╤А╨║╨░ EnumWindows: A = 0-╨╣ top-level (GetWindow-╤А╨░╨╜╨│ 9)
+  --- op1: SetWindowPos(A, HWND_TOP, NOACTIVATE) ---
+    ╤А╨╡╨╖╤Г╨╗╤М╤В╨░╤В: None
+    A ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨▓╤Л╨╖╨╛╨▓╨░ (t=0): ╨╜╨░╨┤ 0x530A60=Some(5180414), ╨┐╨╛╨┤ =Some(4918244), ╤А╨░╨╜╨│=8
+    A ╤З╨╡╤А╨╡╨╖ 50 ╨╝╤Б: ╨╜╨░╨┤ 0x530A60=Some(5180414), ╨┐╨╛╨┤ =Some(4918244), ╤А╨░╨╜╨│=8
+    A ╤З╨╡╤А╨╡╨╖ ~450 ╨╝╤Б: ╨╜╨░╨┤ 0x530A60=Some(5180414), ╨┐╨╛╨┤ =Some(4918244), ╤А╨░╨╜╨│=8
+  --- op2: SetWindowPos(A, ╨╜╨░╨┤ B, NOACTIVATE) тАФ ╨┐╨╛╨┤╤К╤С╨╝ ╨╜╨░╨┤ ╨║╨╛╨╜╨║╤А╨╡╤В╨╜╤Л╨╝ ╤Б╨╛╤Б╨╡╨┤╨╛╨╝ ---
+    ╤А╨╡╨╖╤Г╨╗╤М╤В╨░╤В: None
+    A ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨▓╤Л╨╖╨╛╨▓╨░ (t=0): ╨╜╨░╨┤ 0x530A60=Some(4918244), ╨┐╨╛╨┤ =Some(11733730), ╤А╨░╨╜╨│=9
+    A ╤З╨╡╤А╨╡╨╖ 150 ╨╝╤Б: ╨╜╨░╨┤ 0x530A60=Some(4918244), ╨┐╨╛╨┤ =Some(11733730), ╤А╨░╨╜╨│=9
+  --- op3: SetWindowPos(A, HWND_TOP, ╨С╨Х╨Ч NOACTIVATE) ---
+    ╤А╨╡╨╖╤Г╨╗╤М╤В╨░╤В: None
+    A ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╨▓╤Л╨╖╨╛╨▓╨░ (t=0): ╨╜╨░╨┤ 0x530A60=Some(5180414), ╨┐╨╛╨┤ =Some(4918244), ╤А╨░╨╜╨│=8
+    A ╤З╨╡╤А╨╡╨╖ 150 ╨╝╤Б: ╨╜╨░╨┤ 0x530A60=Some(5180414), ╨┐╨╛╨┤ =Some(4918244), ╤А╨░╨╜╨│=8
+    ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╤Б╤В╨░╨╗╨╛ A? false
+
+=== N. ╨а╨░╨▒╨╛╤З╨╕╨╣ ╨╝╨╡╤Е╨░╨╜╨╕╨╖╨╝: TOPMOSTтЖТNOTOPMOST ╨╜╨░ ╨║╨░╨╢╨┤╨╛╨╝ ╤З╨╗╨╡╨╜╨╡ ===
+  raw: F=0x510BB4 ╨╕╨│╤А╨░=0x510BB4 (╤А╨░╨▓╨╜╤Л? true)
+  ╨┤╨╛: ╨┐╨╛╤А╤П╨┤╨╛╨║ ╤Б╨╛╨╖╨┤╨░╨╜╨╕╤П: N-F[7] > N-USER(╨╕╨│╤А╨░)[7] > NG4[8] > NG3[9] > NG2[11] > NG1[12]
+  ╨┐╨╛╤Б╨╗╨╡ TOPMOSTтЖТNOTOPMOST ╨▓╤Б╨╡╤Е (╨┐╤А╤П╨╝╨╛╨╣ ╨┐╨╛╤А╤П╨┤╨╛╨║): NG4[7] > NG3[8] > NG2[9] > NG1[10] > N-F[11] > N-USER(╨╕╨│╤А╨░)[11]
+  SetForegroundWindow(G1): true
+  ╤Б╤А╨░╨╖╤Г ╨┐╨╛╤Б╨╗╨╡ ╤Д╨╛╨║╤Г╤Б╨░: NG1[7] > NG4[8] > NG3[9] > NG2[10] > N-F[11] > N-USER(╨╕╨│╤А╨░)[11]
+  ╤З╨╡╤А╨╡╨╖ 400 ╨╝╤Б: NG1[7] > NG4[8] > NG3[9] > NG2[10] > N-F[11] > N-USER(╨╕╨│╤А╨░)[11]
+  ╤З╨╡╤А╨╡╨╖ 1200 ╨╝╤Б: NG1[8] > NG4[9] > NG3[10] > NG2[11] > N-F[12] > N-USER(╨╕╨│╤А╨░)[12]
+  ╤З╨╡╤А╨╡╨╖ 3000 ╨╝╤Б: NG1[8] > NG4[9] > NG3[10] > NG2[11] > N-F[12] > N-USER(╨╕╨│╤А╨░)[12]
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╤З╤Г╨╢╨╛╨│╨╛ F (F ╨╜╨░ 12): true
+  ╨▓╤Б╨╡ 4 ╨▓╤Л╤И╨╡ ╨░╨║╤В╨╕╨▓╨╜╨╛╨│╨╛ ╨╛╨║╨╜╨░ (╨╜╨░ 12): true
+  ╨╗╨╕╨┐╨║╨╕╨╣ WS_EX_TOPMOST: ╨╜╨╡ ╨╛╨▒╨╜╨░╤А╤Г╨╢╨╡╨╜ (╨╡╤Б╨╗╨╕ ╨╜╨╡╤В ╨Т╨Э╨Ш╨Ь╨Р╨Э╨Ш╨п ╨▓╤Л╤И╨╡)
+
+=== O. ╨Я╨╛╨║╨░╨╖ ╤Б╨▓╤С╤А╨╜╤Г╤В╨╛╨╣ ╨│╤А╤Г╨┐╨┐╤Л: restore(async) + ╤Б╤А╨░╨╖╤Г raise ===
+  ╨░╨║╤В╨╕╨▓╨╜╨╛╨╡ ╨╛╨║╨╜╨╛ ╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╤В╨╡╨╗╤П: 0x104CC (pid 17632)
+  O1: C1 ╤Б╨▓╤С╤А╨╜╤Г╤В
+  O1: restore+raise ╤Б╤А╨░╨╖╤Г (t=0): ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x0032062C '' [Chrome_WidgetWin_1]
+     7. 0x002A0594 'zorder-OC1' [zorder_OC1]
+     8. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+  O1: ╤З╨╡╤А╨╡╨╖ 100 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x0032062C '' [Chrome_WidgetWin_1]
+     7. 0x002A0594 'zorder-OC1' [zorder_OC1]
+     8. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+  O1: ╤З╨╡╤А╨╡╨╖ 600 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x0032062C '' [Chrome_WidgetWin_1]
+     7. 0x002A0594 'zorder-OC1' [zorder_OC1]
+     8. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+  O2: C2 ╨▓╨╜╨╕╨╖╤Г, ╨╜╨╡ ╤Б╨▓╤С╤А╨╜╤Г╤В: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x002A0594 'zorder-OC1' [zorder_OC1]
+     7. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+     8. 0x00960908 'ClickTheButton' [Engine]
+  O2: ╨┐╨╛╤Б╨╗╨╡ raise (t=0): ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x006A0C04 'zorder-OC2' [zorder_OC2]
+     7. 0x002A0594 'zorder-OC1' [zorder_OC1]
+     8. 0x000104CC '╨С╨╛╨╗╤М╤И╨╛╨╣ ╨б╤В╤Н╨╜ (2007) ╤Б╨╝╨╛╤В╤А╨╡╤В╤М ╨╛╨╜╨╗╨░╨╣╨╜ ╨▒╨╡╤Б╨┐╨╗╨░╤В╨╜╨╛ ╨▓ ╤Е╨╛╤А╨╛╤И╨╡╨╝ ╨║╨░╤З╨╡╤Б╤В╨▓╨╡ - Opera' [Chrome_WidgetWin_1]
+  O2: ╤З╨╡╤А╨╡╨╖ 300 ╨╝╤Б: ╨┐╨╡╤А╨▓╤Л╨╡ 8 ╨╛╨║╨╛╨╜ ╤Б╨▓╨╡╤А╤Е╤Г:
+     1. 0x001D0ABC '' [ThumbnailDeviceHelperWnd]
+     2. 0x00EA0A4C '' [ThumbnailDeviceHelperWnd]
+     3. 0x000B078A '' [ThumbnailDeviceHelperWnd]
+     4. 0x005B0818 'resticker_overlay_wnd' [resticker_overlay]
+     5. 0x000B0BBA 'resticker_overlay_wnd' [resticker_overlay]
+     6. 0x00960908 'ClickTheButton' [Engine]
+     7. 0x006A0C04 'zorder-OC2' [zorder_OC2]
+     8. 0x002A0594 'zorder-OC1' [zorder_OC1]
+
+╨У╨╛╤В╨╛╨▓╨╛.
