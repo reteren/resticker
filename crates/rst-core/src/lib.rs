@@ -7,6 +7,7 @@
 //! юнит-тестами на любой ОС.
 
 pub mod animation_clock;
+pub mod boot_session;
 pub mod config;
 mod error;
 pub mod group_fit;

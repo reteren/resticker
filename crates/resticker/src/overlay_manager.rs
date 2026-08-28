@@ -2693,7 +2693,7 @@ fn run(
                         &monitor_bounds,
                         cfg.settings.snap_shrink_pct,
                     );
-                    if cfg.settings.snap_shrink_all_windows && cfg.settings.snap_shrink_pct > 0 {
+                    if snap_gap_covers_free_windows(&cfg) {
                         enforce_snap_gap_on_free_windows(
                             &mut edit,
                             &window_pins,
@@ -3705,6 +3705,8 @@ fn run(
                         && handle_group_editor_input(
                             &mut groups,
                             &mut edit,
+                            &mut cfg,
+                            &config_path,
                             event,
                             f64::from(scale),
                             &monitor_id,
@@ -3766,8 +3768,35 @@ fn run(
                     ..
                 },
             ) if edit.group_editor.is_some() => {
-                close_group_editor(&mut groups, &mut edit, &monitors_map);
+                // Сначала закрывается верхняя панель: если поверх меню открыт
+                // список групп, `Esc` относится к нему. Иначе один нажатый
+                // `Esc` убирал бы сразу обе, и набор пропадал бы вместе со
+                // списком, который пользователь всего лишь заглянул посмотреть.
+                if edit.group_manager.is_some() {
+                    edit.group_manager = None;
+                } else {
+                    close_group_editor(&mut groups, &mut edit, &monitors_map);
+                }
                 need_redraw = true;
+            }
+            // Enter подтверждает набор — то же, что галочка в ленте и то же,
+            // что повторное нажатие хоткея (запрос пользователя 2026-08-27:
+            // «когда я закончил пресет, я мог просто нажать enter»).
+            // Отложенным флагом, тем же путём, что и галочка: подтверждение
+            // трогает конфиг и закрепления.
+            //
+            // Раньше поля зазора: цифры в него приходят `Key::Digit`, Enter
+            // ему не нужен — значение применяется по каждой клавише, и
+            // «подтверждать» в нём нечего.
+            OverlayMessage::Event(
+                _,
+                OverlayEvent::Key {
+                    vk: VK_RETURN,
+                    pressed: true,
+                    ..
+                },
+            ) if edit.group_editor.is_some() && edit.group_manager.is_none() => {
+                edit.pending_confirm_group = true;
             }
             // Поле зазора в ленте раскладок — числовое, и цифры в него
             // приходят как `Key::Digit`. Без этой ветки в него нельзя было
@@ -4143,7 +4172,7 @@ fn run(
                     // пользователь включил галочку И задал сам отступ:
                     // галочка расширяет область действия, а не включает
                     // функцию.
-                    if cfg.settings.snap_shrink_all_windows && cfg.settings.snap_shrink_pct > 0 {
+                    if snap_gap_covers_free_windows(&cfg) {
                         enforce_snap_gap_on_free_windows(
                             &mut edit,
                             &window_pins,
@@ -6668,12 +6697,36 @@ fn mask_needed(cfg: &Config) -> bool {
 /// переднего плана, чтобы прятать группу при уходе на постороннее окно. Без
 /// этого условия трекер спал, `OverlayMessage::Windows(Changed)` не
 /// приходило вовсе, и обе механики молчали, хотя код для них был написан.
+///
+/// `snap_gap_covers_free_windows(cfg)` — та же болезнь, найденная замером
+/// 2026-08-27 по репорту пользователя «снап-гап в трее перестал работать, а
+/// в редакторе групп работает». Отступ для НЕЗАКРЕПЛЁННЫХ окон применяется
+/// только по снимку трекера (`enforce_snap_gap_on_free_windows` в ветке
+/// `Windows(Changed)`): другого повода узнать, что Windows только что
+/// положила чужое окно в снап-зону, у координатора нет. В его конфиге на
+/// момент замера: один стикер, и тот `always`, ни одного закреплённого окна,
+/// ни одной показанной группы — то есть все прежние условия ложны, трекер
+/// спит, снимки не приходят, и функция молчит, хотя галочка включена и
+/// `snap_shrink_pct = 4`. Включение галочки в трее прикладывало зазор один
+/// раз, к уже стоящим окнам, — отсюда «раньше работало»: пока в конфиге
+/// жил стикер с правилом видимости или закреплённое окно, трекер держали
+/// разбуженным ОНИ.
 fn tracker_mask_needed(cfg: &Config, edit: &EditState, groups: &GroupsState) -> bool {
     mask_needed(cfg)
+        || snap_gap_covers_free_windows(cfg)
         || edit.window_picker.is_some()
         || edit.window_pick_list.is_some()
         || !edit.pinned_windows.is_empty()
         || groups.shown_group().is_some()
+}
+
+/// Включён ли отступ снап-зоны для обычных, незакреплённых окон.
+///
+/// Два условия, а не одно: галочка расширяет область действия на чужие окна,
+/// а величина включает саму функцию — нулевой отступ не двигает ничего, и
+/// будить ради него трекер незачем.
+fn snap_gap_covers_free_windows(cfg: &Config) -> bool {
+    cfg.settings.snap_shrink_all_windows && cfg.settings.snap_shrink_pct > 0
 }
 
 /// Пересчитать группы окклюдеров по каждому монитору (M4_OCCLUDERS_DESIGN.md
@@ -8647,7 +8700,7 @@ fn apply_snap_gap(
         monitor_bounds,
         cfg.settings.snap_shrink_pct,
     );
-    if cfg.settings.snap_shrink_all_windows && cfg.settings.snap_shrink_pct > 0 {
+    if snap_gap_covers_free_windows(cfg) {
         enforce_snap_gap_on_free_windows(
             edit,
             window_pins,
@@ -8810,6 +8863,8 @@ const DRAG_TARGET_COLOR: [u8; 3] = [0x5a, 0x9b, 0xd5];
 fn handle_group_editor_input(
     groups: &mut GroupsState,
     edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
     event: InputEvent,
     scale: f64,
     monitor_id: &MonitorId,
@@ -8817,6 +8872,23 @@ fn handle_group_editor_input(
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     thumbs: &mut rst_win32::thumb_cache::ThumbCache,
 ) -> bool {
+    // Менеджер групп, открытый кнопкой ленты, лежит ПОВЕРХ меню и модален:
+    // пока он открыт, ввод забирает он. Иначе клик по его кнопке уходил бы
+    // насквозь — в карточку окна под ним, — и панель выглядела бы
+    // нарисованной картинкой (та же болезнь, что была у неё в режиме
+    // редактирования: там нажатие тоже пришлось пускать в панель отдельной
+    // веткой).
+    if edit.group_manager.is_some() {
+        return group_manager_input_over_editor(
+            edit,
+            cfg,
+            config_path,
+            monitor_geometry,
+            event,
+            scale,
+            monitor_id,
+        );
+    }
     let Some(panels) = &mut edit.group_editor else {
         return false;
     };
@@ -8836,6 +8908,8 @@ fn handle_group_editor_input(
     // Галочка подтверждения: разбор нажатий поднимает флаг, а исполняет его
     // цикл координатора — у него есть конфиг, мониторы и закрепления.
     let mut confirm = false;
+    // Кнопка списка групп — тем же отложенным путём.
+    let mut open_manager = false;
     match event {
         InputEvent::MouseDown { pos, .. } => {
             let pos = to_dip(pos);
@@ -8903,7 +8977,7 @@ fn handle_group_editor_input(
                 clear_group_editor_clicks(panels);
                 rebuild = true;
             } else {
-                rebuild = take_group_editor_clicks(groups, panels, &mut confirm);
+                rebuild = take_group_editor_clicks(groups, panels, &mut confirm, &mut open_manager);
             }
             dirty = true;
         }
@@ -8953,6 +9027,9 @@ fn handle_group_editor_input(
     if confirm {
         edit.pending_confirm_group = true;
     }
+    if open_manager {
+        edit.pending_open_group_manager = true;
+    }
     if rebuild {
         let (scroll, windows, number) = edit
             .group_editor
@@ -8977,6 +9054,52 @@ fn handle_group_editor_input(
     dirty
 }
 
+/// Ввод в менеджер групп, открытый ПОВЕРХ меню набора.
+///
+/// Отдельный путь, а не ветка в `handle_input`: тот разбирает ввод режима
+/// редактирования, а меню набора живёт вне режима и получает события своей
+/// веткой. Обработчики самой панели общие — те же, что зовёт режим
+/// редактирования, — чтобы «список групп» вёл себя одинаково, откуда бы его
+/// ни открыли.
+///
+/// Колесо панель не принимает (списку из девяти строк листать нечего) и
+/// возвращает `false`: перерисовывать нечего.
+fn group_manager_input_over_editor(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+    event: InputEvent,
+    scale: f64,
+    monitor_id: &MonitorId,
+) -> bool {
+    let to_dip = |p: rst_win32::input::Point| (f64::from(p.x) / scale, f64::from(p.y) / scale);
+    match event {
+        InputEvent::MouseDown { pos, .. } => {
+            group_manager_down(edit, monitor_id, to_dip(pos));
+            true
+        }
+        InputEvent::MouseMove { pos, .. } => {
+            group_manager_move(edit, monitor_id, to_dip(pos));
+            true
+        }
+        InputEvent::MouseUp { pos, .. } => {
+            handle_group_manager_up(edit, cfg, config_path, monitor_geometry, to_dip(pos))
+        }
+        // Захват отобрали посреди жеста — гасим взведённые кнопки, иначе
+        // следующий `Up` где угодно сработал бы как клик по ним.
+        InputEvent::CaptureLost => {
+            if let Some(state) = &mut edit.group_manager {
+                state.panel.pointer_event(PointerEvent::Up {
+                    pos: (f64::MIN, f64::MIN),
+                });
+            }
+            true
+        }
+        InputEvent::MouseWheel { .. } => false,
+    }
+}
+
 /// Разобрать нажатия внутри меню групп. `true` — состав или раскладка
 /// изменились и панели надо пересобрать.
 ///
@@ -8987,6 +9110,7 @@ fn take_group_editor_clicks(
     groups: &mut GroupsState,
     panels: &mut GroupEditorPanels,
     confirm: &mut bool,
+    open_manager: &mut bool,
 ) -> bool {
     let mut changed = false;
     let Some(editor) = groups.editor_mut() else {
@@ -9038,6 +9162,17 @@ fn take_group_editor_clicks(
         *confirm = true;
     }
 
+    // Кнопка списка групп — тем же отложенным путём, что галочка: открытие
+    // менеджера читает `cfg.groups` и геометрию мониторов, которых здесь нет.
+    if panels
+        .strip
+        .panel
+        .widget_mut::<Button>(group_strip::BTN_MANAGER)
+        .is_some_and(Button::take_click)
+    {
+        *open_manager = true;
+    }
+
     // Карточки окон: отметить или снять отметку. Идентификатор кодирует
     // индекс в ПОЛНОМ списке карточек (не в видимом окне прокрутки), поэтому
     // перебираем весь список — прокрученные карточки просто не найдутся в
@@ -9058,12 +9193,20 @@ fn take_group_editor_clicks(
 }
 
 /// Открыть панель менеджера групп на мониторе панели у курсора.
+///
+/// Пока открыто меню набора, панель встаёт на ЕГО мониторе, а не там, где
+/// курсор: меню занимает экран целиком, и список групп, уехавший на соседний
+/// монитор, выглядел бы как «кнопка ничего не сделала».
 fn open_group_manager(
     edit: &mut EditState,
     cfg: &Config,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
 ) {
-    let monitor_id = edit.cursor_monitor.clone();
+    let monitor_id = edit
+        .group_editor
+        .as_ref()
+        .map(|panels| panels.monitor_id.clone())
+        .unwrap_or_else(|| edit.cursor_monitor.clone());
     let Some(&(w, h, scale)) = monitor_geometry.get(&monitor_id) else {
         return;
     };
@@ -15099,6 +15242,42 @@ mod tests {
     }
 
     #[test]
+    fn tracker_stays_awake_while_the_snap_gap_covers_free_windows() {
+        // Репорт пользователя 2026-08-27: «снап-гап в трее перестал
+        // работать». Отступ для чужих окон применяется ТОЛЬКО по снимку
+        // трекера, а конфиг с одним стикером `Always` и без закреплённых
+        // окон трекер усыплял — галочка была включена, а зазора не было.
+        let mut cfg = Config::default();
+        cfg.settings.snap_shrink_all_windows = true;
+        cfg.settings.snap_shrink_pct = 4;
+        let edit = mask_gate_edit_state();
+        assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
+    }
+
+    #[test]
+    fn a_zero_snap_gap_does_not_keep_the_tracker_awake() {
+        // Нулевой отступ не двигает ни одного окна — будить ради него
+        // трекер значит держать хуки включёнными впустую.
+        let mut cfg = Config::default();
+        cfg.settings.snap_shrink_all_windows = true;
+        cfg.settings.snap_shrink_pct = 0;
+        let edit = mask_gate_edit_state();
+        assert!(!tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
+    }
+
+    #[test]
+    fn the_snap_gap_for_pinned_windows_alone_does_not_wake_the_tracker() {
+        // Без галочки отступ касается только закреплённых окон, а их ведёт
+        // `enforce_pinned_geometry`, у которого свой повод разбудить трекер
+        // (`!edit.pinned_windows.is_empty()`).
+        let mut cfg = Config::default();
+        cfg.settings.snap_shrink_all_windows = false;
+        cfg.settings.snap_shrink_pct = 4;
+        let edit = mask_gate_edit_state();
+        assert!(!tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
+    }
+
+    #[test]
     fn tracker_mask_needed_false_on_clean_config_and_idle_edit() {
         // Ни одного стикера, никакой UI не открыт — трекеру спать.
         let cfg = Config::default();
@@ -15689,8 +15868,77 @@ mod tests {
         panels.strip.panel.pointer_event(PointerEvent::Down { pos });
         panels.strip.panel.pointer_event(PointerEvent::Up { pos });
         let mut confirm = false;
-        take_group_editor_clicks(&mut groups, panels, &mut confirm);
+        take_group_editor_clicks(&mut groups, panels, &mut confirm, &mut false);
         assert!(confirm, "клик по галочке обязан поднять флаг подтверждения");
+    }
+
+    #[test]
+    fn the_groups_list_button_raises_the_deferred_flag() {
+        // Кнопка в левом углу ленты открывает тот же список групп, что
+        // кнопка панели у курсора (запрос пользователя 2026-08-27), и тем же
+        // отложенным путём, что галочка: открытие читает конфиг.
+        let (mut groups, mut edit, _w, _geo) = editor_harness(&[1, 2], Some(0));
+        let panels = edit.group_editor.as_mut().expect("меню");
+        let b = panels
+            .strip
+            .panel
+            .widget::<Button>(group_strip::BTN_MANAGER)
+            .map(rst_render::Widget::bounds)
+            .expect("кнопка списка групп нарисована");
+        let pos = (b.cx, b.cy);
+        panels.strip.panel.pointer_event(PointerEvent::Down { pos });
+        panels.strip.panel.pointer_event(PointerEvent::Up { pos });
+        let mut confirm = false;
+        let mut open_manager = false;
+        take_group_editor_clicks(&mut groups, panels, &mut confirm, &mut open_manager);
+        assert!(open_manager, "клик обязан поднять флаг открытия списка");
+        assert!(!confirm, "список групп — не подтверждение набора");
+    }
+
+    #[test]
+    fn the_open_groups_list_takes_the_input_away_from_the_menu() {
+        // Панель лежит ПОВЕРХ ленты: клик по её кнопке не должен проваливаться
+        // в карточку окна под ней. Проверяем на клике мимо панели — он
+        // закрывает список (семантика попап-меню) и обязан оставить набор
+        // нетронутым: пользователь всего лишь заглянул в список.
+        let (mut groups, mut edit, _w, geometry) = editor_harness(&[1, 2], Some(0));
+        let mut cfg = Config::default();
+        let path = std::env::temp_dir().join("resticker_manager_over_editor.json");
+        open_group_manager(&mut edit, &cfg, &geometry);
+        assert!(edit.group_manager.is_some(), "список открыт");
+        let picked_before = groups.editor().expect("меню").picked().len();
+        let monitor_id = edit.group_editor.as_ref().expect("меню").monitor_id.clone();
+        let mut thumbs = rst_win32::thumb_cache::ThumbCache::new(4, GROUP_THUMB_TTL_MS);
+        for event in [
+            InputEvent::MouseDown {
+                pos: rst_win32::input::Point { x: 1, y: 1 },
+                modifiers: rst_win32::input::Modifiers::default(),
+            },
+            InputEvent::MouseUp {
+                pos: rst_win32::input::Point { x: 1, y: 1 },
+                modifiers: rst_win32::input::Modifiers::default(),
+            },
+        ] {
+            handle_group_editor_input(
+                &mut groups,
+                &mut edit,
+                &mut cfg,
+                &path,
+                event,
+                1.0,
+                &monitor_id,
+                &geometry,
+                &HashMap::new(),
+                &mut thumbs,
+            );
+        }
+        assert!(edit.group_manager.is_none(), "клик мимо закрывает список");
+        assert!(edit.group_editor.is_some(), "меню набора остаётся открытым");
+        assert_eq!(
+            groups.editor().expect("меню").picked().len(),
+            picked_before,
+            "набор не должен пострадать от заглядывания в список"
+        );
     }
 
     #[test]
@@ -15936,7 +16184,7 @@ mod tests {
         }
         let panels = edit.group_editor.as_mut().expect("меню");
         assert!(
-            !take_group_editor_clicks(&mut groups, panels, &mut false),
+            !take_group_editor_clicks(&mut groups, panels, &mut false, &mut false),
             "погашенное нажатие не должно срабатывать вдогонку"
         );
     }

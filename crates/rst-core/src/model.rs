@@ -694,6 +694,16 @@ pub struct Config {
     /// config.json без этого поля читаются через `#[serde(default)]` на
     /// структуре — тот же приём, что у `presets`.
     pub groups: Vec<WindowGroup>,
+    /// Сеанс загрузки Windows, в котором этот конфиг писался
+    /// ([`crate::boot_session`]).
+    ///
+    /// Только ради групп: они обязаны пережить перезапуск программы и обязаны
+    /// НЕ пережить перезагрузку компьютера (запрос пользователя 2026-08-27), а
+    /// отличить одно от другого можно только по сеансу.
+    ///
+    /// `None` — конфиг написан сборкой до этой возможности; при старте
+    /// считается чужим сеансом.
+    pub boot_stamp: Option<crate::boot_session::BootStamp>,
 }
 
 impl Default for Config {
@@ -706,6 +716,7 @@ impl Default for Config {
             stickers: Vec::new(),
             presets: Vec::new(),
             groups: Vec::new(),
+            boot_stamp: None,
         }
     }
 }

@@ -54,6 +54,16 @@
 //! повёрнутыми прямоугольниками: в наборе [`Icon`] галочки нет, а глиф «✓»
 //! в шрифте не гарантирован.
 //!
+//! # Кнопка списка групп
+//!
+//! Левый угол ленты — [`BTN_MANAGER`], та же иконка `Icon::Groups`, что у
+//! кнопки «Группы окон» в панели у курсора. Она не отмечает окна и ничего не
+//! подтверждает: координатор поднимает по ней уже существующий флаг
+//! открытия менеджера, и панель со списком групп встаёт ПОВЕРХ ленты, не
+//! разрушая набор (запрос пользователя 2026-08-27). Кнопка стоит вне
+//! прокручиваемой области, как и галочка: обе обязаны оставаться на месте,
+//! сколько бы карточек ни листали.
+//!
 //! # Модуль пока не подключён к координатору
 //!
 //! Лента полностью готова и покрыта тестами, но её вызов из
@@ -66,8 +76,8 @@
 
 use rst_core::model::MIN_GROUP_MEMBERS;
 use rst_render::{
-    Box2D, Button, ButtonContent, LINE_HEIGHT, Panel, PointerEvent, Primitive, Widget, WidgetId,
-    WidgetStyle, box_contains, text_size, theme,
+    Box2D, Button, ButtonContent, Icon, LINE_HEIGHT, Panel, PointerEvent, Primitive, Widget,
+    WidgetId, WidgetStyle, box_contains, text_size, theme,
 };
 
 use crate::window_picker::truncate_to_width;
@@ -81,6 +91,11 @@ pub const PANEL_ID: WidgetId = 600;
 pub const CARD_BASE: WidgetId = 601;
 /// Кнопка подтверждения набора (галочка, правая часть ленты).
 pub const BTN_CONFIRM: WidgetId = 650;
+/// Кнопка «Список групп» — открывает менеджер групп поверх меню набора
+/// (запрос пользователя 2026-08-27). Левый угол ленты, зеркально галочке
+/// подтверждения в правом: два края ленты — два выхода из неё, «посмотреть,
+/// что уже собрано» и «закончить».
+pub const BTN_MANAGER: WidgetId = 652;
 /// Полоса горизонтальной прокрутки ленты (рисуется только при переполнении).
 const SCROLLBAR_ID: WidgetId = 651;
 /// Флаг для id содержимого карточки — не декодируется вызывающим кодом (тот
@@ -171,7 +186,11 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
     // прокручиваться, а не вылезать за края (живой репорт 2026-08-25).
     let available = (screen.w - 2.0 * SCREEN_MARGIN).max(0.0);
     let n = cards.len().max(1) as f64;
-    let needed = 2.0 * STRIP_PAD + n * CARD_W + (n - 1.0) * CARD_GAP + CARD_GAP + CONFIRM_SIZE;
+    let needed = 2.0 * STRIP_PAD
+        + n * CARD_W
+        + (n - 1.0) * CARD_GAP
+        // Две квадратные кнопки по краям: список групп слева, галочка справа.
+        + 2.0 * (CARD_GAP + CONFIRM_SIZE);
     let strip_w = needed.min(available);
     let strip_h = strip_height();
     let screen_top = screen.cy - screen.h / 2.0;
@@ -197,7 +216,11 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
     // подтверждение всегда на виду, даже когда лента длинная и прокручена.
     let confirm_cx = right - CONFIRM_SIZE / 2.0;
     let cards_right = confirm_cx - CONFIRM_SIZE / 2.0 - CARD_GAP;
-    let visible_w = cards_right - left;
+    // Кнопка списка групп — крайняя левая, тем же поводом: она не должна
+    // уезжать вместе с прокруткой карточек.
+    let manager_cx = left + CONFIRM_SIZE / 2.0;
+    let cards_left = manager_cx + CONFIRM_SIZE / 2.0 + CARD_GAP;
+    let visible_w = cards_right - cards_left;
     // Сколько карточек влезает: первый центр — в `left + CARD_W/2`, дальше
     // шаг `CARD_W + CARD_GAP`, последняя карточка обязана закончиться не
     // правее `cards_right`. Неполная карточка у правого края не строится —
@@ -210,7 +233,7 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
 
     let picked = cards.iter().filter(|c| c.slot.is_some()).count();
     for (i, card) in cards.iter().enumerate().skip(scroll).take(visible_cards) {
-        let x = left + CARD_W / 2.0 + (i - scroll) as f64 * (CARD_W + CARD_GAP);
+        let x = cards_left + CARD_W / 2.0 + (i - scroll) as f64 * (CARD_W + CARD_GAP);
         let rect = Box2D {
             cx: x,
             cy: frame.cy,
@@ -240,6 +263,23 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
         });
     }
 
+    // Иконка та же, что у кнопки «Группы окон» в панели у курсора: одна и та
+    // же панель, вызванная из двух мест, обязана выглядеть одинаково.
+    panel.add_widget(
+        Button::new(
+            BTN_MANAGER,
+            Box2D {
+                cx: manager_cx,
+                cy: frame.cy,
+                w: CONFIRM_SIZE,
+                h: CONFIRM_SIZE,
+                rotation: 0.0,
+            },
+            ButtonContent::Icon(Icon::Groups),
+        )
+        .with_style(WidgetStyle::Settings),
+    );
+
     panel.add_widget(ConfirmButton::new(
         BTN_CONFIRM,
         Box2D {
@@ -258,7 +298,7 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
         panel.add_widget(HScrollBar::new(
             SCROLLBAR_ID,
             Box2D {
-                cx: (left + cards_right) / 2.0,
+                cx: (cards_left + cards_right) / 2.0,
                 cy: frame.cy + frame.h / 2.0 - STRIP_PAD / 2.0,
                 w: visible_w,
                 h: theme::SCROLLBAR_WIDTH,
@@ -907,6 +947,44 @@ mod tests {
                     && badge_rect.cy + badge_rect.h / 2.0 <= card_bounds.cy + card_bounds.h / 2.0,
                 "бейдж {digit} внутри карточки {i}: {badge_rect:?}"
             );
+        }
+    }
+
+    /// Кнопка списка групп стоит в левом углу ленты и не налезает ни на одну
+    /// карточку: обе краевые кнопки живут ВНЕ прокручиваемой области, иначе
+    /// они уезжали бы вместе с карточками.
+    #[test]
+    fn the_groups_list_button_sits_at_the_left_edge_clear_of_the_cards() {
+        for count in [2usize, 6, 30] {
+            let result = build(&cards(count), 0, screen(1600.0, 900.0));
+            let button = result
+                .panel
+                .widget::<Button>(BTN_MANAGER)
+                .expect("кнопка списка групп")
+                .bounds();
+            let confirm = result
+                .panel
+                .widget::<ConfirmButton>(BTN_CONFIRM)
+                .expect("галочка")
+                .bounds();
+            assert!(
+                button.cx < confirm.cx,
+                "список слева, подтверждение справа (count={count})"
+            );
+            for i in 0..count {
+                let Some(card) = result.panel.widget::<Button>(CARD_BASE + i as WidgetId) else {
+                    continue; // карточка за пределами видимой части ленты
+                };
+                let card = card.bounds();
+                assert!(
+                    card.cx - card.w / 2.0 >= button.cx + button.w / 2.0,
+                    "карточка {i} налезла на кнопку списка (count={count})"
+                );
+                assert!(
+                    card.cx + card.w / 2.0 <= confirm.cx - confirm.w / 2.0,
+                    "карточка {i} налезла на галочку (count={count})"
+                );
+            }
         }
     }
 

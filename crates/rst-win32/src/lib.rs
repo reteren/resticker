@@ -5,6 +5,7 @@
 //! (CONTRIBUTING.md, «Правила работы с unsafe»).
 
 pub mod autostart;
+pub mod boot_session;
 pub mod clipboard;
 pub mod dwm;
 mod error;

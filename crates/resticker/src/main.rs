@@ -555,7 +555,27 @@ fn main() -> anyhow::Result<()> {
     if let Some(warning) = &loaded.warning {
         tracing::warn!(?warning, "config.json загружен нештатно");
     }
-    let cfg = loaded.config;
+    let mut cfg = loaded.config;
+    // Группы окон живут в конфиге (чтобы пережить перезапуск программы), но
+    // обязаны исчезать при перезагрузке компьютера — запрос пользователя
+    // 2026-08-27. Различает одно от другого отметка сеанса загрузки, и
+    // ставится она ЗДЕСЬ, до первой записи конфига ниже: тогда та же запись и
+    // унесёт на диск уже вычищенные группы.
+    match rst_core::boot_session::adopt_boot_session(
+        &mut cfg,
+        &rst_win32::boot_session::current_stamp(),
+    ) {
+        rst_core::boot_session::GroupsOnStart::Kept => {
+            tracing::info!(
+                groups = cfg.groups.len(),
+                "тот же сеанс загрузки — группы сохранены"
+            );
+        }
+        rst_core::boot_session::GroupsOnStart::Forgotten(0) => {}
+        rst_core::boot_session::GroupsOnStart::Forgotten(n) => {
+            tracing::info!(forgotten = n, "новый сеанс загрузки — группы забыты");
+        }
+    }
     // ROADMAP.md M0: "читает и пишет конфиг" — гарантируем файл на диске
     // сразу при старте (первый запуск создаёт config.json с дефолтами).
     rst_core::config::save(&cfg, &cfg_path).context("сохранение config.json")?;
