@@ -21,6 +21,7 @@
 //! вызывающий слой (`overlay_manager.rs`) разбирает `Primitive` исчерпывающим
 //! match, ломать его вне скоупа этой задачи нельзя.
 
+use crate::glass::{STROKE_RGB, STROKE_STRONG_RGB};
 use crate::selection::Box2D;
 use crate::widgets::Primitive;
 
@@ -43,13 +44,12 @@ impl HighlightKind {
     /// Цвет рамки, RGB.
     pub const fn color(self) -> [u8; 3] {
         match self {
-            // Акцент проекта `#3c9898` — тот же cyan, что у пульса
-            // закрепления и `--accent` в окне настроек (запрос пользователя
-            // 2026-08-22: рамка выделения закреплённого окна была янтарной и
-            // выбивалась из палитры продукта).
-            Self::Pin => [0x3c, 0x98, 0x98],
-            // Акцент проекта (тот же синий, что SLIDER_FILL) — наведение.
-            Self::Hover => [0x4f, 0x9c, 0xff],
+            // §2.4: всё, что было акцентом, стало белым светом разной силы.
+            // Пин — усиленный штрих (STROKE_STRONG), наведение — обычный
+            // (STROKE); различие силы задают непрозрачности
+            // [`HighlightKind::opacity`].
+            Self::Pin => STROKE_STRONG_RGB,
+            Self::Hover => STROKE_RGB,
         }
     }
 
@@ -177,7 +177,7 @@ impl WindowHighlight {
     /// enum-диспетчеризации по [`HighlightKind`]: цвет и прозрачность задаёт
     /// вызывающий слой. Нужно для пульса рамки при пин/анпин по хоткею
     /// (Ctrl+Alt+R): прозрачность анимации меняется каждый кадр, цвет —
-    /// константа акцента проекта `#3c9898`.
+    /// константа вызывающего слоя (белый свет либо DANGER — §2.4).
     ///
     /// `opacity` клампится в `0.0..=1.0` на границе (тот же защитный
     /// конвеншн, что `thickness_dip.max(0.0)` в [`WindowHighlight::outline_rects`]):
@@ -329,18 +329,23 @@ mod tests {
     }
 
     #[test]
-    fn highlight_kind_colors_are_distinct_enums() {
-        // Минимум два цвета через enum — не строка: пин и наведение разные.
-        assert_ne!(HighlightKind::Pin.color(), HighlightKind::Hover.color());
+    fn highlight_kind_colors_are_monochrome_and_opacities_distinct() {
+        // §2.4: единственный «цвет» интерфейса — белый свет разной силы.
+        // Пин и наведение различаются непрозрачностью, а не тоном.
         assert_eq!(
             HighlightKind::Pin.color(),
-            [0x3c, 0x98, 0x98],
-            "пин — акцент проекта (cyan), тот же, что у пульса закрепления"
+            STROKE_STRONG_RGB,
+            "пин — усиленный белый штрих"
         );
         assert_eq!(
             HighlightKind::Hover.color(),
-            [0x4f, 0x9c, 0xff],
-            "наведение — акцентный синий проекта"
+            STROKE_RGB,
+            "наведение — обычный белый штрих"
+        );
+        assert_ne!(
+            HighlightKind::Pin.opacity(),
+            HighlightKind::Hover.opacity(),
+            "сила света у пина и наведения разная"
         );
         // Оба варианта полупрозрачны (окно под рамкой видно).
         assert!(HighlightKind::Pin.opacity() < 1.0);
@@ -392,7 +397,7 @@ mod tests {
         // Произвольный цвет/прозрачность проходят в примитивы без
         // enum-диспетчеризации — та же геометрия, что у `primitives`.
         let h = WindowHighlight::new(100.0, 80.0, 60.0, 40.0, 1.0);
-        let color = [0x3c, 0x98, 0x98]; // акцент проекта #3c9898
+        let color = STROKE_STRONG_RGB; // белый усиленный штрих (§2.4)
         let opacity = 0.37;
         let prims = h.primitives_custom(color, opacity, 2.0);
         assert_eq!(prims.len(), 4, "четыре ребра рамки");
@@ -417,7 +422,7 @@ mod tests {
         // Крайние допустимые значения проходят без изменений.
         let h = WindowHighlight::new(0.0, 0.0, 100.0, 80.0, 1.0);
         for opacity in [0.0, 1.0] {
-            let prims = h.primitives_custom([0x3c, 0x98, 0x98], opacity, 2.0);
+            let prims = h.primitives_custom(STROKE_STRONG_RGB, opacity, 2.0);
             for (i, p) in prims.iter().enumerate() {
                 let Primitive::Fill { opacity: o, .. } = p else {
                     panic!("примитив {i} — Fill");
@@ -429,7 +434,7 @@ mod tests {
         // клампятся на границе — шейдер премультиплицирует opacity без
         // валидации (тот же защитный конвеншн, что толщина в outline_rects).
         for (input, expect) in [(-0.25, 0.0), (1.25, 1.0)] {
-            let prims = h.primitives_custom([0x3c, 0x98, 0x98], input, 2.0);
+            let prims = h.primitives_custom(STROKE_STRONG_RGB, input, 2.0);
             for (i, p) in prims.iter().enumerate() {
                 let Primitive::Fill { opacity: o, .. } = p else {
                     panic!("примитив {i} — Fill");
@@ -443,7 +448,7 @@ mod tests {
     fn primitives_custom_matches_solid_sprite_contract() {
         // Те же Fill/Box2D, что у `primitives` — путь `solid_sprite` общий.
         let h = WindowHighlight::new(0.0, 0.0, 640.0, 480.0, 1.0);
-        for p in h.primitives_custom([0x3c, 0x98, 0x98], 0.5, HIGHLIGHT_THICKNESS_DIP) {
+        for p in h.primitives_custom(STROKE_STRONG_RGB, 0.5, HIGHLIGHT_THICKNESS_DIP) {
             let Primitive::Fill { rect, .. } = p else {
                 panic!("ожидался Fill");
             };

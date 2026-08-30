@@ -2,57 +2,83 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>resticker — settings</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <!-- Оболочка окна — 1:1 стилистика reteren/Reshot (Half-Life 2 / Source
-         VGUI): затемнённая панель, перетаскиваемый заголовок, вкладки,
-         подвал с OK/Отмена/Применить. -->
-    <section class="wrapper">
-      <strong class="titlebar" data-tauri-drag-region>
-        <h2 class="header" data-tauri-drag-region data-i18n="window.header">resticker · settings</h2>
-        <button class="closeButton" id="close" title="Close" data-i18n-title="close">
-          <img src="close.svg" width="16" height="16" alt="Close" data-i18n-alt="close" />
-        </button>
-      </strong>
+    <!-- SVG displacement filter: organic "liquid" edge for the glass sheen -->
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+      <filter id="liquid-soft" x="-30%" y="-30%" width="160%" height="160%">
+        <feTurbulence
+          type="fractalNoise"
+          baseFrequency="0.012 0.03"
+          numOctaves="2"
+          seed="7"
+          result="noise"
+        />
+        <feDisplacementMap
+          in="SourceGraphic"
+          in2="noise"
+          scale="24"
+          xChannelSelector="R"
+          yChannelSelector="G"
+        />
+      </filter>
+    </svg>
+
+    <div class="window wrapper">
+      <!-- Titlebar (draggable, dark liquid glass) -->
+      <header class="titlebar" data-tauri-drag-region>
+        <div class="header brand" data-tauri-drag-region data-i18n="window.header">resticker · settings</div>
+        <div class="win-controls">
+          <button class="win-btn closeButton" id="close" type="button" title="Close" data-i18n-title="close">
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+              <path d="M2 2l8 8M10 2l-8 8" />
+            </svg>
+          </button>
+        </div>
+      </header>
 
       <div class="tabsWrap">
-        <header class="tabList" id="tabs">
-          <div class="tab active" data-tab="stickers"><h3 data-i18n="tab.stickers">Stickers</h3></div>
-          <div class="tab" data-tab="presets"><h3 data-i18n="tab.presets">Presets</h3></div>
-          <div class="tab" data-tab="control"><h3 data-i18n="tab.control">Controls</h3></div>
-          <div class="tab" data-tab="general"><h3 data-i18n="tab.general">General</h3></div>
-          <div class="tab" data-tab="denylist"><h3 data-i18n="tab.denylist">Denylist</h3></div>
-        </header>
+        <!-- Navigation Tabs -->
+        <nav class="tabList" id="tabs">
+          <button class="tab active" data-tab="stickers" type="button"><h3 data-i18n="tab.stickers">Stickers</h3></button>
+          <button class="tab" data-tab="presets" type="button"><h3 data-i18n="tab.presets">Presets</h3></button>
+          <button class="tab" data-tab="control" type="button"><h3 data-i18n="tab.control">Controls</h3></button>
+          <button class="tab" data-tab="general" type="button"><h3 data-i18n="tab.general">General</h3></button>
+          <button class="tab" data-tab="denylist" type="button"><h3 data-i18n="tab.denylist">Denylist</h3></button>
+        </nav>
 
-        <section class="content">
+        <!-- Tab Content Panels -->
+        <main class="content">
           <!-- ==== Стикеры ==== -->
           <div class="panel active" data-panel="stickers">
-            <div class="column">
-              <div class="inputGroup">
-                <p class="inputLabel" data-i18n="stickers.listLabel">Sticker list</p>
-                <button class="button compact" id="add-sticker" data-i18n="stickers.add">Add…</button>
+            <section class="card" style="flex: 1">
+              <div class="cardHeader">
+                <h2 data-i18n="stickers.listLabel">Sticker list</h2>
+                <button class="button compact primary" id="add-sticker" type="button" data-i18n="stickers.add">Add…</button>
               </div>
               <div class="stickerList" id="sticker-list">
                 <p class="emptyHint" data-i18n="stickers.loading">Loading…</p>
               </div>
-              <div class="inputGroup">
-                <button class="button compact" id="reset-all-stickers" data-i18n="stickers.resetAll">Reset all</button>
-                <button class="button compact danger" id="delete-all-stickers" data-i18n="stickers.deleteAll">Delete all</button>
+              <div class="cardFooter">
+                <button class="button compact" id="reset-all-stickers" type="button" data-i18n="stickers.resetAll">Reset all</button>
+                <button class="button compact danger" id="delete-all-stickers" type="button" data-i18n="stickers.deleteAll">Delete all</button>
                 <span class="status" id="sticker-status"></span>
               </div>
-            </div>
+            </section>
           </div>
 
           <!-- ==== Пресеты ==== -->
           <div class="panel" data-panel="presets">
-            <div class="column">
-              <div class="inputGroup">
-                <p class="inputLabel" data-i18n="presets.listLabel">Preset list</p>
+            <section class="card" style="flex: 1">
+              <div class="cardHeader">
+                <h2 data-i18n="presets.listLabel">Preset list</h2>
                 <button
                   class="button compact"
                   id="import-preset"
+                  type="button"
                   title="Import a preset from a .json file"
                   data-i18n="presets.import"
                   data-i18n-title="presets.importTitle"
@@ -60,7 +86,7 @@
                   Import from file…
                 </button>
               </div>
-              <div class="inputGroup presetSaveRow">
+              <div class="presetSaveRow">
                 <input
                   type="text"
                   class="textInput"
@@ -68,281 +94,295 @@
                   placeholder="New preset name"
                   data-i18n-placeholder="presets.namePlaceholder"
                 />
-                <button class="button compact" id="save-preset" disabled data-i18n="presets.save">Save as preset</button>
+                <button class="button compact primary" id="save-preset" type="button" disabled data-i18n="presets.save">Save as preset</button>
               </div>
               <div class="stickerList" id="preset-list">
                 <p class="emptyHint" data-i18n="presets.loading">Loading…</p>
               </div>
-              <div class="inputGroup">
+              <div class="cardFooter">
                 <span class="status" id="preset-status"></span>
               </div>
-            </div>
+            </section>
           </div>
 
           <!-- ==== Управление ==== -->
           <div class="panel" data-panel="control">
             <div class="column">
-              <p data-i18n="control.hotkeysLabel">Global hotkeys:</p>
+              <section class="card">
+                <h2 data-i18n="control.hotkeysLabel">Global hotkeys:</h2>
 
-              <label class="inputGroup">
-                <p class="inputLabel" data-i18n="control.editMode">Edit mode</p>
-                <input
-                  type="text"
-                  class="textInput hotkeyInput"
-                  id="hotkey-edit"
-                  readonly
-                  style="max-width: 160px"
-                />
-              </label>
+                <label class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.editMode">Edit mode</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-edit"
+                    readonly
+                    style="max-width: 170px"
+                  />
+                </label>
 
-              <div class="inputGroup">
-                <p class="inputLabel" data-i18n="control.toggleAll">Show/hide all stickers</p>
-                <input
-                  type="text"
-                  class="textInput hotkeyInput"
-                  id="hotkey-toggle-all"
-                  readonly
-                  placeholder="Not set"
-                  data-i18n-placeholder="control.notSet"
-                  style="max-width: 160px"
-                />
-                <button class="button compact" id="clear-hotkey-toggle-all">×</button>
-              </div>
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.toggleAll">Show/hide all stickers</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-toggle-all"
+                    readonly
+                    placeholder="Not set"
+                    data-i18n-placeholder="control.notSet"
+                    style="max-width: 170px"
+                  />
+                  <button class="button compact" id="clear-hotkey-toggle-all" type="button">×</button>
+                </div>
 
-              <div class="inputGroup">
-                <p class="inputLabel" data-i18n="control.muteAll">Mute all</p>
-                <input
-                  type="text"
-                  class="textInput hotkeyInput"
-                  id="hotkey-mute-all"
-                  readonly
-                  placeholder="Not set"
-                  data-i18n-placeholder="control.notSet"
-                  style="max-width: 160px"
-                />
-                <button class="button compact" id="clear-hotkey-mute-all">×</button>
-              </div>
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.muteAll">Mute all</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-mute-all"
+                    readonly
+                    placeholder="Not set"
+                    data-i18n-placeholder="control.notSet"
+                    style="max-width: 170px"
+                  />
+                  <button class="button compact" id="clear-hotkey-mute-all" type="button">×</button>
+                </div>
 
-              <div class="inputGroup">
-                <p class="inputLabel" data-i18n="control.pinFocusedWindow">Pin focused window</p>
-                <input
-                  type="text"
-                  class="textInput hotkeyInput"
-                  id="hotkey-pin"
-                  readonly
-                  placeholder="Not set"
-                  data-i18n-placeholder="control.notSet"
-                  style="max-width: 160px"
-                />
-                <button class="button compact" id="clear-hotkey-pin">×</button>
-              </div>
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.pinFocusedWindow">Pin focused window</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-pin"
+                    readonly
+                    placeholder="Not set"
+                    data-i18n-placeholder="control.notSet"
+                    style="max-width: 170px"
+                  />
+                  <button class="button compact" id="clear-hotkey-pin" type="button">×</button>
+                </div>
 
-              <label class="inputGroup">
-                <p class="inputLabel" data-i18n="control.unpinAll">Unpin all windows</p>
-                <input
-                  type="text"
-                  class="textInput hotkeyInput"
-                  id="hotkey-unpin-all"
-                  readonly
-                  placeholder="Not set"
-                  data-i18n-placeholder="control.notSet"
-                  style="max-width: 160px"
-                />
-                <button class="button compact" id="clear-hotkey-unpin-all">×</button>
-              </label>
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.unpinAll">Unpin all windows</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-unpin-all"
+                    readonly
+                    placeholder="Not set"
+                    data-i18n-placeholder="control.notSet"
+                    style="max-width: 170px"
+                  />
+                  <button class="button compact" id="clear-hotkey-unpin-all" type="button">×</button>
+                </div>
 
-              <label class="inputGroup">
-                <p class="inputLabel" data-i18n="control.groupsMenu">Window groups menu</p>
-                <input
-                  type="text"
-                  class="textInput hotkeyInput"
-                  id="hotkey-groups-menu"
-                  readonly
-                  placeholder="Not set"
-                  data-i18n-placeholder="control.notSet"
-                  style="max-width: 160px"
-                />
-                <button class="button compact" id="clear-hotkey-groups-menu">×</button>
-              </label>
+                <hr />
 
-              <label class="inputGroup">
-                <p class="inputLabel" data-i18n="control.openGroup">Open group</p>
-                <input
-                  type="text"
-                  class="textInput hotkeyInput"
-                  id="hotkey-open-group"
-                  readonly
-                  placeholder="Not set"
-                  data-i18n-placeholder="control.notSet"
-                  style="max-width: 160px"
-                />
-                <button class="button compact" id="clear-hotkey-open-group">×</button>
-              </label>
-              <p class="hint" data-i18n="control.openGroupHint">
-                Only the modifiers are set here — the digit is the group number (1–9), fixed for each group and not editable. Press the combination with any digit.
-              </p>
-
-              <label class="inputGroup">
-                <p class="inputLabel" data-i18n="control.deleteGroup">Delete open group</p>
-                <input
-                  type="text"
-                  class="textInput hotkeyInput"
-                  id="hotkey-delete-group"
-                  readonly
-                  placeholder="Not set"
-                  data-i18n-placeholder="control.notSet"
-                  style="max-width: 160px"
-                />
-                <button class="button compact" id="clear-hotkey-delete-group">×</button>
-              </label>
-
-              <label class="inputGroup">
-                <p class="inputLabel" data-i18n="control.pinGroup">Keep open group on top</p>
-                <input
-                  type="text"
-                  class="textInput hotkeyInput"
-                  id="hotkey-pin-group"
-                  readonly
-                  placeholder="Not set"
-                  data-i18n-placeholder="control.notSet"
-                  style="max-width: 160px"
-                />
-                <button class="button compact" id="clear-hotkey-pin-group">×</button>
-              </label>
-
-              <div class="inputGroup">
-                <p class="inputLabel" data-i18n="control.pinSoundVolume">Pin sound volume</p>
-                <input
-                  type="range"
-                  class="slider"
-                  id="pin-sound-volume"
-                  min="0"
-                  max="100"
-                  step="1"
-                />
-                <span class="sliderValue" id="pin-sound-volume-value">100</span>
-              </div>
-
-              <p class="hint" data-i18n="control.hintClick">Click a field, then press a key combination.</p>
-              <p class="hint" data-i18n="control.hintRestart">Hotkey changes apply after restarting resticker.</p>
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.pinSoundVolume">Pin sound volume</span>
+                  <input
+                    type="range"
+                    class="slider"
+                    id="pin-sound-volume"
+                    min="0"
+                    max="100"
+                    step="1"
+                  />
+                  <span class="sliderValue" id="pin-sound-volume-value">100</span>
+                </div>
+              </section>
             </div>
 
             <div class="column">
-              <p class="hint" data-i18n="control.hintRequired">
-                "Edit mode" is required (cannot be cleared). The others are optional.
-              </p>
+              <section class="card">
+                <h2 data-i18n="control.groupsMenu">Window groups menu</h2>
+
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.groupsMenu">Window groups menu</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-groups-menu"
+                    readonly
+                    placeholder="Not set"
+                    data-i18n-placeholder="control.notSet"
+                    style="max-width: 170px"
+                  />
+                  <button class="button compact" id="clear-hotkey-groups-menu" type="button">×</button>
+                </div>
+
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.openGroup">Open group</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-open-group"
+                    readonly
+                    placeholder="Not set"
+                    data-i18n-placeholder="control.notSet"
+                    style="max-width: 170px"
+                  />
+                  <button class="button compact" id="clear-hotkey-open-group" type="button">×</button>
+                </div>
+                <p class="hint" data-i18n="control.openGroupHint">
+                  Only the modifiers are set here — the digit is the group number (1–9), fixed for each group and not editable. Press the combination with any digit.
+                </p>
+
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.deleteGroup">Delete open group</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-delete-group"
+                    readonly
+                    placeholder="Not set"
+                    data-i18n-placeholder="control.notSet"
+                    style="max-width: 170px"
+                  />
+                  <button class="button compact" id="clear-hotkey-delete-group" type="button">×</button>
+                </div>
+
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.pinGroup">Keep open group on top</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-pin-group"
+                    readonly
+                    placeholder="Not set"
+                    data-i18n-placeholder="control.notSet"
+                    style="max-width: 170px"
+                  />
+                  <button class="button compact" id="clear-hotkey-pin-group" type="button">×</button>
+                </div>
+
+                <hr />
+
+                <p class="hint" data-i18n="control.hintClick">Click a field, then press a key combination.</p>
+                <p class="hint" data-i18n="control.hintRestart">Hotkey changes apply after restarting resticker.</p>
+                <p class="hint" data-i18n="control.hintRequired">
+                  "Edit mode" is required (cannot be cleared). The others are optional.
+                </p>
+              </section>
             </div>
           </div>
 
           <!-- ==== Общие ==== -->
           <div class="panel" data-panel="general">
             <div class="column">
-              <p data-i18n="general.startupLabel">Startup:</p>
+              <section class="card">
+                <h2 data-i18n="general.startupLabel">Startup:</h2>
 
-              <label class="checkboxWrapper">
-                <input type="checkbox" id="autostart" />
-                <span class="checkmark"></span>
-                <span data-i18n="general.autostart">Launch with Windows</span>
-              </label>
+                <label class="checkboxWrapper">
+                  <input type="checkbox" id="autostart" />
+                  <span class="checkmark"></span>
+                  <span data-i18n="general.autostart">Launch with Windows</span>
+                </label>
 
-              <label class="checkboxWrapper">
-                <input type="checkbox" id="silent-start" />
-                <span class="checkmark"></span>
-                <span data-i18n="general.silentStart">Silent start (don’t open settings)</span>
-              </label>
+                <label class="checkboxWrapper">
+                  <input type="checkbox" id="silent-start" />
+                  <span class="checkmark"></span>
+                  <span data-i18n="general.silentStart">Silent start (don’t open settings)</span>
+                </label>
 
-              <label class="checkboxWrapper">
-                <input type="checkbox" id="tray-icon" />
-                <span class="checkmark"></span>
-                <span data-i18n="general.trayIcon">Tray icon</span>
-              </label>
+                <label class="checkboxWrapper">
+                  <input type="checkbox" id="tray-icon" />
+                  <span class="checkmark"></span>
+                  <span data-i18n="general.trayIcon">Tray icon</span>
+                </label>
+              </section>
 
-              <hr />
-              <p data-i18n="general.dialogsLabel">Dialogs:</p>
+              <section class="card">
+                <h2 data-i18n="general.dialogsLabel">Dialogs:</h2>
 
-              <label class="checkboxWrapper">
-                <input type="checkbox" id="skip-delete-confirmation" />
-                <span class="checkmark"></span>
-                <span data-i18n="general.skipDeleteConfirm">Skip delete confirmation</span>
-              </label>
-
+                <label class="checkboxWrapper">
+                  <input type="checkbox" id="skip-delete-confirmation" />
+                  <span class="checkmark"></span>
+                  <span data-i18n="general.skipDeleteConfirm">Skip delete confirmation</span>
+                </label>
+              </section>
             </div>
 
             <div class="column">
-              <p data-i18n="general.screenLabel">Screen:</p>
+              <section class="card">
+                <h2 data-i18n="general.screenLabel">Screen:</h2>
 
-              <label class="checkboxWrapper">
-                <input type="checkbox" id="outline-pinned-windows" />
-                <span class="checkmark"></span>
-                <span data-i18n="general.outlinePinned">Outline on pinned window</span>
-              </label>
-              <p class="hint" data-i18n="general.outlinePinnedHint">
-                Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.
-              </p>
+                <label class="checkboxWrapper">
+                  <input type="checkbox" id="outline-pinned-windows" />
+                  <span class="checkmark"></span>
+                  <span data-i18n="general.outlinePinned">Outline on pinned window</span>
+                </label>
+                <p class="hint" data-i18n="general.outlinePinnedHint">
+                  Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.
+                </p>
 
-              <label class="inputGroup">
-                <p class="inputLabel" data-i18n="general.snapGap">Snap gap, %</p>
-                <input
-                  type="number"
-                  class="textInput numberInput"
-                  id="snap-shrink-pct"
-                  min="0"
-                  max="35"
-                  step="1"
-                />
-              </label>
-              <p class="hint" data-i18n="general.snapGapHint">
-                Shrinks a window snapped by Windows to a half, quarter or third of the screen by this much on every side, leaving an even gap around it. 0 turns it off. Also available in the tray menu, where you can extend it to unpinned windows.
-              </p>
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="general.snapGap">Snap gap, %</span>
+                  <input
+                    type="number"
+                    class="textInput numberInput"
+                    id="snap-shrink-pct"
+                    min="0"
+                    max="35"
+                    step="1"
+                  />
+                </div>
+                <p class="hint" data-i18n="general.snapGapHint">
+                  Shrinks a window snapped by Windows to a half, quarter or third of the screen by this much on every side, leaving an even gap around it. 0 turns it off. Also available in the tray menu, where you can extend it to unpinned windows.
+                </p>
 
-              <label class="checkboxWrapper">
-                <input type="checkbox" id="hide-from-capture" />
-                <span class="checkmark"></span>
-                <span data-i18n="general.hideFromCapture">Hide stickers from screen capture</span>
-              </label>
-              <p class="hint" data-i18n="general.hideFromCaptureHint">
-                Unstable on some Windows 11 builds — the result is verified after applying; a warning is logged on failure.
-              </p>
+                <label class="checkboxWrapper">
+                  <input type="checkbox" id="hide-from-capture" />
+                  <span class="checkmark"></span>
+                  <span data-i18n="general.hideFromCapture">Hide stickers from screen capture</span>
+                </label>
+                <p class="hint" data-i18n="general.hideFromCaptureHint">
+                  Unstable on some Windows 11 builds — the result is verified after applying; a warning is logged on failure.
+                </p>
 
-              <label class="checkboxWrapper">
-                <input type="checkbox" id="never-overlap-taskbar" />
-                <span class="checkmark"></span>
-                <span data-i18n="general.neverOverlapTaskbar">Don't overlap the taskbar</span>
-              </label>
+                <label class="checkboxWrapper">
+                  <input type="checkbox" id="never-overlap-taskbar" />
+                  <span class="checkmark"></span>
+                  <span data-i18n="general.neverOverlapTaskbar">Don't overlap the taskbar</span>
+                </label>
+              </section>
 
-              <hr />
-              <p data-i18n="general.performanceLabel">Performance:</p>
+              <section class="card">
+                <h2 data-i18n="general.performanceLabel">Performance:</h2>
 
-              <div class="inputGroup">
-                <p class="inputLabel" data-i18n="general.fpsLimit">Overlay FPS limit</p>
-                <input
-                  type="range"
-                  class="slider"
-                  id="battery-fps-limit"
-                  min="5"
-                  max="60"
-                  step="1"
-                />
-                <span class="sliderValue" id="battery-fps-limit-value">30</span>
-              </div>
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="general.fpsLimit">Overlay FPS limit</span>
+                  <input
+                    type="range"
+                    class="slider"
+                    id="battery-fps-limit"
+                    min="5"
+                    max="60"
+                    step="1"
+                  />
+                  <span class="sliderValue" id="battery-fps-limit-value">30</span>
+                </div>
+              </section>
             </div>
           </div>
 
           <!-- ==== Денй-лист ==== -->
           <div class="panel" data-panel="denylist">
-            <div class="column">
-              <div class="inputGroup">
-                <p class="inputLabel" data-i18n="denylist.listLabel">Pin denylist</p>
+            <section class="card" style="flex: 1">
+              <div class="cardHeader">
+                <h2 data-i18n="denylist.listLabel">Pin denylist</h2>
               </div>
               <p class="hint" data-i18n="denylist.hint">
                 Windows whose process or title matches a rule cannot be pinned via the hotkey and are hidden from the window pick list. The denylist has no other effect.
               </p>
               <div class="inputGroup">
-                <select class="textInput" id="denylist-process-picker" style="max-width: 260px">
+                <select class="textInput" id="denylist-process-picker" style="max-width: 320px">
                   <option value="" data-i18n="denylist.pickWindow">Pick an open window…</option>
                 </select>
               </div>
-              <div class="inputGroup denylistAddRow">
+              <div class="denylistAddRow">
                 <input
                   type="text"
                   class="textInput"
@@ -357,28 +397,28 @@
                   placeholder="title substring, * wildcard"
                   data-i18n-placeholder="denylist.titlePlaceholder"
                 />
-                <button class="button compact" id="add-denylist-rule" disabled data-i18n="denylist.add">
+                <button class="button compact primary" id="add-denylist-rule" type="button" disabled data-i18n="denylist.add">
                   Add
                 </button>
               </div>
               <div class="stickerList" id="denylist-list">
                 <p class="emptyHint" data-i18n="denylist.loading">Loading…</p>
               </div>
-              <div class="inputGroup">
+              <div class="cardFooter">
                 <span class="status" id="denylist-status"></span>
               </div>
-            </div>
+            </section>
           </div>
-        </section>
+        </main>
       </div>
 
-      <div class="footer">
+      <footer class="footer">
         <span class="status" id="status"></span>
-        <button class="button" id="apply" data-i18n="footer.apply">Apply</button>
-        <button class="button" id="ok" data-i18n="footer.ok">OK</button>
-        <button class="button" id="cancel" data-i18n="footer.cancel">Cancel</button>
-      </div>
-    </section>
+        <button class="button" id="apply" type="button" data-i18n="footer.apply">Apply</button>
+        <button class="button primary" id="ok" type="button" data-i18n="footer.ok">OK</button>
+        <button class="button" id="cancel" type="button" data-i18n="footer.cancel">Cancel</button>
+      </footer>
+    </div>
 
     <script src="i18n.js"></script>
     <script src="hotkey_util.js"></script>

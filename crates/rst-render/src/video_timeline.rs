@@ -25,22 +25,24 @@
 //! После `Up` внешняя позиция снова принимается — полоса плавно догоняет
 //! кадр, на который перемотали.
 //!
-//! Отрисовка рассчитана на чтение поверх ЛЮБОГО кадра: подложка —
-//! полупрозрачная тёмная полоса на всю ширину (как у нормальных плееров).
-//! Без неё светлая дорожка теряется на белом видео, тёмная — на тёмном;
-//! подложка снимает вопрос фона целиком.
+//! Отрисовка рассчитана на чтение поверх ЛЮБОГО кадра: жёлоб — утопленное
+//! стекло (§2.2 `SUNKEN_BG`) на всю ширину полосы (как у нормальных плееров).
+//! Без него светлая дорожка теряется на белом видео, тёмная — на тёмном;
+//! утопленный жёлоб снимает вопрос фона целиком.
 //!
-//! Сознательное отступление от ТЗ «круглая ручка»: в наборе примитивов
-//! [`Primitive`] нет фигуры круга (только `Fill`/`Icon`/`Rgba`/`Text`), и
-//! ручка рисуется квадратной — тем же `Fill`, что и у существующего
-//! [`crate::widgets::Slider`]. Сменить форму на круглую без нового примитива (или
-//! растрового `Rgba`-круга с кэшем текстур на вызывающем слое) нельзя.
+//! Круглая ручка (ТЗ) достигается радиусом стекла: квадрат 10×10 при
+//! `RADIUS_CTRL` 10 вырождается в диск — отдельный примитив-круг не нужен.
 
 use rst_core::hittest::{to_local, to_world};
+use rst_core::ui_motion::{Phase, lerp};
 
-use crate::{Box2D, HighlightKind, PointerEvent, Primitive, Widget, WidgetId, text_size, theme};
+use crate::{
+    Box2D, PointerEvent, Primitive, Widget, WidgetId, glass::Surface, glass_control, glass_sunken,
+    text_size, theme,
+};
 
-/// Отступ полосы от краёв стикера, DIP.
+/// Отступ полосы от краёв стикера, DIP (в §3 величины нет — это вёрстка
+/// полосы поверх видео, а не корпуса панели).
 pub const TIMELINE_MARGIN: f64 = 8.0;
 /// Высота полосы, DIP: дорожка с ручкой плюс подписи времени.
 pub const TIMELINE_HEIGHT: f64 = 24.0;
@@ -48,7 +50,8 @@ pub const TIMELINE_HEIGHT: f64 = 24.0;
 /// сливаются в кашу, рисовать полосу на таком стикере бессмысленно —
 /// [`timeline_bounds`] вернёт `None`.
 pub const TIMELINE_MIN_WIDTH: f64 = 120.0;
-/// Толщина дорожки в покое, DIP.
+/// Толщина дорожки в покое, DIP. Не §3 `HAIRLINE`: волосинка не прочиталась
+/// бы как дорожка на видео, жёлобу нужна плоть.
 pub const TIMELINE_TRACK_H: f64 = 2.0;
 /// Толщина дорожки при наведении/перетаскивании, DIP: толще — заметнее, но
 /// и в покое дорожка не исчезает (режим редактирования показывает полосу
@@ -56,15 +59,18 @@ pub const TIMELINE_TRACK_H: f64 = 2.0;
 pub const TIMELINE_TRACK_H_HOVER: f64 = 3.0;
 /// Сторона ручки, DIP.
 pub const TIMELINE_KNOB: f64 = 10.0;
-/// Непрозрачность подложки в покое: полупрозрачная, чтобы полоса не
-/// заслоняла кадр целиком, когда к ней не прикасаются.
-pub const TIMELINE_BG_OPACITY: f64 = 0.5;
-/// Непрозрачность подложки при наведении/перетаскивании.
-pub const TIMELINE_BG_OPACITY_HOVER: f64 = 0.85;
-/// Непрозрачность подписей времени в покое.
-pub const TIMELINE_TEXT_OPACITY: f64 = 0.75;
-/// Непрозрачность подписей при наведении/перетаскивании.
-pub const TIMELINE_TEXT_OPACITY_HOVER: f64 = 0.95;
+/// Непрозрачность жёлоба полосы: слой стекла рисуется целиком — альфа
+/// `SUNKEN_BG` (§2.2) запечена в растр, множитель единица.
+pub const TIMELINE_BG_OPACITY: f64 = 1.0;
+/// Максимум белой подсветки жёлоба при наведении (§5): поверх `SUNKEN_BG`
+/// проявляется слой `ControlHover` с этой непрозрачностью, умноженной на
+/// фазу наведения.
+pub const TIMELINE_BG_OPACITY_HOVER: f64 = 0.5;
+/// §2.3 — непрозрачность подписей времени в покое: второстепенный текст
+/// (`TEXT_DIM`), отдельного серого цвета больше нет.
+pub const TIMELINE_TEXT_OPACITY: f64 = theme::TEXT_DIM_OPACITY;
+/// §2.3 — непрозрачность подписей при наведении: основной текст (`TEXT`).
+pub const TIMELINE_TEXT_OPACITY_HOVER: f64 = theme::TEXT_OPACITY;
 
 /// Полоса перемотки видео-стикера: значение — позиция воспроизведения в
 /// секундах (`f64`), отрисовка — дорожка, залитая часть слева (уже
@@ -88,6 +94,13 @@ pub struct VideoTimeline {
     /// Курсор над полосой (или координатор включил появление при наведении
     /// на стикер): влияет на прозрачность/толщину.
     hovered: bool,
+    /// Фаза наведения 0..1 (§5, `theme::HOVER_MS`): жёлоб светлеет, дорожка
+    /// толще, подписи ярче. Не флаг, а плавный переход — координатор
+    /// продвигает его через [`Widget::animate`].
+    hover_phase: Phase,
+    /// Фаза нажатия 0..1 (§5, `theme::PRESS_MS`): ручка продавливается,
+    /// пока палец тащит.
+    press_phase: Phase,
 }
 
 impl VideoTimeline {
@@ -104,6 +117,8 @@ impl VideoTimeline {
             drag_secs: 0.0,
             seek: None,
             hovered: false,
+            hover_phase: Phase::new(theme::HOVER_MS),
+            press_phase: Phase::new(theme::PRESS_MS),
         }
     }
 
@@ -200,37 +215,26 @@ impl VideoTimeline {
         self.seek = Some(self.drag_secs);
     }
 
-    /// Активна ли полоса (наведение или перетаскивание) — от этого зависит
-    /// контраст.
-    fn active(&self) -> bool {
-        self.hovered || self.dragging
+    /// Сила «активного света» полосы 0..1 (§5): наведение или перетаскивание —
+    /// прежний контракт `active()`, drag за пределами полосы подсветку не
+    /// гасит.
+    fn active_t(&self) -> f64 {
+        self.hover_phase.eased().max(self.press_phase.eased())
     }
 
-    /// Непрозрачность подложки.
-    fn bg_opacity(&self) -> f64 {
-        if self.active() {
-            TIMELINE_BG_OPACITY_HOVER
-        } else {
-            TIMELINE_BG_OPACITY
-        }
-    }
-
-    /// Непрозрачность подписей времени.
+    /// Непрозрачность подписей времени: между `TEXT_DIM` (покой) и `TEXT`
+    /// (наведение) по фазе — без ступеньки (§5, §2.3).
     fn text_opacity(&self) -> f64 {
-        if self.active() {
-            TIMELINE_TEXT_OPACITY_HOVER
-        } else {
-            TIMELINE_TEXT_OPACITY
-        }
+        lerp(
+            TIMELINE_TEXT_OPACITY,
+            TIMELINE_TEXT_OPACITY_HOVER,
+            self.active_t(),
+        )
     }
 
-    /// Толщина дорожки.
+    /// Толщина дорожки: плавно от покоя к наведению по фазе (§5).
     fn track_h(&self) -> f64 {
-        if self.active() {
-            TIMELINE_TRACK_H_HOVER
-        } else {
-            TIMELINE_TRACK_H
-        }
+        lerp(TIMELINE_TRACK_H, TIMELINE_TRACK_H_HOVER, self.active_t())
     }
 
     /// Прямоугольник примитива по центру в локальных координатах полосы
@@ -263,30 +267,60 @@ impl Widget for VideoTimeline {
     fn draw(&self, out: &mut Vec<Primitive>) {
         let (x0, x1) = self.track_range();
         let kx = self.secs_to_x(self.position());
-        // Порядок «нижний — первым»: подложка, дорожка, заливка, ручка,
-        // подписи (подписи поверх всего — их должно быть видно всегда).
-        out.push(Primitive::Fill {
-            rect: self.bounds,
-            color: theme::LOCK_INDICATOR_BG,
-            opacity: self.bg_opacity(),
-        });
-        out.push(Primitive::Fill {
-            rect: self.local_rect((x0 + x1) / 2.0, 0.0, x1 - x0, self.track_h()),
-            color: theme::SLIDER_TRACK,
-            opacity: 1.0,
-        });
+        let hover_t = self.hover_phase.eased();
+        let press_t = self.press_phase.eased();
+        let active_t = self.active_t();
+        // Порядок «нижний — первым»: жёлоб, подсветка наведения, дорожка,
+        // заливка, ручка, подписи (подписи поверх всего — их должно быть
+        // видно всегда).
+        // Жёлоб — утопленное стекло (§2.2 SUNKEN_BG; §4: Sunken переворачивает
+        // свет) вместо старой полупрозрачной подложки LOCK_INDICATOR_BG:
+        // подложка обязана читаться поверх ЛЮБОГО кадра, и утопленный жёлоб
+        // делает это без плоской заливки.
+        glass_sunken(out, self.bounds, theme::RADIUS_CTRL, TIMELINE_BG_OPACITY);
+        if active_t > 0.0 {
+            // Мягкий белый свет жёлоба под курсором/пальцем (§5: наведение
+            // зажигает гало). Ровный слой ControlHover по всему жёлобу:
+            // утопленная поверхность, светлея, читается как «пойманная
+            // курсором».
+            out.push(Primitive::Glass {
+                rect: self.bounds,
+                radius: theme::RADIUS_CTRL,
+                surface: Surface::ControlHover,
+                glow: 0.0,
+                opacity: TIMELINE_BG_OPACITY_HOVER * active_t,
+            });
+        }
+        // Дорожка — внутренний утопленный жёлоб, толще при наведении
+        // (плавно, по фазе).
+        glass_sunken(
+            out,
+            self.local_rect((x0 + x1) / 2.0, 0.0, x1 - x0, self.track_h()),
+            theme::RADIUS_TIGHT,
+            TIMELINE_BG_OPACITY,
+        );
         if kx > x0 {
+            // Уже проигранное — белое (§2.4: всё, что было акцентом, стало
+            // белым светом разной силы).
             out.push(Primitive::Fill {
                 rect: self.local_rect((x0 + kx) / 2.0, 0.0, kx - x0, self.track_h()),
-                color: HighlightKind::Pin.color(),
+                color: theme::TEXT,
                 opacity: 1.0,
             });
         }
-        out.push(Primitive::Fill {
-            rect: self.local_rect(kx, 0.0, TIMELINE_KNOB, TIMELINE_KNOB),
-            color: HighlightKind::Pin.color(),
-            opacity: 1.0,
-        });
+        // Ручка — стеклянный контрол: белое тело (ControlPrimary) с усиленной
+        // обводкой, гало при наведении и продавливание при перетаскивании
+        // (§5). Была квадратной из-за отсутствия круга среди примитивов;
+        // теперь круг даёт сам радиус: 10 × 10 при RADIUS_CTRL 10 — диск.
+        glass_control(
+            out,
+            self.local_rect(kx, 0.0, TIMELINE_KNOB, TIMELINE_KNOB),
+            theme::RADIUS_CTRL,
+            hover_t,
+            press_t,
+            true,
+            1.0,
+        );
         // Подписи времени: слева — текущая позиция, справа — длительность
         // (выровнены по краям полосы, вертикально — по центру дорожки).
         let (left_text, right_text) = (
@@ -324,6 +358,7 @@ impl Widget for VideoTimeline {
             return false;
         }
         self.hovered = hovered;
+        self.hover_phase.set_target(hovered);
         true
     }
 
@@ -333,6 +368,7 @@ impl Widget for VideoTimeline {
             // тот же контракт, что у Slider.
             PointerEvent::Down { pos } => {
                 self.dragging = true;
+                self.press_phase.set_target(true);
                 self.set_from_local_x(self.local_x(pos));
                 true
             }
@@ -344,9 +380,19 @@ impl Widget for VideoTimeline {
                     false
                 }
             }
-            PointerEvent::Up { .. } => std::mem::replace(&mut self.dragging, false),
+            PointerEvent::Up { .. } => {
+                let was_dragging = std::mem::replace(&mut self.dragging, false);
+                self.press_phase.set_target(false);
+                was_dragging
+            }
             PointerEvent::Wheel { .. } => false,
         }
+    }
+
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        let hover = self.hover_phase.advance(dt_ms);
+        let press = self.press_phase.advance(dt_ms);
+        hover || press
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -445,6 +491,43 @@ mod tests {
 
     fn right_edge(w: &VideoTimeline) -> f64 {
         w.bounds.cx + w.bounds.w / 2.0
+    }
+
+    fn glass_surfaces(prims: &[Primitive]) -> Vec<Surface> {
+        prims
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::Glass { surface, .. } => Some(*surface),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Толщина дорожки-жёлоба: у жёлоба полосы rect.h = высота полосы,
+    /// у внутренней дорожки — 2–3 DIP, различаем по высоте.
+    fn track_h(prims: &[Primitive]) -> f64 {
+        prims
+            .iter()
+            .find_map(|p| match p {
+                Primitive::Glass {
+                    surface: Surface::Sunken,
+                    rect,
+                    ..
+                } if rect.h < 10.0 => Some(rect.h),
+                _ => None,
+            })
+            .expect("дорожка-жёлоб присутствует")
+    }
+
+    fn last_text_opacity(prims: &[Primitive]) -> f64 {
+        prims
+            .iter()
+            .rev()
+            .find_map(|p| match p {
+                Primitive::Text { opacity, .. } => Some(*opacity),
+                _ => None,
+            })
+            .expect("подписи присутствуют")
     }
 
     #[test]
@@ -572,10 +655,15 @@ mod tests {
         );
         up_at(&mut t, mx, y);
         // Рисование при нулевой длительности не паникует и даёт ровно
-        // подложку, дорожку, ручку и две подписи.
+        // жёлоб, дорожку, ручку и две подписи — без заливки (позиция 0)
+        // и без подсветки наведения.
         let mut out = Vec::new();
         t.draw(&mut out);
         assert_eq!(out.len(), 5);
+        let Primitive::Glass { surface, .. } = &out[0] else {
+            panic!("первый слой — жёлоб стекла: {:?}", out[0]);
+        };
+        assert_eq!(*surface, Surface::Sunken);
         t.set_duration(60.0);
         t.set_position(30.0);
         assert_eq!(t.position(), 30.0);
@@ -664,39 +752,59 @@ mod tests {
     }
 
     #[test]
-    fn hover_changes_visuals_and_returns_redraw_flag() {
+    fn hover_animates_glass_visuals_and_returns_redraw_flag() {
         let mut t = tl();
         assert!(!t.hovered);
         let mut out = Vec::new();
         t.draw(&mut out);
-        let bg_idle = match &out[0] {
-            Primitive::Fill { opacity, .. } => *opacity,
-            other => panic!("первый примитив — подложка: {other:?}"),
+        // Первый слой — утопленный жёлоб стекла (§2.2 SUNKEN_BG), в покое
+        // подсветки наведения нет.
+        let Primitive::Glass { surface, .. } = &out[0] else {
+            panic!("первый примитив — жёлоб Glass: {:?}", out[0]);
         };
-        assert_eq!(bg_idle, TIMELINE_BG_OPACITY);
+        assert_eq!(*surface, Surface::Sunken);
+        assert!(!glass_surfaces(&out).contains(&Surface::ControlHover));
+        assert_eq!(track_h(&out), TIMELINE_TRACK_H);
+        assert_eq!(last_text_opacity(&out), TIMELINE_TEXT_OPACITY);
+
         assert!(t.set_hovered(true), "смена наведения требует перерисовки");
         assert!(t.hovered);
         assert!(
             !t.set_hovered(true),
             "повторная установка — без перерисовки"
         );
+        // Фаза ещё не продвинута — картинка прежняя: свет появляется только
+        // по мере движения фазы (§5), координатор тикает `animate`.
         let mut out = Vec::new();
         t.draw(&mut out);
-        let bg_hover = match &out[0] {
-            Primitive::Fill { opacity, .. } => *opacity,
-            other => panic!("первый примитив — подложка: {other:?}"),
-        };
-        assert_eq!(
-            bg_hover, TIMELINE_BG_OPACITY_HOVER,
-            "при наведении контраст выше"
+        assert!(!glass_surfaces(&out).contains(&Surface::ControlHover));
+        assert_eq!(track_h(&out), TIMELINE_TRACK_H);
+        assert!(
+            !t.animate(theme::HOVER_MS),
+            "ровно за длительность фаза доезжает до цели"
         );
-        let track_h_idle = TIMELINE_TRACK_H;
-        let track_h_hover = match &out[1] {
-            Primitive::Fill { rect, .. } => rect.h,
-            other => panic!("второй примитив — дорожка: {other:?}"),
-        };
-        assert_eq!(track_h_hover, TIMELINE_TRACK_H_HOVER);
-        assert_ne!(track_h_hover, track_h_idle, "при наведении дорожка толще");
+        let mut out = Vec::new();
+        t.draw(&mut out);
+        // Жёлоб подсвечен слоем ControlHover, дорожка толще, подписи ярче.
+        assert!(
+            glass_surfaces(&out).contains(&Surface::ControlHover),
+            "при наведении жёлоб светлеет"
+        );
+        assert_eq!(
+            track_h(&out),
+            TIMELINE_TRACK_H_HOVER,
+            "при наведении дорожка толще"
+        );
+        assert_eq!(last_text_opacity(&out), TIMELINE_TEXT_OPACITY_HOVER);
+
         assert!(t.set_hovered(false));
+        assert!(!t.animate(theme::HOVER_MS));
+        let mut out = Vec::new();
+        t.draw(&mut out);
+        assert!(
+            !glass_surfaces(&out).contains(&Surface::ControlHover),
+            "после ухода курсора подсветка гаснет"
+        );
+        assert_eq!(track_h(&out), TIMELINE_TRACK_H);
     }
 }

@@ -11,13 +11,16 @@ use rst_core::model::{MonitorId, Placement, Transform};
 
 use crate::sprite::Sprite;
 use crate::texture::Texture;
+use crate::theme;
 
 // Единый тип ручек — в rst-core (docs/M2_INTEGRATION_REVIEW.md, §1);
 // реэкспорт сохраняет прежний путь `selection::HandleKind`.
 pub use rst_core::hittest::HandleKind;
 
-/// Толщина рамки выделения, DIP.
-pub const OUTLINE_THICKNESS_DIP: f64 = 2.0;
+/// Толщина рамки выделения, DIP (§3 `HAIRLINE`): рамка — обводка активного
+/// состояния, волосинка, а не жирная линия; былые 2 DIP — наследие плоских
+/// акцентов.
+pub const OUTLINE_THICKNESS_DIP: f64 = theme::HAIRLINE;
 
 /// Сторона квадратной ручки ресайза, DIP.
 pub const HANDLE_SIZE_DIP: f64 = 10.0;
@@ -43,10 +46,22 @@ pub const EDIT_OVERLAY_OPACITY: f64 = 0.5;
 ///
 /// Ручки ресайза остаются БЕЛЫМИ: они лежат прямо на рамке, и одноцветные
 /// с ней читались бы как утолщения линии, а не как точки захвата.
+///
+/// ОТКРЫТЫЙ ВОПРОС к Dark Liquid Glass (2026-08-29). §2.4 запрещает цветной
+/// акцент, и по букве спецификации эта бирюза должна была стать белой. Не
+/// стала по двум причинам сразу: во-первых, цвет выделения — ЯВНАЯ просьба
+/// пользователя от 2026-08-23, и молча её отменять нельзя; во-вторых, белая
+/// рамка слилась бы с белыми ручками захвата, о чём предупреждает абзац
+/// выше. Решение за пользователем: либо бирюза остаётся единственным
+/// исключением из §2.4, либо рамка становится белой, а ручки начинают
+/// отличаться яркостью, а не тоном.
 pub const SELECTION_COLOR: [u8; 3] = [0x3c, 0x98, 0x98];
 
-/// Фуксия шахматки скрытых стикеров (ROADMAP.md M2), RGB.
-pub const CHECKER_MAGENTA: [u8; 3] = [0xff, 0x00, 0xff];
+/// Белый клеток шахматки скрытых стикеров (ROADMAP.md M2), RGB. Фуксия ушла
+/// вместе со старыми акцентами (§2.4: единственный «цвет» интерфейса — белый
+/// свет разной силы). Имя константы — наследие: оно экспортируется через
+/// `lib.rs`, менять его вне скоупа нельзя.
+pub const CHECKER_MAGENTA: [u8; 3] = [0xff, 0xff, 0xff];
 
 /// Чёрный шахматки скрытых стикеров (ROADMAP.md M2), RGB.
 pub const CHECKER_BLACK: [u8; 3] = [0x00, 0x00, 0x00];
@@ -268,8 +283,8 @@ pub fn edit_overlay(screen_w_dip: f64, screen_h_dip: f64) -> Box2D {
 pub const HIDDEN_STICKER_CHECKERBOARD_OPACITY: f64 = 0.5;
 
 /// Сгенерировать RGBA-пиксели шахматки (straight alpha) для текстуры
-/// `width`×`height` с клетками `cell` пикселей: фуксия [`CHECKER_MAGENTA`] и
-/// чёрный [`CHECKER_BLACK`], левый верхний угол — фуксия. Массив подаётся в
+/// `width`×`height` с клетками `cell` пикселей: белый [`CHECKER_MAGENTA`] и
+/// чёрный [`CHECKER_BLACK`], левый верхний угол — белый. Массив подаётся в
 /// `Device::create_texture_from_rgba` и рисуется поверх скрытого стикера
 /// (ROADMAP.md M2: «Шахматка для скрытых стикеров»; SPEC.md 3.7 — по форме
 /// ограничивающего прямоугольника стикера, обычно не квадрат).
@@ -313,7 +328,7 @@ VSOut mainVS(uint vid : SV_VertexID) {
                    1.0 - (tr.y + local.y) / misc2.z * 2.0, 0.0, 1.0);
     return o;
 }
-static const float3 magenta = float3(1.0, 0.0, 1.0);
+static const float3 white = float3(1.0, 1.0, 1.0);
 static const float3 black = float3(0.0, 0.0, 0.0);
 float4 mainPS(VSOut i) : SV_Target {
     float2 cell = misc.xy * misc2.x;          // клетка в физических пикселях
@@ -323,8 +338,8 @@ float4 mainPS(VSOut i) : SV_Target {
     float edge = min(dist.x, dist.y) * cell;  // в физических пикселях
     float aa = smoothstep(0.0, 1.0, edge);    // антиалиасинг границы
     float parity = fmod(cellidx.x + cellidx.y, 2.0);
-    float3 my = parity < 0.5 ? magenta : black;
-    float3 nbr = parity < 0.5 ? black : magenta;
+    float3 my = parity < 0.5 ? white : black;
+    float3 nbr = parity < 0.5 ? black : white;
     float3 color = lerp(my, nbr, 1.0 - aa);
     return float4(color * misc.y, misc.y);    // premultiplied opacity
 }
@@ -550,13 +565,13 @@ mod tests {
             let i = ((y * 4 + x) * 4) as usize;
             [tile[i], tile[i + 1], tile[i + 2], tile[i + 3]]
         };
-        assert_eq!(px(0, 0), [255, 0, 255, 255]); // фуксия
-        assert_eq!(px(1, 0), [255, 0, 255, 255]);
+        assert_eq!(px(0, 0), [255, 255, 255, 255]); // белый
+        assert_eq!(px(1, 0), [255, 255, 255, 255]);
         assert_eq!(px(2, 0), [0, 0, 0, 255]); // чёрный
-        assert_eq!(px(0, 1), [255, 0, 255, 255]);
+        assert_eq!(px(0, 1), [255, 255, 255, 255]);
         assert_eq!(px(3, 1), [0, 0, 0, 255]);
         assert_eq!(px(0, 2), [0, 0, 0, 255]);
-        assert_eq!(px(3, 3), [255, 0, 255, 255]);
+        assert_eq!(px(3, 3), [255, 255, 255, 255]);
     }
 
     #[test]
@@ -565,7 +580,7 @@ mod tests {
         assert_eq!(
             tile,
             vec![
-                255, 0, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 0, 255, 255
+                255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255
             ]
         );
     }
@@ -580,9 +595,9 @@ mod tests {
             let i = ((y * 3 + x) * 4) as usize;
             [tile[i], tile[i + 1], tile[i + 2], tile[i + 3]]
         };
-        assert_eq!(px(0, 0), [255, 0, 255, 255]);
+        assert_eq!(px(0, 0), [255, 255, 255, 255]);
         assert_eq!(px(1, 0), [0, 0, 0, 255]);
-        assert_eq!(px(2, 0), [255, 0, 255, 255]);
+        assert_eq!(px(2, 0), [255, 255, 255, 255]);
         assert_eq!(px(0, 1), [0, 0, 0, 255]);
         assert_eq!(px(2, 1), [0, 0, 0, 255]);
     }
@@ -597,7 +612,7 @@ mod tests {
     fn checkerboard_hlsl_has_both_entry_points() {
         assert!(CHECKERBOARD_HLSL.contains("mainVS"));
         assert!(CHECKERBOARD_HLSL.contains("mainPS"));
-        assert!(CHECKERBOARD_HLSL.contains("magenta"));
+        assert!(CHECKERBOARD_HLSL.contains("white"));
         assert!(CHECKERBOARD_HLSL.contains("black"));
     }
 }

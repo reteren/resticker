@@ -1,80 +1,130 @@
-/*
- * Half-Life 2 / Source VGUI dialog, ported 1:1 from reteren/Reshot's settings
- * window (src/reshot-tauri/src/styles.css), which itself ports 1:1 from
- * github.com/arlagonix/half-life-screen (src/components/**\/index.module.scss).
- * Every colour and border below is that reference verbatim, including
- * Reshot's own deliberate accent swap (HL2 orange #ff9c00 -> teal #3c9898) —
- * kept as-is per user request to copy the styling, not re-derive it.
- */
+/* ============================================================
+   resticker — Dark Liquid Glass design system
+   Specification: docs/DESIGN_LIQUID_GLASS.md
+   Blur: OS acrylic. Material: layered dark translucency +
+   specular sheen + 1px rim highlights + white glow.
+   ============================================================ */
 
+/* ---------- Commissioner (local, offline-safe) ---------- */
 @font-face {
-  font-family: "Roboto";
-  font-style: normal;
-  font-weight: 100;
-  src:
-    url("fonts/roboto-cyrillic-100-normal.woff2") format("woff2"),
-    url("fonts/roboto-latin-100-normal.woff2") format("woff2");
+  font-family: "Commissioner";
+  src: url("fonts/commissioner-latin-400.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+2000-206F, U+20AC, U+2122, U+2212;
 }
-
 @font-face {
-  font-family: "Roboto";
-  font-style: normal;
-  font-weight: 300;
-  src:
-    url("fonts/roboto-cyrillic-300-normal.woff2") format("woff2"),
-    url("fonts/roboto-latin-300-normal.woff2") format("woff2");
+  font-family: "Commissioner";
+  src: url("fonts/commissioner-cyrillic-400.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
 }
-
 @font-face {
-  font-family: "Roboto";
-  font-style: normal;
+  font-family: "Commissioner";
+  src: url("fonts/commissioner-latin-500.woff2") format("woff2");
+  font-weight: 500;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+2000-206F, U+20AC, U+2122, U+2212;
+}
+@font-face {
+  font-family: "Commissioner";
+  src: url("fonts/commissioner-cyrillic-500.woff2") format("woff2");
+  font-weight: 500;
+  font-display: swap;
+  unicode-range: U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: "Commissioner";
+  src: url("fonts/commissioner-latin-700.woff2") format("woff2");
   font-weight: 700;
-  src:
-    url("fonts/roboto-cyrillic-700-normal.woff2") format("woff2"),
-    url("fonts/roboto-latin-700-normal.woff2") format("woff2");
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+2000-206F, U+20AC, U+2122, U+2212;
+}
+@font-face {
+  font-family: "Commissioner";
+  src: url("fonts/commissioner-cyrillic-700.woff2") format("woff2");
+  font-weight: 700;
+  font-display: swap;
+  unicode-range: U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: "Commissioner";
+  src: url("fonts/commissioner-latin-800.woff2") format("woff2");
+  font-weight: 800;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+2000-206F, U+20AC, U+2122, U+2212;
+}
+@font-face {
+  font-family: "Commissioner";
+  src: url("fonts/commissioner-cyrillic-800.woff2") format("woff2");
+  font-weight: 800;
+  font-display: swap;
+  unicode-range: U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
 }
 
+/* ---------- Dark Liquid Glass Design Tokens (§2) ---------- */
 :root {
-  /* --- Modal/index.module.scss --- */
-  --bg: rgba(118, 118, 118, 0.6);
-  --bg-dark: #1a1a1a;
-  --text: white;
-  --accent: #3c9898; /* reference: #ff9c00 */
-  --border-dark: #434343;
-  --border-light: #bbbaba;
+  /* §2.1 Стекло */
+  --glass-ink: rgba(7, 7, 10, 0.62);
+  --glass-ink-deep: rgba(5, 5, 7, 0.74);
+  --glass-sheen-top: rgba(255, 255, 255, 0.055);
+  --glass-sheen-bottom: rgba(255, 255, 255, 0.016);
+  --glass-specular: rgba(255, 255, 255, 0.20);
+  --rim-top: rgba(255, 255, 255, 0.34);
+  --rim-side: rgba(255, 255, 255, 0.10);
+  --rim-bottom: rgba(255, 255, 255, 0.055);
+  --stroke: rgba(255, 255, 255, 0.12);
+  --stroke-strong: rgba(255, 255, 255, 0.30);
 
-  /* --- SettingsModal/index.module.scss --- */
-  --tab-light: #c0bfbf;
-  --tab-dark: #454543;
+  /* §2.2 Контролы */
+  --ctrl-bg: rgba(255, 255, 255, 0.045);
+  --ctrl-bg-hover: rgba(255, 255, 255, 0.105);
+  --ctrl-bg-active: rgba(255, 255, 255, 0.165);
+  --ctrl-bg-primary: rgba(255, 255, 255, 0.16);
+  --ctrl-bg-on: rgba(255, 255, 255, 0.22);
+  --sunken-bg: rgba(0, 0, 0, 0.34);
 
-  /* numberInput */
-  --input-bg: #5a5a5a;
-  --input-dark: #343434;
-  --input-light: #b7b7b7;
+  /* §2.3 Текст и свет */
+  --text: rgba(255, 255, 255, 0.97);
+  --text-dim: rgba(255, 255, 255, 0.66);
+  --text-faint: rgba(255, 255, 255, 0.42);
+  --text-glow: 0 0 2px rgba(255, 255, 255, 0.26);
+  --hover-glow: 0 0 6px rgba(255, 255, 255, 0.22);
 
-  /* Button/index.module.scss */
-  --btn-light: #bbbbbb;
-  --btn-dark: #454545;
-  --btn-bg: #7b7b7b;
+  /* §2.4 Danger */
+  --danger: #d0463c;
+  --danger-bg: rgba(208, 70, 60, 0.18);
+  --danger-hover: rgba(208, 70, 60, 0.30);
+  --danger-stroke: rgba(208, 70, 60, 0.50);
 
-  /* Checkbox/index.module.scss */
-  --check-bg: #555555;
-  --check-dark: #424343;
-  --check-light: #bababa;
+  /* §3 Геометрия */
+  --radius-win: 18px;
+  --radius-card: 14px;
+  --radius-ctl: 10px;
+  --radius-tight: 7px;
+  --hairline: 1px;
+  --pad-panel: 14px;
+  --pad-ctrl-x: 12px;
+  --gap-row: 10px;
 
-  font-synthesis: none;
-  text-rendering: optimizeSpeed;
-  -webkit-font-smoothing: none;
+  /* §5 Движение */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --t-hover: 160ms;
+  --t-press: 110ms;
+  --t-panel: 240ms;
+  --t-card: 300ms;
+
+  --font: "Commissioner", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
-::selection {
-  background-color: var(--accent);
-}
-
-* {
+/* ---------- Reset / Base ---------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
   margin: 0;
   padding: 0;
-  box-sizing: border-box;
 }
 
 html,
@@ -84,78 +134,173 @@ body {
   background: transparent;
 }
 
-/* ==== Modal shell (.wrapper) ==== */
+body {
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.45;
+  color: var(--text);
+  text-shadow: var(--text-glow);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  user-select: none;
+}
 
+/* ---------- Selection & Focus ---------- */
+::selection {
+  background-color: rgba(255, 255, 255, 0.25);
+  color: #ffffff;
+  text-shadow: none;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.3), 0 0 8px var(--hover-glow);
+}
+
+/* ---------- Window Shell (Glass Pane) ---------- */
+.window,
 .wrapper {
-  height: 100%;
-  padding: 16px;
-  background-color: var(--bg);
-  backdrop-filter: blur(4px);
-  border-radius: 8px;
-
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-
-  font-family: "Roboto", sans-serif;
-  font-weight: 100;
-  font-size: 12px;
-  line-height: 125%;
-  color: var(--text);
-  text-align: justify;
+  height: 100vh;
+  border-radius: var(--radius-win);
+  overflow: hidden;
+  background:
+    linear-gradient(
+      180deg,
+      var(--glass-sheen-top) 0%,
+      var(--glass-sheen-bottom) 100%
+    ),
+    var(--glass-ink);
+  border: 1px solid var(--stroke);
+  box-shadow:
+    inset 0 1px 0 var(--rim-top),
+    inset 0 -1px 0 var(--rim-bottom),
+    inset 1px 0 0 var(--rim-side),
+    inset -1px 0 0 var(--rim-side),
+    0 24px 64px rgba(0, 0, 0, 0.65);
+  animation: window-in var(--t-panel) var(--ease-out);
 }
 
-.wrapper hr {
-  border: none;
-  border-top: 1px solid var(--border-dark);
-  border-bottom: 1px solid var(--border-light);
+/* Specular sheen, deformed by SVG displacement for organic liquid edge */
+.window::before,
+.wrapper::before {
+  content: "";
+  position: absolute;
+  top: -30px;
+  left: -10%;
+  width: 70%;
+  height: 160px;
+  background: radial-gradient(
+    90% 100% at 30% 0%,
+    var(--glass-specular),
+    rgba(255, 255, 255, 0.04) 55%,
+    transparent 75%
+  );
+  filter: url(#liquid-soft);
+  pointer-events: none;
+  z-index: 0;
 }
 
-.wrapper p {
-  line-height: 150%;
+.window > *,
+.wrapper > * {
+  position: relative;
+  z-index: 1;
 }
 
-.wrapper a {
-  color: var(--accent);
-  line-height: 150%;
+@keyframes window-in {
+  from {
+    opacity: 0;
+    transform: scale(0.985) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
+/* ---------- Custom Titlebar ---------- */
 .titlebar {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-}
-
-.header {
-  font-family: "Roboto", sans-serif;
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-
-  cursor: move;
+  justify-content: space-between;
+  height: 46px;
+  padding: 0 14px 0 18px;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--stroke);
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.04) 0%,
+    transparent 100%
+  );
+  -webkit-app-region: drag;
   user-select: none;
-  flex-grow: 1;
 }
 
+.titlebar .header,
+.titlebar .brand {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text);
+  text-shadow: var(--text-glow);
+  cursor: move;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.win-controls {
+  display: flex;
+  align-items: center;
+  -webkit-app-region: no-drag;
+}
+
+.win-btn,
 .closeButton {
-  background: none;
-  border: none;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-tight);
+  color: var(--text-dim);
   cursor: pointer;
-  transition: background 0.15s ease-in-out;
-  line-height: 0;
+  transition: background var(--t-hover) var(--ease-out),
+              border-color var(--t-hover) var(--ease-out),
+              color var(--t-hover) var(--ease-out),
+              transform var(--t-press) var(--ease-out),
+              box-shadow var(--t-hover) var(--ease-out);
+  -webkit-app-region: no-drag;
 }
 
+.win-btn:hover,
 .closeButton:hover {
-  background: rgb(0 0 0 / 0.15);
+  background: var(--ctrl-bg-hover);
+  border-color: var(--stroke);
+  color: var(--text);
+  transform: scale(0.972);
+  box-shadow: 0 0 6px var(--hover-glow);
 }
 
-.closeButton > * {
-  display: block;
+.win-btn:active,
+.closeButton:active {
+  background: var(--ctrl-bg-active);
+  transform: scale(0.955);
 }
 
-/* ==== Tabs (SettingsModal) ==== */
+.win-btn svg,
+.closeButton svg {
+  width: 12px;
+  height: 12px;
+}
 
+/* ---------- Navigation Tabs ---------- */
 .tabsWrap {
   flex: 1;
   min-height: 0;
@@ -165,140 +310,398 @@ body {
 
 .tabList {
   display: flex;
-  gap: 1px;
-  align-items: flex-end;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 18px 8px;
+  border-bottom: 1px solid var(--stroke);
+  background: rgba(0, 0, 0, 0.18);
+  flex-shrink: 0;
 }
 
 .tab {
-  flex-grow: 1;
-  border-left: 1px solid var(--tab-light);
-  border-top: 1px solid var(--tab-light);
-  border-right: 1px solid var(--tab-dark);
-  border-bottom: 1px solid var(--tab-light);
+  padding: 6px 16px;
+  border-radius: var(--radius-ctl);
+  border: 1px solid transparent;
+  background: transparent;
   cursor: pointer;
   user-select: none;
-  text-align: center;
-
-  padding: 4px 16px;
+  font-family: var(--font);
+  transition: background var(--t-hover) var(--ease-out),
+              border-color var(--t-hover) var(--ease-out),
+              box-shadow var(--t-hover) var(--ease-out),
+              transform var(--t-hover) var(--ease-out),
+              color var(--t-hover) var(--ease-out);
 }
 
+.tab h3,
 .tab > * {
-  font-family: "Roboto", sans-serif;
-  color: white;
-  font-size: 12px;
-  font-weight: 300;
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin: 0;
+  transition: color var(--t-hover) var(--ease-out);
 }
 
-.tab:not(.active) > * {
-  opacity: 0.5;
+.tab:hover {
+  background: var(--ctrl-bg-hover);
+  border-color: var(--stroke);
+  transform: scale(0.972);
+}
+
+.tab:hover h3,
+.tab:hover > * {
   color: var(--text);
 }
 
-.tab:not(.active):hover > * {
-  opacity: 0.8;
-}
-
 .tab.active {
-  border-bottom-color: transparent;
-  padding-top: 6px;
+  background: var(--ctrl-bg-primary);
+  border-color: var(--stroke-strong);
+  box-shadow:
+    inset 0 1px 0 var(--rim-top),
+    inset 0 -1px 0 var(--rim-bottom),
+    0 0 8px rgba(255, 255, 255, 0.12);
+  transform: none;
 }
 
-.content {
-  padding: 16px;
-  border-left: 1px solid var(--tab-light);
-  border-right: 1px solid var(--tab-dark);
-  border-bottom: 1px solid var(--tab-dark);
-  margin-top: -1px;
-  flex-grow: 1;
-  min-height: 300px;
-  overflow: hidden;
+.tab.active h3,
+.tab.active > * {
+  color: var(--text);
+  font-weight: 700;
+  text-shadow: var(--text-glow);
+}
 
-  font-weight: 300;
+/* ---------- Content Panels & Cards ---------- */
+.content {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 16px 18px;
+  min-height: 0;
 }
 
 .panel {
   display: none;
-  gap: 16px;
-  height: 100%;
+  gap: 14px;
+  min-height: 100%;
 }
 
 .panel.active {
   display: flex;
+  animation: panel-in var(--t-panel) var(--ease-out);
 }
 
-.panel > * {
-  flex: 1;
-  min-width: 0;
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .column {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
+  flex: 1;
   min-width: 0;
-  min-height: 0;
+}
+
+.card {
+  background: var(--ctrl-bg);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-card);
+  padding: 14px 16px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.10),
+    0 8px 24px rgba(0, 0, 0, 0.25);
+  animation: card-in var(--t-card) var(--ease-out) backwards;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.card:nth-of-type(2) {
+  animation-delay: 0.04s;
+}
+.card:nth-of-type(3) {
+  animation-delay: 0.08s;
+}
+.card:nth-of-type(4) {
+  animation-delay: 0.12s;
+}
+
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.card h2,
+.card-title {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 2px;
+  text-shadow: none;
+}
+
+.cardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cardHeader h2 {
+  margin-bottom: 0;
+}
+
+.cardFooter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* ---------- Rows & Layout Utilities ---------- */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 4px 0;
+}
+
+.row.spread {
+  justify-content: space-between;
+}
+
+.row.nowrap {
+  margin: 0;
+  gap: 6px;
 }
 
 .inputGroup {
   display: flex;
   align-items: center;
-  gap: 8px;
-  cursor: pointer;
+  gap: 10px;
 }
 
 .inputLabel {
   flex-grow: 1;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
 }
 
 .hint {
-  opacity: 0.55;
-  font-size: 11px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-faint);
+  text-shadow: none;
 }
 
-.panel kbd {
-  font-family: inherit;
-  font-size: 11px;
-  font-weight: 300;
-  padding: 1px 5px;
-  white-space: nowrap;
-
-  background-color: var(--btn-bg);
-  border: 1px solid;
-  border-left-color: var(--btn-light);
-  border-top-color: var(--btn-light);
-  border-right-color: var(--btn-dark);
-  border-bottom-color: var(--btn-dark);
+.mono {
+  font-variant-numeric: tabular-nums;
+  min-width: 48px;
+  text-align: right;
+  font-weight: 700;
 }
 
-/* ==== Inputs ==== */
+.presetSaveRow,
+.denylistAddRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 
-.numberInput,
-.textInput {
-  height: 24px;
-  background-color: var(--input-bg);
+.presetSaveRow .textInput,
+.denylistAddRow .textInput {
+  flex: 1;
+}
 
+hr {
+  border: none;
+  height: 1px;
+  background: var(--stroke);
+  margin: 4px 0;
+}
+
+/* ---------- Tactile Buttons (§5) ---------- */
+.button,
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: var(--ctrl-bg);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-ctl);
   color: var(--text);
-  padding: 4px;
-  font-family: "Roboto", sans-serif;
+  padding: 6px var(--pad-ctrl-x);
+  min-height: 28px;
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-shadow: var(--text-glow);
+  white-space: nowrap;
+  user-select: none;
+  box-shadow:
+    inset 0 1px 0 var(--rim-top),
+    inset 0 -1px 0 var(--rim-bottom),
+    inset 1px 0 0 var(--rim-side),
+    inset -1px 0 0 var(--rim-side);
+  transition: background var(--t-hover) var(--ease-out),
+              border-color var(--t-hover) var(--ease-out),
+              transform var(--t-hover) var(--ease-out),
+              box-shadow var(--t-hover) var(--ease-out),
+              color var(--t-hover) var(--ease-out);
+}
+
+.button svg,
+.btn svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+
+/* Наведение: кнопка продавливается (scale 0.972), свет переезжает вниз, гало */
+.button:hover:not(:disabled),
+.btn:hover:not(:disabled) {
+  background: var(--ctrl-bg-hover);
+  border-color: var(--stroke-strong);
+  transform: scale(0.972);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.22),
+    0 0 6px var(--hover-glow);
+}
+
+/* Зажатие: scale 0.955 + CTRL_BG_ACTIVE */
+.button:active:not(:disabled),
+.btn:active:not(:disabled) {
+  background: var(--ctrl-bg-active);
+  transform: scale(0.955);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.10),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.26),
+    0 0 4px rgba(255, 255, 255, 0.15);
+}
+
+.button:disabled,
+.btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.button.compact,
+.btn.compact {
+  min-width: 0;
+  padding: 4px 10px;
   font-size: 12px;
-  font-weight: 300;
+}
 
-  border-left: 1px solid var(--input-dark);
-  border-top: 1px solid var(--input-dark);
-  border-right: 1px solid var(--input-light);
-  border-bottom: 1px solid var(--input-light);
+.button.danger,
+.btn.danger {
+  color: #ff9d96;
+}
 
+.button.danger:hover:not(:disabled),
+.btn.danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  border-color: var(--danger-stroke);
+  box-shadow:
+    inset 0 1px 0 rgba(208, 70, 60, 0.3),
+    inset 0 -1px 0 rgba(208, 70, 60, 0.5),
+    0 0 8px rgba(208, 70, 60, 0.35);
+}
+
+.button.primary,
+.btn-primary {
+  background: var(--ctrl-bg-primary);
+  border-color: var(--stroke-strong);
+  font-weight: 700;
+  box-shadow:
+    inset 0 1px 0 var(--rim-top),
+    inset 0 -1px 0 var(--rim-bottom),
+    0 0 8px rgba(255, 255, 255, 0.10);
+}
+
+.button.primary:hover:not(:disabled),
+.btn-primary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.24);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.20),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.35),
+    0 0 8px rgba(255, 255, 255, 0.30);
+}
+
+/* ---------- Inputs: Text, Number, Select ---------- */
+.textInput,
+.numberInput,
+input[type="text"],
+input[type="number"],
+select.textInput {
+  background: var(--sunken-bg);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-ctl);
+  color: var(--text);
+  padding: 6px 10px;
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 500;
+  height: 30px;
   outline: none;
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.5),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.055);
+  transition: border-color var(--t-hover) var(--ease-out),
+              box-shadow var(--t-hover) var(--ease-out),
+              background var(--t-hover) var(--ease-out);
+}
+
+.textInput:hover,
+.numberInput:hover,
+input[type="text"]:hover,
+input[type="number"]:hover,
+select.textInput:hover {
+  border-color: var(--stroke-strong);
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.textInput:focus,
+.numberInput:focus,
+input[type="text"]:focus,
+input[type="number"]:focus,
+select.textInput:focus {
+  border-color: var(--stroke-strong);
+  background: rgba(0, 0, 0, 0.55);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.6),
+    0 0 0 2px rgba(255, 255, 255, 0.12),
+    0 0 8px var(--hover-glow);
+}
+
+input::placeholder {
+  color: var(--text-faint);
 }
 
 .numberInput {
-  max-width: 60px;
+  max-width: 70px;
 }
 
-/* Родные стрелки-крутилки у type=number приходят из движка и не знают ни
-   одной переменной темы: на тёмном фоне это две светлые кнопки, которых
-   никто не рисовал. Поле и так с потолком (`max`) и правится клавиатурой —
-   стрелки убираем целиком. */
 .numberInput::-webkit-outer-spin-button,
 .numberInput::-webkit-inner-spin-button {
   -webkit-appearance: none;
@@ -310,53 +713,80 @@ body {
   appearance: textfield;
 }
 
-.textInput {
-  min-width: 0;
+select.textInput {
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'><path d='M1 1L5 5L9 1' stroke='rgba(255,255,255,0.6)' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
 }
 
-.column > .textInput {
-  width: 100%;
+select.textInput option {
+  background: #111116;
+  color: var(--text);
 }
 
-.pathRow .textInput {
-  flex: 1;
-}
-
-/* Строка «Сохранить как пресет»: поле имени растягивается на свободное
-   место, кнопка остаётся компактной (тот же приём, что .pathRow). */
-.presetSaveRow .textInput {
-  flex: 1;
-}
-
-/* Строка добавления правила денй-листа: оба поля тянутся на свободное
-   место, кнопка остаётся компактной (тот же приём, что .presetSaveRow). */
-.denylistAddRow .textInput {
-  flex: 1;
-}
-
-/* Захват хоткея: то же поле, что textInput, но кликабельное целиком и без
-   курсора ввода — реальный текст пишет JS, а не пользователь. */
+/* ---------- Hotkey Input ---------- */
 .hotkeyInput {
   cursor: pointer;
   user-select: none;
+  text-align: center;
+  font-weight: 600;
+  transition: transform var(--t-hover) var(--ease-out),
+              background var(--t-hover) var(--ease-out),
+              border-color var(--t-hover) var(--ease-out),
+              box-shadow var(--t-hover) var(--ease-out);
+}
+
+.hotkeyInput:hover {
+  transform: scale(0.98);
 }
 
 .hotkeyInput.recording {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  border-color: rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.10);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.5),
+    0 0 0 2px rgba(255, 255, 255, 0.20),
+    0 0 12px var(--hover-glow);
+  animation: pulse-recording 1.2s infinite alternate var(--ease-out);
 }
 
-/* Checkbox: bespoke box, the native input only carries state. */
+@keyframes pulse-recording {
+  from {
+    border-color: rgba(255, 255, 255, 0.4);
+  }
+  to {
+    border-color: rgba(255, 255, 255, 0.9);
+    box-shadow:
+      inset 0 1px 2px rgba(0, 0, 0, 0.5),
+      0 0 0 3px rgba(255, 255, 255, 0.25),
+      0 0 16px rgba(255, 255, 255, 0.35);
+  }
+}
 
-.checkboxWrapper {
-  display: flex;
+/* ---------- Custom Checkbox ---------- */
+.checkboxWrapper,
+label.check {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   cursor: pointer;
   user-select: none;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+  transition: color var(--t-hover) var(--ease-out);
 }
 
-.checkboxWrapper input {
+.checkboxWrapper:hover,
+label.check:hover {
+  color: #fff;
+}
+
+.checkboxWrapper input,
+label.check input {
   position: absolute;
   opacity: 0;
   cursor: pointer;
@@ -365,214 +795,167 @@ body {
 }
 
 .checkmark {
-  height: 12px;
-  width: 12px;
-  flex: none;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  border-radius: 6px;
+  background: var(--ctrl-bg);
+  border: 1px solid var(--stroke);
+  display: grid;
+  place-items: center;
   position: relative;
-  background-color: var(--check-bg);
-
-  border-left: 1px solid var(--check-dark);
-  border-top: 1px solid var(--check-dark);
-  border-right: 1px solid var(--check-light);
-  border-bottom: 1px solid var(--check-light);
+  box-shadow:
+    inset 0 1px 0 var(--rim-top),
+    inset 0 -1px 0 var(--rim-bottom);
+  transition: background var(--t-hover) var(--ease-out),
+              border-color var(--t-hover) var(--ease-out),
+              transform var(--t-hover) var(--ease-out),
+              box-shadow var(--t-hover) var(--ease-out);
 }
 
-.checkboxWrapper input:checked ~ .checkmark {
-  background: var(--check-bg)
-    url("data:image/svg+xml;utf8,<svg width='8' height='7' viewBox='0 0 8 7' fill='none' xmlns='http://www.w3.org/2000/svg'><path d='M1 2.5L3 5L7 1' stroke='white' stroke-width='2'/></svg>");
-  background-size: 80% 80%;
-  background-repeat: no-repeat;
-  background-position: center center;
+.checkboxWrapper:hover .checkmark,
+label.check:hover .checkmark {
+  background: var(--ctrl-bg-hover);
+  border-color: var(--stroke-strong);
+  transform: scale(0.972);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.22),
+    0 0 6px var(--hover-glow);
 }
 
-/* ==== Button ==== */
-
-.button {
-  border: 1px solid black;
-
-  border-left-color: var(--btn-light);
-  border-top-color: var(--btn-light);
-  border-right-color: var(--btn-dark);
-  border-bottom-color: var(--btn-dark);
-
-  background-color: var(--btn-bg);
-  padding: 0 4px;
-  user-select: none;
-
-  min-height: 24px;
-  min-width: 70px;
-
-  display: flex;
-  align-items: center;
-  justify-content: center;
-
-  font-family: "Roboto", sans-serif;
-  font-weight: 300;
-  font-size: 12px;
-  color: var(--text);
-
-  cursor: pointer;
+.checkboxWrapper input:active ~ .checkmark,
+label.check input:active ~ .checkmark {
+  background: var(--ctrl-bg-active);
+  transform: scale(0.955);
 }
 
-.button:active:not(:disabled) {
-  border-left-color: var(--btn-dark);
-  border-top-color: var(--btn-dark);
-  border-right-color: var(--btn-light);
-  border-bottom-color: var(--btn-light);
+.checkmark::after {
+  content: "";
+  width: 9px;
+  height: 5px;
+  margin-top: -2px;
+  border-left: 2px solid #fff;
+  border-bottom: 2px solid #fff;
+  transform: rotate(-45deg) scale(0);
+  transition: transform var(--t-hover) var(--ease-out);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5));
 }
 
-.button:disabled {
-  cursor: not-allowed;
-  color: black;
-  font-weight: 300;
+.checkboxWrapper input:checked ~ .checkmark,
+label.check input:checked ~ .checkmark {
+  background: var(--ctrl-bg-on);
+  border-color: var(--stroke-strong);
+  box-shadow:
+    inset 0 1px 0 var(--rim-top),
+    inset 0 -1px 0 var(--rim-bottom),
+    0 0 6px rgba(255, 255, 255, 0.15);
 }
 
-.button.compact {
-  min-width: 0;
-  padding: 0 8px;
-  flex: none;
+.checkboxWrapper input:checked ~ .checkmark::after,
+label.check input:checked ~ .checkmark::after {
+  transform: rotate(-45deg) scale(1);
 }
 
-.button.danger {
-  color: #ffb0b0;
-}
-
-.footer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  justify-content: flex-end;
-}
-
-.status {
-  font-size: 11px;
-  opacity: 0.75;
-  min-height: 14px;
-  flex-grow: 1;
-  text-align: left;
-}
-
-/*
- * ==== Controls the reference does not define ====
- * resticker needs a slider (FPS limit) and a scrollable list (sticker list),
- * built strictly from the existing bevel vocabulary: raised = Button borders
- * (light top-left / dark bottom-right), inset = numberInput borders.
- */
-
+/* ---------- Range Slider ---------- */
+input[type="range"],
 .slider {
   -webkit-appearance: none;
   appearance: none;
-  flex-grow: 1;
+  flex: 1;
   min-width: 0;
-  height: 12px;
+  height: 22px;
   background: transparent;
   cursor: pointer;
   outline: none;
 }
 
+input[type="range"]::-webkit-slider-runnable-track,
 .slider::-webkit-slider-runnable-track {
-  height: 6px;
-  background-color: var(--input-bg);
-  border-left: 1px solid var(--input-dark);
-  border-top: 1px solid var(--input-dark);
-  border-right: 1px solid var(--input-light);
-  border-bottom: 1px solid var(--input-light);
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.12);
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.5);
+  transition: background var(--t-hover) var(--ease-out);
 }
 
+input[type="range"]:hover::-webkit-slider-runnable-track,
+.slider:hover::-webkit-slider-runnable-track {
+  background: rgba(255, 255, 255, 0.20);
+}
+
+input[type="range"]::-webkit-slider-thumb,
 .slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 10px;
-  height: 18px;
-  margin-top: -7px;
-
-  background-color: var(--btn-bg);
-  border: 1px solid black;
-  border-left-color: var(--btn-light);
-  border-top-color: var(--btn-light);
-  border-right-color: var(--btn-dark);
-  border-bottom-color: var(--btn-dark);
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  box-shadow:
+    0 2px 8px rgba(0, 0, 0, 0.4),
+    0 0 6px rgba(255, 255, 255, 0.4),
+    inset 0 1px 0 #ffffff;
+  transition: transform var(--t-press) var(--ease-out),
+              box-shadow var(--t-hover) var(--ease-out);
 }
 
+input[type="range"]::-webkit-slider-thumb:hover,
+.slider::-webkit-slider-thumb:hover {
+  transform: scale(1.18);
+  box-shadow:
+    0 2px 10px rgba(0, 0, 0, 0.5),
+    0 0 10px rgba(255, 255, 255, 0.6),
+    inset 0 1px 0 #ffffff;
+}
+
+input[type="range"]:active::-webkit-slider-thumb,
 .slider:active::-webkit-slider-thumb {
-  border-left-color: var(--btn-dark);
-  border-top-color: var(--btn-dark);
-  border-right-color: var(--btn-light);
-  border-bottom-color: var(--btn-light);
+  transform: scale(1.08);
 }
 
 .sliderValue {
-  width: 34px;
-  flex: none;
+  min-width: 36px;
   text-align: right;
   font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--text);
+  font-size: 12.5px;
 }
 
-.pathRow {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-/* Список стикеров: та же врезанная (inset) рамка, что у numberInput/select,
-   строки — плоские, разделены hr-подобной линией, без карточек/теней —
-   словарь HL2 не знает таких элементов. */
+/* ---------- Sticker / Preset / Denylist Lists ---------- */
 .stickerList {
   flex: 1;
-  min-height: 0;
+  min-height: 140px;
+  max-height: 320px;
   overflow-y: auto;
-  background-color: var(--input-bg);
-  border-left: 1px solid var(--input-dark);
-  border-top: 1px solid var(--input-dark);
-  border-right: 1px solid var(--input-light);
-  border-bottom: 1px solid var(--input-light);
-}
-
-.stickerList::-webkit-scrollbar {
-  width: 10px;
-}
-
-.stickerList::-webkit-scrollbar-track {
-  background-color: var(--input-bg);
-  border-top: 1px solid var(--input-dark);
-  border-left: 1px solid var(--input-dark);
-}
-
-.stickerList::-webkit-scrollbar-thumb {
-  background-color: var(--btn-bg);
-  border: 1px solid;
-  border-left-color: var(--btn-light);
-  border-top-color: var(--btn-light);
-  border-right-color: var(--btn-dark);
-  border-bottom-color: var(--btn-dark);
-}
-
-.stickerList::-webkit-scrollbar-thumb:hover {
-  background-color: var(--accent);
+  background: var(--sunken-bg);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-ctl);
+  box-shadow:
+    inset 0 1px 3px rgba(0, 0, 0, 0.5),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.055);
+  display: flex;
+  flex-direction: column;
 }
 
 .stickerRow {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--input-dark);
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  transition: background var(--t-hover) var(--ease-out);
 }
 
 .stickerRow:last-child {
   border-bottom: none;
 }
 
-.stickerThumb {
-  width: 32px;
-  height: 32px;
-  flex: none;
-  object-fit: contain;
-  background-color: var(--bg-dark);
-  border-left: 1px solid var(--input-dark);
-  border-top: 1px solid var(--input-dark);
-  border-right: 1px solid var(--input-light);
-  border-bottom: 1px solid var(--input-light);
+.stickerRow:hover {
+  background: rgba(255, 255, 255, 0.035);
 }
 
 .stickerInfo {
@@ -587,11 +970,14 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--text);
 }
 
 .stickerMeta {
   font-size: 11px;
-  opacity: 0.55;
+  color: var(--text-dim);
 }
 
 .stickerRow.disabled .stickerName,
@@ -601,12 +987,64 @@ body {
 
 .stickerActions {
   display: flex;
-  gap: 4px;
+  align-items: center;
+  gap: 6px;
   flex: none;
 }
 
 .emptyHint {
-  padding: 16px;
-  opacity: 0.55;
+  padding: 32px 16px;
+  color: var(--text-faint);
   text-align: center;
+  font-size: 12.5px;
+  margin: auto;
+}
+
+/* ---------- Footer / Status Bar ---------- */
+.footer {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--stroke);
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.02) 0%,
+    rgba(255, 255, 255, 0.04) 100%
+  );
+  justify-content: flex-end;
+}
+
+.status {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+  min-height: 16px;
+  flex-grow: 1;
+  text-align: left;
+  white-space: pre-line;
+}
+
+/* ---------- Scrollbars ---------- */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  transition: background var(--t-hover) var(--ease-out);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+  background-clip: content-box;
 }

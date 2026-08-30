@@ -126,6 +126,27 @@ fn draw_primitives(canvas: &mut Canvas, prims: &[Primitive]) {
                 let a = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
                 canvas.for_each_pixel(rect, |_, _| (*color, a));
             }
+            // Стекло в превью рисуется настоящим растром `rst_render::glass`
+            // — иначе картинка врала бы про самое заметное: материал панели.
+            Primitive::Glass {
+                rect,
+                radius,
+                surface,
+                glow,
+                opacity,
+            } => {
+                let pad = rst_render::glass::glow_pad_px(*glow);
+                let w = ((rect.w * SCALE).round().max(1.0) as u32) + 2 * pad;
+                let h = ((rect.h * SCALE).round().max(1.0) as u32) + 2 * pad;
+                let rgba = rst_render::glass::glass_rgba(w, h, radius * SCALE, *surface, *glow);
+                let pad_dip = f64::from(pad) / SCALE;
+                let inflated = Box2D {
+                    w: rect.w + 2.0 * pad_dip,
+                    h: rect.h + 2.0 * pad_dip,
+                    ..*rect
+                };
+                canvas.blit(&inflated, &rgba, w, h, *opacity);
+            }
             Primitive::Text {
                 rect,
                 text,
@@ -286,7 +307,7 @@ fn ui_preview_png() {
         h: th + 12.0,
         rotation: 0.0,
     };
-    rst_render::settings_frame(&mut tip, frame, 1.0);
+    rst_render::tooltip_frame(&mut tip, frame, 1.0);
     tip.push(Primitive::Text {
         rect: Box2D {
             w: tw,
@@ -294,7 +315,7 @@ fn ui_preview_png() {
             ..frame
         },
         text: text.to_string(),
-        color: rst_render::theme::settings::TEXT,
+        color: rst_render::theme::TEXT,
         opacity: 1.0,
     });
     draw_primitives(&mut canvas, &tip);
@@ -426,7 +447,7 @@ fn ui_preview_png() {
                 &mut canvas,
                 &[Primitive::Fill {
                     rect,
-                    color: rst_render::theme::settings::BTN_BG,
+                    color: rst_render::theme::PANEL_BG,
                     opacity: 1.0,
                 }],
             );

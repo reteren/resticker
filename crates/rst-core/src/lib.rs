@@ -28,6 +28,7 @@ pub mod selection_set;
 pub mod sizing;
 pub mod snap;
 pub mod transform_ops;
+pub mod ui_motion;
 pub mod undo;
 
 pub use animation_clock::AnimationClock;

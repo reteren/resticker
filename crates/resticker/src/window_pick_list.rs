@@ -15,6 +15,11 @@
 //! названиями снимает эту неопределённость — обработка клика по строке
 //! (`handle_window_pick_list_up`) живёт в overlay_manager.rs, тем же
 //! местом, что у `handle_preset_picker_up`.
+//!
+//! Материал — Dark Liquid Glass (`docs/DESIGN_LIQUID_GLASS.md`): корпус —
+//! плита стекла, строки списка — карточки (§8.8) с интерактивной кнопкой
+//! поверх, слот иконки — утопленный жёлоб (`SUNKEN_BG`). Старый тёмный фон
+//! `PANEL_BG` и плоские заливки больше не используются.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -22,8 +27,8 @@ use std::hash::{Hash, Hasher};
 use rst_core::model::OverlapRule;
 use rst_core::occluders::is_denylisted;
 use rst_render::{
-    Box2D, Button, ButtonContent, Label, Panel, Primitive, ScrollBar, Widget, WidgetId, text_size,
-    theme,
+    Box2D, Button, ButtonContent, Panel, Primitive, ScrollBar, Widget, WidgetId, glass_card,
+    glass_sunken, text_size, theme,
 };
 use rst_win32::window_enum::{WindowIcon, WindowInfo};
 
@@ -49,18 +54,18 @@ const EMPTY_LABEL_ID: WidgetId = 598;
 /// `Button` под тем же индексом + неинтерактивная надпись поверх неё, оба
 /// виджета делят видимый прямоугольник строки).
 const LABEL_FLAG: WidgetId = 0x8000_0000;
+/// Флаг для id карточки строки — неинтерактивное «тело» строки под кнопкой
+/// (тот же приём, что `LABEL_FLAG`: id не пересекается с `ROW_BASE + i`,
+/// который декодирует координатор).
+const CARD_FLAG: WidgetId = 0x4000_0000;
 
-/// Ширина панели, DIP.
+/// Ширина панели, DIP. Токена в §3 нет — панель остаётся своей ширины.
 pub const WIDTH: f64 = 320.0;
-/// Внутренний отступ, DIP.
-const PAD: f64 = 6.0;
-/// Зазор между строками, DIP.
-const ROW_GAP: f64 = 4.0;
-/// Сторона слота иконки строки, DIP — тот же размер, что
+/// Сторона слота иконки строки, DIP. Токена в §3 нет; тот же размер, что
 /// `window_picker::PICKER_ICON_SIZE` (визуальная параллель с «Слои
 /// видимости», ближайшим аналогом этой панели в D3D11-рендере).
 const ICON_SIZE: f64 = 20.0;
-/// Зазор между иконкой и текстом строки, DIP — тот же, что
+/// Зазор между иконкой и текстом строки, DIP. Токена в §3 нет; тот же, что
 /// `window_picker::PICKER_GAP`.
 const ICON_GAP: f64 = 8.0;
 /// Сколько строк списка влезает в панель без скролла (виртуализация, тот
@@ -71,7 +76,7 @@ pub const VISIBLE_ROWS: usize = 10;
 /// список выше `VISIBLE_ROWS` строк не растягивает панель, скроллится).
 pub fn height(visible_count: usize) -> f64 {
     let rows = visible_count.clamp(1, VISIBLE_ROWS) as f64;
-    2.0 * PAD + rows * theme::BUTTON_SIZE + (rows - 1.0) * ROW_GAP
+    2.0 * theme::PAD_PANEL + rows * theme::BUTTON_SIZE + (rows - 1.0) * theme::GAP_ROW
 }
 
 /// Снимок, отсортированный по z-order (как в Alt+Tab, верхнее окно первым)
@@ -148,6 +153,124 @@ pub struct PickListPanel {
     pub total_rows: usize,
 }
 
+/// Статичная надпись с явной непрозрачностью (§2.3): белый `theme::TEXT`,
+/// второстепенность задаётся токеном альфы, а не отдельным серым цветом.
+/// Своя, а не `rst_render::Label`: у того `set_dim` зашит на 0.5, токенов
+/// §2.3 там нет — а подсказка пустого списка должна жить на
+/// `TEXT_DIM_OPACITY`.
+struct StaticText {
+    id: WidgetId,
+    rect: Box2D,
+    text: String,
+    /// Непрозрачность текста — токен §2.3.
+    opacity: f64,
+}
+
+impl StaticText {
+    /// Надпись с левым краем `left` и центром строки `cy` (DIP) на
+    /// непрозрачности `opacity`.
+    fn new(id: WidgetId, left: f64, cy: f64, text: &str, opacity: f64) -> Self {
+        let (tw, th) = text_size(text);
+        Self {
+            id,
+            rect: Box2D {
+                cx: left + tw / 2.0,
+                cy,
+                w: tw,
+                h: th,
+                rotation: 0.0,
+            },
+            text: text.to_string(),
+            opacity,
+        }
+    }
+}
+
+impl Widget for StaticText {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.rect = bounds;
+    }
+
+    /// Не интерактивна — клики/hover сквозь неё.
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        out.push(Primitive::Text {
+            rect: self.rect,
+            text: self.text.clone(),
+            color: theme::TEXT,
+            opacity: self.opacity,
+        });
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Карточка строки списка (§8.8): «тело» строки — тёмная плита стекла с
+/// кромками, лежащая под интерактивной кнопкой строки. Поверх неё кнопка
+/// продавливается и светит гало (§5); карточка остаётся видимой по краям
+/// и в зазорах между строками.
+struct RowCard {
+    id: WidgetId,
+    bounds: Box2D,
+}
+
+impl RowCard {
+    fn new(id: WidgetId, bounds: Box2D) -> Self {
+        Self { id, bounds }
+    }
+}
+
+impl Widget for RowCard {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.bounds
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.bounds = bounds;
+    }
+
+    /// Декорация: события строки принимает кнопка над ней.
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        // Радиус совпадает с авто-радиусом кнопки строки (RADIUS_TIGHT для
+        // высоты ≤ BUTTON_SIZE): иначе из-под кнопки выглядывали бы углы
+        // карточки с другим скруглением.
+        glass_card(out, self.bounds, theme::RADIUS_TIGHT, 1.0);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 /// Иконка + подпись строки (визуальный аналог `window_picker::RowLabel` —
 /// не переиспользуется напрямую, тот приватен и завязан на бизнес-логику
 /// панели правил соседства, здесь только отрисовка). Не интерактивна: клики
@@ -172,7 +295,14 @@ impl Widget for RowContent {
     }
 
     fn set_bounds(&mut self, bounds: Box2D) {
-        self.text_rect = bounds;
+        // Панель едет целиком: сдвигаем ОБА прямоугольника (текст и иконку)
+        // на разницу координат — иначе иконка отстала бы от строки.
+        let dx = bounds.cx - self.text_rect.cx;
+        let dy = bounds.cy - self.text_rect.cy;
+        self.text_rect.cx += dx;
+        self.text_rect.cy += dy;
+        self.icon_rect.cx += dx;
+        self.icon_rect.cy += dy;
     }
 
     fn hit_test(&self, _pos: (f64, f64)) -> bool {
@@ -189,18 +319,16 @@ impl Widget for RowContent {
                 rgba: icon.rgba.clone(),
                 opacity: 1.0,
             }),
-            None => out.push(Primitive::Fill {
-                rect: self.icon_rect,
-                color: theme::BUTTON_BG,
-                opacity: 1.0,
-            }),
+            // Слота без иконки — утопленный жёлоб (§2.2 SUNKEN_BG): тёмная
+            // ямка читается как «сюда встанет иконка», а не как грязь.
+            None => glass_sunken(out, self.icon_rect, theme::RADIUS_TIGHT, 1.0),
         }
         if !self.text.is_empty() {
             out.push(Primitive::Text {
                 rect: self.text_rect,
                 text: self.text.clone(),
                 color: theme::TEXT,
-                opacity: 1.0,
+                opacity: theme::TEXT_OPACITY,
             });
         }
     }
@@ -224,42 +352,50 @@ impl Widget for RowContent {
 /// рисуется приглушённая подсказка по центру панели (полироль: раньше
 /// пустая панель ничем не отличалась от зависшей/незагруженной).
 pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPanel {
-    let mut panel = Panel::new(PANEL_ID, frame);
-    let top = frame.cy - frame.h / 2.0 + PAD;
+    let mut panel = Panel::new(PANEL_ID, frame).with_corner_radius(theme::RADIUS_CARD);
+    let top = frame.cy - frame.h / 2.0 + theme::PAD_PANEL;
     // Полоса скролла (ниже) всегда откусывает свою колонку от правого края —
     // ширина строк не скачет в зависимости от того, нужен ли сейчас скролл
     // (тот же приём, что `window_picker::build_picker_panel`).
-    let row_w = frame.w - 2.0 * PAD - theme::SCROLLBAR_WIDTH - ROW_GAP;
-    let row_left = frame.cx - row_w / 2.0 - theme::SCROLLBAR_WIDTH / 2.0 - ROW_GAP / 2.0;
+    let row_w = frame.w - 2.0 * theme::PAD_PANEL - theme::SCROLLBAR_WIDTH - theme::GAP_ROW;
+    let row_left = frame.cx - row_w / 2.0 - theme::SCROLLBAR_WIDTH / 2.0 - theme::GAP_ROW / 2.0;
     let icon_cx = row_left + ICON_SIZE / 2.0;
     let text_left = icon_cx + ICON_SIZE / 2.0 + ICON_GAP;
     let row_right = row_left + row_w;
     let max_text_w = (row_right - text_left).max(0.0);
 
     if sorted.is_empty() {
-        let mut label = Label::new(EMPTY_LABEL_ID, row_left, frame.cy, "No windows available");
-        label.set_dim(true);
-        panel.add_widget(label);
+        panel.add_widget(StaticText::new(
+            EMPTY_LABEL_ID,
+            row_left,
+            frame.cy,
+            "No windows available",
+            theme::TEXT_DIM_OPACITY,
+        ));
     }
 
     for (i, window) in sorted.iter().enumerate().skip(scroll).take(VISIBLE_ROWS) {
         let visible_index = i - scroll;
-        let cy =
-            top + visible_index as f64 * (theme::BUTTON_SIZE + ROW_GAP) + theme::BUTTON_SIZE / 2.0;
+        let cy = top
+            + visible_index as f64 * (theme::BUTTON_SIZE + theme::GAP_ROW)
+            + theme::BUTTON_SIZE / 2.0;
         let id = ROW_BASE + i as WidgetId;
-        // Фон + hover/armed-подсветка + хит-тест строки — без своей надписи
-        // (иначе конвейер спрайтов растянул бы текстуру текста на всю
-        // ширину строки, см. регрессионный тест в rst-render `widgets.rs`);
-        // содержимое рисует `RowContent` поверх.
+        let row_bounds = Box2D {
+            cx: row_left + row_w / 2.0,
+            cy,
+            w: row_w,
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        };
+        // Карточка-тело строки, под кнопкой: кнопка даёт hover/armed
+        // подсветку и хит-тест (без своей надписи — иначе конвейер спрайтов
+        // растянул бы текстуру текста на всю ширину строки, см. регрессионный
+        // тест в rst-render `widgets.rs`); содержимое рисует `RowContent`
+        // поверх.
+        panel.add_widget(RowCard::new(id + CARD_FLAG, row_bounds));
         panel.add_widget(Button::new(
             id,
-            Box2D {
-                cx: row_left + row_w / 2.0,
-                cy,
-                w: row_w,
-                h: theme::BUTTON_SIZE,
-                rotation: 0.0,
-            },
+            row_bounds,
             ButtonContent::Label(String::new()),
         ));
         let label = row_label(window, max_text_w);
@@ -291,11 +427,12 @@ pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPane
         // позиции скролла: панель не меняет размер (`height()` капается на
         // VISIBLE_ROWS), последняя страница просто может быть неполной
         // (тот же принцип, что у `window_picker`).
-        let list_h = VISIBLE_ROWS as f64 * theme::BUTTON_SIZE + (VISIBLE_ROWS - 1) as f64 * ROW_GAP;
+        let list_h =
+            VISIBLE_ROWS as f64 * theme::BUTTON_SIZE + (VISIBLE_ROWS - 1) as f64 * theme::GAP_ROW;
         panel.add_widget(ScrollBar::new(
             SCROLLBAR_ID,
             Box2D {
-                cx: frame.cx + frame.w / 2.0 - PAD - theme::SCROLLBAR_WIDTH / 2.0,
+                cx: frame.cx + frame.w / 2.0 - theme::PAD_PANEL - theme::SCROLLBAR_WIDTH / 2.0,
                 cy: top + list_h / 2.0,
                 w: theme::SCROLLBAR_WIDTH,
                 h: list_h,
@@ -316,6 +453,7 @@ pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPane
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rst_render::glass::Surface;
     use std::path::PathBuf;
 
     fn window(exe: &str, title: &str, z: u32) -> WindowInfo {
@@ -482,22 +620,23 @@ mod tests {
         assert!(text.len() < snapshot[0].title.len());
     }
 
-    /// Полироль: строка без иконки окна рисует плейсхолдер-квадрат (тот же
+    /// Полироль: строка без иконки окна рисует утопленный слот (тот же
     /// приём, что `window_picker::RowLabel`), не оставляет колонку иконки
     /// пустой/невидимой.
     #[test]
-    fn row_without_icon_draws_placeholder_fill() {
+    fn row_without_icon_draws_sunken_placeholder_slot() {
         let snapshot = [window(r"C:\Apps\app.exe", "App", 0)];
         let sorted = sorted_snapshot(&snapshot);
         let p = build(&sorted, 0, frame(height(1)));
         let mut out = Vec::new();
         p.panel.draw(&mut out);
-        let has_icon_placeholder = out.iter().any(|prim| {
-            matches!(prim, Primitive::Fill { rect, .. } if rect.w == ICON_SIZE && rect.h == ICON_SIZE)
+        let has_sunken_slot = out.iter().any(|prim| {
+            matches!(prim, Primitive::Glass { surface: Surface::Sunken, rect, .. }
+                if rect.w == ICON_SIZE && rect.h == ICON_SIZE)
         });
         assert!(
-            has_icon_placeholder,
-            "нет иконки — рисуется плейсхолдер-квадрат"
+            has_sunken_slot,
+            "нет иконки — рисуется утопленный слот стекла"
         );
     }
 
@@ -631,6 +770,30 @@ mod tests {
         assert!(
             b1.cy + b1.h / 2.0 <= f.cy + f.h / 2.0,
             "последняя строка в рамке"
+        );
+    }
+
+    #[test]
+    fn rows_are_drawn_as_card_surfaces() {
+        // §8.8: строка списка — карточка стекла. Раньше фон строки был
+        // плоской заливкой кнопки, теперь под кнопкой лежит Card-плита.
+        let snapshot = [window(r"C:\Apps\a.exe", "A", 0)];
+        let sorted = sorted_snapshot(&snapshot);
+        let p = build(&sorted, 0, frame(height(1)));
+        let mut out = Vec::new();
+        p.panel.draw(&mut out);
+        let has_card = out.iter().any(|prim| {
+            matches!(
+                prim,
+                Primitive::Glass {
+                    surface: Surface::Card,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_card,
+            "строка списка обязана быть карточкой стекла (§8.8)"
         );
     }
 }

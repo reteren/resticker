@@ -20,6 +20,7 @@
         "decorations": false,
         "transparent": true,
         "shadow": false,
+        "theme": "dark",
         "windowEffects": {
           "effects": ["acrylic"]
         }

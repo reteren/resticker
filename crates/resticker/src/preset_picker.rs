@@ -14,13 +14,17 @@
 //! со списком, панель при них НЕ закрывается: сохранил — видишь новую
 //! строку, удалил — строка исчезла.
 //!
-//! Оформление — та же стилистика окна настроек, что у остальных панелей
-//! (VGUI, скруглённые углы).
+//! Оформление — Dark Liquid Glass (docs/DESIGN_LIQUID_GLASS.md): корпус —
+//! плита чёрного стекла с радиусом окна (§3 `RADIUS_WINDOW`), строки и
+//! кнопки действий — стекло с фазами наведения/нажатия (кнопки rst-render
+//! анимируют сами). Крестик удаления — единственный цвет интерфейса
+//! [`DANGER`] (§2.4): тонкое предупреждение, не заливка.
 
 use rst_core::model::Preset;
+use rst_render::glass::STROKE_ALPHA;
 use rst_render::{
-    Box2D, Button, ButtonContent, Divider, LINE_HEIGHT, Label, Panel, TextField, WidgetId,
-    WidgetStyle, text_size, theme,
+    Box2D, Button, ButtonContent, LINE_HEIGHT, Label, Panel, Primitive, TextField, Widget,
+    WidgetId, text_size, theme,
 };
 
 use crate::window_picker::truncate_to_width;
@@ -47,18 +51,9 @@ const ID_EMPTY: WidgetId = 415;
 /// Разделитель между списком и действиями.
 const ID_DIVIDER: WidgetId = 416;
 
-/// Ширина панели, DIP.
+/// Ширина панели, DIP. В §3 токена нет — панель пресетов не менялась,
+/// оставлена именованной константой модуля.
 pub const WIDTH: f64 = 320.0;
-/// Внутренний отступ, DIP.
-const PAD: f64 = 12.0;
-/// Зазор между строками, DIP.
-const ROW_GAP: f64 = 4.0;
-/// Зазор между блоками (заголовок / список / действия), DIP.
-const SECTION_GAP: f64 = 10.0;
-/// Высота строки списка и кнопок действий, DIP.
-const ROW_H: f64 = 28.0;
-/// Сторона кнопки удаления строки, DIP.
-const DELETE_W: f64 = 28.0;
 /// Максимум строк без прокрутки: дальше список просто обрезается — панель
 /// не должна перерастать экран, а десятки пресетов редактируются в
 /// настройках.
@@ -76,6 +71,11 @@ const NAME_PLACEHOLDER: &str = "New preset name";
 const NAME_MAX_LEN: usize = 64;
 const DELETE_MARK: &str = "x";
 
+/// §2.4 `DANGER` — единственный цвет во всём интерфейсе (#D0463C), только
+/// тонкие предупреждения. Псевдоним общего токена: константа заведена в
+/// `rst_render::theme`, дублировать её по модулям нельзя (§9.1).
+use rst_render::theme::DANGER;
+
 /// Сколько строк реально показывается для `count` пресетов (пустой список
 /// занимает одну строку под подпись).
 fn visible_rows(count: usize) -> usize {
@@ -85,17 +85,17 @@ fn visible_rows(count: usize) -> usize {
 /// Высота панели под `count` пресетов.
 pub fn height(count: usize) -> f64 {
     let rows = visible_rows(count) as f64;
-    2.0 * PAD
+    2.0 * theme::PAD_PANEL
         + LINE_HEIGHT
-        + SECTION_GAP
-        + rows * ROW_H
-        + (rows - 1.0) * ROW_GAP
-        + SECTION_GAP
-        + 1.0
-        + SECTION_GAP
-        + ROW_H
-        + ROW_GAP
-        + ROW_H
+        + theme::GAP_ROW
+        + rows * theme::BUTTON_SIZE
+        + (rows - 1.0) * theme::GAP_ROW
+        + theme::GAP_ROW
+        + theme::HAIRLINE
+        + theme::GAP_ROW
+        + theme::BUTTON_SIZE
+        + theme::GAP_ROW
+        + theme::BUTTON_SIZE
 }
 
 /// Собрать панель: заголовок, список пресетов (строка = применить, «x» —
@@ -106,11 +106,11 @@ pub fn height(count: usize) -> f64 {
 /// вызывающего кода).
 pub fn build(presets: &[Preset], name_draft: &str, frame: Box2D) -> Panel {
     let mut panel = Panel::new(PANEL_ID, frame)
-        .with_style(WidgetStyle::Settings)
-        .with_corner_radius(theme::settings::CORNER_RADIUS);
-    let left = frame.cx - frame.w / 2.0 + PAD;
-    let right = frame.cx + frame.w / 2.0 - PAD;
-    let top = frame.cy - frame.h / 2.0 + PAD;
+        // Радиус окна (§3): панель пресетов — большая панель, как модал.
+        .with_corner_radius(theme::RADIUS_WINDOW);
+    let left = frame.cx - frame.w / 2.0 + theme::PAD_PANEL;
+    let right = frame.cx + frame.w / 2.0 - theme::PAD_PANEL;
+    let top = frame.cy - frame.h / 2.0 + theme::PAD_PANEL;
     let content_w = right - left;
 
     // Заголовок.
@@ -118,62 +118,61 @@ pub fn build(presets: &[Preset], name_draft: &str, frame: Box2D) -> Panel {
     panel.add_widget(Label::new(ID_TITLE, left, title_cy, TITLE_LABEL));
 
     // Список пресетов.
-    let list_top = title_cy + LINE_HEIGHT / 2.0 + SECTION_GAP;
+    let list_top = title_cy + LINE_HEIGHT / 2.0 + theme::GAP_ROW;
     if presets.is_empty() {
-        let mut empty = Label::new(
+        // Подпись пустого списка — второстепенная: белый свет на
+        // `TEXT_DIM_OPACITY` (§2.3), отдельных серых цветов больше нет.
+        panel.add_widget(DimLabel::new(
             ID_EMPTY,
             left,
-            list_top + ROW_H / 2.0,
+            list_top + theme::BUTTON_SIZE / 2.0,
             &truncate_to_width(EMPTY_LABEL, content_w),
-        );
-        empty.set_dim(true);
-        panel.add_widget(empty);
+        ));
     }
     for (i, preset) in presets.iter().take(VISIBLE_ROWS).enumerate() {
-        let cy = list_top + i as f64 * (ROW_H + ROW_GAP) + ROW_H / 2.0;
-        let row_w = content_w - DELETE_W - ROW_GAP;
-        let label = truncate_to_width(&preset.name, row_w - 2.0 * theme::BUTTON_PAD);
-        panel.add_widget(
-            Button::new(
-                ROW_BASE + i as WidgetId,
-                Box2D {
-                    cx: left + row_w / 2.0,
-                    cy,
-                    w: row_w,
-                    h: ROW_H,
-                    rotation: 0.0,
-                },
-                ButtonContent::Label(label),
-            )
-            .with_style(WidgetStyle::Settings),
-        );
+        let cy =
+            list_top + i as f64 * (theme::BUTTON_SIZE + theme::GAP_ROW) + theme::BUTTON_SIZE / 2.0;
+        let row_w = content_w - theme::BUTTON_SIZE - theme::GAP_ROW;
+        let label = truncate_to_width(&preset.name, row_w - 2.0 * theme::PAD_CTRL_X);
+        panel.add_widget(Button::new(
+            ROW_BASE + i as WidgetId,
+            Box2D {
+                cx: left + row_w / 2.0,
+                cy,
+                w: row_w,
+                h: theme::BUTTON_SIZE,
+                rotation: 0.0,
+            },
+            ButtonContent::Label(label),
+        ));
+        // Крестик удаления — квадратная кнопка тулбара (§3 `BUTTON_SIZE`)
+        // с опасным знаком: `DANGER` — только тонкие предупреждения.
         panel.add_widget(
             Button::new(
                 DELETE_BASE + i as WidgetId,
                 Box2D {
-                    cx: right - DELETE_W / 2.0,
+                    cx: right - theme::BUTTON_SIZE / 2.0,
                     cy,
-                    w: DELETE_W,
-                    h: ROW_H,
+                    w: theme::BUTTON_SIZE,
+                    h: theme::BUTTON_SIZE,
                     rotation: 0.0,
                 },
                 ButtonContent::Label(DELETE_MARK.to_string()),
             )
-            .with_style(WidgetStyle::Settings)
-            .with_label_color(DANGER_TEXT),
+            .with_label_color(DANGER),
         );
     }
 
     // Разделитель между списком и действиями.
     let rows = visible_rows(presets.len()) as f64;
-    let list_bottom = list_top + rows * ROW_H + (rows - 1.0) * ROW_GAP;
-    let divider_cy = list_bottom + SECTION_GAP;
-    panel.add_widget(Divider::new(ID_DIVIDER, frame.cx, divider_cy, content_w));
+    let list_bottom = list_top + rows * theme::BUTTON_SIZE + (rows - 1.0) * theme::GAP_ROW;
+    let divider_cy = list_bottom + theme::GAP_ROW;
+    panel.add_widget(Hairline::new(ID_DIVIDER, frame.cx, divider_cy, content_w));
 
     // Поле имени + «сохранить».
-    let save_w = text_size(SAVE_LABEL).0 + 2.0 * theme::FIELD_PAD + 12.0;
-    let save_cy = divider_cy + SECTION_GAP + ROW_H / 2.0;
-    let field_w = content_w - save_w - ROW_GAP;
+    let save_w = text_size(SAVE_LABEL).0 + 2.0 * theme::PAD_CTRL_X;
+    let save_cy = divider_cy + theme::GAP_ROW + theme::BUTTON_SIZE / 2.0;
+    let field_w = content_w - save_w - theme::GAP_ROW;
     panel.add_widget(
         TextField::with_placeholder(
             FIELD_NAME,
@@ -181,69 +180,181 @@ pub fn build(presets: &[Preset], name_draft: &str, frame: Box2D) -> Panel {
                 cx: left + field_w / 2.0,
                 cy: save_cy,
                 w: field_w,
-                h: ROW_H,
+                h: theme::BUTTON_SIZE,
                 rotation: 0.0,
             },
             name_draft,
             NAME_MAX_LEN,
             NAME_PLACEHOLDER,
         )
-        .with_style(WidgetStyle::Settings)
         .keep_on_blur(),
     );
-    panel.add_widget(
-        Button::new(
-            BTN_SAVE,
-            Box2D {
-                cx: right - save_w / 2.0,
-                cy: save_cy,
-                w: save_w,
-                h: ROW_H,
-                rotation: 0.0,
-            },
-            ButtonContent::Label(SAVE_LABEL.to_string()),
-        )
-        .with_style(WidgetStyle::Settings),
-    );
+    panel.add_widget(Button::new(
+        BTN_SAVE,
+        Box2D {
+            cx: right - save_w / 2.0,
+            cy: save_cy,
+            w: save_w,
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label(SAVE_LABEL.to_string()),
+    ));
 
     // Импорт и закрытие.
-    let actions_cy = save_cy + ROW_H / 2.0 + ROW_GAP + ROW_H / 2.0;
-    let import_w = text_size(IMPORT_LABEL).0 + 2.0 * theme::FIELD_PAD + 12.0;
-    let close_w = text_size(CLOSE_LABEL).0 + 2.0 * theme::FIELD_PAD + 12.0;
-    panel.add_widget(
-        Button::new(
-            BTN_IMPORT,
-            Box2D {
-                cx: left + import_w / 2.0,
-                cy: actions_cy,
-                w: import_w,
-                h: ROW_H,
-                rotation: 0.0,
-            },
-            ButtonContent::Label(IMPORT_LABEL.to_string()),
-        )
-        .with_style(WidgetStyle::Settings),
-    );
-    panel.add_widget(
-        Button::new(
-            BTN_CLOSE,
-            Box2D {
-                cx: right - close_w / 2.0,
-                cy: actions_cy,
-                w: close_w,
-                h: ROW_H,
-                rotation: 0.0,
-            },
-            ButtonContent::Label(CLOSE_LABEL.to_string()),
-        )
-        .with_style(WidgetStyle::Settings),
-    );
+    let actions_cy = save_cy + theme::BUTTON_SIZE / 2.0 + theme::GAP_ROW + theme::BUTTON_SIZE / 2.0;
+    let import_w = text_size(IMPORT_LABEL).0 + 2.0 * theme::PAD_CTRL_X;
+    let close_w = text_size(CLOSE_LABEL).0 + 2.0 * theme::PAD_CTRL_X;
+    panel.add_widget(Button::new(
+        BTN_IMPORT,
+        Box2D {
+            cx: left + import_w / 2.0,
+            cy: actions_cy,
+            w: import_w,
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label(IMPORT_LABEL.to_string()),
+    ));
+    panel.add_widget(Button::new(
+        BTN_CLOSE,
+        Box2D {
+            cx: right - close_w / 2.0,
+            cy: actions_cy,
+            w: close_w,
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label(CLOSE_LABEL.to_string()),
+    ));
 
     panel
 }
 
-/// Цвет крестика удаления — тот же `.button.danger`, что в модале удаления.
-const DANGER_TEXT: [u8; 3] = [0xff, 0xb0, 0xb0];
+/// Второстепенная подпись: белый текст на [`theme::TEXT_DIM_OPACITY`] вместо
+/// отдельного серого цвета — «цвет» интерфейса один, свет разной силы (§2.3).
+/// Своя, а не [`Label`] с `set_dim`: у `Label` приглушение зашито числом 0.5,
+/// а здесь непрозрачность — из токена темы.
+struct DimLabel {
+    id: WidgetId,
+    rect: Box2D,
+    text: String,
+}
+
+impl DimLabel {
+    /// Подпись с левым краем в `left` и центром по вертикали в `cy` — та же
+    /// геометрия, что у [`Label`].
+    fn new(id: WidgetId, left: f64, cy: f64, text: &str) -> Self {
+        let (tw, _) = text_size(text);
+        Self {
+            id,
+            rect: Box2D {
+                cx: left + tw / 2.0,
+                cy,
+                w: tw,
+                h: LINE_HEIGHT,
+                rotation: 0.0,
+            },
+            text: text.to_string(),
+        }
+    }
+}
+
+impl Widget for DimLabel {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.rect = bounds;
+    }
+
+    /// Не интерактивна — клики/hover сквозь неё, как у [`Label`].
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        out.push(Primitive::Text {
+            rect: self.rect,
+            text: self.text.clone(),
+            color: theme::TEXT,
+            opacity: theme::TEXT_DIM_OPACITY,
+        });
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Разделитель — волосинка белого света (`STROKE`, §2.1): у стекла нет
+/// тёмной «рамки», разделитель живёт светом на малой непрозрачности.
+/// Свой, а не [`rst_render::Divider`]: у того цвет зашит из старой палитры.
+struct Hairline {
+    id: WidgetId,
+    rect: Box2D,
+}
+
+impl Hairline {
+    /// Горизонтальная линия-разделитель шириной `w` с центром в `(cx, cy)`,
+    /// толщина — волосинка [`theme::HAIRLINE`].
+    fn new(id: WidgetId, cx: f64, cy: f64, w: f64) -> Self {
+        Self {
+            id,
+            rect: Box2D {
+                cx,
+                cy,
+                w,
+                h: theme::HAIRLINE,
+                rotation: 0.0,
+            },
+        }
+    }
+}
+
+impl Widget for Hairline {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.rect = bounds;
+    }
+
+    /// Не интерактивна — клики/hover сквозь неё, как у [`Label`].
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        out.push(Primitive::Fill {
+            rect: self.rect,
+            color: theme::TEXT,
+            opacity: STROKE_ALPHA,
+        });
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -353,6 +464,7 @@ mod tests {
             for prim in &prims {
                 let rect = match prim {
                     Primitive::Fill { rect, .. }
+                    | Primitive::Glass { rect, .. }
                     | Primitive::Icon { rect, .. }
                     | Primitive::Rgba { rect, .. }
                     | Primitive::Text { rect, .. } => rect,

@@ -19,7 +19,7 @@
 //! координатор и передаёт сюда флагом.
 
 use rst_core::hittest::DipRect;
-use rst_render::{Box2D, Button, ButtonContent, Icon, Panel, WidgetId, WidgetStyle, theme};
+use rst_render::{Box2D, Button, ButtonContent, Icon, Panel, WidgetId, theme};
 
 /// Идентификатор панели у курсора. Диапазон 100+; тулбар стикера
 /// (SPEC 3.6) получит свой диапазон отдельно.
@@ -49,13 +49,12 @@ pub const BTN_GROUPS: WidgetId = 107;
 
 /// Сторона кнопки панели, DIP — вдвое больше кнопки тулбара выделения
 /// (запрос пользователя 2026-08-23: «увеличь его размер в 2 раза»). Своя
-/// константа, а не `theme::BUTTON_SIZE`: тулбар стикера остаётся прежним,
-/// он живёт вплотную к стикеру и от размера кнопок там зависит вся
-/// раскладка.
+/// константа с множителем, а не `theme::BUTTON_SIZE` напрямую: пропорция
+/// задержана в одном месте, и повторная правка размера не разъезжается
+/// по формулам раскладки.
 pub const BUTTON_SIZE: f64 = 2.0 * theme::BUTTON_SIZE;
-/// Внутренний отступ панели, DIP.
-const PANEL_PAD: f64 = 12.0;
-/// Зазор между кнопками, DIP.
+/// Зазор между кнопками, DIP. §3 не задаёт зазор между кнопками в ряд —
+/// оставлен прежним. Внутренний отступ панели — `theme::PAD_PANEL` (§3).
 const BUTTON_GAP: f64 = 8.0;
 /// Число кнопок панели: открыть файл, добавить окно, пресеты, группы,
 /// показать/скрыть все, настройки, выход.
@@ -73,8 +72,8 @@ pub const HOVER_MARGIN_DIP: f64 = 7.0;
 /// Размер панели (ширина, высота), DIP: [`BUTTON_COUNT`] кнопок
 /// [`BUTTON_SIZE`] с зазорами и отступами.
 pub const CURSOR_PANEL_SIZE: (f64, f64) = (
-    2.0 * PANEL_PAD + BUTTON_COUNT * BUTTON_SIZE + (BUTTON_COUNT - 1.0) * BUTTON_GAP,
-    2.0 * PANEL_PAD + BUTTON_SIZE,
+    2.0 * theme::PAD_PANEL + BUTTON_COUNT * BUTTON_SIZE + (BUTTON_COUNT - 1.0) * BUTTON_GAP,
+    2.0 * theme::PAD_PANEL + BUTTON_SIZE,
 );
 
 /// Центр панели (DIP) на экране `screen` при степени раскрытия `progress`
@@ -125,12 +124,10 @@ pub fn build_cursor_panel(screen: &DipRect, all_visible: bool, progress: f64) ->
         h,
         rotation: 0.0,
     };
-    // Оформление — стилистика окна настроек (Source VGUI), как у тулбара
-    // стикера и панели свойств закреплённого окна (запрос пользователя
-    // 2026-08-23): весь UI поверх экрана читается как одно окно продукта.
-    let mut panel = Panel::new(CURSOR_PANEL_ID, frame)
-        .with_style(WidgetStyle::Settings)
-        .with_corner_radius(theme::settings::CORNER_RADIUS);
+    // Корпус — плита чёрного стекла (§4): материал и кромки рисует сам
+    // `Panel::draw` через `glass_panel`. Радиус — `RADIUS_CARD` (§3):
+    // свободно плавающая панель у края экрана читается как карточка.
+    let mut panel = Panel::new(CURSOR_PANEL_ID, frame).with_corner_radius(theme::RADIUS_CARD);
 
     let toggle_icon = if all_visible {
         Icon::HideAll
@@ -147,23 +144,20 @@ pub fn build_cursor_panel(screen: &DipRect, all_visible: bool, progress: f64) ->
         (BTN_EXIT, Icon::Exit),
     ];
     // Горизонтальная полоса: кнопки по центру панели, слева направо.
-    let first_cx = cx - w / 2.0 + PANEL_PAD + BUTTON_SIZE / 2.0;
+    let first_cx = cx - w / 2.0 + theme::PAD_PANEL + BUTTON_SIZE / 2.0;
     for (i, (id, icon)) in buttons.into_iter().enumerate() {
         let bx = first_cx + i as f64 * (BUTTON_SIZE + BUTTON_GAP);
-        panel.add_widget(
-            Button::new(
-                id,
-                Box2D {
-                    cx: bx,
-                    cy,
-                    w: BUTTON_SIZE,
-                    h: BUTTON_SIZE,
-                    rotation: 0.0,
-                },
-                ButtonContent::Icon(icon),
-            )
-            .with_style(WidgetStyle::Settings),
-        );
+        panel.add_widget(Button::new(
+            id,
+            Box2D {
+                cx: bx,
+                cy,
+                w: BUTTON_SIZE,
+                h: BUTTON_SIZE,
+                rotation: 0.0,
+            },
+            ButtonContent::Icon(icon),
+        ));
     }
     panel
 }

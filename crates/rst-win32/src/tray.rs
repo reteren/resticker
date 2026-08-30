@@ -6,14 +6,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, BACKGROUND_MODE, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW,
-    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, FF_DONTCARE, FW_LIGHT, FillRect, GetDC,
-    GetTextExtentPoint32W, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FF_DONTCARE, FW_MEDIUM, FillRect, GetDC,
+    GetTextExtentPoint32W, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, PS_NULL, ReleaseDC, RoundRect,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED};
@@ -23,12 +25,13 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, HICON, HMENU,
-    IDI_APPLICATION, LoadIconW, MENUINFO, MF_DISABLED, MF_OWNERDRAW, MF_POPUP, MIM_APPLYTOSUBMENUS,
-    MIM_BACKGROUND, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    SetMenuInfo, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DRAWITEM,
-    WM_LBUTTONUP, WM_MEASUREITEM, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPED,
+    DestroyWindow, DispatchMessageW, FindWindowW, GWLP_USERDATA, GetCursorPos, GetMessageW, HICON,
+    HMENU, IDI_APPLICATION, LoadIconW, MENUINFO, MF_DISABLED, MF_OWNERDRAW, MF_POPUP,
+    MIM_APPLYTOSUBMENUS, MIM_BACKGROUND, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SetForegroundWindow, SetMenuInfo, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DRAWITEM, WM_INITMENUPOPUP, WM_LBUTTONUP, WM_MEASUREITEM, WM_RBUTTONUP, WNDCLASSEXW,
+    WS_EX_NOACTIVATE, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -349,8 +352,9 @@ fn app_icon() -> Option<HICON> {
     wide.push(0);
     // SAFETY: wide — валидный нуль-терминированный путь на время вызова;
     // индекс 0 — первая (обычно единственная) иконка ресурсов exe.
+    // ExtractIconW возвращает (HICON)1, если в файле нет иконок, или null/invalid при ошибке.
     let icon = unsafe { ExtractIconW(None, PCWSTR(wide.as_ptr()), 0) };
-    if icon.is_invalid() || icon.0.is_null() {
+    if icon.is_invalid() || icon.0.is_null() || icon.0 as usize <= 1 {
         None
     } else {
         Some(icon)
@@ -424,37 +428,53 @@ fn remove_notify_icon(hwnd: HWND) -> Result<(), Win32Error> {
     }
 }
 
-/// Палитра и метрики контекстного меню трея — те же значения, что у
-/// панелей оверлея и окна настроек (Source VGUI): системное меню Windows
-/// выбивалось из продукта (репорт пользователя 2026-08-23).
+/// Палитра и метрики контекстного меню трея — спецификация Dark Liquid Glass (§2, §3).
 ///
-/// Здесь цвета заданы числами, а не взяты из `rst-render`: этот крейт —
-/// платформенный слой и о рендерере ничего не знает (CONTRIBUTING.md,
-/// «правило зависимостей»). Значения обязаны совпадать с
-/// `rst_render::theme::settings`, поэтому рядом стоят имена оттуда.
+/// GDI не поддерживает альфа-прозрачность (alpha blending) для стандартных
+/// всплывающих меню Win32, поэтому полупрозрачные токены палитры (§2) приведены
+/// к их непрозрачным эквивалентам поверх базового фона стекла GLASS_INK_DEEP.
 mod menu_style {
-    /// `settings::BG` — фон меню (поля вокруг кнопок).
-    pub const BG: u32 = 0x0076_7676;
-    /// `settings::BTN_BG` — фон кнопки-пункта.
-    pub const BTN_BG: u32 = 0x007B_7B7B;
-    /// `settings::BTN_BG_HOVER` — кнопка под курсором.
-    pub const BTN_HOVER: u32 = 0x008C_8C8C;
-    /// `settings::BORDER_DARK` / `BORDER_LIGHT` — грани.
-    pub const BORDER_DARK: u32 = 0x0043_4343;
-    pub const BORDER_LIGHT: u32 = 0x00BA_BABB;
-    /// `settings::TEXT` — белый текст пункта.
-    pub const TEXT: u32 = 0x00FF_FFFF;
-    /// Отступ подписи от края кнопки, px.
-    pub const PAD_X: i32 = 18;
-    /// Поле вокруг кнопки внутри пункта, px: между соседними кнопками
-    /// получается двойное — они не слипаются в сплошную стену.
-    pub const BTN_MARGIN: i32 = 3;
-    /// Высота пункта, px (кнопка плюс поля).
-    pub const ITEM_H: i32 = 32;
-    /// Высота разделителя, px.
+    /// Фон меню (§2.1 `GLASS_INK_DEEP` = `#050507` @ 0.74, непрозрачный эквивалент).
+    /// COLORREF: 0x00bbggrr -> R=0x05, G=0x05, B=0x07.
+    pub const BG: u32 = 0x0007_0505;
+
+    /// Строка под курсором (§2.2 `CTRL_BG_HOVER` = `#FFFFFF` @ 0.105 поверх `#050507` -> `#1F1F21`).
+    /// COLORREF: R=0x1F, G=0x1F, B=0x21.
+    pub const CTRL_BG_HOVER: u32 = 0x0021_1F1F;
+
+    /// Волосяная кромка сверху строки при наведении (§2.1 `RIM_TOP` = `#FFFFFF` @ 0.34
+    /// поверх `CTRL_BG_HOVER` `#1F1F21` -> `#6B6B6C`).
+    /// COLORREF: R=0x6B, G=0x6B, B=0x6C.
+    pub const RIM_TOP: u32 = 0x006C_6B6B;
+
+    /// Разделитель (§2.1 `STROKE` = `#FFFFFF` @ 0.12 поверх `#050507` -> `#232325`).
+    /// COLORREF: R=0x23, G=0x23, B=0x25.
+    pub const STROKE: u32 = 0x0025_2323;
+
+    /// Текст пункта меню (§2.3 `TEXT` = `#FFFFFF` @ 0.97 -> `#F7F7F7`).
+    /// COLORREF: R=0xF7, G=0xF7, B=0xF7.
+    pub const TEXT: u32 = 0x00F7_F7F7;
+
+    /// Радиус скругления строки под курсором (§3 `RADIUS_CTRL` = 10 DIP).
+    pub const RADIUS_CTRL: i32 = 10;
+
+    /// Горизонтальный отступ подписи внутри пункта (§3 `PAD_CTRL_X` = 12 DIP).
+    pub const PAD_CTRL_X: i32 = 12;
+
+    /// Боковой отступ плашки контрола от внешнего края меню, px.
+    pub const MARGIN_X: i32 = 4;
+
+    /// Вертикальный зазор между пунктами меню, px.
+    pub const MARGIN_Y: i32 = 2;
+
+    /// Высота пункта меню (§3: просторный пункт, дышит), px.
+    pub const ITEM_H: i32 = 34;
+
+    /// Высота разделителя, px (1px волосяная линия по центру).
     pub const SEPARATOR_H: i32 = 9;
-    /// Кегль подписи, px (тот же 12 DIP, что у панелей, на 100% DPI).
-    pub const FONT_PX: i32 = 15;
+
+    /// Кегль подписи по §6: 12.5 DIP при 96 DPI (CreateFontW: -17 px em-height).
+    pub const FONT_PX: i32 = -17;
 }
 
 /// Данные пункта для owner-draw: Win32 хранит только `dwItemData`, поэтому
@@ -500,8 +520,8 @@ static MENU_FONT_FAMILY: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::ne
 /// гарнитуру, которой набран оверлей — `rst_render::FONT_BYTES`). Без вызова
 /// меню рисуется системным шрифтом: не ошибка, просто не так красиво.
 ///
-/// `family` — имя семейства внутри файла («Roboto Light»); GDI ищет шрифт по
-/// имени, а не по хендлу ресурса.
+/// `family` — имя семейства внутри файла («Roboto Light» / «Commissioner»);
+/// GDI ищет шрифт по имени, а не по хендлу ресурса.
 pub fn register_menu_font(bytes: &'static [u8], family: &str) {
     // SAFETY: bytes живёт всю программу ('static), длина берётся из среза.
     let handle = unsafe {
@@ -522,7 +542,8 @@ pub fn register_menu_font(bytes: &'static [u8], family: &str) {
     let _ = MENU_FONT_FAMILY.set(wide);
 }
 
-/// Шрифт для отрисовки пунктов: зарегистрированное семейство, если оно есть.
+/// Шрифт для отрисовки пунктов: зарегистрированное семейство (Commissioner), если оно есть.
+/// Вес по §6 — FW_MEDIUM (500), кегль — 12.5 DIP.
 fn create_menu_font() -> HFONT {
     let family = MENU_FONT_FAMILY.get();
     let name = family.map_or(PCWSTR::null(), |f| PCWSTR(f.as_ptr()));
@@ -534,7 +555,7 @@ fn create_menu_font() -> HFONT {
             0,
             0,
             0,
-            FW_LIGHT.0 as i32,
+            FW_MEDIUM.0 as i32,
             0,
             0,
             0,
@@ -575,11 +596,11 @@ fn on_measure_item(hwnd: HWND, lparam: LPARAM, font: HFONT) {
         ReleaseDC(Some(hwnd), hdc);
         size.cx
     };
-    mis.itemWidth = (width + 2 * (menu_style::PAD_X + menu_style::BTN_MARGIN)) as u32;
+    mis.itemWidth = (width + 2 * (menu_style::PAD_CTRL_X + menu_style::MARGIN_X)) as u32;
     mis.itemHeight = menu_style::ITEM_H as u32;
 }
 
-/// Обработчик `WM_DRAWITEM`: фон, подсветка, подпись, разделитель.
+/// Обработчик `WM_DRAWITEM`: фон, скруглённая подсветка, кромка, подпись, разделитель.
 fn on_draw_item(lparam: LPARAM, font: HFONT) {
     let Some(dis) = (unsafe { (lparam.0 as *const DRAWITEMSTRUCT).as_ref() }) else {
         return;
@@ -595,89 +616,76 @@ fn on_draw_item(lparam: LPARAM, font: HFONT) {
     // SAFETY: hdc принадлежит системе на время обработки сообщения; все
     // созданные объекты удаляются здесь же, выбранные — возвращаются.
     unsafe {
-        // Поле пункта — фоном меню; сама кнопка рисуется внутри с отступом.
+        // Фоновая заливка пункта цветом стекла GLASS_INK_DEEP (§2.1)
         let bg = CreateSolidBrush(COLORREF(menu_style::BG));
         FillRect(hdc, &rect, bg);
         let _ = DeleteObject(bg.into());
 
         if item.separator {
-            // Канавка VGUI: тёмная линия и светлая под ней.
+            // Волосяная линия STROKE (1 px) с боковыми отступами PAD_CTRL_X, без объёма/канавки VGUI (§2.1, §4)
             let mid = (rect.top + rect.bottom) / 2;
-            for (y, color) in [
-                (mid, menu_style::BORDER_DARK),
-                (mid + 1, menu_style::BORDER_LIGHT),
-            ] {
-                let line = RECT {
-                    left: rect.left + menu_style::PAD_X / 2,
-                    top: y,
-                    right: rect.right - menu_style::PAD_X / 2,
-                    bottom: y + 1,
-                };
-                let brush = CreateSolidBrush(COLORREF(color));
-                FillRect(hdc, &line, brush);
-                let _ = DeleteObject(brush.into());
-            }
+            let line = RECT {
+                left: rect.left + menu_style::PAD_CTRL_X,
+                top: mid,
+                right: rect.right - menu_style::PAD_CTRL_X,
+                bottom: mid + 1,
+            };
+            let stroke_brush = CreateSolidBrush(COLORREF(menu_style::STROKE));
+            FillRect(hdc, &line, stroke_brush);
+            let _ = DeleteObject(stroke_brush.into());
             return;
         }
 
-        // Кнопка VGUI: фон с гранями — светлая сверху слева, тёмная снизу
-        // справа (запрос пользователя 2026-08-23 — «сделай полноценные
-        // красивые кнопки»). Пункт под курсором светлее, как в панелях.
         let button = RECT {
-            left: rect.left + menu_style::BTN_MARGIN,
-            top: rect.top + menu_style::BTN_MARGIN,
-            right: rect.right - menu_style::BTN_MARGIN,
-            bottom: rect.bottom - menu_style::BTN_MARGIN,
+            left: rect.left + menu_style::MARGIN_X,
+            top: rect.top + menu_style::MARGIN_Y,
+            right: rect.right - menu_style::MARGIN_X,
+            bottom: rect.bottom - menu_style::MARGIN_Y,
         };
-        let face = CreateSolidBrush(COLORREF(if selected {
-            menu_style::BTN_HOVER
-        } else {
-            menu_style::BTN_BG
-        }));
-        FillRect(hdc, &button, face);
-        let _ = DeleteObject(face.into());
-        for (edge, color) in [
-            (
-                RECT {
-                    bottom: button.top + 1,
-                    ..button
-                },
-                menu_style::BORDER_LIGHT,
-            ),
-            (
-                RECT {
-                    right: button.left + 1,
-                    ..button
-                },
-                menu_style::BORDER_LIGHT,
-            ),
-            (
-                RECT {
-                    top: button.bottom - 1,
-                    ..button
-                },
-                menu_style::BORDER_DARK,
-            ),
-            (
-                RECT {
-                    left: button.right - 1,
-                    ..button
-                },
-                menu_style::BORDER_DARK,
-            ),
-        ] {
-            let brush = CreateSolidBrush(COLORREF(color));
-            FillRect(hdc, &edge, brush);
-            let _ = DeleteObject(brush.into());
+
+        if selected {
+            // Строка под курсором: плашка CTRL_BG_HOVER со скруглением RADIUS_CTRL (§2.2, §3).
+            // Используем PS_NULL pen, чтобы RoundRect заполнил форму без стандартной чёрной рамки GDI.
+            let face_brush = CreateSolidBrush(COLORREF(menu_style::CTRL_BG_HOVER));
+            let null_pen = CreatePen(PS_NULL, 0, COLORREF(0));
+            let old_brush = SelectObject(hdc, face_brush.into());
+            let old_pen = SelectObject(hdc, null_pen.into());
+
+            let corner_d = menu_style::RADIUS_CTRL * 2;
+            let _ = RoundRect(
+                hdc,
+                button.left,
+                button.top,
+                button.right,
+                button.bottom,
+                corner_d,
+                corner_d,
+            );
+
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            let _ = DeleteObject(face_brush.into());
+            let _ = DeleteObject(null_pen.into());
+
+            // Волосяная кромка RIM_TOP сверху строки при наведении (§2.1, §4)
+            let rim_line = RECT {
+                left: button.left + menu_style::RADIUS_CTRL,
+                top: button.top,
+                right: button.right - menu_style::RADIUS_CTRL,
+                bottom: button.top + 1,
+            };
+            let rim_brush = CreateSolidBrush(COLORREF(menu_style::RIM_TOP));
+            FillRect(hdc, &rim_line, rim_brush);
+            let _ = DeleteObject(rim_brush.into());
         }
 
         let old_font = SelectObject(hdc, font.into());
         let old_mode = SetBkMode(hdc, TRANSPARENT);
         let old_color = SetTextColor(hdc, COLORREF(menu_style::TEXT));
         let mut text_rect = RECT {
-            left: button.left + menu_style::PAD_X,
+            left: button.left + menu_style::PAD_CTRL_X,
             top: button.top,
-            right: button.right - menu_style::PAD_X,
+            right: button.right - menu_style::PAD_CTRL_X,
             bottom: button.bottom,
         };
         let mut text: Vec<u16> = item.label.clone();
@@ -823,6 +831,31 @@ fn menu_font() -> HFONT {
     HFONT(MENU_FONT.load(std::sync::atomic::Ordering::Acquire) as *mut core::ffi::c_void)
 }
 
+/// Применить скругление DWM к системному окну всплывающего меню (`#32768`).
+fn apply_menu_window_rounding() {
+    // Всплывающее меню Win32 создаёт окно предопределённого класса "#32768".
+    // Во время показа TrackPopupMenu окно меню создано на текущем потоке.
+    let menu_hwnd = unsafe { FindWindowW(w!("#32768"), None) }.unwrap_or_default();
+    if !menu_hwnd.0.is_null() {
+        // На Windows 11 (build 22000+) DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND
+        // задаёт системное аппаратное скругление углов меню с сохранением тени DWM.
+        let preference = DWMWCP_ROUND;
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                menu_hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &preference as *const _ as *const core::ffi::c_void,
+                size_of_val(&preference) as u32,
+            )
+        };
+        // Примечание: на Windows 10 атрибут DWMWA_WINDOW_CORNER_PREFERENCE не поддерживается
+        // и вернёт ошибку (DWM на Win10 не поддерживал скругление окон).
+        // Альтернативный механизм CreateRoundRectRgn + SetWindowRgn намеренно не применяется:
+        // установка кастомного региона окна меню на уровне Win32 отключает стандартную
+        // DWM-тень окна (CS_DROPSHADOW) и приводит к артефактам отрисовки системной рамки.
+    }
+}
+
 fn with_state<F: FnOnce(&WndState)>(hwnd: HWND, f: F) {
     // SAFETY: указатель либо null (сообщение пришло до установки состояния),
     // либо владеющий указатель этого потока — не освобождается здесь.
@@ -849,11 +882,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_INITMENUPOPUP => {
+            apply_menu_window_rounding();
+            LRESULT(0)
+        }
         WM_MEASUREITEM => {
             on_measure_item(hwnd, lparam, menu_font());
             LRESULT(1)
         }
         WM_DRAWITEM => {
+            apply_menu_window_rounding();
             on_draw_item(lparam, menu_font());
             LRESULT(1)
         }
@@ -960,6 +998,7 @@ mod tests {
     // --- интеграция: реальный трей ---
 
     #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 tray -- --ignored"]
     fn create_then_drop_destroys_window() {
         let (tray, _rx) = TrayIcon::new("test", vec![]).expect("создание трея");
         let hwnd = tray.hwnd;
@@ -995,6 +1034,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 tray -- --ignored"]
     fn set_menu_replaces_items_seen_by_next_build() {
         let (tray, _rx) = TrayIcon::new("test", vec![MenuItem::new(1, "one")]).expect("трей");
         tray.set_menu(vec![MenuItem::new(2, "two"), MenuItem::new(3, "three")]);
@@ -1006,6 +1046,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 tray -- --ignored"]
     fn show_balloon_succeeds_on_real_tray() {
         let (tray, _rx) = TrayIcon::new("test", vec![]).expect("создание трея");
         // NIM_MODIFY с NIF_INFO на живой иконке трея (hwnd/uID из NIM_ADD) —
@@ -1018,5 +1059,33 @@ mod tests {
         )
         .expect("Shell_NotifyIconW(NIM_MODIFY) не вернул ошибку");
         drop(tray);
+    }
+
+    // --- модульные тесты: Dark Liquid Glass стили и шрифт ---
+
+    #[test]
+    fn menu_style_constants_match_spec() {
+        // Проверяем соответствие констант menu_style спецификации Dark Liquid Glass
+        assert_eq!(menu_style::BG, 0x0007_0505);
+        assert_eq!(menu_style::CTRL_BG_HOVER, 0x0021_1F1F);
+        assert_eq!(menu_style::RIM_TOP, 0x006C_6B6B);
+        assert_eq!(menu_style::STROKE, 0x0025_2323);
+        assert_eq!(menu_style::TEXT, 0x00F7_F7F7);
+        assert_eq!(menu_style::RADIUS_CTRL, 10);
+        assert_eq!(menu_style::PAD_CTRL_X, 12);
+        assert_eq!(menu_style::ITEM_H, 34);
+        assert_eq!(menu_style::SEPARATOR_H, 9);
+        assert_eq!(menu_style::FONT_PX, -17);
+    }
+
+    #[test]
+    fn create_menu_font_returns_valid_handle() {
+        let font = create_menu_font();
+        assert!(!font.is_invalid());
+        assert!(!font.0.is_null());
+        // SAFETY: удаление созданного шрифта.
+        unsafe {
+            let _ = DeleteObject(font.into());
+        }
     }
 }

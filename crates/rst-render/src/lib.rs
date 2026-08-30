@@ -18,6 +18,7 @@
 mod atlas;
 mod device;
 mod error;
+pub mod glass;
 mod icons;
 mod marquee;
 mod selection;
@@ -48,7 +49,8 @@ pub use selection::{
 };
 pub use sprite::Sprite;
 pub use text::{
-    FONT_BYTES, FONT_FAMILY, FONT_SIZE_DIP, LINE_HEIGHT, rasterize, text_size, width_up_to,
+    FONT_BYTES, FONT_FAMILY, FONT_SIZE_DIP, GLOW_PAD_DIP, LINE_HEIGHT, glow_pad_px, rasterize,
+    text_size, width_up_to,
 };
 pub use texture::Texture;
 pub use ui_textures::{TextureFactory, UiTextures};
@@ -65,9 +67,9 @@ pub use widgets::{
     PINNED_PAD, PINNED_PANEL_HEIGHT, PINNED_PANEL_ID, PINNED_PANEL_WIDTH, PINNED_ROW_BASE,
     PINNED_ROW_FIELD_BITS, PINNED_RULE_ROW_H, PINNED_SECTION_ROW_H, PINNED_VISIBLE_RULES, Panel,
     PinnedPanel, PinnedRowField, PointerEvent, Primitive, ScrollBar, Slider, TextField, Widget,
-    WidgetId, WidgetStyle, box_contains, build_pinned_lock_panel, build_pinned_panel,
-    decode_pinned_row_id, lock_indicator, pin_indicator, pinned_lock_panel_height, pinned_row_id,
-    settings_frame, theme,
+    WidgetId, box_contains, build_pinned_lock_panel, build_pinned_panel, decode_pinned_row_id,
+    glass_card, glass_control, glass_on, glass_panel, glass_sunken, lock_indicator, pin_indicator,
+    pinned_lock_panel_height, pinned_row_id, theme, tooltip_frame,
 };
 pub use window_highlight::{HIGHLIGHT_THICKNESS_DIP, HighlightKind, WindowHighlight};
 pub use window_target::{PresentSync, WindowTarget};

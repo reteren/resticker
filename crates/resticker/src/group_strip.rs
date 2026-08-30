@@ -3,8 +3,8 @@
 //!
 //! Внизу экрана горизонтальная лента карточек — как переключатель Alt+Tab.
 //! Пользователь кликами отмечает несколько окон, чтобы собрать из них группу.
-//! Отмеченная карточка получает акцентную рамку и цифру слота (с единицы):
-//! порядок набора решает, какое окно станет главным в раскладке
+//! Отмеченная карточка загорается стеклом ControlOn и получает цифру слота
+//! (с единицы): порядок набора решает, какое окно станет главным в раскладке
 //! ([`crate::groups::GroupEditor::slot_of`]), и пользователь обязан этот
 //! порядок видеть.
 //!
@@ -50,7 +50,8 @@
 //! У `Button` в rst-render нет disabled-состояния, поэтому кнопка — свой
 //! виджет [`ConfirmButton`] с семантикой `Checkbox::set_disabled`:
 //! неактивная не отвечает на хит-тест и рисуется полупрозрачной (0.45),
-//! клик опрашивается как у кнопки — `take_click`. Галочка нарисована двумя
+//! клик опрашивается как у кнопки — `take_click`. Материал — первичное
+//! стекло (§2.2 `CTRL_BG_PRIMARY`). Галочка нарисована двумя
 //! повёрнутыми прямоугольниками: в наборе [`Icon`] галочки нет, а глиф «✓»
 //! в шрифте не гарантирован.
 //!
@@ -75,9 +76,10 @@
 #![allow(dead_code)]
 
 use rst_core::model::MIN_GROUP_MEMBERS;
+use rst_core::ui_motion::{Phase, stagger_delay_ms};
 use rst_render::{
     Box2D, Button, ButtonContent, Icon, LINE_HEIGHT, Panel, PointerEvent, Primitive, Widget,
-    WidgetId, WidgetStyle, box_contains, text_size, theme,
+    WidgetId, box_contains, glass_card, glass_control, glass_on, glass_sunken, text_size, theme,
 };
 
 use crate::window_picker::truncate_to_width;
@@ -103,26 +105,30 @@ const SCROLLBAR_ID: WidgetId = 651;
 /// `Button` под тем же индексом, содержимое поверх — неинтерактивный виджет).
 const LABEL_FLAG: WidgetId = 0x8000_0000;
 
-/// Отступ ленты от краёв экрана, DIP.
+/// Отступ ленты от краёв экрана, DIP. В §3 токена нет — внешний отступ
+/// панели от края рабочей области, локальное решение.
 const SCREEN_MARGIN: f64 = 20.0;
-/// Внутренний отступ ленты, DIP.
-const STRIP_PAD: f64 = 8.0;
-/// Ширина карточки, DIP.
+/// Внутренний отступ ленты, DIP — §3 PAD_PANEL.
+const STRIP_PAD: f64 = theme::PAD_PANEL;
+/// Ширина карточки, DIP. В §3 токена нет — размер снимка окна, локальное
+/// решение (скругление карточки при этом — §3 RADIUS_CARD).
 pub const CARD_W: f64 = 132.0;
-/// Высота карточки, DIP.
+/// Высота карточки, DIP. В §3 токена нет — см. [`CARD_W`].
 pub const CARD_H: f64 = 96.0;
-/// Зазор между карточками, DIP.
-const CARD_GAP: f64 = 8.0;
-/// Внутренний отступ карточки, DIP.
-const CARD_PAD: f64 = 4.0;
+/// Зазор между карточками, DIP — §3 GAP_ROW.
+const CARD_GAP: f64 = theme::GAP_ROW;
+/// Внутренний отступ карточки, DIP — §3 PAD_CTRL_X.
+const CARD_PAD: f64 = theme::PAD_CTRL_X;
 /// Высота полосы снимка карточки (над подписью), DIP: карточка минус два
 /// отступа минус полоса подписи (`LINE_HEIGHT` + отступ под ней).
 const THUMB_H: f64 = CARD_H - 2.0 * CARD_PAD - LINE_HEIGHT - CARD_PAD;
-/// Сторона бейджа номера слота, DIP.
+/// Сторона бейджа номера слота, DIP. В §3 токена нет — скругление бейджа
+/// при этом §3 RADIUS_TIGHT (мелкий бейдж).
 const BADGE_SIZE: f64 = 18.0;
-/// Отступ бейджа от угла карточки, DIP.
+/// Отступ бейджа от угла карточки, DIP. В §3 токена нет.
 const BADGE_GAP: f64 = 4.0;
-/// Толщина штриха галочки, DIP.
+/// Толщина штриха галочки, DIP. В §3 токена нет — штрих глифа, иконки не
+/// переделываются (§8 спецификации).
 const CHECK_THICKNESS: f64 = 2.0;
 /// Сторона квадратной кнопки подтверждения — та же, что у кнопок тулбара
 /// (визуально лента и тулбар — родные панели режима редактирования).
@@ -206,9 +212,7 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
         h: strip_h,
         rotation: 0.0,
     };
-    let mut panel = Panel::new(PANEL_ID, frame)
-        .with_style(WidgetStyle::Settings)
-        .with_corner_radius(theme::settings::CORNER_RADIUS);
+    let mut panel = Panel::new(PANEL_ID, frame).with_corner_radius(theme::RADIUS_WINDOW);
 
     let left = frame.cx - frame.w / 2.0 + STRIP_PAD;
     let right = frame.cx + frame.w / 2.0 - STRIP_PAD;
@@ -241,18 +245,18 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
             h: CARD_H,
             rotation: 0.0,
         };
-        // Фон + hover/armed + хит-тест карточки — кнопка без своей подписи
-        // (пустая подпись не эмитит текст, тот же приём, что строки
-        // `window_pick_list`); содержимое рисует `CardContent` поверх.
-        panel.add_widget(
-            Button::new(
-                CARD_BASE + i as WidgetId,
-                rect,
-                ButtonContent::Label(String::new()),
-            )
-            .with_style(WidgetStyle::Settings),
-        );
+        // Фон, hover/armed, хит-тест карточки и гало наведения — кнопка без
+        // своей подписи (пустая подпись не эмитит текст, тот же приём, что
+        // строки `window_pick_list`); материал карточки — стекло Card с
+        // каскадом появления, его рисует `CardContent` поверх.
+        panel.add_widget(Button::new(
+            CARD_BASE + i as WidgetId,
+            rect,
+            ButtonContent::Label(String::new()),
+        ));
         let title = truncate_to_width(&card.title, CARD_W - 2.0 * CARD_PAD);
+        let mut appear = Phase::new(theme::CARD_IN_MS);
+        appear.set_target(true);
         panel.add_widget(CardContent {
             id: CARD_BASE + i as WidgetId + LABEL_FLAG,
             card: rect,
@@ -260,25 +264,28 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
             icon: card.icon.clone(),
             title,
             slot: card.slot,
+            appear,
+            // Каскад от первой карточки ленты (§5): каждая следующая ждёт
+            // свой шаг, и ряд «выплывает», а не появляется разом.
+            delay_ms: stagger_delay_ms(i),
         });
     }
 
     // Иконка та же, что у кнопки «Группы окон» в панели у курсора: одна и та
     // же панель, вызванная из двух мест, обязана выглядеть одинаково.
-    panel.add_widget(
-        Button::new(
-            BTN_MANAGER,
-            Box2D {
-                cx: manager_cx,
-                cy: frame.cy,
-                w: CONFIRM_SIZE,
-                h: CONFIRM_SIZE,
-                rotation: 0.0,
-            },
-            ButtonContent::Icon(Icon::Groups),
-        )
-        .with_style(WidgetStyle::Settings),
-    );
+    // Мелкая иконка-кнопка — §3 RADIUS_TIGHT (высота кнопки не больше
+    // BUTTON_SIZE + 2, радиус выбирает сам `Button`).
+    panel.add_widget(Button::new(
+        BTN_MANAGER,
+        Box2D {
+            cx: manager_cx,
+            cy: frame.cy,
+            w: CONFIRM_SIZE,
+            h: CONFIRM_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Icon(Icon::Groups),
+    ));
 
     panel.add_widget(ConfirmButton::new(
         BTN_CONFIRM,
@@ -317,11 +324,11 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
     }
 }
 
-/// Содержимое карточки: снимок окна (или иконка как fallback, или
-/// плейсхолдер), подпись, акцентная рамка и бейдж слота у отмеченной.
-/// Не интерактивна — клики и hover строки обрабатывает `Button` под ней
-/// (тот же приём разделения «фон/интерактив» и «контент», что
-/// `window_pick_list::RowContent`).
+/// Содержимое карточки: стеклянное тело (Card, у отмеченной — ControlOn),
+/// снимок окна (или иконка как fallback, или утопленный плейсхолдер),
+/// подпись и бейдж слота. Не интерактивно — клики и hover строки
+/// обрабатывает `Button` под ним (тот же приём разделения «фон/интерактив»
+/// и «контент», что `window_pick_list::RowContent`).
 struct CardContent {
     id: WidgetId,
     card: Box2D,
@@ -329,6 +336,11 @@ struct CardContent {
     icon: Option<StripImage>,
     title: String,
     slot: Option<usize>,
+    /// Фаза появления карточки (§5, CARD_IN_MS): тело и тексты гаснут
+    /// вместе с ней, иначе содержимое выскочило бы раньше стекла.
+    appear: Phase,
+    /// Остаток задержки каскада до начала появления, мс.
+    delay_ms: f64,
 }
 
 impl Widget for CardContent {
@@ -348,12 +360,29 @@ impl Widget for CardContent {
         false
     }
 
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        if self.delay_ms > 0.0 {
+            self.delay_ms = (self.delay_ms - dt_ms).max(0.0);
+            return true;
+        }
+        self.appear.advance(dt_ms)
+    }
+
     fn draw(&self, out: &mut Vec<Primitive>) {
         let (left, top, bottom) = (
             self.card.cx - self.card.w / 2.0,
             self.card.cy - self.card.h / 2.0,
             self.card.cy + self.card.h / 2.0,
         );
+        let appear = self.appear.eased();
+        // Отмеченная карточка — стекло ControlOn (§2.2 «включённый
+        // переключатель»): выбор читается светом и усиленной обводкой, а не
+        // рамкой-состоянием VGUI.
+        if self.slot.is_some() {
+            glass_on(out, self.card, theme::RADIUS_CARD, appear);
+        } else {
+            glass_card(out, self.card, theme::RADIUS_CARD, appear);
+        }
         let thumb_area = Box2D {
             cx: self.card.cx,
             cy: top + CARD_PAD + THUMB_H / 2.0,
@@ -362,8 +391,8 @@ impl Widget for CardContent {
             rotation: 0.0,
         };
         // Снимок — если есть, иначе иконка в натуральном размере, иначе
-        // плейсхолдер-квадрат: слот снимка никогда не пустует молча (тот же
-        // приём, что плейсхолдер иконки в `window_pick_list`).
+        // утопленный жёлоб-плейсхолдер: слот снимка никогда не пустует
+        // молча (тот же приём, что плейсхолдер иконки в `window_pick_list`).
         match self.thumb.as_ref().or(self.icon.as_ref()) {
             Some(img) => {
                 let rect = if self.thumb.is_some() {
@@ -385,25 +414,15 @@ impl Widget for CardContent {
                     width: img.width,
                     height: img.height,
                     rgba: img.rgba.clone(),
-                    opacity: 1.0,
+                    opacity: appear,
                 });
             }
-            None => out.push(Primitive::Fill {
-                rect: thumb_area,
-                color: theme::BUTTON_BG,
-                opacity: 1.0,
-            }),
+            None => glass_sunken(out, thumb_area, theme::RADIUS_CTRL, appear),
         }
         if let Some(slot) = self.slot {
-            // Акцентная рамка + бейдж с цифрой: «это окно уже в группе, и оно
-            // n-е». Рамка нарисована четырьмя тонкими полосами по периметру.
-            for edge in picked_outline_edges(self.card) {
-                out.push(Primitive::Fill {
-                    rect: edge,
-                    color: theme::settings::ACCENT,
-                    opacity: 1.0,
-                });
-            }
+            // Бейдж с цифрой — тот же свет, что и у тела отмеченной
+            // карточки: «это окно уже в группе, и оно n-е» (§2.2 ControlOn,
+            // скругление мелкого бейджа — §3 RADIUS_TIGHT).
             let badge = Box2D {
                 cx: left + BADGE_GAP + BADGE_SIZE / 2.0,
                 cy: top + BADGE_GAP + BADGE_SIZE / 2.0,
@@ -411,11 +430,7 @@ impl Widget for CardContent {
                 h: BADGE_SIZE,
                 rotation: 0.0,
             };
-            out.push(Primitive::Fill {
-                rect: badge,
-                color: theme::settings::ACCENT,
-                opacity: 1.0,
-            });
+            glass_on(out, badge, theme::RADIUS_TIGHT, appear);
             let digit = slot.to_string();
             let (dw, dh) = text_size(&digit);
             out.push(Primitive::Text {
@@ -427,8 +442,8 @@ impl Widget for CardContent {
                     rotation: 0.0,
                 },
                 text: digit,
-                color: theme::settings::TEXT,
-                opacity: 1.0,
+                color: theme::TEXT,
+                opacity: theme::TEXT_OPACITY * appear,
             });
         }
         if !self.title.is_empty() {
@@ -442,8 +457,8 @@ impl Widget for CardContent {
                     rotation: 0.0,
                 },
                 text: self.title.clone(),
-                color: theme::settings::TEXT,
-                opacity: 1.0,
+                color: theme::TEXT,
+                opacity: theme::TEXT_OPACITY * appear,
             });
         }
     }
@@ -469,28 +484,6 @@ fn fit_rect(area: Box2D, w: u32, h: u32) -> Box2D {
         h: f64::from(h) * scale,
         rotation: 0.0,
     }
-}
-
-/// Четыре тонкие полосы акцентной рамки отмеченной карточки. Толщина —
-/// [`theme::settings::BEVEL`], та же, что у граней VGUI: рамка читается как
-/// состояние, а не как второй контур кнопки.
-fn picked_outline_edges(rect: Box2D) -> [Box2D; 4] {
-    let t = theme::settings::BEVEL;
-    let half_w = rect.w / 2.0;
-    let half_h = rect.h / 2.0;
-    let edge = |cx: f64, cy: f64, w: f64, h: f64| Box2D {
-        cx,
-        cy,
-        w,
-        h,
-        rotation: 0.0,
-    };
-    [
-        edge(rect.cx, rect.cy - half_h + t / 2.0, rect.w, t),
-        edge(rect.cx, rect.cy + half_h - t / 2.0, rect.w, t),
-        edge(rect.cx - half_w + t / 2.0, rect.cy, t, rect.h),
-        edge(rect.cx + half_w - t / 2.0, rect.cy, t, rect.h),
-    ]
 }
 
 /// Два штриха галочки в квадрате содержимого кнопки: из верхнего левого угла
@@ -525,7 +518,9 @@ fn stroke(a: (f64, f64), b: (f64, f64)) -> Box2D {
 /// требование «неактивна, пока отмечено меньше двух окон» — визуальное и
 /// интерактивное сразу (см. докмодуль). Поведение — как у кнопки, состояние
 /// — как у чекбокса: неактивная не ловит хит-тест и рисуется с
-/// непрозрачностью 0.45.
+/// непрозрачностью 0.45. Материал — первичное стекло (§2.2 CTRL_BG_PRIMARY):
+/// подтверждение набора — главное действие ленты и обязано быть ярче
+/// остальных контролов; фазы наведения/нажатия — §5.
 pub struct ConfirmButton {
     id: WidgetId,
     bounds: Box2D,
@@ -533,6 +528,10 @@ pub struct ConfirmButton {
     hovered: bool,
     armed: bool,
     clicked: bool,
+    /// Фаза наведения 0..1 (§5): кнопка продавливается плавно, а не ступенькой.
+    hover_phase: Phase,
+    /// Фаза нажатия 0..1 (§5).
+    press_phase: Phase,
 }
 
 impl ConfirmButton {
@@ -544,6 +543,8 @@ impl ConfirmButton {
             hovered: false,
             armed: false,
             clicked: false,
+            hover_phase: Phase::new(theme::HOVER_MS),
+            press_phase: Phase::new(theme::PRESS_MS),
         }
     }
 
@@ -572,7 +573,11 @@ impl Widget for ConfirmButton {
     }
 
     fn set_hovered(&mut self, hovered: bool) -> bool {
-        std::mem::replace(&mut self.hovered, hovered) != hovered
+        let changed = std::mem::replace(&mut self.hovered, hovered) != hovered;
+        if changed {
+            self.hover_phase.set_target(hovered);
+        }
+        changed
     }
 
     fn pointer_event(&mut self, ev: PointerEvent) -> bool {
@@ -583,6 +588,7 @@ impl Widget for ConfirmButton {
                 }
                 if self.hit_test(pos) {
                     self.armed = true;
+                    self.press_phase.set_target(true);
                     return true;
                 }
                 false
@@ -592,6 +598,7 @@ impl Widget for ConfirmButton {
                     return false;
                 }
                 self.armed = false;
+                self.press_phase.set_target(false);
                 if !self.disabled && self.hit_test(pos) {
                     self.clicked = true;
                 }
@@ -601,21 +608,26 @@ impl Widget for ConfirmButton {
         }
     }
 
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        let hover = self.hover_phase.advance(dt_ms);
+        let press = self.press_phase.advance(dt_ms);
+        hover || press
+    }
+
     fn draw(&self, out: &mut Vec<Primitive>) {
-        // Приглушение неактивной — та же непрозрачность, что у disabled
-        // чекбокса: кнопка видна, но явно «не для нажатия».
+        // Первичное стекло (§2.2 CTRL_BG_PRIMARY): подтверждение — главное
+        // действие ленты. Приглушение неактивной — та же непрозрачность,
+        // что у disabled чекбокса: кнопка видна, но явно «не для нажатия».
         let opacity = if self.disabled { 0.45 } else { 1.0 };
-        let bg = if self.hovered {
-            theme::settings::BTN_BG_HOVER
-        } else {
-            theme::settings::BTN_BG
-        };
-        out.push(Primitive::Fill {
-            rect: self.bounds,
-            color: bg,
+        glass_control(
+            out,
+            self.bounds,
+            theme::RADIUS_TIGHT,
+            self.hover_phase.eased(),
+            self.press_phase.eased(),
+            true,
             opacity,
-        });
-        bevel(out, self.bounds, !self.armed, opacity);
+        );
         let pad = theme::BUTTON_PAD;
         let content = Box2D {
             w: (self.bounds.w - 2.0 * pad).max(0.0),
@@ -625,7 +637,7 @@ impl Widget for ConfirmButton {
         for s in checkmark_strokes(content) {
             out.push(Primitive::Fill {
                 rect: s,
-                color: theme::settings::TEXT,
+                color: theme::TEXT,
                 opacity,
             });
         }
@@ -638,36 +650,6 @@ impl Widget for ConfirmButton {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
-}
-
-/// «Объёмная» рамка VGUI вокруг кнопки: светлая грань сверху и слева,
-/// тёмная снизу и справа; зажатая кнопка «проваливается» — грани меняются
-/// местами (`raised == false`). Локальная копия приватного
-/// `settings_bevel` из rst-render: тот не экспортируется, а виджет обязан
-/// выглядеть как остальные кнопки окна настроек.
-fn bevel(out: &mut Vec<Primitive>, rect: Box2D, raised: bool, opacity: f64) {
-    let (light, dark) = (theme::settings::BORDER_LIGHT, theme::settings::BORDER_DARK);
-    let (top_left, bottom_right) = if raised { (light, dark) } else { (dark, light) };
-    let t = theme::settings::BEVEL;
-    let half_w = rect.w / 2.0;
-    let half_h = rect.h / 2.0;
-    let mut edge = |cx: f64, cy: f64, w: f64, h: f64, color: [u8; 3]| {
-        out.push(Primitive::Fill {
-            rect: Box2D {
-                cx,
-                cy,
-                w: w.max(0.0),
-                h: h.max(0.0),
-                rotation: 0.0,
-            },
-            color,
-            opacity,
-        });
-    };
-    edge(rect.cx, rect.cy - half_h + t / 2.0, rect.w, t, top_left);
-    edge(rect.cx - half_w + t / 2.0, rect.cy, t, rect.h, top_left);
-    edge(rect.cx, rect.cy + half_h - t / 2.0, rect.w, t, bottom_right);
-    edge(rect.cx + half_w - t / 2.0, rect.cy, t, rect.h, bottom_right);
 }
 
 /// Горизонтальная полоса прокрутки ленты: только отрисовка, неинтерактивная
@@ -723,17 +705,19 @@ impl Widget for HScrollBar {
 
     fn draw(&self, out: &mut Vec<Primitive>) {
         let (w, h) = (self.bounds.w.max(0.0), self.bounds.h.max(0.0));
-        // Те же цвета, что у вертикального `ScrollBar`: полупрозрачная
-        // дорожка и акцентная ручка.
-        out.push(Primitive::Fill {
-            rect: Box2D {
+        // Дорожка — утопленный жёлоб (§2.2 SUNKEN_BG, §4 «утопленная
+        // поверхность переворачивает свет»), ручка — белый свет (§2.4):
+        // у скроллбара нет своего токена в §3, но материал тот же.
+        glass_sunken(
+            out,
+            Box2D {
                 w,
                 h,
                 ..self.bounds
             },
-            color: theme::SLIDER_TRACK,
-            opacity: 0.5,
-        });
+            theme::RADIUS_TIGHT,
+            1.0,
+        );
         let left = self.bounds.cx - self.bounds.w / 2.0;
         let thumb_w = (self.bounds.w * self.thumb_fraction).max(theme::SCROLLBAR_MIN_THUMB_H);
         let thumb_left = left + (self.bounds.w - thumb_w) * self.thumb_offset;
@@ -762,6 +746,7 @@ impl Widget for HScrollBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rst_render::glass::Surface;
 
     fn screen(w: f64, h: f64) -> Box2D {
         Box2D {
@@ -888,6 +873,7 @@ mod tests {
                 for prim in prims(&result.panel) {
                     let rect = match &prim {
                         Primitive::Fill { rect, .. }
+                        | Primitive::Glass { rect, .. }
                         | Primitive::Icon { rect, .. }
                         | Primitive::Rgba { rect, .. }
                         | Primitive::Text { rect, .. } => *rect,
@@ -1184,9 +1170,9 @@ mod tests {
             .expect("снимок окна на карточке");
         assert_eq!(key, 77);
         assert_eq!((width, height), (200, 100));
-        // Слот 124×69, кадр 200×100: масштаб по ширине 0.62, высота 62.
-        assert!((rect.w - 124.0).abs() < 1e-9, "ширина {rect:?}");
-        assert!((rect.h - 62.0).abs() < 1e-9, "высота {rect:?}");
+        // Слот 108×44, кадр 200×100: масштаб по высоте 0.44, ширина 88.
+        assert!((rect.w - 88.0).abs() < 1e-9, "ширина {rect:?}");
+        assert!((rect.h - 44.0).abs() < 1e-9, "высота {rect:?}");
         let card_bounds = result.panel.widget::<Button>(CARD_BASE).unwrap().bounds();
         assert_eq!(rect.cx, card_bounds.cx);
         assert!(
@@ -1195,19 +1181,20 @@ mod tests {
         );
     }
 
-    /// Карточка без снимка и иконки рисует плейсхолдер-квадрат на месте
-    /// снимка (тот же приём, что плейсхолдер иконки в `window_pick_list`).
+    /// Карточка без снимка и иконки рисует утопленный жёлоб-плейсхолдер на
+    /// месте снимка (тот же приём, что плейсхолдер иконки в
+    /// `window_pick_list`).
     #[test]
     fn card_without_image_draws_a_placeholder_slot() {
         let result = build(&[card(1, "окно", None)], 0, screen(1600.0, 900.0));
         let placeholder = prims(&result.panel)
             .into_iter()
             .find_map(|p| match p {
-                Primitive::Fill { rect, .. }
-                    if rect.w == CARD_W - 2.0 * CARD_PAD && rect.h == THUMB_H =>
-                {
-                    Some(rect)
-                }
+                Primitive::Glass {
+                    rect,
+                    surface: Surface::Sunken,
+                    ..
+                } if rect.w == CARD_W - 2.0 * CARD_PAD && rect.h == THUMB_H => Some(rect),
                 _ => None,
             })
             .expect("плейсхолдер слота снимка");
@@ -1215,30 +1202,53 @@ mod tests {
         assert_eq!(placeholder.cx, card_bounds.cx);
     }
 
-    /// Отмеченная карточка получает акцентную рамку по периметру и бейдж
-    /// слота (рамка — 4 грани + бейдж = 5 акцентных заливок).
+    /// Отмеченная карточка загорается стеклом ControlOn и несёт бейдж слота:
+    /// тело карточки и бейдж — два стеклянных примитива ControlOn (§2.2,
+    /// §7), неотмеченная остаётся стеклом Card.
     #[test]
-    fn picked_card_draws_accent_outline_and_badge() {
+    fn picked_card_lights_up_with_glass_and_badge() {
         let mut c = card(1, "окно", None);
         c.slot = Some(1);
         let result = build(std::slice::from_ref(&c), 0, screen(1600.0, 900.0));
         let card_bounds = result.panel.widget::<Button>(CARD_BASE).unwrap().bounds();
-        for edge in picked_outline_edges(card_bounds) {
-            assert!(
-                edge.cx - edge.w / 2.0 >= card_bounds.cx - card_bounds.w / 2.0 - 1e-9
-                    && edge.cx + edge.w / 2.0 <= card_bounds.cx + card_bounds.w / 2.0 + 1e-9
-                    && edge.cy - edge.h / 2.0 >= card_bounds.cy - card_bounds.h / 2.0 - 1e-9
-                    && edge.cy + edge.h / 2.0 <= card_bounds.cy + card_bounds.h / 2.0 + 1e-9,
-                "грань рамки на периметре карточки: {edge:?}"
-            );
-        }
-        let accent_fills = prims(&result.panel)
+        let on = prims(&result.panel)
             .into_iter()
-            .filter(
-                |p| matches!(p, Primitive::Fill { color, .. } if *color == theme::settings::ACCENT),
-            )
+            .filter_map(|p| match p {
+                Primitive::Glass {
+                    rect,
+                    surface: Surface::ControlOn,
+                    ..
+                } => Some(rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(on.len(), 2, "тело карточки + бейдж слота");
+        assert!(
+            on.iter()
+                .all(|r| r.cx - r.w / 2.0 >= card_bounds.cx - card_bounds.w / 2.0
+                    && r.cx + r.w / 2.0 <= card_bounds.cx + card_bounds.w / 2.0
+                    && r.cy - r.h / 2.0 >= card_bounds.cy - card_bounds.h / 2.0
+                    && r.cy + r.h / 2.0 <= card_bounds.cy + card_bounds.h / 2.0),
+            "бейдж и тело внутри карточки"
+        );
+        assert!(
+            texts(&result.panel).contains(&"1".to_string()),
+            "цифра слота на бейдже"
+        );
+        let plain = build(&[card(1, "окно", None)], 0, screen(1600.0, 900.0));
+        let on = prims(&plain.panel)
+            .into_iter()
+            .filter(|p| {
+                matches!(
+                    p,
+                    Primitive::Glass {
+                        surface: Surface::ControlOn,
+                        ..
+                    }
+                )
+            })
             .count();
-        assert_eq!(accent_fills, 5, "4 грани рамки + бейдж слота");
+        assert_eq!(on, 0, "неотмеченная карточка — обычное стекло Card");
     }
 
     /// Оба штриха галочки лежат внутри квадрата содержимого кнопки и идут

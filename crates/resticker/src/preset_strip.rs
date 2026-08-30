@@ -60,8 +60,8 @@
 use rst_core::group_layout::{Preset, UnitRect};
 use rst_core::hittest::DipRect;
 use rst_render::{
-    Box2D, Button, ButtonContent, Label, NumericField, Panel, Primitive, Widget, WidgetId,
-    WidgetStyle, text_size, theme,
+    Box2D, Button, ButtonContent, NumericField, Panel, Primitive, Widget, WidgetId, glass_card,
+    glass_on, text_size, theme,
 };
 
 /// Идентификатор панели ленты. Диапазон 800+ свободен: лента карточек 600+,
@@ -94,10 +94,14 @@ const BACKDROP_FLAG: WidgetId = 0x4000_0000;
 /// кнопка, и совпади флаги — второй виджет с тем же id молча потерялся бы
 /// в `Panel::widget`.
 const RING_FLAG: WidgetId = 0x4000_0002;
+/// §2.4 `DANGER` — единственный цвет во всём интерфейсе (#D0463C), только
+/// тонкие предупреждения. Псевдоним общего токена: константа заведена в
+/// `rst_render::theme`, дублировать её по модулям нельзя (§9.1).
+use rst_render::theme::DANGER;
 /// Отступ красного кольца внутрь миниатюры, когда раскладка одновременно
-/// ВЫБРАНА и не влезает: акцентное кольцо выбора стоит на кромке, и красное
-/// на той же кромке легло бы ровно поверх него, съев выбор. Две рамки
-/// читаются только когда вторая сдвинута внутрь.
+/// ВЫБРАНА и не влезает: свет выбора стоит на кромке, и красное на той же
+/// кромке легло бы ровно поверх него, съев выбор. Две рамки читаются только
+/// когда вторая сдвинута внутрь. В §3 токена нет — локальное решение.
 const WARN_RING_INSET: f64 = 2.0;
 /// Подпись поля зазора (нативный UI — английский, как весь UI оверлея).
 /// Подпись поля зазора. Знак процента стоит В ПОДПИСИ, а не в самом поле:
@@ -117,25 +121,31 @@ const ADAPTIVE_LABEL: &str = "adaptive";
 /// у [`ID_GAP_LABEL`]: id вне диапазона слотов, иначе `Panel::widget` по
 /// совпавшему id нашёл бы слот, а не подпись.
 const ID_ADAPTIVE_LABEL: WidgetId = 882;
-/// Зазор между нижней кромкой миниатюры и подписью под ней, DIP.
+/// Зазор между нижней кромкой миниатюры и подписью под ней, DIP. В §3
+/// токена нет — локальное решение.
 const ADAPTIVE_CAPTION_GAP: f64 = 4.0;
 
-/// Сторона миниатюры при полном размере, DIP.
+/// Сторона миниатюры при полном размере, DIP. В §3 токена нет — размер
+/// схемы раскладки, локальное решение (скругление миниатюры при этом —
+/// §3 RADIUS_CARD: карточка внутри панели).
 pub const THUMB_SIZE: f64 = 72.0;
-/// Зазор между миниатюрами, DIP.
-const THUMB_GAP: f64 = 8.0;
-/// Зазор между слотами внутри миниатюры, DIP — между светлыми слотами
-/// просвечивает тёмная подложка, и зазор читается как разделитель «окон».
-const SLOT_GAP: f64 = 1.0;
-/// Внутренний отступ панели, DIP.
-const PAD: f64 = 12.0;
-/// Зазор между лентой миниатюр и блоком поля зазора, DIP.
-const STRIP_GAP: f64 = 14.0;
-/// Зазор между подписью и полем зазора, DIP.
-const LABEL_GAP: f64 = 8.0;
-/// Отступ панели от верхнего края экрана, DIP.
+/// Зазор между миниатюрами, DIP — §3 GAP_ROW.
+const THUMB_GAP: f64 = theme::GAP_ROW;
+/// Зазор между слотами внутри миниатюры, DIP — §3 HAIRLINE: между светлыми
+/// слотами просвечивает тёмная подложка, и зазор читается как разделитель
+/// «окон».
+const SLOT_GAP: f64 = theme::HAIRLINE;
+/// Внутренний отступ панели, DIP — §3 PAD_PANEL.
+const PAD: f64 = theme::PAD_PANEL;
+/// Зазор между лентой миниатюр и блоком поля зазора, DIP — §3 GAP_ROW.
+const STRIP_GAP: f64 = theme::GAP_ROW;
+/// Зазор между подписью и полем зазора, DIP — §3 GAP_ROW.
+const LABEL_GAP: f64 = theme::GAP_ROW;
+/// Отступ панели от верхнего края экрана, DIP. В §3 токена нет — внешний
+/// отступ от края рабочей области, локальное решение.
 const TOP_GAP: f64 = 16.0;
-/// Ширина поля зазора, DIP.
+/// Ширина поля зазора, DIP. В §3 токена нет — размер числового поля,
+/// локальное решение.
 const FIELD_W: f64 = 56.0;
 
 /// Прямоугольник слота в экранных DIP: `preset` — индекс раскладки,
@@ -223,11 +233,12 @@ fn unit_to_box(unit: UnitRect, thumb: Box2D, gap: f64) -> Box2D {
     }
 }
 
-/// Четыре тонкие полосы accent-рамки выбранной миниатюры — та же геометрия,
-/// что `group_strip::picked_outline_edges` (рамка читается как состояние,
-/// а не как второй контур).
+/// Четыре тонкие полосы предупреждающего кольца невлезающей миниатюры —
+/// та же геометрия, что у старой accent-рамки выбора (кольцо читается как
+/// состояние, а не как второй контур). Толщина — §3 HAIRLINE. Выбор больше
+/// не рисуется полосами: его несёт стекло ControlOn (§7).
 fn outline_edges(rect: Box2D) -> [Box2D; 4] {
-    let t = theme::settings::BEVEL;
+    let t = theme::HAIRLINE;
     let half_w = rect.w / 2.0;
     let half_h = rect.h / 2.0;
     let edge = |cx: f64, cy: f64, w: f64, h: f64| Box2D {
@@ -266,7 +277,7 @@ fn outline_edges(rect: Box2D) -> [Box2D; 4] {
 /// индексу в срезе как обычно — флаг лишь рисует подпись на карточке 0.
 /// Без флага лента выглядит ровно как сегодня.
 ///
-/// `selected` — индекс выбранной раскладки (accent-рамка); `gap_pct` —
+/// `selected` — индекс выбранной раскладки (стекло ControlOn); `gap_pct` —
 /// текущая величина зазора в процентах, подставляется в поле.
 ///
 /// `fit` — вердикты, параллельные срезу `presets`: `fit[i]` решает судьбу
@@ -309,9 +320,7 @@ pub fn build(
         h,
         rotation: 0.0,
     };
-    let mut panel = Panel::new(STRIP_PANEL_ID, frame)
-        .with_style(WidgetStyle::Settings)
-        .with_corner_radius(theme::settings::CORNER_RADIUS);
+    let mut panel = Panel::new(STRIP_PANEL_ID, frame).with_corner_radius(theme::RADIUS_WINDOW);
 
     let mut thumbs = Vec::new();
     let mut slots = Vec::new();
@@ -327,15 +336,13 @@ pub fn build(
         // Клик по пустому месту миниатюры (раскладки «главное по центру»
         // оставляют свободные углы) тоже выбирает раскладку: кнопка без
         // своей подписи под неинтерактивным оформлением — тот же приём, что
-        // карточки `group_strip`.
-        panel.add_widget(
-            Button::new(
-                THUMB_BASE + i as WidgetId,
-                thumb_frame,
-                ButtonContent::Label(String::new()),
-            )
-            .with_style(WidgetStyle::Settings),
-        );
+        // карточки `group_strip`. Стекло самой миниатюры рисует
+        // `ThumbBackdrop` поверх.
+        panel.add_widget(Button::new(
+            THUMB_BASE + i as WidgetId,
+            thumb_frame,
+            ButtonContent::Label(String::new()),
+        ));
         panel.add_widget(ThumbBackdrop {
             id: THUMB_BASE + i as WidgetId + BACKDROP_FLAG,
             frame: thumb_frame,
@@ -343,14 +350,13 @@ pub fn build(
         });
         for (j, unit) in preset.slots.iter().enumerate() {
             let slot_rect = unit_to_box(*unit, thumb_frame, SLOT_GAP);
-            panel.add_widget(
-                Button::new(
-                    SLOT_BASE + (i * MAX_SLOTS + j) as WidgetId,
-                    slot_rect,
-                    ButtonContent::Label((j + 1).to_string()),
-                )
-                .with_style(WidgetStyle::Settings),
-            );
+            // Слот-окно — обычный контрол (§3 RADIUS_CTRL): hover и нажатие
+            // у него уже есть у `Button`, стекло и фазы — в rst-render.
+            panel.add_widget(Button::new(
+                SLOT_BASE + (i * MAX_SLOTS + j) as WidgetId,
+                slot_rect,
+                ButtonContent::Label((j + 1).to_string()),
+            ));
             slots.push(SlotTarget {
                 preset: i,
                 slot: j,
@@ -376,12 +382,12 @@ pub fn build(
     }
 
     if has_caption {
-        // Подпись по центру под первой (adaptive) карточкой. `Label`
-        // неинтерактивен (hit_test ложь) — кликам и перетаскиванию по
-        // миниатюре не мешает, хотя и лежит внутри панели.
+        // Подпись по центру под первой (adaptive) карточкой. Неинтерактивна
+        // (hit_test ложь) — кликам и перетаскиванию по миниатюре не мешает,
+        // хотя и лежит внутри панели.
         let first = &thumbs[0];
         let (tw, th) = text_size(ADAPTIVE_LABEL);
-        panel.add_widget(Label::new(
+        panel.add_widget(Caption::new(
             ID_ADAPTIVE_LABEL,
             first.cx - tw / 2.0,
             first.cy + first.h / 2.0 + ADAPTIVE_CAPTION_GAP + th / 2.0,
@@ -394,14 +400,13 @@ pub fn build(
     // миниатюры).
     let label_w = text_size(GAP_LABEL).0;
     let field_cx = frame.cx + frame.w / 2.0 - PAD - FIELD_W / 2.0;
-    panel.add_widget(Label::new(
+    panel.add_widget(Caption::new(
         ID_GAP_LABEL,
         field_cx - FIELD_W / 2.0 - LABEL_GAP - label_w,
         frame.cy,
         GAP_LABEL,
     ));
-    let mut field = NumericField::snap_gap(GAP_FIELD_ID, field_cx, frame.cy, FIELD_W)
-        .with_style(WidgetStyle::Settings);
+    let mut field = NumericField::snap_gap(GAP_FIELD_ID, field_cx, frame.cy, FIELD_W);
     field.set_value(gap_pct);
     panel.add_widget(field);
 
@@ -412,10 +417,74 @@ pub fn build(
     }
 }
 
-/// Оформление миниатюры: тёмная подложка «экрана» и accent-рамка выбранной
-/// раскладки. Неинтерактивна — клики и hover ловит кнопка-подложка под ней
-/// (тот же приём разделения «фон/интерактив» и «контент», что `CardContent`
-/// в `group_strip`).
+/// Статичная подпись ленты: белый текст [`theme::TEXT`] на стекле,
+/// второстепенность задаётся непрозрачностью примитива (§2.3
+/// `TEXT_DIM_OPACITY`) — отдельных серых цветов больше нет. Неинтерактивна
+/// (hit_test ложь) — кликам и перетаскиванию не мешает.
+struct Caption {
+    id: WidgetId,
+    rect: Box2D,
+    text: String,
+}
+
+impl Caption {
+    /// Подпись `text` с левым краем `left` и центром строки `cy` (DIP);
+    /// прямоугольник считается по [`text_size`].
+    fn new(id: WidgetId, left: f64, cy: f64, text: &str) -> Self {
+        let (tw, th) = text_size(text);
+        Self {
+            id,
+            rect: Box2D {
+                cx: left + tw / 2.0,
+                cy,
+                w: tw,
+                h: th,
+                rotation: 0.0,
+            },
+            text: text.to_string(),
+        }
+    }
+}
+
+impl Widget for Caption {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.rect = bounds;
+    }
+
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        out.push(Primitive::Text {
+            rect: self.rect,
+            text: self.text.clone(),
+            color: theme::TEXT,
+            opacity: theme::TEXT_DIM_OPACITY,
+        });
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Оформление миниатюры: стеклянное тело (Card; выбранная — ControlOn,
+/// §2.2 «включённый переключатель»). Неинтерактивна — клики и hover ловит
+/// кнопка-подложка под ней (тот же приём разделения «фон/интерактив» и
+/// «контент», что `CardContent` в `group_strip`).
 struct ThumbBackdrop {
     id: WidgetId,
     frame: Box2D,
@@ -440,21 +509,14 @@ impl Widget for ThumbBackdrop {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
-        // Подложка темнее фона панели — светлые слоты-кнопки читаются на ней
-        // как окна, а зазор между ними виден как тонкая тёмная сетка.
-        out.push(Primitive::Fill {
-            rect: self.frame,
-            color: theme::settings::INPUT_BG,
-            opacity: 1.0,
-        });
+        // Тело миниатюры — карточка внутри панели (§4 Surface::Card);
+        // выбранная загорается стеклом ControlOn: выбор читается светом и
+        // усиленной обводкой, а не рамкой-состоянием VGUI. Слоты-контролы
+        // рисуются поверх и остаются тёмными на светящемся теле.
         if self.selected {
-            for edge in outline_edges(self.frame) {
-                out.push(Primitive::Fill {
-                    rect: edge,
-                    color: theme::settings::ACCENT,
-                    opacity: 1.0,
-                });
-            }
+            glass_on(out, self.frame, theme::RADIUS_CARD, 1.0);
+        } else {
+            glass_card(out, self.frame, theme::RADIUS_CARD, 1.0);
         }
     }
 
@@ -467,14 +529,14 @@ impl Widget for ThumbBackdrop {
     }
 }
 
-/// Красное кольцо невлезающей раскладки: та же геометрия, что у акцентной
-/// рамки выбора ([`ThumbBackdrop`]), но в неинтерактивном слое ПОВЕРХ
-/// слотов — силуэт остаётся читаемым, клик по миниатюре не блокируется, и
-/// кольцо видно даже там, где слоты прилегают к кромке.
+/// Красное кольцо невлезающей раскладки: тонкие полосы [`DANGER`] по
+/// кромке, в неинтерактивном слое ПОВЕРХ слотов — силуэт остаётся
+/// читаемым, клик по миниатюре не блокируется, и кольцо видно даже там,
+/// где слоты прилегают к кромке.
 ///
 /// `inset` — отступ от кромки внутрь: 0 у невыбранной миниатюры (кольцо на
-/// кромке, как акцентное), [`WARN_RING_INSET`] у выбранной — иначе красное
-/// кольцо легло бы ровно на акцентное и съело бы выбор.
+/// кромке, как свет выбора), [`WARN_RING_INSET`] у выбранной — иначе красное
+/// кольцо легло бы ровно на светящееся стекло выбора и съело бы его.
 struct OverflowRing {
     id: WidgetId,
     frame: Box2D,
@@ -516,7 +578,7 @@ impl Widget for OverflowRing {
         for edge in outline_edges(inner) {
             out.push(Primitive::Fill {
                 rect: edge,
-                color: theme::settings::DANGER,
+                color: DANGER,
                 opacity: 1.0,
             });
         }
@@ -536,6 +598,7 @@ mod tests {
     use super::*;
     use rst_core::group_layout::presets_for;
     use rst_render::PointerEvent;
+    use rst_render::glass::Surface;
 
     fn screen(w: f64, h: f64) -> DipRect {
         DipRect::new(0.0, 0.0, w, h)
@@ -590,8 +653,9 @@ mod tests {
         );
     }
 
-    /// Все непустые заливки панели заданного цвета — фон слотов (BTN_BG) и
-    /// подложек, полосы рамки (ACCENT) и т.п.
+    /// Все непустые заливки панели заданного цвета — полосы предупреждающего
+    /// кольца (DANGER) и т.п.: единственное, что ещё рисуется плоскими
+    /// полосами (тонкие предупреждения §2.4).
     fn fills(panel: &Panel, color: [u8; 3]) -> Vec<Box2D> {
         let mut out = Vec::new();
         panel.draw(&mut out);
@@ -602,6 +666,21 @@ mod tests {
                 {
                     Some(rect)
                 }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Все стеклянные примитивы панели заданной поверхности — тела
+    /// миниатюр (Card/ControlOn), тела слотов (Control).
+    fn glasses(panel: &Panel, surface: Surface) -> Vec<Box2D> {
+        let mut out = Vec::new();
+        panel.draw(&mut out);
+        out.into_iter()
+            .filter_map(|p| match p {
+                Primitive::Glass {
+                    rect, surface: s, ..
+                } if s == surface && rect.w > 0.0 && rect.h > 0.0 => Some(rect),
                 _ => None,
             })
             .collect()
@@ -712,12 +791,13 @@ mod tests {
     }
 
     #[test]
-    fn reported_slot_rects_match_the_drawn_slot_fills() {
-        // Слоты рисуются кнопками: фон слота — заливка BTN_BG ровно на его
-        // прямоугольнике. Подложки миниатюр рисуют BTN_BG на весь квадрат —
-        // они не совпадают ни с одним отданным слотом и в подсчёт не входят.
+    fn reported_slot_rects_match_the_drawn_slot_glasses() {
+        // Слоты рисуются кнопками: тело слота — стекло Control ровно на его
+        // прямоугольнике (§7 glass_control). Миниатюры-подложки рисуют свои
+        // поверхности (Card) на весь квадрат — они не совпадают ни с одним
+        // отданным слотом и в подсчёт не входят.
         let built = build(presets_for(3), false, None, &screen(1920.0, 1080.0), 5, &[]);
-        let drawn = fills(&built.panel, theme::settings::BTN_BG);
+        let drawn = glasses(&built.panel, Surface::Control);
         let reported: Vec<Box2D> = built.slots.iter().map(|s| s.rect).collect();
         let matched = drawn.iter().filter(|r| reported.contains(r)).count();
         assert_eq!(
@@ -833,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_layout_draws_an_accent_ring_and_others_do_not() {
+    fn selected_layout_lights_up_with_glass_and_others_do_not() {
         let built = build(
             presets_for(2),
             false,
@@ -842,29 +922,12 @@ mod tests {
             5,
             &[],
         );
-        let accent = fills(&built.panel, theme::settings::ACCENT);
-        assert_eq!(accent.len(), 4, "ровно четыре полосы рамки");
-        let thumb = built.thumbs[1];
-        assert_eq!(
-            accent
-                .iter()
-                .filter(|r| (r.w - thumb.w).abs() < 1e-9)
-                .count(),
-            2,
-            "две горизонтальные полосы"
-        );
-        assert_eq!(
-            accent
-                .iter()
-                .filter(|r| (r.h - thumb.h).abs() < 1e-9)
-                .count(),
-            2,
-            "две вертикальные полосы"
-        );
+        let on = glasses(&built.panel, Surface::ControlOn);
+        assert_eq!(on, vec![built.thumbs[1]], "ровно одна светящаяся миниатюра");
         let plain = build(presets_for(2), false, None, &screen(1920.0, 1080.0), 5, &[]);
         assert!(
-            fills(&plain.panel, theme::settings::ACCENT).is_empty(),
-            "без выбора акцентных полос нет"
+            glasses(&plain.panel, Surface::ControlOn).is_empty(),
+            "без выбора светящихся миниатюр нет"
         );
     }
 
@@ -1055,14 +1118,14 @@ mod tests {
 
     /// Невлезающая раскладка получает красное кольцо РОВНО на своей
     /// миниатюре: четыре полосы цвета DANGER на самой кромке (та же
-    /// геометрия, что у акцентной рамки), и ни одной полосы на соседях.
+    /// геометрия, что у старой accent-рамки), и ни одной полосы на соседях.
     #[test]
     fn an_overflowing_layout_draws_a_danger_ring_only_on_that_thumbnail() {
         let presets = presets_for(4);
         let mut fit = vec![ThumbFit::Fits; presets.len()];
         fit[2] = ThumbFit::Overflows;
         let built = build(presets, false, None, &screen(1920.0, 1080.0), 5, &fit);
-        let danger = fills(&built.panel, theme::settings::DANGER);
+        let danger = fills(&built.panel, DANGER);
         assert_eq!(
             danger,
             outline_edges(built.thumbs[2]),
@@ -1070,23 +1133,20 @@ mod tests {
         );
     }
 
-    /// Выбранная И невлезающая раскладка несёт ДВЕ рамки: акцентную на
-    /// кромке (выбор) и красную с отступом внутрь (предупреждение) — на
-    /// одной кромке красная легла бы поверх акцентной и съела бы выбор.
+    /// Выбранная И невлезающая раскладка несёт ДВА состояния: свет выбора
+    /// (стекло ControlOn на кромке) и красное кольцо с отступом внутрь
+    /// (предупреждение) — на одной кромке красная легла бы поверх света и
+    /// съела бы выбор.
     #[test]
-    fn a_selected_layout_that_overflows_draws_accent_and_danger_rings_together() {
+    fn a_selected_layout_that_overflows_draws_glass_and_danger_rings_together() {
         let presets = presets_for(4);
         let mut fit = vec![ThumbFit::Fits; presets.len()];
         fit[3] = ThumbFit::Overflows;
         let built = build(presets, false, Some(3), &screen(1920.0, 1080.0), 5, &fit);
-        let accent = fills(&built.panel, theme::settings::ACCENT);
-        let danger = fills(&built.panel, theme::settings::DANGER);
+        let on = glasses(&built.panel, Surface::ControlOn);
+        let danger = fills(&built.panel, DANGER);
         let thumb = built.thumbs[3];
-        assert_eq!(
-            accent,
-            outline_edges(thumb),
-            "акцентное кольцо выбора на кромке"
-        );
+        assert_eq!(on, vec![thumb], "выбор — светом ControlOn на кромке");
         let inner = Box2D {
             cx: thumb.cx,
             cy: thumb.cy,
@@ -1097,19 +1157,19 @@ mod tests {
         assert_eq!(
             danger,
             outline_edges(inner),
-            "красное кольцо отступает внутрь, акцентное остаётся на кромке"
+            "красное кольцо отступает внутрь, свет выбора остаётся на кромке"
         );
     }
 
     /// Пустой срез вердиктов — «вердиктов нет» (минимумы неизвестны,
-    /// координатор ещё не посчитал): ни одного красного кольца, а
-    /// акцентное кольцо выбора работает как раньше.
+    /// координатор ещё не посчитал): ни одного красного кольца, а свет
+    /// выбора работает как раньше.
     #[test]
     fn an_empty_verdict_slice_marks_nothing() {
         for presets in [presets_for(2), presets_for(4), &[][..]] {
             let built = build(presets, false, None, &screen(1920.0, 1080.0), 5, &[]);
             assert!(
-                fills(&built.panel, theme::settings::DANGER).is_empty(),
+                fills(&built.panel, DANGER).is_empty(),
                 "len={}: без вердиктов красных колец нет",
                 presets.len()
             );
@@ -1123,12 +1183,12 @@ mod tests {
             &[],
         );
         assert_eq!(
-            fills(&selected.panel, theme::settings::ACCENT).len(),
-            4,
-            "выбор помечается акцентным кольцом и без вердиктов"
+            glasses(&selected.panel, Surface::ControlOn),
+            vec![selected.thumbs[1]],
+            "выбор помечается светом и без вердиктов"
         );
         assert!(
-            fills(&selected.panel, theme::settings::DANGER).is_empty(),
+            fills(&selected.panel, DANGER).is_empty(),
             "красных колец нет даже при выбранной раскладке"
         );
     }
@@ -1166,7 +1226,7 @@ mod tests {
         let presets = presets_for(4);
         let short = vec![ThumbFit::Fits, ThumbFit::Overflows];
         let built = build(presets, false, None, &screen(1920.0, 1080.0), 5, &short);
-        let danger = fills(&built.panel, theme::settings::DANGER);
+        let danger = fills(&built.panel, DANGER);
         assert_eq!(
             danger,
             outline_edges(built.thumbs[1]),
@@ -1176,7 +1236,7 @@ mod tests {
         let long = vec![ThumbFit::Overflows; 9];
         let built = build(presets, false, None, &screen(1920.0, 1080.0), 5, &long);
         assert_eq!(
-            fills(&built.panel, theme::settings::DANGER).len(),
+            fills(&built.panel, DANGER).len(),
             presets.len() * 4,
             "по четыре полосы на каждую миниатюру среза"
         );
@@ -1289,8 +1349,8 @@ mod tests {
     }
 
     /// Карточка `adaptive` ведёт себя как обычная: выбирается кликом,
-    /// получает акцентное кольцо при выборе и красное при невыполнимости —
-    /// флаг подписи не трогает ни индексы, ни механизмы колец.
+    /// получает свет ControlOn при выборе и красное кольцо при невыполнимости —
+    /// флаг подписи не трогает ни индексы, ни механизмы состояний.
     #[test]
     fn adaptive_card_still_selects_and_draws_both_rings() {
         // Срез из одной карточки со слотом по центру: у неё есть свободные
@@ -1306,14 +1366,10 @@ mod tests {
         }];
         let fit = [ThumbFit::Overflows];
         let mut built = build(&presets, true, Some(0), &screen(1920.0, 1080.0), 5, &fit);
-        let accent = fills(&built.panel, theme::settings::ACCENT);
-        let danger = fills(&built.panel, theme::settings::DANGER);
+        let on = glasses(&built.panel, Surface::ControlOn);
+        let danger = fills(&built.panel, DANGER);
         let thumb = built.thumbs[0];
-        assert_eq!(
-            accent,
-            outline_edges(thumb),
-            "акцентное кольцо выбора на adaptive-карточке"
-        );
+        assert_eq!(on, vec![thumb], "свет выбора на adaptive-карточке");
         let inner = Box2D {
             cx: thumb.cx,
             cy: thumb.cy,

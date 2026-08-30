@@ -8,9 +8,10 @@
 //! `rst_core::selection_set::SelectionSet::rubber_band` и сюда не входит.
 
 use crate::selection::Box2D;
+use crate::theme;
 
-/// Толщина штриха пунктира, DIP.
-pub const MARQUEE_THICKNESS_DIP: f64 = 1.0;
+/// Толщина штриха пунктира, DIP (§3 `HAIRLINE` — обводка-волосинка).
+pub const MARQUEE_THICKNESS_DIP: f64 = theme::HAIRLINE;
 /// Длина штриха, DIP.
 pub const MARQUEE_DASH_DIP: f64 = 6.0;
 /// Зазор между штрихами, DIP.
@@ -21,8 +22,8 @@ pub const MARQUEE_FILL_OPACITY: f64 = 0.08;
 pub const MARQUEE_STROKE_OPACITY: f64 = 0.9;
 
 /// Визуал рамки-марки: заливка и сегменты пунктира по периметру.
-/// Цвет выбирает вызывающий слой (разумный дефолт — акцент
-/// `theme::SLIDER_FILL`), прозрачности — константы выше.
+/// Цвет выбирает вызывающий слой — белый (§2.4: тонов в интерфейсе нет,
+/// только свет разной силы), прозрачности — константы выше.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MarqueeVisuals {
     /// Заливка прямоугольника протяжки; `None` для вырожденного

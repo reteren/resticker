@@ -9,29 +9,24 @@
 //! состояния и никакого Win32.
 //!
 //! Цифра — растровый примитив [`Primitive::Rgba`], а не [`Primitive::Text`]:
-//! конвейер текста растрирует гарнитуру на фиксированном кегле 12 DIP
-//! (`rst_render::rasterize`, `FONT_SIZE_DIP` в rst-render), и сколько ни
-//! растягивай прямоугольник текстового примитива — получится размытая
-//! надпись, а не крупная цифра (тот же вывод, что у комментария про
-//! растяжение подписи кнопки в `widgets.rs`). `Rgba` же растягивает любой
-//! битмап на свой прямоугольник — на этом живут скруглённые углы панелей
-//! (`settings_frame_radius`) — поэтому цифра растрируется во встроенной
-//! гарнитуре на большом кегле ([`DIGIT_RASTER_SCALE`]) и рисуется с
-//! сохранением пропорций битмапа.
+//! конвейер текста растрирует гарнитуру на фиксированном кегле
+//! ([`rst_render::FONT_SIZE_DIP`]), и сколько ни растягивай прямоугольник
+//! текстового примитива — получится размытая надпись, а не крупная цифра.
+//! `Rgba` же растягивает любой битмап на свой прямоугольник — поэтому цифра
+//! растрируется во встроенной гарнитуре на большом кегле
+//! ([`DIGIT_RASTER_SCALE`]) и рисуется с сохранением пропорций битмапа.
 //!
-//! Оформление — стилистика окна настроек, как у всех панелей режима
-//! редактирования (VGUI, скруглённые углы; запрос пользователя 2026-08-23 —
-//! «весь UI поверх экрана читается как одно окно продукта»). Полупрозрачный
-//! [`theme::settings::BG`] на [`theme::settings::BG_OPACITY`] поверх светлого
-//! десктопа даёт примерно тот же серый, что бейдж Identify у Windows
-//! (чёрный при ~60 % поверх белого — оба выходят в район 0x66–0x8F), а
-//! белая цифра [`theme::settings::TEXT`] читается на нём с любого расстояния.
-//! Отдельную «тёмную» заливку не вводим: скруглённый полупрозрачный фон в
-//! теме ровно один, и уходить от палитры продукта ради оттенка бейджа —
-//! значит выбить его из остального UI.
+//! Оформление — Dark Liquid Glass (docs/DESIGN_LIQUID_GLASS.md): бейдж — это
+//! не окно с корпусом, а самостоятельная карточка на рабочем столе, поэтому
+//! его поверхность — [`Surface::Card`] с малым радиусом (§3 `RADIUS_TIGHT`),
+//! а цифра — белый свет [`theme::TEXT`]. Гало вокруг цифры печёт сам
+//! растеризатор (§6), и прямоугольник цифры обязан покрыть битмап целиком,
+//! иначе свечение обрежется ([`digit_rect_h`]).
 
 use rst_core::hittest::DipRect;
-use rst_render::{Box2D, Panel, Primitive, Widget, WidgetId, WidgetStyle, rasterize, theme};
+use rst_render::{
+    Box2D, Panel, Primitive, Widget, WidgetId, glass_card, glow_pad_px, rasterize, theme,
+};
 
 /// Идентификатор панели бейджа. Диапазон 900+ в оверлее свободен (баннер
 /// предупреждений — 901). Бейджи разных мониторов — отдельные объекты
@@ -41,29 +36,35 @@ use rst_render::{Box2D, Panel, Primitive, Widget, WidgetId, WidgetStyle, rasteri
 pub const BADGE_PANEL_ID: WidgetId = 902;
 /// Идентификатор виджета цифры внутри панели (для опроса; не интерактивен).
 const DIGIT_ID: WidgetId = 903;
+/// Идентификатор корпуса-карточки бейджа (для опроса; не интерактивен).
+const BODY_ID: WidgetId = 904;
 
 /// Сторона квадрата бейджа, DIP. Windows рисует Identify примерно в восьмую
 /// часть высоты монитора (для 1080p это ~135 px); фиксированные 112 DIP дают
 /// тот же порядок на любом экране и не привязывают размер к разрешению —
-/// цифра остаётся крупным элементом, а не подписью.
+/// цифра остаётся крупным элементом, а не подписью. В §3 токена нет —
+/// спец-элемент, оставлен именованной константой модуля.
 pub const BADGE_SIZE: f64 = 112.0;
-/// Отступ бейджа от левого верхнего угла рабочей области, DIP.
+/// Отступ бейджа от левого верхнего угла рабочей области, DIP. Это отступ
+/// от края экрана, а не внутренний отступ корпуса (`PAD_PANEL`), поэтому
+/// токена в §3 нет — оставлен именованной константой модуля.
 const MARGIN: f64 = 16.0;
 /// Высота цифры как доля стороны бейджа (у Windows — примерно те же 70 %).
 const DIGIT_FRACTION: f64 = 0.7;
 /// Масштаб растра цифры: высота битмапа `LINE_HEIGHT × DIGIT_RASTER_SCALE`
-/// = 300 пикселей. На мониторе цифра занимает `DIGIT_FRACTION × BADGE_SIZE`
-/// ≈ 78 DIP, а физический размер прямоугольника — ещё и DPI-масштаб
-/// (вплоть до ~3 на 4K-ноутбуках): 300 пикселей с запасом покрывают 78 DIP
-/// до ~380 %, при меньшем DPI растр уменьшается, а уменьшение чёткое
-/// (увеличение — мыльное). Выше порога цифра слегка смягчается, но не
-/// ломается, а такие масштабы — экзотика.
+/// = 320 пикселей (плюс запас под свечение, §6). На мониторе цифра занимает
+/// `DIGIT_FRACTION × BADGE_SIZE` ≈ 78 DIP, а физический размер
+/// прямоугольника — ещё и DPI-масштаб (вплоть до ~3 на 4K-ноутбуках): 320
+/// пикселей с запасом покрывают 78 DIP до ~400 %, при меньшем DPI растр
+/// уменьшается, а уменьшение чёткое (увеличение — мыльное). Выше порога
+/// цифра слегка смягчается, но не ломается, а такие масштабы — экзотика.
 const DIGIT_RASTER_SCALE: u32 = 20;
 
 /// База ключа кэша растров цифр. Кэш вызывающего слоя ключуется по
 /// `(key, width, height)` (`UiTextureCache::rgba_texture`): у разных номеров
-/// разные ключ и ширина, пересечений нет; база вне диапазона ключей углов
-/// скругления (`SETTINGS_CORNER_KEY` в rst-render).
+/// разные ключ и ширина, пересечений нет; диапазон выше ключей стекла
+/// (`glass_texture` ключуется по `(surface, размер, радиус, гало)` — другие
+/// значения, пересечений не бывает).
 const BADGE_KEY_BASE: u64 = 0xBAD6_2026_0000_0000;
 
 /// Сторона бейджа под рабочую область: полный размер, пока помещается с
@@ -77,9 +78,20 @@ fn badge_side(work_area: &DipRect) -> f64 {
     BADGE_SIZE.min(max_w).min(max_h)
 }
 
+/// Высота прямоугольника цифры, DIP. Растр [`rasterize`] с §6 шире глифа на
+/// запас под свечение (`GLOW_PAD_DIP` с каждой стороны), и прямоугольник
+/// обязан покрыть ВЕСЬ битмап — иначе гало обрежется по краю. Глиф внутри
+/// остаётся ровно `DIGIT_FRACTION × side`: высота делится на долю глифа
+/// в битмапе.
+fn digit_rect_h(side: f64, bitmap_h_px: u32) -> f64 {
+    let pad_px = f64::from(glow_pad_px(DIGIT_RASTER_SCALE));
+    let glyph_fraction = (f64::from(bitmap_h_px) - 2.0 * pad_px) / f64::from(bitmap_h_px);
+    side * DIGIT_FRACTION / glyph_fraction
+}
+
 /// Собрать бейдж номера `number` в рабочей области `work_area` (DIP, без
-/// панели задач): скруглённый полупрозрачный квадрат в левом верхнем углу
-/// с отступом [`MARGIN`] и крупная светлая цифра по центру.
+/// панели задач): карточка чёрного стекла в левом верхнем углу с отступом
+/// [`MARGIN`] и крупная светящаяся цифра по центру.
 pub fn build(work_area: &DipRect, number: u32) -> Panel {
     let side = badge_side(work_area);
     let cx = work_area.x + MARGIN + side / 2.0;
@@ -92,14 +104,24 @@ pub fn build(work_area: &DipRect, number: u32) -> Panel {
         rotation: 0.0,
     };
     let mut panel = Panel::new(BADGE_PANEL_ID, frame)
-        .with_style(WidgetStyle::Settings)
-        .with_corner_radius(theme::settings::CORNER_RADIUS);
+        // Малый радиус §3: бейдж — мелкий элемент, как бейджи и иконки.
+        .with_corner_radius(theme::RADIUS_TIGHT);
+
+    // Корпус — карточка стекла (`Surface::Card`), а не фон панели: бейдж не
+    // окно, а самостоятельная карточка на рабочем столе. Рисуется виджетом,
+    // потому что `Panel::draw` всегда кладёт корпус `Surface::Panel`; под
+    // карточкой остаётся тот же материал панели — растры совпадают, видна
+    // только карточка.
+    panel.add_widget(BadgeBody {
+        id: BODY_ID,
+        rect: frame,
+    });
 
     let label = number.to_string();
-    let (rgba, w_px, h_px) = rasterize(&label, theme::settings::TEXT, DIGIT_RASTER_SCALE);
+    let (rgba, w_px, h_px) = rasterize(&label, theme::TEXT, DIGIT_RASTER_SCALE);
     // Прямоугольник цифры сохраняет соотношение сторон битмапа — иначе
     // растяжение по одной оси раздавило бы глиф.
-    let digit_h = side * DIGIT_FRACTION;
+    let digit_h = digit_rect_h(side, h_px);
     let digit_w = digit_h * w_px as f64 / h_px as f64;
     panel.add_widget(BadgeDigit {
         id: DIGIT_ID,
@@ -116,6 +138,43 @@ pub fn build(work_area: &DipRect, number: u32) -> Panel {
         rgba,
     });
     panel
+}
+
+/// Корпус бейджа: одна карточка стекла (`Surface::Card`) с радиусом
+/// [`theme::RADIUS_TIGHT`]. Неинтерактивна, как цифра.
+struct BadgeBody {
+    id: WidgetId,
+    rect: Box2D,
+}
+
+impl Widget for BadgeBody {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.rect = bounds;
+    }
+
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        glass_card(out, self.rect, theme::RADIUS_TIGHT, 1.0);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 /// Виджет цифры бейджа — неинтерактивный (клики сквозь него, как у
@@ -183,9 +242,9 @@ mod tests {
         );
     }
 
-    /// Растровый примитив цифры. Другие `Rgba` в выводе панели — углы
-    /// скругления (`settings_frame_radius`) с ключами из rst-render, они
-    /// лежат ниже [`BADGE_KEY_BASE`].
+    /// Растровый примитив цифры. Другие `Rgba` в выводе панели отсутствуют:
+    /// корпус и фон — стекло (`Primitive::Glass`), ключи стекла живут в
+    /// отдельном кэше и в вывод `Rgba` не попадают.
     fn digit_prim(panel: &Panel) -> Primitive {
         let mut out = Vec::new();
         panel.draw(&mut out);
@@ -211,6 +270,7 @@ mod tests {
             for prim in &out {
                 let rect = match prim {
                     Primitive::Fill { rect, .. }
+                    | Primitive::Glass { rect, .. }
                     | Primitive::Icon { rect, .. }
                     | Primitive::Rgba { rect, .. }
                     | Primitive::Text { rect, .. } => rect,
@@ -252,7 +312,13 @@ mod tests {
         };
         assert_close(rect.cx, f.cx, "цифра по центру по X");
         assert_close(rect.cy, f.cy, "цифра по центру по Y");
-        assert_close(rect.h, f.h * DIGIT_FRACTION, "высота цифры");
+        // Прямоугольник покрывает битмап с запасом под свечение, поэтому
+        // выше, чем глиф: глиф внутри остаётся `DIGIT_FRACTION × side`.
+        assert_close(
+            rect.h,
+            digit_rect_h(f.h, height),
+            "высота прямоугольника цифры",
+        );
         assert_close(
             rect.w / rect.h,
             f64::from(width) / f64::from(height),
@@ -276,8 +342,7 @@ mod tests {
                 panic!("цифра — Rgba");
             };
             assert_eq!(key, BADGE_KEY_BASE + u64::from(n), "свой ключ кэша");
-            let (expected, ew, eh) =
-                rasterize(&n.to_string(), theme::settings::TEXT, DIGIT_RASTER_SCALE);
+            let (expected, ew, eh) = rasterize(&n.to_string(), theme::TEXT, DIGIT_RASTER_SCALE);
             assert_eq!((width, height), (ew, eh), "размеры битмапа");
             assert_eq!(&rgba, &expected, "битмап — растризация номера {n}");
         }

@@ -56,6 +56,7 @@ use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
 use rst_media::animation as media_animation;
 use rst_media::paste;
+use rst_render::glass::Surface;
 use rst_render::{
     Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon, Key, Label,
     NumericField, Panel, PinnedRowField, PointerEvent, PresentSync, Primitive, RenderError,
@@ -676,15 +677,20 @@ const PIN_FLASH_DURATION: Duration = PIN_FLASH_FADE_IN
 /// Шаг перепланирования кадра пульса — тот же принцип «ноль пробуждений в
 /// покое» (ADR-006), что у тултипа: 16 мс ≈ 60 Гц, дешевле некуда.
 const PIN_FLASH_STEP: Duration = Duration::from_millis(16);
-/// Цвет рамки пульса ПРИ ЗАКРЕПЛЕНИИ — акцент проекта: тот же `#3c9898`,
-/// что `--accent` в настройках (НЕ синий `SLIDER_FILL` D3D-темы — тот для
-/// другой семантики).
-const PIN_FLASH_COLOR_PIN: [u8; 3] = [0x3c, 0x98, 0x98];
+/// Цвет рамки пульса ПРИ ЗАКРЕПЛЕНИИ — белый.
+///
+/// Был бирюзовый `#3c9898` (акцент старого языка настроек). В Dark Liquid
+/// Glass цветного акцента нет вовсе (`docs/DESIGN_LIQUID_GLASS.md` §2.4):
+/// единственный «цвет» интерфейса — белый свет разной силы, и «окно
+/// закреплено» читается вспышкой света, а не оттенком. Отличие от
+/// открепления держит [`PIN_FLASH_COLOR_UNPIN`] — единственный оставшийся
+/// в приложении цвет.
+const PIN_FLASH_COLOR_PIN: [u8; 3] = [0xff, 0xff, 0xff];
 /// Цвет рамки пульса ПРИ ОТКРЕПЛЕНИИ (запрос пользователя 2026-08-19:
 /// «обводка становится красного цвета, а не цвета cyan») — красный, чтобы
 /// визуально отличаться от закрепления и читаться как «окно освобождено»,
 /// не «окно занято».
-const PIN_FLASH_COLOR_UNPIN: [u8; 3] = [0xd0, 0x3c, 0x3c];
+const PIN_FLASH_COLOR_UNPIN: [u8; 3] = [0xd0, 0x46, 0x3c];
 /// Толщина рамки пульса — в 1.5 раза толще обычной рамки выделения
 /// (`HIGHLIGHT_THICKNESS_DIP`, запрос пользователя 2026-08-19: «обводку в
 /// 1.5 раза больше»); намеренно отдельная константа — амбарная рамка
@@ -973,6 +979,56 @@ enum OverlayMessage {
 /// 20-секундный отсчёт стартует не с момента пропажи, а с первого снапшота
 /// **после пробуждения** (`reenumerate_monitors` на `SystemResumed`) — время
 /// сна в отсчёт не идёт. Врождённо событийной модели, не баг
+impl EditState {
+    /// Продвинуть фазы наведения и нажатия всех живых панелей на `dt_ms`
+    /// (`docs/DESIGN_LIQUID_GLASS.md` §5). `true` — пока что-то движется.
+    ///
+    /// Панели перечислены руками, а не собраны обходом: они живут в разных
+    /// полях разных состояний, общего контейнера у них нет, и заводить его
+    /// ради анимации значило бы перекроить всё состояние редактирования.
+    /// Новая панель, забытая здесь, не сломается — она просто будет
+    /// переключать наведение ступенькой, как было до стекла.
+    fn animate_ui(&mut self, dt_ms: f64) -> bool {
+        let mut moving = false;
+        for panel in [self.toolbar.as_mut(), self.cursor_panel.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            moving |= panel.animate(dt_ms);
+        }
+        if let Some(st) = self.confirm.as_mut() {
+            moving |= st.panel.animate(dt_ms);
+        }
+        if let Some(st) = self.window_picker.as_mut() {
+            moving |= st.panel.animate(dt_ms);
+        }
+        if let Some(st) = self.preset_picker.as_mut() {
+            moving |= st.panel.animate(dt_ms);
+        }
+        if let Some(st) = self.gap_panel.as_mut() {
+            moving |= st.panel.animate(dt_ms);
+        }
+        if let Some(st) = self.group_manager.as_mut() {
+            moving |= st.panel.animate(dt_ms);
+        }
+        if let Some(st) = self.window_pick_list.as_mut() {
+            moving |= st.panel.animate(dt_ms);
+        }
+        if let Some(st) = self.pinned_panel.as_mut() {
+            moving |= st.panel.animate(dt_ms);
+        }
+        if let Some(st) = self.video_timeline.as_mut() {
+            moving |= st.panel.animate(dt_ms);
+        }
+        if let Some(panels) = self.group_editor.as_mut() {
+            moving |= panels.badge.animate(dt_ms);
+            moving |= panels.strip.panel.animate(dt_ms);
+            moving |= panels.presets.panel.animate(dt_ms);
+        }
+        moving
+    }
+}
+
 /// (M3_SESSION_SLEEP_REVIEW.md, пункт 2.2).
 const LOSS_TICK_PERIOD: Duration = Duration::from_secs(1);
 
@@ -1443,6 +1499,10 @@ struct EditState {
     /// 1 && marquee.is_none()` (docs/M2_WIRING_PLAN.md, раздел 4). Мультивыделение
     /// (`docs/M2_MULTISELECT_TOOLBAR_NOTES.md`) — следующий срез: билдер уже
     /// поддерживает `opacity: None`, но действия батчем сюда не подключены.
+    /// Момент прошлого кадра анимации интерфейса (§5). `None` — сейчас
+    /// ничего не движется, и следующий переход начнёт отсчёт с чистого
+    /// кадрового шага, а не с паузы длиной в простой приложения.
+    ui_anim_last: Option<Instant>,
     toolbar: Option<Panel>,
     /// Панель у курсора — есть, пока `active` (раздел 4).
     cursor_panel: Option<Panel>,
@@ -1687,6 +1747,11 @@ struct PinnedPanelState {
     scroll: usize,
 }
 
+/// Число ступеней квантования силы гало в ключе кэша стекла: на глаз
+/// ступени не различимы, а без квантования плавное наведение (§5) плодило
+/// бы по новому растру и новой GPU-текстуре на каждый кадр.
+const GLOW_STEPS: u32 = 4;
+
 /// Кэш 1×1 текстур заливки и текстур растрированного текста для перевода
 /// `Primitive` (immediate-mode виджетов) в `Sprite` (docs/M2_WIRING_PLAN.md,
 /// раздел 2–3). Живёт на весь сеанс редактирования в `run()`, не в
@@ -1706,6 +1771,13 @@ struct UiTextureCache {
     // `fills` — пересоздаются только при потере устройства (кэш целиком
     // пересоздаётся в `recover_device`).
     rgba_icons: HashMap<(u64, u32, u32), Texture>,
+    // Растры стекла (`Primitive::Glass`, docs/DESIGN_LIQUID_GLASS.md §4):
+    // ключ — (поверхность, физический размер, радиус в сотых DIP, ступень
+    // гало). Размеры панелей и кнопок между кадрами не меняются, поэтому
+    // кэш попадает почти всегда; ступень гало квантована (см. GLOW_STEPS),
+    // иначе каждый кадр плавного наведения давал бы новый растр и новую
+    // текстуру.
+    glass: HashMap<(Surface, u32, u32, u32, u32), Texture>,
 }
 
 impl UiTextureCache {
@@ -1715,6 +1787,7 @@ impl UiTextureCache {
             texts: HashMap::new(),
             icons: HashMap::new(),
             rgba_icons: HashMap::new(),
+            glass: HashMap::new(),
         }
     }
 
@@ -1779,6 +1852,43 @@ impl UiTextureCache {
             }
         }
     }
+    /// Текстура стеклянного прямоугольника (`Primitive::Glass`).
+    ///
+    /// Гало квантуется по [`GLOW_STEPS`] ступеням: при плавном наведении
+    /// (§5) сила гало меняется каждый кадр, и некэшированный растр означал
+    /// бы генерацию картинки и аплоад текстуры 60 раз в секунду на каждую
+    /// кнопку под курсором. На глаз ступени не различимы — сам растр
+    /// смешивается с фоном ещё и непрозрачностью спрайта, которая остаётся
+    /// непрерывной.
+    fn glass_texture(
+        &mut self,
+        renderer: &Renderer,
+        surface: Surface,
+        w_px: u32,
+        h_px: u32,
+        radius_px: f64,
+        glow: f64,
+    ) -> Option<Texture> {
+        let radius_key = (radius_px.max(0.0) * 100.0).round() as u32;
+        let glow_step = (glow.clamp(0.0, 1.0) * f64::from(GLOW_STEPS)).round() as u32;
+        let key = (surface, w_px, h_px, radius_key, glow_step);
+        if let Some(t) = self.glass.get(&key) {
+            return Some(t.clone());
+        }
+        let glow_q = f64::from(glow_step) / f64::from(GLOW_STEPS);
+        let rgba = rst_render::glass::glass_rgba(w_px, h_px, radius_px, surface, glow_q);
+        match renderer.create_texture_from_rgba(&rgba, w_px, h_px) {
+            Ok(t) => {
+                self.glass.insert(key, t.clone());
+                Some(t)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, ?surface, "не удалось создать текстуру стекла");
+                None
+            }
+        }
+    }
+
     /// Текстура произвольного RGBA-растра (иконка окна в панели выбора,
     /// M4 §6): кэш по (key, width, height) — окна одного процесса делят
     /// один key и одну текстуру; `rgba` используется только на первом
@@ -1840,7 +1950,47 @@ fn primitives_to_sprites(
                     continue;
                 }
                 if let Some(tex) = cache.text_texture(renderer, text, *color, text_scale) {
-                    out.push(solid_sprite(&tex, monitor_id, rect, *opacity));
+                    // Растр строки шире и выше её коробки на запас под
+                    // свечение (`rst_render::GLOW_PAD_DIP`) — раздуваем
+                    // прямоугольник назначения ровно на столько же, иначе
+                    // гало сожмёт глифы. Это единственное место сшивки:
+                    // сборщики панелей про свечение не знают
+                    // (docs/DESIGN_LIQUID_GLASS.md §6).
+                    let pad = rst_render::GLOW_PAD_DIP;
+                    let glowing = Box2D {
+                        w: rect.w + 2.0 * pad,
+                        h: rect.h + 2.0 * pad,
+                        ..*rect
+                    };
+                    out.push(solid_sprite(&tex, monitor_id, &glowing, *opacity));
+                }
+            }
+            Primitive::Glass {
+                rect,
+                radius,
+                surface,
+                glow,
+                opacity,
+            } => {
+                // Растр стекла генерируется в ФИЗИЧЕСКИХ пикселях того же
+                // масштаба, что текст и иконки, — иначе кромка толщиной
+                // 1 DIP на 200 % DPI размазалась бы вдвое. Гало живёт за
+                // границей прямоугольника, поэтому и растр, и прямоугольник
+                // назначения раздуваются на `glow_pad_px` (§4 п. 6).
+                let scale = f64::from(text_scale);
+                let pad_px = rst_render::glass::glow_pad_px(*glow);
+                let pad_dip = f64::from(pad_px) / scale;
+                let w_px = ((rect.w * scale).round().max(1.0) as u32) + 2 * pad_px;
+                let h_px = ((rect.h * scale).round().max(1.0) as u32) + 2 * pad_px;
+                if let Some(tex) =
+                    cache.glass_texture(renderer, *surface, w_px, h_px, radius * scale, *glow)
+                {
+                    let inflated = Box2D {
+                        w: rect.w + 2.0 * pad_dip,
+                        h: rect.h + 2.0 * pad_dip,
+                        ..*rect
+                    };
+                    out.push(solid_sprite(&tex, monitor_id, &inflated, *opacity));
                 }
             }
             Primitive::Icon {
@@ -2502,6 +2652,7 @@ fn run(
         pending_video: None,
         marquee: None,
         marquee_started: false,
+        ui_anim_last: None,
         toolbar: None,
         cursor_panel: None,
         cursor_panel_hovered: false,
@@ -4715,6 +4866,28 @@ fn run(
                 .any(|s| s.playback.show_timeline && sticker_is_video(s))
                 .then(|| Instant::now() + TIMELINE_HOVER_POLL)
         };
+        // Плавность наведения и нажатия (§5): фазы виджетов живут во
+        // времени, а цикл координатора событийный — без собственного
+        // дедлайна переход замер бы на середине, стоило курсору
+        // остановиться над кнопкой. Продвигаем фазы на реально прошедшее
+        // время и просим планировщик будить нас, пока хоть что-то движется;
+        // как только всё доехало, дедлайн исчезает и пробуждений снова ноль.
+        let now_ui = Instant::now();
+        let dt_ms = edit.ui_anim_last.map_or(UI_FRAME_MS, |prev| {
+            now_ui.duration_since(prev).as_secs_f64() * 1000.0
+        });
+        let ui_moving = edit.animate_ui(dt_ms.min(UI_FRAME_CAP_MS));
+        if ui_moving {
+            edit.ui_anim_last = Some(now_ui);
+            need_redraw = true;
+        } else {
+            edit.ui_anim_last = None;
+        }
+        let next_ui_anim_deadline = if session_locked || !ui_moving {
+            None
+        } else {
+            Some(now_ui + UI_FRAME)
+        };
         let next_tick_deadline = [
             next_anim_deadline,
             next_timeline_deadline,
@@ -4724,6 +4897,7 @@ fn run(
             next_banner_deadline,
             next_pin_follow_deadline,
             next_cursor_panel_deadline,
+            next_ui_anim_deadline,
         ]
         .into_iter()
         .flatten()
@@ -6560,7 +6734,7 @@ fn tooltip_primitives(tooltip: &TooltipState, screen_h: f64, opacity: f64) -> Ve
     // сам: серая модалка настроек с объёмной рамкой (запрос пользователя
     // 2026-08-23), а не тёмная плашка старой схемы.
     let mut out = Vec::new();
-    rst_render::settings_frame(&mut out, frame, opacity);
+    rst_render::tooltip_frame(&mut out, frame, opacity);
     out.push(Primitive::Text {
         rect: Box2D {
             cx,
@@ -6570,7 +6744,7 @@ fn tooltip_primitives(tooltip: &TooltipState, screen_h: f64, opacity: f64) -> Ve
             rotation: 0.0,
         },
         text: tooltip.text.to_string(),
-        color: theme::settings::TEXT,
+        color: theme::TEXT,
         opacity,
     });
     out
@@ -7175,6 +7349,19 @@ const TIMELINE_WIDGET_ID: rst_render::WidgetId = 1;
 /// `WM_MOUSEMOVE` не получает вовсе, так что узнать о наведении можно
 /// только опросом. 60 мс — незаметно для руки и в разы дешевле кадра.
 const TIMELINE_HOVER_POLL: Duration = Duration::from_millis(60);
+
+/// Шаг кадра анимации интерфейса (§5) — 60 Гц. Дедлайн ставится только пока
+/// хоть одна фаза в движении: в покое пробуждений по-прежнему ноль (ADR-006).
+const UI_FRAME: Duration = Duration::from_millis(16);
+
+/// Тот же шаг в миллисекундах — им продвигается первый кадр перехода, когда
+/// прошлого кадра ещё не было.
+const UI_FRAME_MS: f64 = 16.0;
+
+/// Потолок шага времени анимации, мс: между сообщениями координатора может
+/// пройти сколько угодно (сон, залипший чужой процесс), и без потолка первый
+/// же кадр после паузы проскочил бы весь переход целиком.
+const UI_FRAME_CAP_MS: f64 = 100.0;
 
 /// Стикер, которому сейчас положена полоса перемотки, и режим показа.
 ///
@@ -8847,10 +9034,13 @@ fn group_drag_overlay(panels: &GroupEditorPanels) -> Vec<Primitive> {
 const DRAG_GHOST_W: f64 = 64.0;
 /// Высота призрака, DIP.
 const DRAG_GHOST_H: f64 = 44.0;
-/// Цвет призрака — светлый, чтобы читался и на тёмной ленте, и на светлом окне.
-const DRAG_GHOST_COLOR: [u8; 3] = [0xd8, 0xd8, 0xd8];
-/// Цвет подсветки слота-цели.
-const DRAG_TARGET_COLOR: [u8; 3] = [0x5a, 0x9b, 0xd5];
+/// Цвет призрака — белый: читается и на тёмной ленте, и на светлом окне.
+const DRAG_GHOST_COLOR: [u8; 3] = [0xff, 0xff, 0xff];
+/// Цвет подсветки слота-цели — белый.
+///
+/// Был синий `#5a9bd5`; §2.4 запрещает цветной акцент — цель перетаскивания
+/// показывает свет, а не оттенок.
+const DRAG_TARGET_COLOR: [u8; 3] = [0xff, 0xff, 0xff];
 
 /// Ввод мышью в меню редактирования групп. `true` — надо перерисовать.
 ///
@@ -15068,6 +15258,7 @@ mod tests {
             pending_video: None,
             marquee: None,
             marquee_started: false,
+            ui_anim_last: None,
             toolbar: None,
             cursor_panel: None,
             cursor_panel_hovered: false,
@@ -17989,19 +18180,13 @@ mod tests {
     fn tooltip_primitives_positions_below_anchor_when_room() {
         let tooltip = test_tooltip(Instant::now());
         let prims = tooltip_primitives(&tooltip, 1080.0, 1.0);
-        assert_eq!(
-            prims.len(),
-            6,
-            "фон + четыре грани объёмной рамки настроек + один Text"
-        );
-        let Primitive::Fill { rect, opacity, .. } = prims[0] else {
-            panic!("первый примитив — фон панели");
+        // Корпус тултипа — ОДНА плита стекла (§4), а не фон плюс четыре
+        // грани объёмной рамки: весь материал приходит одним растром.
+        assert_eq!(prims.len(), 2, "корпус стекла + один Text");
+        let Primitive::Glass { rect, opacity, .. } = prims[0] else {
+            panic!("первый примитив — стеклянный корпус тултипа");
         };
-        assert_eq!(
-            opacity,
-            theme::settings::BG_OPACITY,
-            "полная анимация — полная непрозрачность фона"
-        );
+        assert_eq!(opacity, 1.0, "полная анимация — полная непрозрачность фона");
         // Верх тултипа строго ниже низа кнопки (anchor.cy + h/2 = 114) плюс
         // зазор TOOLTIP_GAP_DIP.
         let anchor_bottom = tooltip.anchor.cy + tooltip.anchor.h / 2.0;
@@ -18018,8 +18203,8 @@ mod tests {
         let mut tooltip = test_tooltip(Instant::now());
         tooltip.anchor.cy = 195.0; // низ кнопки на y=209, экран высотой 210
         let prims = tooltip_primitives(&tooltip, 210.0, 1.0);
-        let Primitive::Fill { rect, .. } = prims[0] else {
-            panic!("первый примитив — фон-рамка");
+        let Primitive::Glass { rect, .. } = prims[0] else {
+            panic!("первый примитив — стеклянный корпус тултипа");
         };
         let anchor_top = tooltip.anchor.cy - tooltip.anchor.h / 2.0;
         assert!(
@@ -19053,6 +19238,7 @@ mod tests {
             pending_video: None,
             marquee: None,
             marquee_started: false,
+            ui_anim_last: None,
             toolbar: None,
             cursor_panel: None,
             cursor_panel_hovered: false,

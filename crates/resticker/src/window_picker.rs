@@ -17,7 +17,7 @@ use rst_core::model::{OverlapRule, VisibilityMode, VisibilityRule};
 use rst_core::occluders::{OccluderCandidate, rule_matches};
 use rst_render::{
     Box2D, Button, ButtonContent, Checkbox, Panel, Primitive, ScrollBar, Widget, WidgetId,
-    text_size, theme,
+    glass_control, text_size, theme,
 };
 use rst_win32::window_enum::{WindowIcon, WindowInfo};
 
@@ -345,8 +345,10 @@ pub const PICKER_HEADER_H: f64 = 40.0;
 /// Высота строки списка, DIP (равна `theme::BUTTON_SIZE` — колонка иконок
 /// проектировалась квадратом этого размера, дизайн §6).
 pub const PICKER_ROW_H: f64 = theme::BUTTON_SIZE;
-/// Внутренний отступ панели, DIP.
-pub const PICKER_PAD: f64 = 6.0;
+/// Внутренний отступ корпуса, DIP (§3 `PAD_PANEL`): панель — большой корпус,
+/// поэтому берём токен спецификации, а не локальное число — панели должны
+/// дышать одинаково.
+pub const PICKER_PAD: f64 = theme::PAD_PANEL;
 /// Отступ строк окон от левого края строк процесса, DIP.
 pub const PICKER_WINDOW_INDENT: f64 = 24.0;
 /// Сторона слота иконки, DIP (дизайн §6: реальный растр окна
@@ -388,7 +390,7 @@ pub fn build_picker_panel(
     frame: Box2D,
     desktop_preset: bool,
 ) -> PickerPanel {
-    let mut panel = Panel::new(PICKER_PANEL_ID, frame);
+    let mut panel = Panel::new(PICKER_PANEL_ID, frame).with_corner_radius(theme::RADIUS_WINDOW);
     let left = frame.cx - frame.w / 2.0 + PICKER_PAD;
     let top = frame.cy - frame.h / 2.0;
 
@@ -420,7 +422,10 @@ pub fn build_picker_panel(
     };
     for &(id, text) in header_buttons {
         let (tw, _) = text_size(text);
-        let btn_w = tw + 2.0 * theme::BUTTON_PAD + 8.0;
+        // Ширина кнопки — подпись плюс горизонтальные отступы §3 (`PAD_CTRL_X`).
+        // Прежнее магическое 8.0 было локальным падом; у кнопки с подписью
+        // отступ задаёт спецификация, а `BUTTON_PAD` (4) — это отступ иконки.
+        let btn_w = tw + 2.0 * theme::PAD_CTRL_X;
         panel.add_widget(Button::new(
             id,
             Box2D {
@@ -576,7 +581,7 @@ fn text_rect(left: f64, cy: f64, text: &str) -> Box2D {
 }
 
 /// Слот иконки строки: квадрат в колонке иконок (реальный растр
-/// [`Primitive::Rgba`] или плейсхолдер-`Fill` — решает `RowLabel::draw`).
+/// [`Primitive::Rgba`] или плита стекла-плейсхолдер — решает `RowLabel::draw`).
 fn icon_rect(cx: f64, cy: f64) -> Box2D {
     Box2D {
         cx,
@@ -598,7 +603,7 @@ fn all_windows_checked(visibility: &VisibilityRule, snapshot: &[WindowInfo]) -> 
 /// Надпись строки списка + слот иконки (дизайн §6; иконки — срез M4,
 /// `WindowInfo.icon`): один виджет на строку, эмитит квадрат колонки
 /// иконок (реальный растр [`Primitive::Rgba`] при `icon: Some`, иначе
-/// плейсхолдер-`Fill`) и текст (заголовок окна / имя процесса).
+/// плита стекла-плейсхолдер) и текст (заголовок окна / имя процесса).
 /// В toolbar.rs/cursor_panel.rs текстовых виджетов нет (подписи живут
 /// внутри кнопок) — поэтому мини-виджет приватный здесь. Хит-теста нет:
 /// строка не потребляет клики, интерактивны только чекбоксы.
@@ -658,18 +663,24 @@ impl Widget for RowLabel {
                 rgba: icon.rgba.clone(),
                 opacity: 1.0,
             }),
-            None => out.push(Primitive::Fill {
-                rect: self.icon_rect,
-                color: theme::BUTTON_BG,
-                opacity: 1.0,
-            }),
+            None => glass_control(
+                out,
+                self.icon_rect,
+                theme::RADIUS_TIGHT,
+                0.0,
+                0.0,
+                false,
+                1.0,
+            ),
         }
         if !self.text.is_empty() {
             out.push(Primitive::Text {
                 rect: self.text_rect,
                 text: self.text.clone(),
                 color: theme::TEXT,
-                opacity: 1.0,
+                // Основной текст UI (§6) — белый `TEXT` при непрозрачности §2.3:
+                // приглушение теперь только альфой, отдельных серых цветов нет.
+                opacity: theme::TEXT_OPACITY,
             });
         }
     }
@@ -705,6 +716,7 @@ fn process_icon(group: &ProcessGroup) -> Option<(u64, WindowIcon)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rst_render::glass::Surface;
     use std::path::PathBuf;
 
     fn window(hwnd: usize, exe: &str, title: &str, pid: u32, z: u32) -> WindowInfo {
@@ -1306,13 +1318,15 @@ mod tests {
             .collect()
     }
 
-    /// Сколько слотов-плейсхолдеров иконок (квадраты `PICKER_ICON_SIZE`).
-    fn icon_slot_count(panel: &Panel) -> usize {
+    /// Сколько слотов-плейсхолдеров иконок: плиты стекла `Surface::Control`
+    /// размера `PICKER_ICON_SIZE` (в покое `glass_control` не ужимает rect —
+    /// фильтр по точному квадрату работает).
+    fn glass_slot_count(panel: &Panel) -> usize {
         let mut out = Vec::new();
         panel.draw(&mut out);
         out.into_iter()
             .filter(|p| {
-                matches!(p, Primitive::Fill { rect, .. }
+                matches!(p, Primitive::Glass { rect, surface: Surface::Control, .. }
                     if rect.w == PICKER_ICON_SIZE && rect.h == PICKER_ICON_SIZE)
             })
             .count()
@@ -1349,7 +1363,7 @@ mod tests {
                 .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE)
                 .is_none()
         );
-        assert_eq!(icon_slot_count(&p.panel), 0);
+        assert_eq!(glass_slot_count(&p.panel), 0);
     }
 
     #[test]
@@ -1530,7 +1544,7 @@ mod tests {
             p.panel.widget::<Checkbox>(PICKER_ROW_WINDOW_BASE).is_none(),
             "окно a пропущено"
         );
-        assert_eq!(icon_slot_count(&p.panel), 4, "видны b, окно b, c, окно c");
+        assert_eq!(glass_slot_count(&p.panel), 4, "видны b, окно b, c, окно c");
         // Скролл за пределы списка: строк нет, шапка на месте.
         let p = build_picker_panel(&allowlist(vec![]), &snapshot, 6, picker_frame(), true);
         assert!(
@@ -1551,7 +1565,7 @@ mod tests {
                 .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE + 1)
                 .is_none()
         );
-        assert_eq!(icon_slot_count(&p.panel), 2);
+        assert_eq!(glass_slot_count(&p.panel), 2);
     }
 
     #[test]
@@ -1588,7 +1602,7 @@ mod tests {
         let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         assert_eq!(p.total_rows, 13);
         assert_eq!(
-            icon_slot_count(&p.panel),
+            glass_slot_count(&p.panel),
             PICKER_VISIBLE_ROWS,
             "строится только видимое окно"
         );
@@ -1764,7 +1778,7 @@ mod tests {
     // --- иконки строк (M4 §6) ---
 
     #[test]
-    fn row_with_icon_emits_rgba_primitive_not_fill() {
+    fn row_with_icon_emits_rgba_not_placeholder() {
         let snapshot = [window_with_icon(
             1,
             r"C:\Apps\chrome.exe",
@@ -1775,11 +1789,11 @@ mod tests {
         )];
         let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         // Строки: chrome-процесс + chrome-окно — обе с иконками: два Rgba,
-        // плейсхолдеров (Fill) в колонке иконок нет вовсе.
+        // стеклянных плейсхолдеров в колонке иконок нет вовсе.
         let icons = rgba_icons(&p.panel);
         assert_eq!(icons.len(), 2, "процесс и окно несут иконки: {icons:?}");
         assert!(icons.iter().all(|&(_, w, h)| w == 16 && h == 16));
-        assert_eq!(icon_slot_count(&p.panel), 0, "плейсхолдеров не осталось");
+        assert_eq!(glass_slot_count(&p.panel), 0, "плейсхолдеров не осталось");
     }
 
     #[test]
@@ -1815,10 +1829,14 @@ mod tests {
     }
 
     #[test]
-    fn window_without_icon_keeps_fill_placeholder() {
+    fn window_without_icon_keeps_glass_placeholder() {
         let snapshot = [window(1, r"C:\Apps\app.exe", "No icon", 1, 1)];
         let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
-        assert_eq!(icon_slot_count(&p.panel), 2, "процесс и окно: плейсхолдеры");
+        assert_eq!(
+            glass_slot_count(&p.panel),
+            2,
+            "процесс и окно: плейсхолдеры"
+        );
         assert!(rgba_icons(&p.panel).is_empty());
     }
 

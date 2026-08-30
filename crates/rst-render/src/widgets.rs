@@ -21,7 +21,9 @@
 
 use rst_core::hittest::to_local;
 use rst_core::model::OverlapRule;
+use rst_core::ui_motion::Phase;
 
+use crate::glass::Surface;
 use crate::selection::Box2D;
 use crate::text;
 
@@ -178,6 +180,22 @@ pub enum Primitive {
         rgba: Vec<u8>,
         opacity: f64,
     },
+    /// Скруглённый прямоугольник стекла — единственный способ нарисовать
+    /// корпус панели, карточку или контрол (`docs/DESIGN_LIQUID_GLASS.md`
+    /// §4). Растр со всеми слоями материала генерирует [`crate::glass`],
+    /// кэширует вызывающий слой по (поверхность, размер, радиус, гало).
+    ///
+    /// `glow` 0..1 — сила внешнего белого гало. Растр из-за него больше
+    /// прямоугольника на [`crate::glass::glow_pad_px`] с каждой стороны, и
+    /// место сшивки раздувает `rect` ровно на столько же — тот же приём,
+    /// что у свечения текста (§6).
+    Glass {
+        rect: Box2D,
+        radius: f64,
+        surface: Surface,
+        glow: f64,
+        opacity: f64,
+    },
     /// Строка текста: растрируется [`crate::text::rasterize`] в текстуру;
     /// `rect` — область назначения (её размер совпадает с [`text::text_size`]).
     Text {
@@ -197,6 +215,7 @@ impl Primitive {
     pub fn translate(&mut self, dx: f64, dy: f64) {
         let rect = match self {
             Primitive::Fill { rect, .. }
+            | Primitive::Glass { rect, .. }
             | Primitive::Icon { rect, .. }
             | Primitive::Rgba { rect, .. }
             | Primitive::Text { rect, .. } => rect,
@@ -211,34 +230,36 @@ impl Primitive {
 /// и фокусной рамки.
 pub mod theme {
     /// Фон панели/тулбара.
-    pub const PANEL_BG: [u8; 3] = [0x2b, 0x2b, 0x30];
+    pub const PANEL_BG: [u8; 3] = [0x07, 0x07, 0x0a];
     /// Непрозрачность фона панели.
-    pub const PANEL_BG_OPACITY: f64 = 0.92;
+    pub const PANEL_BG_OPACITY: f64 = 0.62;
     /// Рамка панели.
-    pub const PANEL_BORDER: [u8; 3] = [0x55, 0x55, 0x5e];
+    pub const PANEL_BORDER: [u8; 3] = [0x2c, 0x2c, 0x33];
     /// Фон кнопки.
-    pub const BUTTON_BG: [u8; 3] = [0x3a, 0x3a, 0x41];
+    pub const BUTTON_BG: [u8; 3] = [0x1b, 0x1b, 0x20];
     /// Фон кнопки под курсором.
-    pub const BUTTON_BG_HOVER: [u8; 3] = [0x4a, 0x4a, 0x54];
+    pub const BUTTON_BG_HOVER: [u8; 3] = [0x2f, 0x2f, 0x36];
     /// Фон кнопки зажатой.
-    pub const BUTTON_BG_ARMED: [u8; 3] = [0x2a, 0x2a, 0x30];
+    pub const BUTTON_BG_ARMED: [u8; 3] = [0x3d, 0x3d, 0x45];
     /// Дорожка ползунка.
-    pub const SLIDER_TRACK: [u8; 3] = [0x55, 0x55, 0x5e];
+    pub const SLIDER_TRACK: [u8; 3] = [0x2c, 0x2c, 0x33];
     /// Заполненная часть и ручка ползунка (акцент).
-    pub const SLIDER_FILL: [u8; 3] = [0x4f, 0x9c, 0xff];
+    pub const SLIDER_FILL: [u8; 3] = [0xff, 0xff, 0xff];
     /// Фон поля ввода.
-    pub const FIELD_BG: [u8; 3] = [0x20, 0x20, 0x24];
+    pub const FIELD_BG: [u8; 3] = [0x08, 0x08, 0x0b];
     /// Рамка поля ввода.
-    pub const FIELD_BORDER: [u8; 3] = [0x55, 0x55, 0x5e];
+    pub const FIELD_BORDER: [u8; 3] = [0x2c, 0x2c, 0x33];
     /// Рамка поля ввода в фокусе (акцент).
-    pub const FIELD_BORDER_FOCUS: [u8; 3] = [0x4f, 0x9c, 0xff];
+    pub const FIELD_BORDER_FOCUS: [u8; 3] = [0xff, 0xff, 0xff];
     /// Каретка.
     pub const CARET: [u8; 3] = [0xff, 0xff, 0xff];
     /// Текст.
-    pub const TEXT: [u8; 3] = [0xf0, 0xf0, 0xf0];
+    pub const TEXT: [u8; 3] = [0xf7, 0xf7, 0xf9];
 
-    /// Сторона квадратной кнопки тулбара, DIP.
-    pub const BUTTON_SIZE: f64 = 28.0;
+    /// Сторона квадратной кнопки тулбара, DIP (§3). Выросла с 28 при
+    /// переходе на стекло: кнопке нужно место под скругление и кромку, а
+    /// иконке — не упираться в них.
+    pub const BUTTON_SIZE: f64 = 30.0;
     /// Внутренний отступ иконки в кнопке, DIP.
     pub const BUTTON_PAD: f64 = 4.0;
     /// Высота ползунка, DIP.
@@ -278,341 +299,176 @@ pub mod theme {
     /// не заслонять содержимое окна.
     pub const LOCK_INDICATOR_OPACITY: f64 = 0.85;
     /// Фон бейджа индикатора (тёмный — читается и на светлых окнах).
-    pub const LOCK_INDICATOR_BG: [u8; 3] = [0x1a, 0x1a, 0x1e];
+    pub const LOCK_INDICATOR_BG: [u8; 3] = [0x07, 0x07, 0x0a];
 
-    /// Палитра окна настроек (Half-Life 2 / Source VGUI), перенесённая
-    /// один-в-один из `crates/resticker/ui/styles.css` — те же значения
-    /// переменных `--bg`, `--border-*`, `--btn-*`, `--check-*`, `--accent`.
-    /// Применяется к панелям со стилем [`super::WidgetStyle::Settings`]
-    /// (сейчас — панель инструментов закреплённого окна), чтобы оверлей и
-    /// окно настроек читались как один продукт.
-    ///
-    /// Одно сознательное расхождение: в вебвью у панели есть
-    /// `backdrop-filter: blur(4px)`, поэтому там фон живёт при
-    /// непрозрачности 0.6. Оверлей размывать нечем (композитор рисует
-    /// поверх произвольного окна), и при 0.6 без размытия панель читалась бы
-    /// как грязное пятно — берём [`SETTINGS_BG_OPACITY`] повыше.
-    pub mod settings {
-        /// `--bg`: rgba(118, 118, 118, 0.6).
-        pub const BG: [u8; 3] = [0x76, 0x76, 0x76];
-        /// `--border-light` — светлая грань «поднятой» рамки (сверху слева).
-        pub const BORDER_LIGHT: [u8; 3] = [0xbb, 0xba, 0xba];
-        /// `--border-dark` — тёмная грань (снизу справа).
-        pub const BORDER_DARK: [u8; 3] = [0x43, 0x43, 0x43];
-        /// `--btn-bg` / `--btn-light` / `--btn-dark`.
-        pub const BTN_BG: [u8; 3] = [0x7b, 0x7b, 0x7b];
-        pub const BTN_BG_HOVER: [u8; 3] = [0x8c, 0x8c, 0x8c];
-        pub const BTN_LIGHT: [u8; 3] = [0xbb, 0xbb, 0xbb];
-        pub const BTN_DARK: [u8; 3] = [0x45, 0x45, 0x45];
-        /// `--check-bg` / `--check-light` / `--check-dark`.
-        pub const CHECK_BG: [u8; 3] = [0x55, 0x55, 0x55];
-        pub const CHECK_BG_HOVER: [u8; 3] = [0x63, 0x63, 0x63];
-        pub const CHECK_LIGHT: [u8; 3] = [0xba, 0xba, 0xba];
-        pub const CHECK_DARK: [u8; 3] = [0x42, 0x43, 0x43];
-        /// `--input-bg` / `--input-light` / `--input-dark` — «вдавленное»
-        /// поле ввода (`.numberInput`/`.textInput` в styles.css): грани у
-        /// него перевёрнуты относительно кнопки, тёмная сверху слева.
-        pub const INPUT_BG: [u8; 3] = [0x5a, 0x5a, 0x5a];
-        pub const INPUT_LIGHT: [u8; 3] = [0xb7, 0xb7, 0xb7];
-        pub const INPUT_DARK: [u8; 3] = [0x34, 0x34, 0x34];
-        /// `--accent`: тот же бирюзовый, что подсветка ссылок, выделение
-        /// текста и рамка записи хоткея в окне настроек. Только тонкие
-        /// акценты (заполнение дорожки ползунка, рамка фокуса) — заливать
-        /// им иконку поверх [`BTN_BG`] нельзя: контраст 1.2:1.
-        pub const ACCENT: [u8; 3] = [0x3c, 0x98, 0x98];
-        /// Предупреждение: тот же красный, что пульс открепления окна в
-        /// координаторе (`PIN_FLASH_COLOR_UNPIN`), — «проблема» в приложении
-        /// уже означает именно этот цвет, и язык цвета размножать нельзя.
-        /// Только тонкие предупреждения (кольцо невлезающей раскладки в
-        /// ленте групп): крупные заливки этим цветом кричащие.
-        pub const DANGER: [u8; 3] = [0xd0, 0x3c, 0x3c];
-        /// `--text`: белый, а не мягкий [`super::TEXT`] оверлея.
-        pub const TEXT: [u8; 3] = [0xff, 0xff, 0xff];
-        /// Толщина грани, DIP (в CSS — 1 px).
-        pub const BEVEL: f64 = 1.0;
-        /// Непрозрачность фона панели — см. доккомент модуля.
-        pub const BG_OPACITY: f64 = 0.82;
-        /// Непрозрачность иконки выключенного переключателя (в CSS
-        /// неактивная вкладка живёт на `opacity: 0.5`).
-        pub const ICON_OFF_OPACITY: f64 = 0.5;
-        /// Радиус скругления углов панели, DIP (запрос пользователя
-        /// 2026-08-23 — «немного закруглённые углы»). В окне настроек это
-        /// `border-radius: 8px` у `.wrapper`. Применяется только к панелям,
-        /// которым его явно назначили ([`super::super::Panel::with_corner_radius`]):
-        /// у тулбара стикера углы остаются острыми — он маленький, и
-        /// скругление съело бы крайние кнопки.
-        pub const CORNER_RADIUS: f64 = 8.0;
-    }
+    // --- Dark Liquid Glass, docs/DESIGN_LIQUID_GLASS.md ------------------
+    //
+    // Материал (цвета и альфы слоёв стекла) живёт в `crate::glass` — там же,
+    // где растрируется, чтобы значение и его применение нельзя было развести.
+    // Здесь только то, что нужно СБОРЩИКУ панели: геометрия, длительности и
+    // непрозрачности текста.
+
+    /// §2.3 `TEXT` — непрозрачность основного текста.
+    pub const TEXT_OPACITY: f64 = 0.97;
+    /// §2.3 `TEXT_DIM` — подписи и второстепенное.
+    pub const TEXT_DIM_OPACITY: f64 = 0.66;
+    /// §2.3 `TEXT_FAINT` — заголовки секций и выключенное.
+    pub const TEXT_FAINT_OPACITY: f64 = 0.42;
+
+    /// §3 — радиус корпуса большой панели, DIP.
+    pub const RADIUS_WINDOW: f64 = 18.0;
+    /// §3 — радиус карточки внутри панели, DIP.
+    pub const RADIUS_CARD: f64 = 14.0;
+    /// §3 — радиус кнопки, поля, чекбокса, DIP.
+    pub const RADIUS_CTRL: f64 = 10.0;
+    /// §3 — радиус мелкой иконки-кнопки и бейджа, DIP. Им же скруглён тулбар
+    /// стикера: он узкий, и большой радиус съел бы крайние кнопки.
+    pub const RADIUS_TIGHT: f64 = 7.0;
+    /// §3 — толщина кромки и обводки, DIP.
+    pub const HAIRLINE: f64 = 1.0;
+    /// §3 — внутренний отступ корпуса панели, DIP.
+    pub const PAD_PANEL: f64 = 14.0;
+    /// §3 — горизонтальный отступ подписи в кнопке, DIP.
+    pub const PAD_CTRL_X: f64 = 12.0;
+    /// §3 — расстояние между строками, DIP.
+    pub const GAP_ROW: f64 = 10.0;
+
+    /// §5 — длительность перехода наведения, мс.
+    pub const HOVER_MS: f64 = 160.0;
+    /// §5 — длительность перехода нажатия, мс.
+    pub const PRESS_MS: f64 = 110.0;
+    /// §5 — длительность появления панели, мс.
+    pub const PANEL_IN_MS: f64 = 240.0;
+    /// §5 — длительность появления карточки списка, мс.
+    pub const CARD_IN_MS: f64 = 300.0;
+
+    /// §5 — во сколько раз контрол ужимается под курсором («продавливается»).
+    pub const HOVER_SCALE: f64 = 0.972;
+    /// §5 — во сколько раз ужимается зажатый контрол.
+    pub const PRESS_SCALE: f64 = 0.955;
+
+    /// §2.4 — ЕДИНСТВЕННЫЙ цвет во всём интерфейсе. Только тонкие
+    /// предупреждения: кольцо не влезающей раскладки, подпись удаления,
+    /// пульс открепления окна. Заливать им площади запрещено — на чёрном
+    /// стекле красная плоскость кричит.
+    pub const DANGER: [u8; 3] = [0xd0, 0x46, 0x3c];
 }
 
-/// Оформление виджета: тёмная схема оверлея (по умолчанию) либо стилистика
-/// окна настроек (Source VGUI, [`theme::settings`]).
+/// Корпус панели: одна плита чёрного стекла со всеми слоями §4.
 ///
-/// Стиль выбирает СБОРЩИК панели, а не сам виджет: панель инструментов
-/// закреплённого окна строится в стиле настроек целиком
-/// ([`build_pinned_lock_panel`]), тулбар и остальные панели остаются
-/// тёмными.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum WidgetStyle {
-    /// Тёмная схема оверлея ([`theme::PANEL_BG`] и соседи).
-    #[default]
-    Overlay,
-    /// Стилистика окна настроек ([`theme::settings`]).
-    Settings,
-}
-
-/// Грани «объёмной» рамки VGUI: светлая сверху и слева, тёмная снизу и
-/// справа (`raised == true`) либо наоборот — «вдавленное» поле
-/// (`raised == false`, так в настройках нарисованы поля ввода и чекбоксы).
-/// Ровно те же четыре односторонние границы, что задаёт CSS настроек.
-fn settings_bevel(out: &mut Vec<Primitive>, rect: Box2D, raised: bool, opacity: f64) {
-    let (light, dark) = (theme::settings::BORDER_LIGHT, theme::settings::BORDER_DARK);
-    let (top_left, bottom_right) = if raised { (light, dark) } else { (dark, light) };
-    let t = theme::settings::BEVEL;
-    let half_w = rect.w / 2.0;
-    let half_h = rect.h / 2.0;
-    let mut edge = |cx: f64, cy: f64, w: f64, h: f64, color: [u8; 3]| {
-        out.push(Primitive::Fill {
-            rect: Box2D {
-                cx,
-                cy,
-                w: w.max(0.0),
-                h: h.max(0.0),
-                rotation: rect.rotation,
-            },
-            color,
-            opacity,
-        });
-    };
-    edge(rect.cx, rect.cy - half_h + t / 2.0, rect.w, t, top_left);
-    edge(rect.cx - half_w + t / 2.0, rect.cy, t, rect.h, top_left);
-    edge(rect.cx, rect.cy + half_h - t / 2.0, rect.w, t, bottom_right);
-    edge(rect.cx + half_w - t / 2.0, rect.cy, t, rect.h, bottom_right);
-}
-
-/// Фон панели в стилистике настроек со скруглением углов на `radius` DIP
-/// (`0` — острые углы, обычный [`settings_frame`]).
-///
-/// Тело складывается из двух пересекающихся полос (их объединение — весь
-/// прямоугольник, кроме четырёх угловых квадратов), прямые грани
-/// укорачиваются на радиус, а сами углы рисуются готовыми RGBA-растрами со
-/// сглаженной дугой ([`settings_corner_rgba`]). Скруглить заливку иначе
-/// нечем: конвейер спрайтов умеет только текстурированные прямоугольники,
-/// а лесенка из тонких полос была бы видна на глаз.
-pub fn settings_frame_radius(out: &mut Vec<Primitive>, rect: Box2D, radius: f64, opacity: f64) {
-    let r = radius.min(rect.w / 2.0).min(rect.h / 2.0);
-    // NaN-радиус или вырожденная панель — рисуем обычную прямоугольную
-    // рамку: скруглять нечего.
-    if !r.is_finite() || r <= 0.0 {
-        settings_frame(out, rect, opacity);
-        return;
-    }
-    let bg_opacity = theme::settings::BG_OPACITY * opacity;
-    // Две полосы вместо одного прямоугольника: их объединение покрывает всё,
-    // кроме угловых квадратов, которые займут дуги.
-    for (w, h) in [(rect.w, rect.h - 2.0 * r), (rect.w - 2.0 * r, rect.h)] {
-        out.push(Primitive::Fill {
-            rect: Box2D { w, h, ..rect },
-            color: theme::settings::BG,
-            opacity: bg_opacity,
-        });
-    }
-
-    // Прямые части граней — укорочены на радиус с обоих концов.
-    let (light, dark) = (theme::settings::BORDER_LIGHT, theme::settings::BORDER_DARK);
-    let t = theme::settings::BEVEL;
-    let (half_w, half_h) = (rect.w / 2.0, rect.h / 2.0);
-    let mut edge = |cx: f64, cy: f64, w: f64, h: f64, color: [u8; 3]| {
-        out.push(Primitive::Fill {
-            rect: Box2D {
-                cx,
-                cy,
-                w: w.max(0.0),
-                h: h.max(0.0),
-                rotation: rect.rotation,
-            },
-            color,
-            opacity: bg_opacity,
-        });
-    };
-    edge(
-        rect.cx,
-        rect.cy - half_h + t / 2.0,
-        rect.w - 2.0 * r,
-        t,
-        light,
-    );
-    edge(
-        rect.cx - half_w + t / 2.0,
-        rect.cy,
-        t,
-        rect.h - 2.0 * r,
-        light,
-    );
-    edge(
-        rect.cx,
-        rect.cy + half_h - t / 2.0,
-        rect.w - 2.0 * r,
-        t,
-        dark,
-    );
-    edge(
-        rect.cx + half_w - t / 2.0,
-        rect.cy,
-        t,
-        rect.h - 2.0 * r,
-        dark,
-    );
-
-    // Углы: (знак по X, знак по Y) в порядке TL, TR, BR, BL.
-    for (index, (sx, sy)) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-        .into_iter()
-        .enumerate()
-    {
-        out.push(Primitive::Rgba {
-            rect: Box2D {
-                cx: rect.cx + sx * (half_w - r / 2.0),
-                cy: rect.cy + sy * (half_h - r / 2.0),
-                w: r,
-                h: r,
-                rotation: rect.rotation,
-            },
-            key: SETTINGS_CORNER_KEY + index as u64,
-            width: CORNER_TEX_PX,
-            height: CORNER_TEX_PX,
-            rgba: settings_corner_rgba(index),
-            opacity: bg_opacity,
-        });
-    }
-}
-
-/// Сторона растра одного угла, px. Растягивается конвейером спрайтов до
-/// радиуса в DIP — 48 px хватает и на 200% DPI (радиус 8 DIP = 16 px).
-const CORNER_TEX_PX: u32 = 48;
-
-/// База ключа кэша текстур для четырёх углов (кэш вызывающего слоя ключуется
-/// по `(key, width, height)`; растры постоянные, грузятся один раз).
-const SETTINGS_CORNER_KEY: u64 = 0x5E77_1465_C020_0000;
-
-/// Растр одного скруглённого угла панели настроек (straight alpha):
-/// заливка [`theme::settings::BG`] внутри дуги и грань толщиной в один DIP
-/// по её краю. `index` — по часовой от левого верхнего.
-///
-/// Цвет грани идёт от того же правила, что у прямых граней: сверху и слева
-/// светлая, снизу и справа тёмная. На «смешанных» углах (правый верхний,
-/// левый нижний) цвет плавно переходит вдоль дуги — резкий стык на 45°
-/// читался бы как дефект.
-fn settings_corner_rgba(index: usize) -> Vec<u8> {
-    static CORNERS: std::sync::OnceLock<[Vec<u8>; 4]> = std::sync::OnceLock::new();
-    CORNERS.get_or_init(|| std::array::from_fn(build_settings_corner))[index & 3].clone()
-}
-
-fn build_settings_corner(index: usize) -> Vec<u8> {
-    let n = CORNER_TEX_PX as f64;
-    // Центр дуги — внутренний угол квадрата (тот, что смотрит внутрь панели).
-    let (arc_cx, arc_cy) = match index {
-        0 => (n, n),
-        1 => (0.0, n),
-        2 => (0.0, 0.0),
-        _ => (n, 0.0),
-    };
-    // Толщина грани в пикселях растра: один DIP при номинальном радиусе.
-    let bevel = n * theme::settings::BEVEL / theme::settings::CORNER_RADIUS;
-    let (light, dark) = (theme::settings::BORDER_LIGHT, theme::settings::BORDER_DARK);
-    // Цвет грани на концах дуги: (у начала — вертикальная сторона, у конца —
-    // горизонтальная), см. доккомент.
-    let (from, to) = match index {
-        0 => (light, light),
-        1 => (light, dark),
-        2 => (dark, dark),
-        _ => (dark, light),
-    };
-
-    let size = CORNER_TEX_PX as usize;
-    let mut out = vec![0u8; size * size * 4];
-    for py in 0..size {
-        for px in 0..size {
-            // Покрытие дугой — суперсемплинг 2×2, как у иконок.
-            let mut hits = 0u32;
-            for (ox, oy) in SUB_SAMPLES_CORNER {
-                let (x, y) = (px as f64 + ox, py as f64 + oy);
-                if (x - arc_cx).hypot(y - arc_cy) <= n {
-                    hits += 1;
-                }
-            }
-            if hits == 0 {
-                continue;
-            }
-            let coverage = hits as f64 / SUB_SAMPLES_CORNER.len() as f64;
-            let (x, y) = (px as f64 + 0.5, py as f64 + 0.5);
-            let dist = (x - arc_cx).hypot(y - arc_cy);
-            let color = if dist > n - bevel {
-                // Доля пути по дуге от вертикальной стороны к горизонтальной.
-                let t = ((x - arc_cx).abs() / (dist.max(1e-6))).clamp(0.0, 1.0);
-                let mix = |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * t) as u8;
-                [
-                    mix(from[0], to[0]),
-                    mix(from[1], to[1]),
-                    mix(from[2], to[2]),
-                ]
-            } else {
-                theme::settings::BG
-            };
-            let i = (py * size + px) * 4;
-            out[i..i + 3].copy_from_slice(&color);
-            out[i + 3] = (coverage * 255.0).round() as u8;
-        }
-    }
-    out
-}
-
-/// Смещения суперсемплинга для растра угла (2×2 внутри пикселя).
-const SUB_SAMPLES_CORNER: [(f64, f64); 4] =
-    [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
-
-/// Фон панели в стилистике настроек: полупрозрачная серая заливка и
-/// «поднятая» объёмная рамка — ровно то, что рисует [`Panel::draw`] для
-/// [`WidgetStyle::Settings`]. Публичная, потому что не всё, что должно
-/// выглядеть как модалка настроек, является [`Panel`]: тултип кнопки
-/// тулбара — это три примитива без виджетов и хит-теста.
-///
-/// `opacity` — множитель поверх [`theme::settings::BG_OPACITY`] (анимация
-/// появления тултипа); `1.0` даёт обычный фон панели.
-pub fn settings_frame(out: &mut Vec<Primitive>, rect: Box2D, opacity: f64) {
-    let bg_opacity = theme::settings::BG_OPACITY * opacity;
-    out.push(Primitive::Fill {
+/// Заменил прежний способ (фон из двух полос плюс четыре растровые дуги в
+/// углах): рисовать было нечем, кроме плоских прямоугольников. Теперь весь
+/// материал приходит одним растром.
+pub fn glass_panel(out: &mut Vec<Primitive>, rect: Box2D, radius: f64, opacity: f64) {
+    out.push(Primitive::Glass {
         rect,
-        color: theme::settings::BG,
-        opacity: bg_opacity,
+        radius,
+        surface: Surface::Panel,
+        glow: 0.0,
+        opacity,
     });
-    settings_bevel(out, rect, true, bg_opacity);
 }
 
-/// Ровная рамка в один тон по периметру `rect` — акцент фокуса поверх
-/// граней (`outline: 1px solid var(--accent); outline-offset: -1px` в
-/// styles.css). В отличие от [`settings_bevel`] все четыре стороны одного
-/// цвета: это не объём, а состояние.
-fn accent_outline(out: &mut Vec<Primitive>, rect: Box2D, color: [u8; 3]) {
-    let t = theme::settings::BEVEL;
-    let half_w = rect.w / 2.0;
-    let half_h = rect.h / 2.0;
-    let mut edge = |cx: f64, cy: f64, w: f64, h: f64| {
-        out.push(Primitive::Fill {
-            rect: Box2D {
-                cx,
-                cy,
-                w: w.max(0.0),
-                h: h.max(0.0),
-                rotation: rect.rotation,
-            },
-            color,
-            opacity: 1.0,
-        });
+/// Карточка внутри панели (§4, `Surface::Card`).
+pub fn glass_card(out: &mut Vec<Primitive>, rect: Box2D, radius: f64, opacity: f64) {
+    out.push(Primitive::Glass {
+        rect,
+        radius,
+        surface: Surface::Card,
+        glow: 0.0,
+        opacity,
+    });
+}
+
+/// Контрол с учётом фаз наведения и нажатия (§5).
+///
+/// Состояния не переключаются ступенькой, а НАКЛАДЫВАЮТСЯ: поверх покоя
+/// проявляется растр наведения с непрозрачностью `hover_t`, поверх него —
+/// растр нажатия с `press_t`. Ступенчатый выбор поверхности дал бы рывок в
+/// середине перехода — ровно то, чего просили избежать. Сам прямоугольник
+/// при этом ужимается вокруг центра: кнопка проминается телом, а не просто
+/// светлеет.
+pub fn glass_control(
+    out: &mut Vec<Primitive>,
+    rect: Box2D,
+    radius: f64,
+    hover_t: f64,
+    press_t: f64,
+    primary: bool,
+    opacity: f64,
+) {
+    let hover_t = hover_t.clamp(0.0, 1.0);
+    let press_t = press_t.clamp(0.0, 1.0);
+    // Наведение ужимает до HOVER_SCALE, нажатие добирает остаток до PRESS_SCALE.
+    let scale = 1.0
+        - (1.0 - theme::HOVER_SCALE) * hover_t
+        - (theme::HOVER_SCALE - theme::PRESS_SCALE) * press_t;
+    let pressed = Box2D {
+        w: rect.w * scale,
+        h: rect.h * scale,
+        ..rect
     };
-    edge(rect.cx, rect.cy - half_h + t / 2.0, rect.w, t);
-    edge(rect.cx, rect.cy + half_h - t / 2.0, rect.w, t);
-    edge(rect.cx - half_w + t / 2.0, rect.cy, t, rect.h);
-    edge(rect.cx + half_w - t / 2.0, rect.cy, t, rect.h);
+    let base = if primary {
+        Surface::ControlPrimary
+    } else {
+        Surface::Control
+    };
+    let glow = hover_t.max(press_t);
+    out.push(Primitive::Glass {
+        rect: pressed,
+        radius,
+        surface: base,
+        glow,
+        opacity,
+    });
+    if hover_t > 0.0 {
+        out.push(Primitive::Glass {
+            rect: pressed,
+            radius,
+            surface: Surface::ControlHover,
+            glow,
+            opacity: opacity * hover_t,
+        });
+    }
+    if press_t > 0.0 {
+        out.push(Primitive::Glass {
+            rect: pressed,
+            radius,
+            surface: Surface::ControlActive,
+            glow,
+            opacity: opacity * press_t,
+        });
+    }
+}
+
+/// Утопленная поверхность: поле ввода, жёлоб ползунка (§4, `Surface::Sunken`).
+pub fn glass_sunken(out: &mut Vec<Primitive>, rect: Box2D, radius: f64, opacity: f64) {
+    out.push(Primitive::Glass {
+        rect,
+        radius,
+        surface: Surface::Sunken,
+        glow: 0.0,
+        opacity,
+    });
+}
+
+/// Включённый переключатель/чекбокс (§2.2 `CTRL_BG_ON`).
+pub fn glass_on(out: &mut Vec<Primitive>, rect: Box2D, radius: f64, opacity: f64) {
+    out.push(Primitive::Glass {
+        rect,
+        radius,
+        surface: Surface::ControlOn,
+        glow: 0.0,
+        opacity,
+    });
+}
+
+/// Корпус тултипа или оверлея на стекле ([`glass_panel`]).
+///
+/// Сохранена для обратной совместимости вызовов из `resticker::overlay_manager`
+/// и `resticker::ui_preview`.
+pub fn tooltip_frame(out: &mut Vec<Primitive>, rect: Box2D, opacity: f64) {
+    glass_panel(out, rect, theme::RADIUS_TIGHT, opacity);
 }
 
 /// Примитивы индикатора interact-lock закреплённого окна (SPEC «закрепление
@@ -764,6 +620,13 @@ pub trait Widget {
     fn paste(&mut self, _text: &str) -> bool {
         false
     }
+    /// Продвинуть собственные анимации на `dt_ms` (§5). `true` — что-то ещё
+    /// движется, и вызывающий обязан запланировать следующий кадр: цикл
+    /// координатора событийный, и без этого переход замрёт на середине, если
+    /// курсор остановился.
+    fn animate(&mut self, _dt_ms: f64) -> bool {
+        false
+    }
 }
 
 /// Содержимое кнопки.
@@ -781,10 +644,15 @@ pub struct Button {
     id: WidgetId,
     bounds: Box2D,
     content: ButtonContent,
-    /// Оформление (см. [`WidgetStyle`]).
-    style: WidgetStyle,
     /// Цвет подписи; `None` — цвет текста текущего оформления.
     label_color: Option<[u8; 3]>,
+    /// Первичная (подтверждающая) кнопка — заметно ярче остальных (§2.2
+    /// `CTRL_BG_PRIMARY`). Одна на панель: если ярких две, ни одна не ведёт.
+    primary: bool,
+    /// Фаза наведения 0..1 (§5): кнопка проминается плавно, а не ступенькой.
+    hover_phase: Phase,
+    /// Фаза нажатия 0..1 (§5).
+    press_phase: Phase,
     hovered: bool,
     /// Нажата (указатель зажат внутри), клик ещё не свершился.
     armed: bool,
@@ -792,15 +660,15 @@ pub struct Button {
 }
 
 impl Button {
-    /// Та же кнопка в заданном оформлении (см. [`WidgetStyle`]).
-    pub fn with_style(mut self, style: WidgetStyle) -> Self {
-        self.style = style;
-        self
-    }
-
     /// Та же кнопка с собственным цветом подписи — для опасного действия
     /// («Delete» в модале удаления): в окне настроек это `.button.danger`
     /// с текстом `#ffb0b0`, фон при этом обычный.
+    /// Сделать кнопку первичной: подтверждение группы, «Применить», «Да».
+    pub fn primary(mut self) -> Self {
+        self.primary = true;
+        self
+    }
+
     pub fn with_label_color(mut self, color: [u8; 3]) -> Self {
         self.label_color = Some(color);
         self
@@ -812,8 +680,10 @@ impl Button {
             id,
             bounds,
             content,
-            style: WidgetStyle::default(),
             label_color: None,
+            primary: false,
+            hover_phase: Phase::new(theme::HOVER_MS),
+            press_phase: Phase::new(theme::PRESS_MS),
             hovered: false,
             armed: false,
             clicked: false,
@@ -856,24 +726,23 @@ impl Widget for Button {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
-        let settings = self.style == WidgetStyle::Settings;
-        let bg = match (settings, self.armed, self.hovered) {
-            (true, _, true) => theme::settings::BTN_BG_HOVER,
-            (true, _, _) => theme::settings::BTN_BG,
-            (false, true, _) => theme::BUTTON_BG_ARMED,
-            (false, _, true) => theme::BUTTON_BG_HOVER,
-            (false, _, _) => theme::BUTTON_BG,
+        // Стекло вместо плоской заливки и бевеля VGUI: фон, кромки, обводка
+        // и гало приходят одним растром, а фазы дают плавное продавливание
+        // (docs/DESIGN_LIQUID_GLASS.md §4–5).
+        let radius = if self.bounds.h <= theme::BUTTON_SIZE + 2.0 {
+            theme::RADIUS_TIGHT
+        } else {
+            theme::RADIUS_CTRL
         };
-        out.push(Primitive::Fill {
-            rect: self.bounds,
-            color: bg,
-            opacity: 1.0,
-        });
-        if settings {
-            // Нажатая кнопка в VGUI «проваливается» — грани меняются местами
-            // (`.button:active` в styles.css).
-            settings_bevel(out, self.bounds, !self.armed, 1.0);
-        }
+        glass_control(
+            out,
+            self.bounds,
+            radius,
+            self.hover_phase.eased(),
+            self.press_phase.eased(),
+            self.primary,
+            1.0,
+        );
         let pad = theme::BUTTON_PAD;
         let content_rect = Box2D {
             w: (self.bounds.w - 2.0 * pad).max(0.0),
@@ -908,11 +777,7 @@ impl Widget for Button {
                         rotation: content_rect.rotation,
                     },
                     text: label.clone(),
-                    color: self.label_color.unwrap_or(if settings {
-                        theme::settings::TEXT
-                    } else {
-                        theme::TEXT
-                    }),
+                    color: self.label_color.unwrap_or(theme::TEXT),
                     opacity: 1.0,
                 });
             }
@@ -925,7 +790,17 @@ impl Widget for Button {
     }
 
     fn set_hovered(&mut self, hovered: bool) -> bool {
-        std::mem::replace(&mut self.hovered, hovered) != hovered
+        let changed = std::mem::replace(&mut self.hovered, hovered) != hovered;
+        if changed {
+            self.hover_phase.set_target(hovered);
+        }
+        changed
+    }
+
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        let hover = self.hover_phase.advance(dt_ms);
+        let press = self.press_phase.advance(dt_ms);
+        hover || press
     }
 
     fn pointer_event(&mut self, ev: PointerEvent) -> bool {
@@ -933,6 +808,7 @@ impl Widget for Button {
             PointerEvent::Down { pos } => {
                 if self.hit_test(pos) {
                     self.armed = true;
+                    self.press_phase.set_target(true);
                     return true;
                 }
                 false
@@ -942,6 +818,7 @@ impl Widget for Button {
                     return false;
                 }
                 self.armed = false;
+                self.press_phase.set_target(false);
                 if self.hit_test(pos) {
                     self.clicked = true;
                 }
@@ -968,20 +845,15 @@ pub struct Slider {
     min: u32,
     max: u32,
     value: u32,
-    /// Оформление (см. [`WidgetStyle`]).
-    style: WidgetStyle,
+    /// Фаза наведения 0..1 (§5) для плавного свечения ручки под курсором.
+    hover_phase: Phase,
+    hovered: bool,
     /// Ручка перетаскивается указателем (захват удерживается панелью).
     dragging: bool,
     changed: bool,
 }
 
 impl Slider {
-    /// Тот же ползунок в заданном оформлении (см. [`WidgetStyle`]).
-    pub fn with_style(mut self, style: WidgetStyle) -> Self {
-        self.style = style;
-        self
-    }
-
     /// Ползунок диапазона `min..=max` с текущим значением `value`
     /// (приводится к диапазону). Паника при `min >= max`.
     pub fn new(id: WidgetId, bounds: Box2D, min: u32, max: u32, value: u32) -> Self {
@@ -989,10 +861,11 @@ impl Slider {
         Self {
             id,
             bounds,
-            style: WidgetStyle::default(),
             min,
             max,
             value: value.clamp(min, max),
+            hover_phase: Phase::new(theme::HOVER_MS),
+            hovered: false,
             dragging: false,
             changed: false,
         }
@@ -1074,64 +947,6 @@ impl Slider {
         self.changed = true;
         true
     }
-
-    /// Отрисовка в стилистике окна настроек (Source VGUI): «вдавленный»
-    /// жёлоб вместо волосяной дорожки, заполнение акцентом и прямоугольная
-    /// «поднятая» ручка того же вида, что кнопка. Тонкая двухпиксельная
-    /// линия тёмной схемы на светло-сером фоне панели читалась бы как
-    /// царапина — VGUI рисует именно жёлоб.
-    fn draw_settings(&self, out: &mut Vec<Primitive>) {
-        let (x0, x1) = self.track_range();
-        let cy = self.bounds.cy;
-        let groove = Box2D {
-            cx: (x0 + x1) / 2.0,
-            cy,
-            w: (x1 - x0) + theme::SLIDER_KNOB,
-            h: theme::SETTINGS_GROOVE_H,
-            rotation: 0.0,
-        };
-        out.push(Primitive::Fill {
-            rect: groove,
-            color: theme::settings::INPUT_BG,
-            opacity: 1.0,
-        });
-        settings_bevel(out, groove, false, 1.0);
-
-        // Заполненная часть — внутри жёлоба, без наезда на его грани.
-        let kx = self.value_to_x(self.value);
-        let fill_x0 = groove.cx - groove.w / 2.0 + theme::settings::BEVEL;
-        if kx > fill_x0 {
-            out.push(Primitive::Fill {
-                rect: Box2D {
-                    cx: (fill_x0 + kx) / 2.0,
-                    cy,
-                    w: kx - fill_x0,
-                    h: (groove.h - 2.0 * theme::settings::BEVEL).max(0.0),
-                    rotation: 0.0,
-                },
-                color: theme::settings::ACCENT,
-                opacity: 1.0,
-            });
-        }
-
-        let knob = Box2D {
-            cx: kx,
-            cy,
-            w: theme::SETTINGS_KNOB_W,
-            h: self.bounds.h.min(theme::BUTTON_SIZE),
-            rotation: 0.0,
-        };
-        out.push(Primitive::Fill {
-            rect: knob,
-            color: if self.dragging {
-                theme::settings::BTN_BG_HOVER
-            } else {
-                theme::settings::BTN_BG
-            },
-            opacity: 1.0,
-        });
-        settings_bevel(out, knob, true, 1.0);
-    }
 }
 
 impl Widget for Slider {
@@ -1148,25 +963,19 @@ impl Widget for Slider {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
-        if self.style == WidgetStyle::Settings {
-            self.draw_settings(out);
-            return;
-        }
         let (x0, x1) = self.track_range();
         let cy = self.bounds.cy;
-        // Дорожка на всю ширину хода ручки.
-        out.push(Primitive::Fill {
-            rect: Box2D {
-                cx: (x0 + x1) / 2.0,
-                cy,
-                w: x1 - x0,
-                h: theme::SLIDER_TRACK_H,
-                rotation: 0.0,
-            },
-            color: theme::SLIDER_TRACK,
-            opacity: 1.0,
-        });
-        // Заполненная часть слева от ручки.
+        // Жёлоб ползунка — утопленное стекло Surface::Sunken (RADIUS_TIGHT)
+        let groove = Box2D {
+            cx: (x0 + x1) / 2.0,
+            cy,
+            w: (x1 - x0) + theme::SLIDER_KNOB,
+            h: 6.0,
+            rotation: 0.0,
+        };
+        glass_sunken(out, groove, theme::RADIUS_TIGHT, 1.0);
+
+        // Заполненная часть слева от ручки — белая полоска внутри жёлоба
         let kx = self.value_to_x(self.value);
         if kx > x0 {
             out.push(Primitive::Fill {
@@ -1174,25 +983,44 @@ impl Widget for Slider {
                     cx: (x0 + kx) / 2.0,
                     cy,
                     w: kx - x0,
-                    h: theme::SLIDER_TRACK_H,
+                    h: 2.0,
                     rotation: 0.0,
                 },
-                color: theme::SLIDER_FILL,
-                opacity: 1.0,
+                color: [0xff, 0xff, 0xff],
+                opacity: theme::TEXT_OPACITY,
             });
         }
-        // Ручка.
-        out.push(Primitive::Fill {
-            rect: Box2D {
-                cx: kx,
-                cy,
-                w: theme::SLIDER_KNOB,
-                h: theme::SLIDER_KNOB,
-                rotation: 0.0,
-            },
-            color: theme::SLIDER_FILL,
-            opacity: 1.0,
-        });
+
+        // Ручка ползунка — белая со свечением под курсором и сжатием при захвате
+        let knob_size = theme::SLIDER_KNOB;
+        let knob = Box2D {
+            cx: kx,
+            cy,
+            w: knob_size,
+            h: knob_size,
+            rotation: 0.0,
+        };
+        glass_control(
+            out,
+            knob,
+            theme::RADIUS_TIGHT,
+            self.hover_phase.eased(),
+            if self.dragging { 1.0 } else { 0.0 },
+            true,
+            1.0,
+        );
+    }
+
+    fn set_hovered(&mut self, hovered: bool) -> bool {
+        let changed = std::mem::replace(&mut self.hovered, hovered) != hovered;
+        if changed {
+            self.hover_phase.set_target(hovered);
+        }
+        changed
+    }
+
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        self.hover_phase.advance(dt_ms)
     }
 
     fn pointer_event(&mut self, ev: PointerEvent) -> bool {
@@ -1233,6 +1061,9 @@ pub struct ScrollBar {
     /// Положение верха ручки как доля высоты дорожки, `[0.0, 1.0 -
     /// thumb_fraction]`.
     thumb_offset: f64,
+    /// Фаза наведения 0..1 для плавного разгорания ручки под курсором.
+    hover_phase: Phase,
+    hovered: bool,
 }
 
 impl ScrollBar {
@@ -1261,6 +1092,8 @@ impl ScrollBar {
             bounds,
             thumb_fraction,
             thumb_offset,
+            hover_phase: Phase::new(theme::HOVER_MS),
+            hovered: false,
         }
     }
 }
@@ -1279,16 +1112,16 @@ impl Widget for ScrollBar {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
-        // Дорожка — на всю высоту, полупрозрачная; ручка — акцентным
-        // цветом поверх (тот же принцип, что у `Slider::opacity`/`SLIDER_FILL`).
-        out.push(Primitive::Fill {
-            rect: self.bounds,
-            color: theme::SLIDER_TRACK,
-            opacity: 0.5,
-        });
+        // Дорожка — утопленное стекло Surface::Sunken (RADIUS_TIGHT)
+        glass_sunken(out, self.bounds, theme::RADIUS_TIGHT, 1.0);
+
+        // Ручка — белая на TEXT_DIM_OPACITY в покое, плавно разгорается до TEXT_OPACITY под курсором
         let top = self.bounds.cy - self.bounds.h / 2.0;
         let thumb_h = (self.bounds.h * self.thumb_fraction).max(theme::SCROLLBAR_MIN_THUMB_H);
         let thumb_top = top + self.bounds.h * self.thumb_offset;
+        let hover_t = self.hover_phase.eased();
+        let opacity =
+            theme::TEXT_DIM_OPACITY + (theme::TEXT_OPACITY - theme::TEXT_DIM_OPACITY) * hover_t;
         out.push(Primitive::Fill {
             rect: Box2D {
                 cx: self.bounds.cx,
@@ -1297,15 +1130,25 @@ impl Widget for ScrollBar {
                 h: thumb_h,
                 rotation: 0.0,
             },
-            color: theme::SLIDER_FILL,
-            opacity: 0.9,
+            color: [0xff, 0xff, 0xff],
+            opacity,
         });
     }
 
-    /// Не интерактивна (доккомент структуры) — клики/hover сквозь неё к
-    /// содержимому под ней, панель не отдаёт ей события указателя.
-    fn hit_test(&self, _pos: Point) -> bool {
-        false
+    fn hit_test(&self, pos: Point) -> bool {
+        box_contains(&self.bounds, pos)
+    }
+
+    fn set_hovered(&mut self, hovered: bool) -> bool {
+        let changed = std::mem::replace(&mut self.hovered, hovered) != hovered;
+        if changed {
+            self.hover_phase.set_target(hovered);
+        }
+        changed
+    }
+
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        self.hover_phase.advance(dt_ms)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1339,21 +1182,15 @@ pub struct NumericField {
     /// Каретка: индекс символа 0..=len (курсор ПЕРЕД ним).
     caret: usize,
     focused: bool,
+    /// Фаза фокуса 0..1 для плавной анимации рамки.
+    focus_phase: Phase,
     /// Текст на момент получения фокуса — для отмены по `Esc`/потере фокуса.
     original: String,
     submitted: Option<u32>,
     cancelled: bool,
-    /// Оформление (см. [`WidgetStyle`]).
-    style: WidgetStyle,
 }
 
 impl NumericField {
-    /// То же поле в заданном оформлении (см. [`WidgetStyle`]).
-    pub fn with_style(mut self, style: WidgetStyle) -> Self {
-        self.style = style;
-        self
-    }
-
     /// Задать шаг изменения значения при прокрутке колесом мыши
     /// (значение меньше 1 приводится к 1).
     pub fn with_step(mut self, step: u32) -> Self {
@@ -1388,9 +1225,9 @@ impl NumericField {
             original: text.clone(),
             text,
             focused: false,
+            focus_phase: Phase::new(theme::HOVER_MS),
             submitted: None,
             cancelled: false,
-            style: WidgetStyle::default(),
         }
     }
 
@@ -1559,6 +1396,7 @@ impl NumericField {
         self.text = v.to_string();
         self.caret = self.text.len();
         self.focused = false;
+        self.focus_phase.set_target(false);
         self.submitted = Some(v);
     }
 
@@ -1567,6 +1405,7 @@ impl NumericField {
         self.text.clone_from(&self.original);
         self.caret = self.text.len();
         self.focused = false;
+        self.focus_phase.set_target(false);
         self.cancelled = true;
     }
 }
@@ -1585,43 +1424,22 @@ impl Widget for NumericField {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
-        let settings = self.style == WidgetStyle::Settings;
-        if settings {
-            // «Вдавленное» поле VGUI: заливка `--input-bg`, грани наоборот
-            // (тёмная сверху слева). Фокус — акцентная рамка поверх граней,
-            // ровно как `.hotkeyInput.recording` в окне настроек.
-            out.push(Primitive::Fill {
+        // Поле ввода — утопленное стекло Surface::Sunken (RADIUS_CTRL)
+        glass_sunken(out, self.bounds, theme::RADIUS_CTRL, 1.0);
+
+        // Рамка фокуса — белая обводка (STROKE_STRONG = 0.30) с плавной фазой
+        let focus_t = self.focus_phase.eased();
+        if focus_t > 0.0 {
+            out.push(Primitive::Glass {
                 rect: self.bounds,
-                color: theme::settings::INPUT_BG,
-                opacity: 1.0,
-            });
-            settings_bevel(out, self.bounds, false, 1.0);
-            if self.focused {
-                accent_outline(out, self.bounds, theme::settings::ACCENT);
-            }
-        } else {
-            // Рамка (в фокусе — акцентная) и фон с отступом в 1 DIP.
-            let border = if self.focused {
-                theme::FIELD_BORDER_FOCUS
-            } else {
-                theme::FIELD_BORDER
-            };
-            out.push(Primitive::Fill {
-                rect: self.bounds,
-                color: border,
-                opacity: 1.0,
-            });
-            out.push(Primitive::Fill {
-                rect: Box2D {
-                    w: (self.bounds.w - 2.0).max(0.0),
-                    h: (self.bounds.h - 2.0).max(0.0),
-                    ..self.bounds
-                },
-                color: theme::FIELD_BG,
-                opacity: 1.0,
+                radius: theme::RADIUS_CTRL,
+                surface: Surface::ControlPrimary,
+                glow: focus_t,
+                opacity: focus_t * 0.30,
             });
         }
-        // Текст: левый край + отступ, по вертикали — по центру поля.
+
+        // Текст: левый край + отступ, по вертикали — по центру поля
         if !self.text.is_empty() {
             let (tw, th) = text::text_size(&self.text);
             out.push(Primitive::Text {
@@ -1633,15 +1451,12 @@ impl Widget for NumericField {
                     rotation: 0.0,
                 },
                 text: self.text.clone(),
-                color: if settings {
-                    theme::settings::TEXT
-                } else {
-                    theme::TEXT
-                },
-                opacity: 1.0,
+                color: [0xff, 0xff, 0xff],
+                opacity: theme::TEXT_OPACITY,
             });
         }
-        // Рисованная каретка (1 DIP шириной, чуть выше строки).
+
+        // Рисованная белая каретка (1 DIP шириной, чуть выше строки)
         if self.focused {
             let cx = self.text_origin_x() + text::width_up_to(&self.text, self.caret);
             out.push(Primitive::Fill {
@@ -1652,7 +1467,7 @@ impl Widget for NumericField {
                     h: text::LINE_HEIGHT + 2.0,
                     rotation: 0.0,
                 },
-                color: theme::CARET,
+                color: [0xff, 0xff, 0xff],
                 opacity: 1.0,
             });
         }
@@ -1672,6 +1487,10 @@ impl Widget for NumericField {
         }
     }
 
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        self.focus_phase.advance(dt_ms)
+    }
+
     fn pointer_event(&mut self, ev: PointerEvent) -> bool {
         match ev {
             PointerEvent::Down { pos } => {
@@ -1680,6 +1499,7 @@ impl Widget for NumericField {
                 }
                 if !self.focused {
                     self.focused = true;
+                    self.focus_phase.set_target(true);
                     self.original.clone_from(&self.text);
                 }
                 self.caret = self.caret_from_x(pos.0);
@@ -1768,8 +1588,6 @@ impl Widget for NumericField {
 pub struct TextField {
     id: WidgetId,
     bounds: Box2D,
-    /// Оформление (см. [`WidgetStyle`]).
-    style: WidgetStyle,
     /// Потеря фокуса оставляет набранное, а не откатывает к исходному
     /// (см. [`TextField::keep_on_blur`]).
     keep_on_blur: bool,
@@ -1779,6 +1597,8 @@ pub struct TextField {
     /// Каретка: индекс символа 0..=len (курсор ПЕРЕД ним).
     caret: usize,
     focused: bool,
+    /// Фаза фокуса 0..1 для плавной анимации рамки.
+    focus_phase: Phase,
     /// Текст на момент получения фокуса — для отмены по `Esc`/потере фокуса.
     original: String,
     submitted: Option<String>,
@@ -1797,9 +1617,9 @@ impl TextField {
             caret: text.chars().count(),
             original: text.clone(),
             text,
-            style: WidgetStyle::default(),
             keep_on_blur: false,
             focused: false,
+            focus_phase: Phase::new(theme::HOVER_MS),
             submitted: None,
             cancelled: false,
             placeholder: None,
@@ -1808,12 +1628,6 @@ impl TextField {
 
     /// Поле с плейсхолдером `placeholder` (рисуется приглушённым, пока
     /// текст пуст).
-    /// То же поле в заданном оформлении (см. [`WidgetStyle`]).
-    pub fn with_style(mut self, style: WidgetStyle) -> Self {
-        self.style = style;
-        self
-    }
-
     /// Не откатывать набранное при потере фокуса.
     ///
     /// По умолчанию поле ведёт себя как числовое поле тулбара: клик мимо =
@@ -1905,6 +1719,7 @@ impl TextField {
     fn submit(&mut self) {
         self.caret = self.text.chars().count();
         self.focused = false;
+        self.focus_phase.set_target(false);
         self.submitted = Some(self.text.clone());
     }
 
@@ -1913,6 +1728,7 @@ impl TextField {
         self.text.clone_from(&self.original);
         self.caret = self.text.chars().count();
         self.focused = false;
+        self.focus_phase.set_target(false);
         self.cancelled = true;
     }
 }
@@ -1931,40 +1747,23 @@ impl Widget for TextField {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
-        if self.style == WidgetStyle::Settings {
-            // «Вдавленное» поле VGUI — то же, что у `NumericField`.
-            out.push(Primitive::Fill {
+        // Поле ввода — утопленное стекло Surface::Sunken (RADIUS_CTRL)
+        glass_sunken(out, self.bounds, theme::RADIUS_CTRL, 1.0);
+
+        // Рамка фокуса — белая обводка (STROKE_STRONG = 0.30) с плавной фазой
+        let focus_t = self.focus_phase.eased();
+        if focus_t > 0.0 {
+            out.push(Primitive::Glass {
                 rect: self.bounds,
-                color: theme::settings::INPUT_BG,
-                opacity: 1.0,
-            });
-            settings_bevel(out, self.bounds, false, 1.0);
-            if self.focused {
-                accent_outline(out, self.bounds, theme::settings::ACCENT);
-            }
-        } else {
-            let border = if self.focused {
-                theme::FIELD_BORDER_FOCUS
-            } else {
-                theme::FIELD_BORDER
-            };
-            out.push(Primitive::Fill {
-                rect: self.bounds,
-                color: border,
-                opacity: 1.0,
-            });
-            out.push(Primitive::Fill {
-                rect: Box2D {
-                    w: (self.bounds.w - 2.0).max(0.0),
-                    h: (self.bounds.h - 2.0).max(0.0),
-                    ..self.bounds
-                },
-                color: theme::FIELD_BG,
-                opacity: 1.0,
+                radius: theme::RADIUS_CTRL,
+                surface: Surface::ControlPrimary,
+                glow: focus_t,
+                opacity: focus_t * 0.30,
             });
         }
+
         // Текст: левый край + отступ, по вертикали — по центру поля. Пустое
-        // поле рисует плейсхолдер приглушённым (если задан).
+        // поле рисует плейсхолдер приглушённым (TEXT_FAINT_OPACITY).
         let shown = if self.text.is_empty() {
             self.placeholder.clone().unwrap_or_default()
         } else {
@@ -1981,11 +1780,16 @@ impl Widget for TextField {
                     rotation: 0.0,
                 },
                 text: shown,
-                color: theme::TEXT,
-                opacity: if self.text.is_empty() { 0.45 } else { 1.0 },
+                color: [0xff, 0xff, 0xff],
+                opacity: if self.text.is_empty() {
+                    theme::TEXT_FAINT_OPACITY
+                } else {
+                    theme::TEXT_OPACITY
+                },
             });
         }
-        // Рисованная каретка (1 DIP шириной, чуть выше строки).
+
+        // Рисованная белая каретка (1 DIP шириной, чуть выше строки)
         if self.focused {
             let cx = self.text_origin_x() + text::width_up_to(&self.text, self.caret);
             out.push(Primitive::Fill {
@@ -1996,7 +1800,7 @@ impl Widget for TextField {
                     h: text::LINE_HEIGHT + 2.0,
                     rotation: 0.0,
                 },
-                color: theme::CARET,
+                color: [0xff, 0xff, 0xff],
                 opacity: 1.0,
             });
         }
@@ -2017,10 +1821,15 @@ impl Widget for TextField {
         if self.keep_on_blur {
             // Набранное остаётся: фокус ушёл, текст — нет.
             self.focused = false;
+            self.focus_phase.set_target(false);
             self.original.clone_from(&self.text);
             return;
         }
         self.cancel();
+    }
+
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        self.focus_phase.advance(dt_ms)
     }
 
     fn pointer_event(&mut self, ev: PointerEvent) -> bool {
@@ -2032,6 +1841,7 @@ impl Widget for TextField {
         }
         if !self.focused {
             self.focused = true;
+            self.focus_phase.set_target(true);
             self.original.clone_from(&self.text);
         }
         self.caret = self.caret_from_x(pos.0);
@@ -2114,8 +1924,6 @@ pub struct Checkbox {
     id: WidgetId,
     bounds: Box2D,
     checked: bool,
-    /// Оформление (см. [`WidgetStyle`]).
-    style: WidgetStyle,
     /// Недоступен (строки, которые нельзя выразить правилом, панель задач
     /// при `never_overlap_taskbar` — §2.3, §7.8): рисуется приглушённым,
     /// хит-тест отключён.
@@ -2127,6 +1935,11 @@ pub struct Checkbox {
     /// Рисовать состояние иконкой замка на фоне кнопки (вместо квадрата
     /// с галочкой) — панель свойств закреплённого окна.
     icon_toggle: bool,
+    /// Фаза наведения 0..1 (§5) — переключатель проминается так же, как
+    /// кнопка: одинаковый отклик у всего, что нажимается.
+    hover_phase: Phase,
+    /// Фаза нажатия 0..1 (§5).
+    press_phase: Phase,
 }
 
 impl Checkbox {
@@ -2136,19 +1949,14 @@ impl Checkbox {
             id,
             bounds,
             checked,
-            style: WidgetStyle::default(),
             disabled: false,
             hovered: false,
             armed: false,
             changed: false,
             icon_toggle: false,
+            hover_phase: Phase::new(theme::HOVER_MS),
+            press_phase: Phase::new(theme::PRESS_MS),
         }
-    }
-
-    /// Тот же чекбокс в заданном оформлении (см. [`WidgetStyle`]).
-    pub fn with_style(mut self, style: WidgetStyle) -> Self {
-        self.style = style;
-        self
     }
 
     /// Чекбокс стандартного размера (`theme::CHECKBOX_SIZE`) с центром
@@ -2234,34 +2042,28 @@ impl Widget for Checkbox {
     fn draw(&self, out: &mut Vec<Primitive>) {
         let opacity = if self.disabled { 0.45 } else { 1.0 };
         if self.icon_toggle {
-            // Кнопка с иконкой замка: фон как у [`Button`], состояние —
-            // иконка Lock (заблокировано) / LockOpen (свободно).
-            let settings = self.style == WidgetStyle::Settings;
-            let bg = match (settings, self.armed, self.hovered) {
-                (true, _, true) => theme::settings::CHECK_BG_HOVER,
-                (true, _, _) => theme::settings::CHECK_BG,
-                (false, true, _) => theme::BUTTON_BG_ARMED,
-                (false, _, true) => theme::BUTTON_BG_HOVER,
-                (false, _, _) => theme::BUTTON_BG,
-            };
-            out.push(Primitive::Fill {
-                rect: self.bounds,
-                color: bg,
+            // Кнопка с иконкой замка: то же стекло и те же фазы, что у
+            // [`Button`] — всё, что нажимается, обязано отвечать одинаково.
+            // Включённое состояние доливается поверх (§2.2 `CTRL_BG_ON`).
+            glass_control(
+                out,
+                self.bounds,
+                theme::RADIUS_TIGHT,
+                self.hover_phase.eased(),
+                self.press_phase.eased(),
+                false,
                 opacity,
-            });
-            if settings {
-                // Переключатель — «вдавленное» поле, как `.checkmark` в
-                // настройках; нажатие временно поднимает его.
-                settings_bevel(out, self.bounds, self.armed, opacity);
+            );
+            if self.checked {
+                glass_on(out, self.bounds, theme::RADIUS_TIGHT, opacity);
             }
             let pad = theme::BUTTON_PAD;
             // Иконка нужного состояния уже несёт смысл; выключенный замок
-            // дополнительно приглушается — тот же приём, что у неактивной
-            // вкладки настроек (`opacity: 0.5`).
-            let icon_opacity = if settings && !self.checked {
-                opacity * theme::settings::ICON_OFF_OPACITY
-            } else {
+            // дополнительно приглушается — светится то, что включено.
+            let icon_opacity = if self.checked {
                 opacity
+            } else {
+                opacity * theme::TEXT_DIM_OPACITY
             };
             out.push(Primitive::Icon {
                 rect: Box2D {
@@ -2278,46 +2080,21 @@ impl Widget for Checkbox {
             });
             return;
         }
-        if self.style == WidgetStyle::Settings {
-            // `.checkmark` окна настроек: «вдавленный» квадрат `--check-bg`
-            // с гранями наоборот (тёмная сверху слева). Нажатие временно
-            // поднимает его — как у кнопки.
-            let bg = if self.hovered && !self.disabled {
-                theme::settings::CHECK_BG_HOVER
-            } else {
-                theme::settings::CHECK_BG
-            };
-            out.push(Primitive::Fill {
-                rect: self.bounds,
-                color: bg,
-                opacity,
-            });
-            settings_bevel(out, self.bounds, self.armed, opacity);
-        } else {
-            let border = if !self.disabled && (self.armed || self.hovered) {
-                theme::FIELD_BORDER_FOCUS
-            } else {
-                theme::FIELD_BORDER
-            };
-            let bg = if self.armed {
-                theme::BUTTON_BG_ARMED
-            } else {
-                theme::FIELD_BG
-            };
-            out.push(Primitive::Fill {
-                rect: self.bounds,
-                color: border,
-                opacity,
-            });
-            out.push(Primitive::Fill {
-                rect: Box2D {
-                    w: (self.bounds.w - 2.0).max(0.0),
-                    h: (self.bounds.h - 2.0).max(0.0),
-                    ..self.bounds
-                },
-                color: bg,
-                opacity,
-            });
+        // Квадрат чекбокса — тот же контрол, что кнопка: проминается под
+        // курсором и наливается светом, когда включён. Прежние два языка
+        // («вдавленный» бевель настроек и «рамка плюс заливка» тёмной
+        // схемы) сведены в один — разница между ними была только в цвете.
+        glass_control(
+            out,
+            self.bounds,
+            theme::RADIUS_TIGHT,
+            self.hover_phase.eased(),
+            self.press_phase.eased(),
+            false,
+            opacity,
+        );
+        if self.checked {
+            glass_on(out, self.bounds, theme::RADIUS_TIGHT, opacity);
         }
         // Галочка — два наклонных штриха «✓» (плечо и хвост), геометрия
         // в долях полустороны от центра, y — вниз.
@@ -2347,7 +2124,17 @@ impl Widget for Checkbox {
     }
 
     fn set_hovered(&mut self, hovered: bool) -> bool {
-        std::mem::replace(&mut self.hovered, hovered) != hovered
+        let changed = std::mem::replace(&mut self.hovered, hovered) != hovered;
+        if changed {
+            self.hover_phase.set_target(hovered);
+        }
+        changed
+    }
+
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        let hover = self.hover_phase.advance(dt_ms);
+        let press = self.press_phase.advance(dt_ms);
+        hover || press
     }
 
     fn pointer_event(&mut self, ev: PointerEvent) -> bool {
@@ -2355,6 +2142,7 @@ impl Widget for Checkbox {
             PointerEvent::Down { pos } => {
                 if !self.disabled && self.hit_test(pos) {
                     self.armed = true;
+                    self.press_phase.set_target(true);
                     return true;
                 }
                 false
@@ -2364,6 +2152,7 @@ impl Widget for Checkbox {
                     return false;
                 }
                 self.armed = false;
+                self.press_phase.set_target(false);
                 if self.hit_test(pos) {
                     self.checked = !self.checked;
                     self.changed = true;
@@ -2443,8 +2232,12 @@ impl Widget for Label {
         out.push(Primitive::Text {
             rect: self.text_rect,
             text: self.text.clone(),
-            color: theme::TEXT,
-            opacity: if self.dim { 0.5 } else { 1.0 },
+            color: [0xff, 0xff, 0xff],
+            opacity: if self.dim {
+                theme::TEXT_DIM_OPACITY
+            } else {
+                theme::TEXT_OPACITY
+            },
         });
     }
 
@@ -2469,11 +2262,9 @@ impl Widget for Label {
 pub struct Panel {
     id: WidgetId,
     frame: Box2D,
-    /// Оформление панели и её фона (виджетам стиль назначается отдельно —
-    /// см. [`WidgetStyle`]).
-    style: WidgetStyle,
-    /// Радиус скругления углов фона, DIP; `0` — острые углы. Работает
-    /// только со стилем [`WidgetStyle::Settings`].
+    /// Радиус скругления корпуса, DIP. `0` означает «взять радиус по
+    /// умолчанию» ([`theme::RADIUS_TIGHT`]): острых углов в Dark Liquid
+    /// Glass нет — стекло всегда скруглено (§3).
     corner_radius: f64,
     /// Виджеты в порядке отрисовки: первый — нижний.
     widgets: Vec<Box<dyn Widget>>,
@@ -2488,7 +2279,6 @@ impl Panel {
         Self {
             id,
             frame,
-            style: WidgetStyle::default(),
             corner_radius: 0.0,
             widgets: Vec::new(),
             focus: None,
@@ -2501,12 +2291,6 @@ impl Panel {
     /// половиной меньшей стороны — иначе «скругление» съело бы всю панель.
     pub fn with_corner_radius(mut self, radius: f64) -> Self {
         self.corner_radius = radius.max(0.0);
-        self
-    }
-
-    /// Панель в заданном оформлении (см. [`WidgetStyle`]).
-    pub fn with_style(mut self, style: WidgetStyle) -> Self {
-        self.style = style;
         self
     }
 
@@ -2575,32 +2359,32 @@ impl Panel {
 
     /// Примитивы отрисовки: фон панели, затем виджеты в порядке добавления.
     pub fn draw(&self, out: &mut Vec<Primitive>) {
-        if self.style == WidgetStyle::Settings {
-            // Полупрозрачный серый прямоугольник с объёмной рамкой — модалка
-            // окна настроек (`.wrapper` в styles.css).
-            settings_frame_radius(out, self.frame, self.corner_radius, 1.0);
-            for w in &self.widgets {
-                w.draw(out);
-            }
-            return;
-        }
-        out.push(Primitive::Fill {
-            rect: self.frame,
-            color: theme::PANEL_BORDER,
-            opacity: theme::PANEL_BG_OPACITY,
-        });
-        out.push(Primitive::Fill {
-            rect: Box2D {
-                w: (self.frame.w - 2.0).max(0.0),
-                h: (self.frame.h - 2.0).max(0.0),
-                ..self.frame
-            },
-            color: theme::PANEL_BG,
-            opacity: theme::PANEL_BG_OPACITY,
-        });
+        // Корпус — одна плита чёрного стекла (§4). Оба прежних языка
+        // (объёмная рамка VGUI и «рамка + заливка» тёмной схемы) сведены
+        // сюда: разница между ними была только в цвете, а материал теперь
+        // один на всё приложение.
+        let radius = if self.corner_radius > 0.0 {
+            self.corner_radius
+        } else {
+            theme::RADIUS_TIGHT
+        };
+        glass_panel(out, self.frame, radius, 1.0);
         for w in &self.widgets {
             w.draw(out);
         }
+    }
+
+    /// Продвинуть анимации всех виджетов на `dt_ms` (§5).
+    ///
+    /// `true` — что-то ещё движется: вызывающий обязан запланировать
+    /// следующий кадр, иначе переход замрёт на середине (цикл координатора
+    /// событийный, а замерший над кнопкой курсор событий не порождает).
+    pub fn animate(&mut self, dt_ms: f64) -> bool {
+        let mut moving = false;
+        for w in &mut self.widgets {
+            moving |= w.animate(dt_ms);
+        }
+        moving
     }
 
     /// Снять клавиатурный фокус (с `on_blur` виджета). Возвращает `true`,
@@ -2907,10 +2691,11 @@ impl Widget for Divider {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
+        // Тонкая разделительная волосинка STROKE (§2.1, STROKE = 0.12)
         out.push(Primitive::Fill {
             rect: self.rect,
-            color: theme::PANEL_BORDER,
-            opacity: 0.6,
+            color: [0xff, 0xff, 0xff],
+            opacity: 0.12,
         });
     }
 
@@ -3135,7 +2920,7 @@ pub fn build_pinned_lock_panel(
     hosts: Option<&[String]>,
     frame: Box2D,
 ) -> Panel {
-    let mut panel = Panel::new(PINNED_PANEL_ID, frame).with_style(WidgetStyle::Settings);
+    let mut panel = Panel::new(PINNED_PANEL_ID, frame);
     let left = frame.cx - frame.w / 2.0 + PINNED_PAD;
     let top = frame.cy - frame.h / 2.0;
     let bottom = frame.cy + frame.h / 2.0;
@@ -3145,10 +2930,12 @@ pub fn build_pinned_lock_panel(
     // Секция замков: два переключателя-иконки с подписями (см.
     // `build_pinned_panel` — идентичная раскладка).
     let cy_move = top + PINNED_PAD + PINNED_SECTION_ROW_H / 2.0;
-    panel.add_widget(
-        Checkbox::icon_toggle(PINNED_CHECK_MOVE_LOCK, toggle_cx, cy_move, move_locked)
-            .with_style(WidgetStyle::Settings),
-    );
+    panel.add_widget(Checkbox::icon_toggle(
+        PINNED_CHECK_MOVE_LOCK,
+        toggle_cx,
+        cy_move,
+        move_locked,
+    ));
     panel.add_widget(Label::new(
         PINNED_LABEL_MOVE_LOCK,
         label_left,
@@ -3156,15 +2943,12 @@ pub fn build_pinned_lock_panel(
         "Lock position",
     ));
     let cy_interact = cy_move + PINNED_SECTION_ROW_H;
-    panel.add_widget(
-        Checkbox::icon_toggle(
-            PINNED_CHECK_INTERACT_LOCK,
-            toggle_cx,
-            cy_interact,
-            interact_locked,
-        )
-        .with_style(WidgetStyle::Settings),
-    );
+    panel.add_widget(Checkbox::icon_toggle(
+        PINNED_CHECK_INTERACT_LOCK,
+        toggle_cx,
+        cy_interact,
+        interact_locked,
+    ));
     panel.add_widget(Label::new(
         PINNED_LABEL_INTERACT_LOCK,
         label_left,
@@ -3185,37 +2969,31 @@ pub fn build_pinned_lock_panel(
         Some([]) => "Visibility layers: nowhere".to_string(),
         Some(list) => format!("Visibility layers ({})", list.len()),
     };
-    panel.add_widget(
-        Button::new(
-            PINNED_BTN_ADD_HOST,
-            Box2D {
-                cx: frame.cx,
-                cy: cy_hosts,
-                w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
-                h: theme::BUTTON_SIZE,
-                rotation: 0.0,
-            },
-            ButtonContent::Label(hosts_label),
-        )
-        .with_style(WidgetStyle::Settings),
-    );
+    panel.add_widget(Button::new(
+        PINNED_BTN_ADD_HOST,
+        Box2D {
+            cx: frame.cx,
+            cy: cy_hosts,
+            w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label(hosts_label),
+    ));
 
     // Кнопка «Открепить» — внизу, на всю ширину контента (см.
     // `build_pinned_panel` — идентичная раскладка).
-    panel.add_widget(
-        Button::new(
-            PINNED_BTN_UNPIN,
-            Box2D {
-                cx: frame.cx,
-                cy: bottom - PINNED_PAD - theme::BUTTON_SIZE / 2.0,
-                w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
-                h: theme::BUTTON_SIZE,
-                rotation: 0.0,
-            },
-            ButtonContent::Label("Unpin".to_string()),
-        )
-        .with_style(WidgetStyle::Settings),
-    );
+    panel.add_widget(Button::new(
+        PINNED_BTN_UNPIN,
+        Box2D {
+            cx: frame.cx,
+            cy: bottom - PINNED_PAD - theme::BUTTON_SIZE / 2.0,
+            w: (frame.w - 2.0 * PINNED_PAD).max(0.0),
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label("Unpin".to_string()),
+    ));
 
     panel
 }
@@ -3318,8 +3096,17 @@ mod tests {
         let b = Button::icon(ID_BTN, 50.0, 50.0, Icon::Eye);
         let mut out = Vec::new();
         b.draw(&mut out);
+        // Кнопка в покое — один растр стекла плюс иконка. Слои наведения и
+        // нажатия не эмитятся вовсе, пока фазы на нуле: иначе каждая кнопка
+        // платила бы тремя спрайтами за состояние, в котором ничего не видно.
         assert_eq!(out.len(), 2);
-        assert!(matches!(out[0], Primitive::Fill { .. }));
+        assert!(matches!(
+            out[0],
+            Primitive::Glass {
+                surface: Surface::Control,
+                ..
+            }
+        ));
         assert!(matches!(
             out[1],
             Primitive::Icon {
@@ -3482,7 +3269,11 @@ mod tests {
     #[test]
     fn scrollbar_never_intercepts_pointer() {
         let sb = ScrollBar::new(ID_SCROLLBAR, scrollbar_bounds(), 10, 30, 5);
-        assert!(!sb.hit_test((100.0, 100.0)), "не интерактивна");
+        assert!(
+            sb.hit_test((100.0, 100.0)),
+            "хитуется для hover-свечения ручки"
+        );
+        assert!(!sb.hit_test((500.0, 500.0)));
     }
 
     /// Поле 1–100, центр (100, 50), ширина 48: левый край 76, текст с x = 80.
@@ -3575,12 +3366,12 @@ mod tests {
         let mut f = field(50);
         let mut out = Vec::new();
         f.draw(&mut out);
-        assert_eq!(out.len(), 3, "рамка + фон + текст");
+        assert_eq!(out.len(), 2, "sunken-стекло + текст");
         f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
         out.clear();
         f.draw(&mut out);
-        assert_eq!(out.len(), 4, "+ рисованная каретка");
-        let Primitive::Fill { rect, .. } = out[3] else {
+        assert_eq!(out.len(), 3, "+ рисованная каретка");
+        let Primitive::Fill { rect, .. } = out[2] else {
             panic!("каретка — Fill")
         };
         assert!(rect.w < 1.1 && rect.h > 8.0);
@@ -3764,11 +3555,11 @@ mod tests {
         let mut c = checkbox(false);
         let mut out = Vec::new();
         c.draw(&mut out);
-        assert_eq!(out.len(), 2, "рамка + фон");
+        assert_eq!(out.len(), 1, "стекло контрола в покое");
         c.set_checked(true);
         out.clear();
         c.draw(&mut out);
-        assert_eq!(out.len(), 4, "рамка + фон + два штриха галочки");
+        assert_eq!(out.len(), 4, "контрол + glass_on + два штриха галочки");
         let Primitive::Fill { rect, .. } = out[2] else {
             panic!("штрих галочки — Fill")
         };
@@ -3956,10 +3747,25 @@ mod tests {
         let p = panel_with_two_buttons();
         let mut out = Vec::new();
         p.draw(&mut out);
-        assert_eq!(out.len(), 2 + 2 + 2, "фон ×2 + две кнопки ×2");
-        assert!(matches!(out[0], Primitive::Fill { .. }));
+        assert_eq!(out.len(), 1 + 2 + 2, "корпус ×1 + две кнопки ×2");
         assert!(
-            matches!(out[2], Primitive::Fill { .. }),
+            matches!(
+                out[0],
+                Primitive::Glass {
+                    surface: Surface::Panel,
+                    ..
+                }
+            ),
+            "корпус панели — одна плита стекла, а не рамка с заливкой"
+        );
+        assert!(
+            matches!(
+                out[1],
+                Primitive::Glass {
+                    surface: Surface::Control,
+                    ..
+                }
+            ),
             "первая кнопка ниже второй"
         );
     }
@@ -4264,9 +4070,9 @@ mod tests {
         let f = text_field("");
         let mut out = Vec::new();
         f.draw(&mut out);
-        assert_eq!(out.len(), 3, "рамка + фон + плейсхолдер");
-        let Primitive::Text { text, opacity, .. } = &out[2] else {
-            panic!("третий примитив — Text")
+        assert_eq!(out.len(), 2, "sunken-стекло + плейсхолдер");
+        let Primitive::Text { text, opacity, .. } = &out[1] else {
+            panic!("второй примитив — Text")
         };
         assert_eq!(text, "процесс");
         assert!(*opacity < 1.0, "плейсхолдер приглушён");
@@ -4277,12 +4083,12 @@ mod tests {
         let mut f = text_field("text");
         let mut out = Vec::new();
         f.draw(&mut out);
-        assert_eq!(out.len(), 3, "рамка + фон + текст");
+        assert_eq!(out.len(), 2, "sunken-стекло + текст");
         f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
         out.clear();
         f.draw(&mut out);
-        assert_eq!(out.len(), 4, "+ рисованная каретка");
-        let Primitive::Fill { rect, .. } = out[3] else {
+        assert_eq!(out.len(), 3, "+ рисованная каретка");
+        let Primitive::Fill { rect, .. } = out[2] else {
             panic!("каретка — Fill")
         };
         assert!(rect.w < 1.1 && rect.h > 8.0);
@@ -4300,7 +4106,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(matches!(
             &out[0],
-            Primitive::Text { text, opacity, .. } if text == "Правила" && *opacity == 1.0
+            Primitive::Text { text, opacity, .. } if text == "Правила" && (*opacity - theme::TEXT_OPACITY).abs() < 1e-6
         ));
         assert!(!l.hit_test((50.0, 30.0)), "надпись не интерактивна");
     }
@@ -4325,7 +4131,7 @@ mod tests {
         let Primitive::Text { opacity, .. } = &out[0] else {
             panic!("Text")
         };
-        assert_eq!(*opacity, 0.5, "приглушённая подпись");
+        assert_eq!(*opacity, theme::TEXT_DIM_OPACITY, "приглушённая подпись");
     }
 
     // --- Панель свойств закреплённого окна ---

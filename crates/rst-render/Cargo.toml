@@ -11,7 +11,7 @@ rst-core = { path = "../rst-core" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
-# Растеризация встроенной гарнитуры (assets/Roboto-Light.ttf): чистый Rust,
+# Растеризация встроенной гарнитуры (assets/Commissioner-Medium.ttf): чистый Rust,
 # без системных шрифтов и DirectWrite — тот же результат на любой машине и
 # в юнит-тестах ширины строк.
 fontdue = "0.9"

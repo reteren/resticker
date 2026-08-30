@@ -8,12 +8,12 @@
 //! `rst_core::ops` (`should_confirm_delete` / `suppress_delete_confirmation`);
 //! этот модуль его не трогает.
 //!
-//! Оформление — стилистика окна настроек (Source VGUI) со скруглёнными
-//! углами, как у панели инструментов: серая модалка с объёмной рамкой,
-//! кнопки с гранями (нажатая «проваливается»), «вдавленный» чекбокс.
-//! Подпись опасного действия — бледно-красная (`.button.danger` в
-//! `styles.css`), фон при этом обычный: красная кнопка целиком кричала бы
-//! на весь экран.
+//! Оформление — Dark Liquid Glass (docs/DESIGN_LIQUID_GLASS.md): корпус —
+//! плита чёрного стекла с радиусом окна (§3 `RADIUS_WINDOW`), кнопки —
+//! стекло с фазами наведения/нажатия (кнопки rst-render анимируют сами).
+//! Подпись опасного действия — единственный цвет интерфейса [`DANGER`]
+//! (§2.4), фон при этом обычный: красная кнопка целиком кричала бы на весь
+//! экран.
 //!
 //! Ширина модала считается по содержимому, а не задана константой: подписи
 //! кнопок раньше не помещались (репорт пользователя 2026-08-23 — «Canc»
@@ -21,7 +21,7 @@
 //! арифметике, а размеры были подобраны под старый растровый шрифт.
 
 use rst_render::{
-    Box2D, Button, ButtonContent, Checkbox, LINE_HEIGHT, Label, Panel, WidgetId, WidgetStyle,
+    Box2D, Button, ButtonContent, Checkbox, LINE_HEIGHT, Label, Panel, Primitive, Widget, WidgetId,
     text_size, theme,
 };
 
@@ -40,20 +40,12 @@ const ID_DONT_ASK_LABEL: WidgetId = 105;
 
 /// Минимальная ширина модала, DIP (шире — если не влезает содержимое).
 pub const DIALOG_MIN_W: f64 = 320.0;
-/// Внутренний отступ содержимого от краёв модала, DIP.
-pub const PAD: f64 = 16.0;
-/// Зазор между кнопками в нижнем ряду, DIP.
-pub const GAP: f64 = 8.0;
-/// Вертикальный отступ между рядами содержимого, DIP.
-pub const ROW_GAP: f64 = 14.0;
-/// Высота кнопок с подписью, DIP.
-pub const BUTTON_H: f64 = 26.0;
-/// Горизонтальный отступ подписи внутри кнопки, DIP.
-pub const BUTTON_PAD_X: f64 = 14.0;
-/// Минимальная ширина кнопки, DIP (`min-width: 70px` у `.button`).
-pub const BUTTON_MIN_W: f64 = 76.0;
-/// Зазор между чекбоксом и его подписью, DIP.
+/// Зазор между чекбоксом и его подписью, DIP. В §3 токена для зазора
+/// «контрол — подпись» нет, оставлена именованной константой модуля.
 const CHECK_GAP: f64 = 8.0;
+/// Минимальная ширина кнопки, DIP (`min-width: 70px` у `.button` старых
+/// настроек). В §3 токена нет, оставлена именованной константой модуля.
+pub const BUTTON_MIN_W: f64 = 76.0;
 
 /// Подпись тумблера «Больше не спрашивать».
 pub const DONT_ASK_LABEL: &str = "Don't ask again";
@@ -62,8 +54,10 @@ pub const DELETE_LABEL: &str = "Delete";
 /// Подпись кнопки отмены.
 pub const CANCEL_LABEL: &str = "Cancel";
 
-/// Цвет подписи опасного действия — `.button.danger` из `styles.css`.
-const DANGER_TEXT: [u8; 3] = [0xff, 0xb0, 0xb0];
+/// §2.4 `DANGER` — единственный цвет во всём интерфейсе (#D0463C), только
+/// тонкие предупреждения. Псевдоним общего токена: константа заведена в
+/// `rst_render::theme`, дублировать её по модулям нельзя (§9.1).
+use rst_render::theme::DANGER;
 
 /// Текст сообщения для `count` удаляемых стикеров.
 pub fn message_for(count: u32) -> String {
@@ -74,9 +68,11 @@ pub fn message_for(count: u32) -> String {
     }
 }
 
-/// Ширина кнопки под подпись `label`.
+/// Ширина кнопки под подпись `label`: подпись плюс горизонтальный отступ
+/// подписи в кнопке (§3 `PAD_CTRL_X`) с каждой стороны, но не уже
+/// [`BUTTON_MIN_W`].
 fn button_width(label: &str) -> f64 {
-    (text_size(label).0 + 2.0 * BUTTON_PAD_X).max(BUTTON_MIN_W)
+    (text_size(label).0 + 2.0 * theme::PAD_CTRL_X).max(BUTTON_MIN_W)
 }
 
 /// Размер модала (ширина, высота) в DIP для `count` удаляемых стикеров:
@@ -84,11 +80,16 @@ fn button_width(label: &str) -> f64 {
 pub fn dialog_size(count: u32) -> (f64, f64) {
     let message_w = text_size(&message_for(count)).0;
     let check_row_w = theme::CHECKBOX_SIZE + CHECK_GAP + text_size(DONT_ASK_LABEL).0;
-    let buttons_w = button_width(CANCEL_LABEL) + GAP + button_width(DELETE_LABEL);
+    let buttons_w = button_width(CANCEL_LABEL) + theme::GAP_ROW + button_width(DELETE_LABEL);
     let content_w = message_w.max(check_row_w).max(buttons_w);
-    let w = (content_w + 2.0 * PAD).max(DIALOG_MIN_W);
+    let w = (content_w + 2.0 * theme::PAD_PANEL).max(DIALOG_MIN_W);
     let check_row_h = theme::CHECKBOX_SIZE.max(LINE_HEIGHT);
-    let h = 2.0 * PAD + LINE_HEIGHT + ROW_GAP + check_row_h + ROW_GAP + BUTTON_H;
+    let h = 2.0 * theme::PAD_PANEL
+        + LINE_HEIGHT
+        + theme::GAP_ROW
+        + check_row_h
+        + theme::GAP_ROW
+        + theme::BUTTON_SIZE;
     (w, h)
 }
 
@@ -113,15 +114,15 @@ pub fn build(count: u32, center: (f64, f64)) -> Panel {
             rotation: 0.0,
         },
     )
-    .with_style(WidgetStyle::Settings)
-    .with_corner_radius(theme::settings::CORNER_RADIUS);
+    // Радиус окна (§3): модал — большая панель, а не мелкий контрол.
+    .with_corner_radius(theme::RADIUS_WINDOW);
 
     // Сообщение — по центру модала, обычной надписью: это текст, а не
     // кнопка (раньше оно было Label-кнопкой и рисовалось с фоном кнопки,
     // из-за чего выглядело нажимаемым).
     let message = message_for(count);
     let message_w = text_size(&message).0;
-    let message_cy = top + PAD + LINE_HEIGHT / 2.0;
+    let message_cy = top + theme::PAD_PANEL + LINE_HEIGHT / 2.0;
     panel.add_widget(Label::new(
         ID_MESSAGE,
         cx - message_w / 2.0,
@@ -129,34 +130,33 @@ pub fn build(count: u32, center: (f64, f64)) -> Panel {
         &message,
     ));
 
-    // «Больше не спрашивать» — настоящий чекбокс с подписью справа.
+    // «Больше не спрашивать» — настоящий чекбокс с подписью справа. Подпись
+    // второстепенная: белый свет на `TEXT_DIM_OPACITY` (§2.3) — отдельных
+    // серых цветов больше нет.
     let check_row_h = theme::CHECKBOX_SIZE.max(LINE_HEIGHT);
-    let check_cy = message_cy + LINE_HEIGHT / 2.0 + ROW_GAP + check_row_h / 2.0;
-    panel.add_widget(
-        Checkbox::standard(
-            ID_DONT_ASK,
-            left + PAD + theme::CHECKBOX_SIZE / 2.0,
-            check_cy,
-            false,
-        )
-        .with_style(WidgetStyle::Settings),
-    );
-    panel.add_widget(Label::new(
+    let check_cy = message_cy + LINE_HEIGHT / 2.0 + theme::GAP_ROW + check_row_h / 2.0;
+    panel.add_widget(Checkbox::standard(
+        ID_DONT_ASK,
+        left + theme::PAD_PANEL + theme::CHECKBOX_SIZE / 2.0,
+        check_cy,
+        false,
+    ));
+    panel.add_widget(DimLabel::new(
         ID_DONT_ASK_LABEL,
-        left + PAD + theme::CHECKBOX_SIZE + CHECK_GAP,
+        left + theme::PAD_PANEL + theme::CHECKBOX_SIZE + CHECK_GAP,
         check_cy,
         DONT_ASK_LABEL,
     ));
 
     // Ряд кнопок — справа, снизу; Delete крайняя справа.
-    let buttons_cy = check_cy + check_row_h / 2.0 + ROW_GAP + BUTTON_H / 2.0;
+    let buttons_cy = check_cy + check_row_h / 2.0 + theme::GAP_ROW + theme::BUTTON_SIZE / 2.0;
     let delete_w = button_width(DELETE_LABEL);
     let cancel_w = button_width(CANCEL_LABEL);
-    let delete_cx = right - PAD - delete_w / 2.0;
+    let delete_cx = right - theme::PAD_PANEL - delete_w / 2.0;
     // Полная ширина соседней кнопки, а не половина: старая формула вычитала
     // только половину ширины «Cancel» и клала кнопки друг на друга — «Delete»
     // рисовался поверх и срезал подпись до «Canc».
-    let cancel_cx = delete_cx - delete_w / 2.0 - GAP - cancel_w / 2.0;
+    let cancel_cx = delete_cx - delete_w / 2.0 - theme::GAP_ROW - cancel_w / 2.0;
 
     panel.add_widget(dialog_button(
         ID_CANCEL,
@@ -164,45 +164,98 @@ pub fn build(count: u32, center: (f64, f64)) -> Panel {
         buttons_cy,
         cancel_w,
         CANCEL_LABEL,
-        None,
     ));
-    panel.add_widget(dialog_button(
-        ID_DELETE,
-        delete_cx,
-        buttons_cy,
-        delete_w,
-        DELETE_LABEL,
-        Some(DANGER_TEXT),
-    ));
+    // Delete — подтверждающая кнопка модала: она ведёт диалог, поэтому
+    // первичная (§2.2 `CTRL_BG_PRIMARY`, ярче «Отмены»). Опасность действия
+    // — цветом подписи, а не фоном.
+    panel.add_widget(
+        dialog_button(ID_DELETE, delete_cx, buttons_cy, delete_w, DELETE_LABEL)
+            .primary()
+            .with_label_color(DANGER),
+    );
 
     panel
 }
 
-/// Кнопка модала: стилистика настроек, фиксированная высота, свой цвет
-/// подписи у опасного действия.
-fn dialog_button(
-    id: WidgetId,
-    cx: f64,
-    cy: f64,
-    w: f64,
-    label: &str,
-    label_color: Option<[u8; 3]>,
-) -> Button {
-    let button = Button::new(
+/// Кнопка модала: фиксированная высота — сторона квадратной кнопки тулбара
+/// (§3 `BUTTON_SIZE`, общая высота всех контролов этого размера), подпись
+/// по центру. Материал и фазы наведения/нажатия рисует сама кнопка.
+fn dialog_button(id: WidgetId, cx: f64, cy: f64, w: f64, label: &str) -> Button {
+    Button::new(
         id,
         Box2D {
             cx,
             cy,
             w,
-            h: BUTTON_H,
+            h: theme::BUTTON_SIZE,
             rotation: 0.0,
         },
         ButtonContent::Label(label.to_string()),
     )
-    .with_style(WidgetStyle::Settings);
-    match label_color {
-        Some(color) => button.with_label_color(color),
-        None => button,
+}
+
+/// Второстепенная подпись: белый текст на [`theme::TEXT_DIM_OPACITY`] вместо
+/// отдельного серого цвета — «цвет» интерфейса один, свет разной силы (§2.3).
+/// Своя, а не [`Label`] с `set_dim`: у `Label` приглушение зашито числом 0.5,
+/// а здесь непрозрачность — из токена темы.
+struct DimLabel {
+    id: WidgetId,
+    rect: Box2D,
+    text: String,
+}
+
+impl DimLabel {
+    /// Подпись с левым краем в `left` и центром по вертикали в `cy` — та же
+    /// геометрия, что у [`Label`].
+    fn new(id: WidgetId, left: f64, cy: f64, text: &str) -> Self {
+        let (tw, _) = text_size(text);
+        Self {
+            id,
+            rect: Box2D {
+                cx: left + tw / 2.0,
+                cy,
+                w: tw,
+                h: LINE_HEIGHT,
+                rotation: 0.0,
+            },
+            text: text.to_string(),
+        }
+    }
+}
+
+impl Widget for DimLabel {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.rect = bounds;
+    }
+
+    /// Не интерактивна — клики/hover сквозь неё, как у [`Label`].
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        out.push(Primitive::Text {
+            rect: self.rect,
+            text: self.text.clone(),
+            color: theme::TEXT,
+            opacity: theme::TEXT_DIM_OPACITY,
+        });
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
@@ -270,8 +323,8 @@ mod tests {
             "кнопки перекрываются: cancel {cancel:?}, delete {delete:?}"
         );
         assert!(
-            (delete.cx - delete.w / 2.0) - (cancel.cx + cancel.w / 2.0) - GAP < 1e-9,
-            "между кнопками ровно GAP"
+            (delete.cx - delete.w / 2.0) - (cancel.cx + cancel.w / 2.0) - theme::GAP_ROW < 1e-9,
+            "между кнопками ровно GAP_ROW"
         );
         assert_eq!(cancel.cy, delete.cy, "кнопки в одном ряду");
     }
@@ -288,6 +341,7 @@ mod tests {
             for prim in &prims {
                 let rect = match prim {
                     Primitive::Fill { rect, .. }
+                    | Primitive::Glass { rect, .. }
                     | Primitive::Icon { rect, .. }
                     | Primitive::Rgba { rect, .. }
                     | Primitive::Text { rect, .. } => rect,
@@ -320,7 +374,7 @@ mod tests {
         let delete = button_bounds(&panel, ID_DELETE);
         assert!(message.cy < check.cy, "сообщение выше тумблера");
         assert!(check.cy < delete.cy, "тумблер выше кнопок");
-        let label = bounds_of::<Label>(&panel, ID_DONT_ASK_LABEL);
+        let label = bounds_of::<DimLabel>(&panel, ID_DONT_ASK_LABEL);
         assert_eq!(label.cy, check.cy, "подпись на одной строке с тумблером");
         assert!(label.cx > check.cx, "подпись справа от тумблера");
     }
@@ -361,7 +415,7 @@ mod tests {
                 _ => None,
             })
         };
-        assert_eq!(color_of(DELETE_LABEL), Some(DANGER_TEXT));
-        assert_eq!(color_of(CANCEL_LABEL), Some(theme::settings::TEXT));
+        assert_eq!(color_of(DELETE_LABEL), Some(DANGER));
+        assert_eq!(color_of(CANCEL_LABEL), Some(theme::TEXT));
     }
 }

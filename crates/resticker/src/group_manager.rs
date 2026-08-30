@@ -12,11 +12,18 @@
 //!
 //! Строитель чистый: на вход срез групп и что раскрыто, на выход [`Panel`].
 //! Состояние живёт в координаторе.
+//!
+//! Материал — Dark Liquid Glass (`docs/DESIGN_LIQUID_GLASS.md`): корпус —
+//! плита стекла (§4), строки списка — карточки, раскрытая строка — выбранная
+//! (залита светом, §8.8), интерактив ведёт `Button`, который сам ужимается и
+//! светит гало (§5). Старого языка оформления (объёмные рамки VGUI,
+//! светло-серая палитра настроек) здесь нет — он удалён из проекта
+//! целиком (§7).
 
 use rst_core::model::WindowGroup;
 use rst_render::{
-    Box2D, Button, ButtonContent, Divider, LINE_HEIGHT, Label, Panel, WidgetId, WidgetStyle,
-    text_size, theme,
+    Box2D, Button, ButtonContent, LINE_HEIGHT, Panel, Primitive, Widget, WidgetId, glass,
+    glass_card, glass_on, text_size, theme,
 };
 
 use crate::window_picker::truncate_to_width;
@@ -32,7 +39,7 @@ pub const ROW_BASE: WidgetId = 911;
 pub const DELETE_BASE: WidgetId = 940;
 // Поля имени и кнопки переименования здесь НЕТ намеренно: группы только
 // нумеруются (решение пользователя 2026-08-26 — «нахрена мне вообще функция
-// названия групп»). Номер — это цифра хоткея `Ctrl+Shift+N`, им группу и
+// названий групп»). Номер — это цифра хоткея `Ctrl+Shift+N`, им группу и
 // зовут; произвольное имя добавляло бы второй способ называть то же самое.
 /// Кнопка «закрыть панель».
 pub const BTN_CLOSE: WidgetId = 972;
@@ -49,25 +56,20 @@ const ID_EMPTY: WidgetId = 974;
 const ID_DIVIDER: WidgetId = 975;
 /// Первая строка состава раскрытой группы.
 const MEMBER_BASE: WidgetId = 980;
+/// Флаг id карточки строки: не пересекается с id кнопки строки
+/// (`ROW_BASE + i`), который декодирует координатор (тот же приём, что
+/// `LABEL_FLAG` в `window_pick_list`).
+const CARD_FLAG: WidgetId = 0x8000_0000;
 
 /// Ширина панели, DIP. Шире, чем у пресетов: строка несёт номер, имя и
 /// счётчик окон, а строки состава — заголовки чужих окон, которые обрезать
-/// хочется как можно позже.
+/// хочется как можно позже. Токена в §3 нет — панель остаётся своей ширины.
 pub const WIDTH: f64 = 380.0;
-/// Внутренний отступ, DIP.
-const PAD: f64 = 12.0;
-/// Зазор между строками, DIP.
-const ROW_GAP: f64 = 4.0;
-/// Зазор между блоками, DIP.
-const SECTION_GAP: f64 = 10.0;
-/// Высота строки и кнопок, DIP.
-const ROW_H: f64 = 28.0;
-/// Высота строки состава: она мельче строки группы — это подпись, а не
-/// кнопка.
+/// Высота строки состава, DIP. Токена в §3 нет: это подпись, а не кнопка,
+/// и дышит она плотнее кнопочной строки.
 const MEMBER_H: f64 = 20.0;
-/// Сторона кнопки удаления, DIP.
-const DELETE_W: f64 = 28.0;
-/// Отступ строк состава от левого края: вложенность должна читаться глазом.
+/// Отступ строк состава от левого края, DIP. Токена в §3 нет; вложенность
+/// должна читаться глазом.
 const MEMBER_INDENT: f64 = 18.0;
 
 /// Групп не больше девяти (по числу цифровых хоткеев), поэтому прокрутка
@@ -86,14 +88,198 @@ const WINDOWS_WORD: &str = "windows";
 const NEW_LABEL: &str = "New group";
 const EDIT_LABEL: &str = "Edit windows";
 const DELETE_MARK: &str = "x";
-/// Цвет подписи кнопки удаления — тот же приглушённо-красный, что у
-/// удаления пресета: одинаковое действие обязано выглядеть одинаково.
-const DANGER_TEXT: [u8; 3] = [0xff, 0xb0, 0xb0];
 
 /// Сколько строк занимает список: пустой список занимает одну строку под
 /// подпись.
 fn visible_rows(count: usize) -> usize {
     count.clamp(1, MAX_ROWS)
+}
+
+/// Статичная надпись с явной непрозрачностью (§2.3): белый `theme::TEXT`,
+/// второстепенность задаётся токеном альфы, а не отдельным серым цветом.
+/// Своя, а не `rst_render::Label`: у того `set_dim` зашит на 0.5, токенов
+/// §2.3 там нет — а у этой панели заголовок и подписи должны жить на
+/// `TEXT_OPACITY`/`TEXT_DIM_OPACITY`.
+struct StaticText {
+    id: WidgetId,
+    rect: Box2D,
+    text: String,
+    /// Непрозрачность текста — токен §2.3.
+    opacity: f64,
+}
+
+impl StaticText {
+    /// Надпись с левым краем `left` и центром строки `cy` (DIP) на
+    /// непрозрачности `opacity`.
+    fn new(id: WidgetId, left: f64, cy: f64, text: &str, opacity: f64) -> Self {
+        let (tw, th) = text_size(text);
+        Self {
+            id,
+            rect: Box2D {
+                cx: left + tw / 2.0,
+                cy,
+                w: tw,
+                h: th,
+                rotation: 0.0,
+            },
+            text: text.to_string(),
+            opacity,
+        }
+    }
+}
+
+impl Widget for StaticText {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.rect = bounds;
+    }
+
+    /// Не интерактивна — клики/hover сквозь неё.
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        out.push(Primitive::Text {
+            rect: self.rect,
+            text: self.text.clone(),
+            color: theme::TEXT,
+            opacity: self.opacity,
+        });
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Разделитель-волосинка между списком и действиями: белый свет силой
+/// внешней обводки (§2.1 `STROKE`) толщиной `HAIRLINE`. Свой, а не
+/// `rst_render::Divider`: тот всё ещё рисует тёмный `PANEL_BORDER`, а на
+/// чёрном стекле тёмная линия читалась бы грязью.
+struct Hairline {
+    id: WidgetId,
+    rect: Box2D,
+}
+
+impl Hairline {
+    /// Горизонтальная линия шириной `w` с центром в `(cx, cy)`.
+    fn new(id: WidgetId, cx: f64, cy: f64, w: f64) -> Self {
+        Self {
+            id,
+            rect: Box2D {
+                cx,
+                cy,
+                w,
+                h: theme::HAIRLINE,
+                rotation: 0.0,
+            },
+        }
+    }
+}
+
+impl Widget for Hairline {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.rect
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.rect = bounds;
+    }
+
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        out.push(Primitive::Fill {
+            rect: self.rect,
+            color: theme::TEXT,
+            opacity: glass::STROKE_ALPHA,
+        });
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Карточка строки группы (§8.8): строка списка — карточка стекла,
+/// раскрытая (выбранная) — залита светом `glass_on`. Лежит ПОД кнопкой
+/// строки: кнопка даёт хит-тест и фазы продавливания (§5), карточка —
+/// «тело» строки, видимое между кнопками и по краям.
+struct GroupRowCard {
+    id: WidgetId,
+    bounds: Box2D,
+    /// Раскрыта ли группа этой строки — выбранная строка заливается светом.
+    selected: bool,
+}
+
+impl GroupRowCard {
+    fn new(id: WidgetId, bounds: Box2D, selected: bool) -> Self {
+        Self {
+            id,
+            bounds,
+            selected,
+        }
+    }
+}
+
+impl Widget for GroupRowCard {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.bounds
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.bounds = bounds;
+    }
+
+    /// Декорация: события строки принимает кнопка над ней.
+    fn hit_test(&self, _pos: (f64, f64)) -> bool {
+        false
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        // Радиус совпадает с авто-радиусом кнопки строки (RADIUS_TIGHT для
+        // высоты ≤ BUTTON_SIZE): иначе из-под кнопки выглядывали бы углы
+        // карточки с другим скруглением.
+        if self.selected {
+            glass_on(out, self.bounds, theme::RADIUS_TIGHT, 1.0);
+        } else {
+            glass_card(out, self.bounds, theme::RADIUS_TIGHT, 1.0);
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 /// Высота панели под `count` групп, из которых одна раскрыта на
@@ -104,16 +290,16 @@ fn visible_rows(count: usize) -> usize {
 pub fn height(count: usize, expanded_members: usize) -> f64 {
     let rows = visible_rows(count) as f64;
     let members = expanded_members.min(MAX_MEMBERS) as f64;
-    2.0 * PAD
+    2.0 * theme::PAD_PANEL
         + LINE_HEIGHT
-        + SECTION_GAP
-        + rows * ROW_H
-        + (rows - 1.0) * ROW_GAP
-        + members * (MEMBER_H + ROW_GAP)
-        + SECTION_GAP
-        + 1.0
-        + SECTION_GAP
-        + ROW_H
+        + theme::GAP_ROW
+        + rows * theme::BUTTON_SIZE
+        + (rows - 1.0) * theme::GAP_ROW
+        + members * (MEMBER_H + theme::GAP_ROW)
+        + theme::GAP_ROW
+        + theme::HAIRLINE
+        + theme::GAP_ROW
+        + theme::BUTTON_SIZE
 }
 
 /// Собрать панель.
@@ -123,35 +309,38 @@ pub fn height(count: usize, expanded_members: usize) -> f64 {
 /// уже не помещаются на экран, а выбирать, какую обрезать, — решение, которое
 /// пользователю объяснить нечем.
 pub fn build(groups: &[WindowGroup], expanded: Option<usize>, frame: Box2D) -> Panel {
-    let mut panel = Panel::new(PANEL_ID, frame)
-        .with_style(WidgetStyle::Settings)
-        .with_corner_radius(theme::settings::CORNER_RADIUS);
-    let left = frame.cx - frame.w / 2.0 + PAD;
-    let right = frame.cx + frame.w / 2.0 - PAD;
-    let top = frame.cy - frame.h / 2.0 + PAD;
+    let mut panel = Panel::new(PANEL_ID, frame).with_corner_radius(theme::RADIUS_WINDOW);
+    let left = frame.cx - frame.w / 2.0 + theme::PAD_PANEL;
+    let right = frame.cx + frame.w / 2.0 - theme::PAD_PANEL;
+    let top = frame.cy - frame.h / 2.0 + theme::PAD_PANEL;
     let content_w = right - left;
 
     let title_cy = top + LINE_HEIGHT / 2.0;
-    panel.add_widget(Label::new(ID_TITLE, left, title_cy, TITLE_LABEL));
+    panel.add_widget(StaticText::new(
+        ID_TITLE,
+        left,
+        title_cy,
+        TITLE_LABEL,
+        theme::TEXT_OPACITY,
+    ));
 
-    let list_top = title_cy + LINE_HEIGHT / 2.0 + SECTION_GAP;
+    let list_top = title_cy + LINE_HEIGHT / 2.0 + theme::GAP_ROW;
     if groups.is_empty() {
-        let mut empty = Label::new(
+        panel.add_widget(StaticText::new(
             ID_EMPTY,
             left,
-            list_top + ROW_H / 2.0,
+            list_top + theme::BUTTON_SIZE / 2.0,
             &truncate_to_width(EMPTY_LABEL, content_w),
-        );
-        empty.set_dim(true);
-        panel.add_widget(empty);
+            theme::TEXT_DIM_OPACITY,
+        ));
     }
 
     // Список групп. Строки состава вставляются СРАЗУ под своей группой,
     // поэтому вертикальная позиция считается накопительно, а не по индексу:
     // раскрытая группа сдвигает всё, что ниже неё.
-    let mut cy = list_top + ROW_H / 2.0;
+    let mut cy = list_top + theme::BUTTON_SIZE / 2.0;
     for (i, group) in groups.iter().take(MAX_ROWS).enumerate() {
-        let row_w = content_w - DELETE_W - ROW_GAP;
+        let row_w = content_w - theme::BUTTON_SIZE - theme::GAP_ROW;
         // Подпись читается словами, а не набором чисел: «Group 3 — 4 windows».
         // Раньше здесь было «3 3 (4)» — номер, имя (совпадавшее с номером) и
         // счётчик в скобках, и понять это было нельзя (репорт 2026-08-26).
@@ -166,117 +355,109 @@ pub fn build(groups: &[WindowGroup], expanded: Option<usize>, frame: Box2D) -> P
                 WINDOWS_WORD
             }
         );
-        panel.add_widget(
-            Button::new(
-                ROW_BASE + i as WidgetId,
-                Box2D {
-                    cx: left + row_w / 2.0,
-                    cy,
-                    w: row_w,
-                    h: ROW_H,
-                    rotation: 0.0,
-                },
-                ButtonContent::Label(truncate_to_width(&label, row_w - 2.0 * theme::BUTTON_PAD)),
-            )
-            .with_style(WidgetStyle::Settings),
-        );
+        let row_bounds = Box2D {
+            cx: left + row_w / 2.0,
+            cy,
+            w: row_w,
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        };
+        panel.add_widget(GroupRowCard::new(
+            ROW_BASE + i as WidgetId + CARD_FLAG,
+            row_bounds,
+            expanded == Some(i),
+        ));
+        panel.add_widget(Button::new(
+            ROW_BASE + i as WidgetId,
+            row_bounds,
+            ButtonContent::Label(truncate_to_width(&label, row_w - 2.0 * theme::PAD_CTRL_X)),
+        ));
         panel.add_widget(
             Button::new(
                 DELETE_BASE + i as WidgetId,
                 Box2D {
-                    cx: right - DELETE_W / 2.0,
+                    cx: right - theme::BUTTON_SIZE / 2.0,
                     cy,
-                    w: DELETE_W,
-                    h: ROW_H,
+                    w: theme::BUTTON_SIZE,
+                    h: theme::BUTTON_SIZE,
                     rotation: 0.0,
                 },
                 ButtonContent::Label(DELETE_MARK.to_string()),
             )
-            .with_style(WidgetStyle::Settings)
-            .with_label_color(DANGER_TEXT),
+            .with_label_color(theme::DANGER),
         );
-        cy += ROW_H / 2.0;
+        cy += theme::BUTTON_SIZE / 2.0;
 
         if expanded == Some(i) {
             for (m, member) in group.members.iter().take(MAX_MEMBERS).enumerate() {
-                cy += ROW_GAP + MEMBER_H / 2.0;
+                cy += theme::GAP_ROW + MEMBER_H / 2.0;
                 // Слот виден числом: он объясняет, почему окна встают именно
                 // так, — первое в списке попадает в главный слот раскладки.
                 let text = format!("{}. {}", m + 1, member.title);
-                let mut label = Label::new(
+                panel.add_widget(StaticText::new(
                     MEMBER_BASE + m as WidgetId,
                     left + MEMBER_INDENT,
                     cy,
                     &truncate_to_width(&text, content_w - MEMBER_INDENT),
-                );
-                label.set_dim(true);
-                panel.add_widget(label);
+                    theme::TEXT_DIM_OPACITY,
+                ));
                 cy += MEMBER_H / 2.0;
             }
         }
-        cy += ROW_GAP + ROW_H / 2.0;
+        cy += theme::GAP_ROW + theme::BUTTON_SIZE / 2.0;
     }
 
     // Разделитель ставится под фактическим низом списка, а не по формуле:
     // раскрытая группа сдвигает его вниз, и второй счёт разъехался бы с
     // первым.
-    let list_bottom = cy - ROW_H / 2.0 - ROW_GAP;
-    let divider_cy = list_bottom + SECTION_GAP;
-    panel.add_widget(Divider::new(ID_DIVIDER, frame.cx, divider_cy, content_w));
+    let list_bottom = cy - theme::BUTTON_SIZE / 2.0 - theme::GAP_ROW;
+    let divider_cy = list_bottom + theme::GAP_ROW;
+    panel.add_widget(Hairline::new(ID_DIVIDER, frame.cx, divider_cy, content_w));
 
     // Нижний ряд действий — сразу под разделителем: строки переименования
     // между ними больше нет.
-    let actions_cy = divider_cy + SECTION_GAP + ROW_H / 2.0;
-    let new_w = text_size(NEW_LABEL).0 + 2.0 * theme::FIELD_PAD + 12.0;
-    panel.add_widget(
-        Button::new(
-            BTN_NEW,
-            Box2D {
-                cx: left + new_w / 2.0,
-                cy: actions_cy,
-                w: new_w,
-                h: ROW_H,
-                rotation: 0.0,
-            },
-            ButtonContent::Label(NEW_LABEL.to_string()),
-        )
-        .with_style(WidgetStyle::Settings),
-    );
+    let actions_cy = divider_cy + theme::GAP_ROW + theme::BUTTON_SIZE / 2.0;
+    let new_w = text_size(NEW_LABEL).0 + 2.0 * theme::PAD_CTRL_X;
+    panel.add_widget(Button::new(
+        BTN_NEW,
+        Box2D {
+            cx: left + new_w / 2.0,
+            cy: actions_cy,
+            w: new_w,
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label(NEW_LABEL.to_string()),
+    ));
     // «Править состав» есть только при раскрытой группе: без неё непонятно,
     // чей состав правим, а неактивная кнопка в этой панели ничем не
     // отличается от активной — стиль такого состояния не поддерживает.
     if expanded.is_some() {
-        let edit_w = text_size(EDIT_LABEL).0 + 2.0 * theme::FIELD_PAD + 12.0;
-        panel.add_widget(
-            Button::new(
-                BTN_EDIT,
-                Box2D {
-                    cx: left + new_w + ROW_GAP + edit_w / 2.0,
-                    cy: actions_cy,
-                    w: edit_w,
-                    h: ROW_H,
-                    rotation: 0.0,
-                },
-                ButtonContent::Label(EDIT_LABEL.to_string()),
-            )
-            .with_style(WidgetStyle::Settings),
-        );
-    }
-    let close_w = text_size(CLOSE_LABEL).0 + 2.0 * theme::FIELD_PAD + 12.0;
-    panel.add_widget(
-        Button::new(
-            BTN_CLOSE,
+        let edit_w = text_size(EDIT_LABEL).0 + 2.0 * theme::PAD_CTRL_X;
+        panel.add_widget(Button::new(
+            BTN_EDIT,
             Box2D {
-                cx: right - close_w / 2.0,
+                cx: left + new_w + theme::GAP_ROW + edit_w / 2.0,
                 cy: actions_cy,
-                w: close_w,
-                h: ROW_H,
+                w: edit_w,
+                h: theme::BUTTON_SIZE,
                 rotation: 0.0,
             },
-            ButtonContent::Label(CLOSE_LABEL.to_string()),
-        )
-        .with_style(WidgetStyle::Settings),
-    );
+            ButtonContent::Label(EDIT_LABEL.to_string()),
+        ));
+    }
+    let close_w = text_size(CLOSE_LABEL).0 + 2.0 * theme::PAD_CTRL_X;
+    panel.add_widget(Button::new(
+        BTN_CLOSE,
+        Box2D {
+            cx: right - close_w / 2.0,
+            cy: actions_cy,
+            w: close_w,
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label(CLOSE_LABEL.to_string()),
+    ));
 
     panel
 }
@@ -285,7 +466,7 @@ pub fn build(groups: &[WindowGroup], expanded: Option<usize>, frame: Box2D) -> P
 mod tests {
     use super::*;
     use rst_core::model::{GroupMember, MAX_GROUP_MEMBERS};
-    use rst_render::Widget;
+    use rst_render::glass::Surface;
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -339,7 +520,7 @@ mod tests {
         // что делать, а не показать пустоту.
         let f = frame(0, 0);
         let panel = build(&[], None, f);
-        assert!(panel.widget::<Label>(ID_EMPTY).is_some());
+        assert!(panel.widget::<StaticText>(ID_EMPTY).is_some());
         assert!(panel.widget::<Button>(BTN_CLOSE).is_some());
     }
 
@@ -367,7 +548,7 @@ mod tests {
         let groups = vec![group(1, 3)];
         let panel = build(&groups, None, frame(1, 0));
         assert!(
-            panel.widget::<Label>(MEMBER_BASE).is_none(),
+            panel.widget::<StaticText>(MEMBER_BASE).is_none(),
             "свёрнутая группа не должна показывать состав"
         );
     }
@@ -378,7 +559,9 @@ mod tests {
         let panel = build(&groups, Some(0), frame(1, 4));
         for m in 0..4 {
             assert!(
-                panel.widget::<Label>(MEMBER_BASE + m as WidgetId).is_some(),
+                panel
+                    .widget::<StaticText>(MEMBER_BASE + m as WidgetId)
+                    .is_some(),
                 "нет строки окна {m}"
             );
         }
@@ -469,10 +652,63 @@ mod tests {
         let panel = build(&[g], Some(0), f);
         assert!(
             panel
-                .widget::<Label>(MEMBER_BASE + MAX_MEMBERS as WidgetId)
+                .widget::<StaticText>(MEMBER_BASE + MAX_MEMBERS as WidgetId)
                 .is_none(),
             "девятое окно рисовать некуда"
         );
         assert_inside(&panel, f, &[BTN_NEW, BTN_CLOSE]);
+    }
+
+    #[test]
+    fn panel_body_is_a_glass_panel() {
+        // §4: корпус — одна плита стекла. Раньше фон был «рамка + заливка»
+        // (два Fill), теперь — один Primitive::Glass с Surface::Panel.
+        let f = frame(0, 0);
+        let panel = build(&[], None, f);
+        let mut prims = Vec::new();
+        panel.draw(&mut prims);
+        assert!(
+            prims.iter().any(|p| matches!(
+                p,
+                Primitive::Glass {
+                    surface: Surface::Panel,
+                    ..
+                }
+            )),
+            "корпус панели обязан быть плитой стекла"
+        );
+    }
+
+    #[test]
+    fn expanded_row_is_drawn_selected_and_collapsed_rows_are_cards() {
+        // §8.8: строка списка — карточка стекла, выбранная (раскрытая)
+        // строка залита светом. Раньше фон строки был плоской заливкой.
+        let groups: Vec<WindowGroup> = (1..=2).map(|n| group(n, 2)).collect();
+        let collapsed = build(&groups, None, frame(2, 0));
+        let mut prims = Vec::new();
+        collapsed.draw(&mut prims);
+        assert!(
+            prims.iter().any(|p| matches!(
+                p,
+                Primitive::Glass {
+                    surface: Surface::Card,
+                    ..
+                }
+            )),
+            "свёрнутые строки обязаны быть карточками стекла"
+        );
+        let expanded = build(&groups, Some(0), frame(2, 2));
+        let mut prims = Vec::new();
+        expanded.draw(&mut prims);
+        assert!(
+            prims.iter().any(|p| matches!(
+                p,
+                Primitive::Glass {
+                    surface: Surface::ControlOn,
+                    ..
+                }
+            )),
+            "раскрытая строка обязана читаться выбранной (glass_on)"
+        );
     }
 }
