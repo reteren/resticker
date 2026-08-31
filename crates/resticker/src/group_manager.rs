@@ -325,20 +325,27 @@ pub fn build(groups: &[WindowGroup], expanded: Option<usize>, frame: Box2D) -> P
     ));
 
     let list_top = title_cy + LINE_HEIGHT / 2.0 + theme::GAP_ROW;
-    if groups.is_empty() {
-        panel.add_widget(StaticText::new(
-            ID_EMPTY,
-            left,
-            list_top + theme::BUTTON_SIZE / 2.0,
-            &truncate_to_width(EMPTY_LABEL, content_w),
-            theme::TEXT_DIM_OPACITY,
-        ));
-    }
-
     // Список групп. Строки состава вставляются СРАЗУ под своей группой,
     // поэтому вертикальная позиция считается накопительно, а не по индексу:
     // раскрытая группа сдвигает всё, что ниже неё.
     let mut cy = list_top + theme::BUTTON_SIZE / 2.0;
+    if groups.is_empty() {
+        panel.add_widget(StaticText::new(
+            ID_EMPTY,
+            left,
+            cy,
+            &truncate_to_width(EMPTY_LABEL, content_w),
+            theme::TEXT_DIM_OPACITY,
+        ));
+        // Подпись занимает строку списка ровно как настоящая группа —
+        // [`height`] и считает её за строку (`visible_rows(0) == 1`).
+        // Накопитель обязан сдвинуться на ту же строку, что и тело цикла
+        // ниже: без этого разделитель и нижний ряд кнопок вставали на
+        // место, где строки нет, и наезжали прямо на подпись (живой
+        // репорт пользователя со скриншотом, 2026-08-31: текст «No groups
+        // yet…» лежал поверх кнопок «New group» и «Close»).
+        cy += theme::BUTTON_SIZE + theme::GAP_ROW;
+    }
     for (i, group) in groups.iter().take(MAX_ROWS).enumerate() {
         let row_w = content_w - theme::BUTTON_SIZE - theme::GAP_ROW;
         // Подпись читается словами, а не набором чисел: «Group 3 — 4 windows».
@@ -522,6 +529,35 @@ mod tests {
         let panel = build(&[], None, f);
         assert!(panel.widget::<StaticText>(ID_EMPTY).is_some());
         assert!(panel.widget::<Button>(BTN_CLOSE).is_some());
+    }
+
+    /// Подпись «групп ещё нет» не имеет права наезжать на нижний ряд
+    /// кнопок (живой репорт со скриншотом, 2026-08-31): накопитель `cy` не
+    /// сдвигался на пустую строку, и разделитель с кнопками вставали выше,
+    /// чем сама подпись.
+    #[test]
+    fn empty_list_label_does_not_overlap_the_action_row() {
+        let f = frame(0, 0);
+        let panel = build(&[], None, f);
+        let label = panel
+            .widget::<StaticText>(ID_EMPTY)
+            .map(Widget::bounds)
+            .expect("подпись пустого списка");
+        let label_bottom = label.cy + label.h / 2.0;
+        for id in [BTN_NEW, BTN_CLOSE] {
+            let b = panel
+                .widget::<Button>(id)
+                .map(Widget::bounds)
+                .expect("кнопка нижнего ряда");
+            assert!(
+                b.cy - b.h / 2.0 >= label_bottom,
+                "кнопка {id} налезает на подпись: верх {} < низа подписи {label_bottom}",
+                b.cy - b.h / 2.0
+            );
+        }
+        // И весь нижний ряд обязан остаться внутри рамки — сдвиг не должен
+        // выдавить его наружу.
+        assert_inside(&panel, f, &[BTN_NEW, BTN_CLOSE]);
     }
 
     #[test]

@@ -8083,6 +8083,18 @@ fn rebuild_window_pick_list(
     // (`handle_window_pick_list_up`) — порядок и состав обязаны совпадать.
     let eligible = window_pick_list::eligible_snapshot(window_snapshot, &cfg.settings.denylist);
     let sorted = window_pick_list::sorted_snapshot(&eligible);
+    // Уровень info, а не debug, намеренно: пустой список — единственная
+    // жалоба по этой панели, которая доходит до пользователя («окон нет»),
+    // и разобрать её задним числом можно только по этим трём числам —
+    // сколько окон отдал трекер, сколько пережило денайлист и сколько из
+    // них свёрнуто. Строка пишется на пересборку панели, то есть только
+    // пока она открыта, — постоянного шума в журнале от неё нет.
+    tracing::info!(
+        raw = window_snapshot.len(),
+        eligible = sorted.len(),
+        iconic = sorted.iter().filter(|w| w.iconic).count(),
+        "список окон для закрепления пересобран"
+    );
     let frame = Box2D {
         cx: screen.w / 2.0,
         cy: screen.h / 2.0,
@@ -11264,7 +11276,26 @@ fn pin_window(
         );
         return false;
     }
-    let Some(monitor_id) = monitor_for_window_rect(&win.rect, monitor_bounds) else {
+    // Свёрнутое окно закрепляется наравне с открытым (оно есть в списке
+    // выбора — см. `window_pick_list::eligible_snapshot`), но rect в снимке
+    // у него мусорный (`-32000, -32000` от DWM). Место, куда окно вернётся,
+    // Windows знает заранее — `WINDOWPLACEMENT::rcNormalPosition`; по нему
+    // и монитор, и кламп, и целевой прямоугольник разворота.
+    let place_rect = if win.iconic {
+        match rst_win32::window_enum::restored_rect(hwnd) {
+            Some(rect) => rect,
+            None => {
+                tracing::warn!(
+                    hwnd,
+                    "у свёрнутого окна не читается placement — закрепление пропущено"
+                );
+                return false;
+            }
+        }
+    } else {
+        win.rect
+    };
+    let Some(monitor_id) = monitor_for_window_rect(&place_rect, monitor_bounds) else {
         tracing::warn!(
             hwnd,
             "окно вне известной геометрии мониторов — закрепление пропущено"
@@ -11307,25 +11338,30 @@ fn pin_window(
         }
     }
     // Кламп 90%: только размер, позиция не трогается (окно fullscreen/
-    // негабаритное при закреплении). Окно успело свернуться между кликом и
-    // пином — rect от DWM мусорный, кламп пропускаем.
-    if !win.iconic {
-        let (clamped_w, clamped_h) = pinned_window::clamp_to_monitor_max(
-            win.rect.w as f64,
-            win.rect.h as f64,
-            bounds.bounds_px.w as f64,
-            bounds.bounds_px.h as f64,
-        );
-        if clamped_w != win.rect.w as f64 || clamped_h != win.rect.h as f64 {
-            if let Err(e) = window_pins.move_resize(
-                hwnd,
-                win.rect.x,
-                win.rect.y,
-                clamped_w.round() as i32,
-                clamped_h.round() as i32,
-            ) {
-                tracing::warn!(hwnd, error = %e, "кламп размера закреплённого окна не применился");
-            }
+    // негабаритное при закреплении).
+    let (clamped_w, clamped_h) = pinned_window::clamp_to_monitor_max(
+        place_rect.w as f64,
+        place_rect.h as f64,
+        bounds.bounds_px.w as f64,
+        bounds.bounds_px.h as f64,
+    );
+    // Свёрнутое окно двигаем ВСЕГДА, даже когда кламп ничего не меняет:
+    // тем же вызовом оно и разворачивается. `move_resize` — это
+    // `SetWindowPlacement` с `SW_SHOWNOACTIVATE`, то есть разворот БЕЗ
+    // кражи фокуса (закрепление не должно выдёргивать пользователя из
+    // того, где он сейчас печатает) и без промежуточного `SW_RESTORE`,
+    // который дал бы лишний кадр на старом месте.
+    let resize_needed =
+        clamped_w != place_rect.w as f64 || clamped_h != place_rect.h as f64 || win.iconic;
+    if resize_needed {
+        if let Err(e) = window_pins.move_resize(
+            hwnd,
+            place_rect.x,
+            place_rect.y,
+            clamped_w.round() as i32,
+            clamped_h.round() as i32,
+        ) {
+            tracing::warn!(hwnd, error = %e, "кламп размера закреплённого окна не применился");
         }
     }
     edit.pinned_windows.push(PinnedWindow::new(hwnd as isize));
@@ -11708,10 +11744,11 @@ fn toggle_focused_pin(
 ///
 /// С редизайном пинов клик по строке больше НЕ создаёт стикер-окно в
 /// конфиге — только рантайм-пин через [`pin_window`] с записью в
-/// `EditState::pinned_windows` (см. доккомент поля). Свёрнутые и
-/// денайлистовые окна в списке отсутствуют вовсе (фильтр
-/// `window_pick_list::eligible_snapshot`, общий для билдера панели и
-/// декодирования клика — индексы строк обязаны совпадать).
+/// `EditState::pinned_windows` (см. доккомент поля). Денайлистовые окна в
+/// списке отсутствуют вовсе (фильтр `window_pick_list::eligible_snapshot`,
+/// общий для билдера панели и декодирования клика — индексы строк обязаны
+/// совпадать), а свёрнутые в нём ЕСТЬ: [`pin_window`] разворачивает их
+/// заодно с закреплением.
 #[allow(clippy::too_many_arguments)]
 fn handle_window_pick_list_up(
     edit: &mut EditState,

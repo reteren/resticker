@@ -24,10 +24,10 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor,
-    GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MINMAXINFO, SMTO_ABORTIFHUNG,
-    SendMessageTimeoutW, WM_GETMINMAXINFO, WM_GETTEXT, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowPlacement,
+    GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MINMAXINFO,
+    SMTO_ABORTIFHUNG, SendMessageTimeoutW, WINDOWPLACEMENT, WM_GETMINMAXINFO, WM_GETTEXT,
+    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
@@ -609,6 +609,33 @@ pub fn live_rect(hwnd: usize) -> Option<WindowRect> {
     }
     let rect = extended_frame_bounds(hwnd);
     (rect.w != 0 && rect.h != 0).then_some(rect)
+}
+
+/// Прямоугольник, в который окно вернётся при разворачивании
+/// (`WINDOWPLACEMENT::rcNormalPosition`) — единственный способ узнать место
+/// СВЁРНУТОГО окна: `DWMWA_EXTENDED_FRAME_BOUNDS` у него отдаёт мусор
+/// (`-32000, -32000`), а ждать реального разворота, чтобы прочитать rect,
+/// значит гонку с чужой очередью сообщений.
+///
+/// Нужен закреплению свёрнутого окна (список выбора окна, `window_pick_list`):
+/// по этому прямоугольнику определяется монитор и считается кламп ДО того,
+/// как окно развернут.
+///
+/// `None` — окна нет или Windows не отдала placement. Координаты — экранные,
+/// как у [`live_rect`], но БЕЗ поправки на теневую рамку DWM: placement
+/// хранит оконный rect. Разница — единицы пикселей, и для выбора монитора и
+/// клампа она роли не играет.
+pub fn restored_rect(hwnd: usize) -> Option<WindowRect> {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    let mut placement = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: буфер заполнен (length обязателен); GetWindowPlacement
+    // безопасен для чужого и мёртвого хэндла — вернёт ошибку.
+    unsafe { GetWindowPlacement(hwnd, &mut placement) }.ok()?;
+    let rect: WindowRect = placement.rcNormalPosition.into();
+    (rect.w > 0 && rect.h > 0).then_some(rect)
 }
 
 pub(crate) fn extended_frame_bounds(hwnd: HWND) -> WindowRect {

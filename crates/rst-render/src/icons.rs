@@ -31,8 +31,9 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
         Icon::Duplicate => draw_duplicate(&mut canvas, s),
         Icon::Delete => draw_delete(&mut canvas, s),
         Icon::FileOpen => draw_file_open(&mut canvas, s),
-        Icon::ShowAll => draw_show_all(&mut canvas, s),
-        Icon::HideAll => draw_hide_all(&mut canvas, s),
+        // Пара «состояние видимости» — рисунки пользователя, см. `eye_rgba`.
+        Icon::AllVisible => return eye_rgba(EYE_OPEN_PNG, size_px, color_of(icon)),
+        Icon::AllHidden => return eye_rgba(EYE_CLOSED_PNG, size_px, color_of(icon)),
         Icon::PresetSave => draw_preset_save(&mut canvas, s),
         Icon::PresetLoad => draw_preset_load(&mut canvas, s),
         Icon::Settings => draw_settings(&mut canvas, s),
@@ -104,6 +105,57 @@ fn pinned_badge_rgba(size_px: u32) -> Vec<u8> {
 /// Цвет штриха булавки поверх тёмного бейджа.
 const PINNED_BADGE_COLOR: [u8; 3] = [0xf0, 0xf0, 0xf0];
 
+/// Открытый глаз — рисунок пользователя (2026-08-31) для состояния «все
+/// стикеры видны».
+const EYE_OPEN_PNG: &[u8] = include_bytes!("../assets/eye_open.png");
+/// Перечёркнутый глаз — тот же рисунок для состояния «все стикеры скрыты».
+const EYE_CLOSED_PNG: &[u8] = include_bytes!("../assets/eye_closed.png");
+
+/// Доля стороны иконки, которую занимает присланный рисунок.
+///
+/// Оба глаза нарисованы почти во всю квадратную канву (штрих доходит до
+/// 0.94 стороны), а соседние по панели пиктограммы рисуются примитивами
+/// внутри примерно 0.76 — вписанный «как есть» глаз читался бы заметно
+/// крупнее соседей. Множитель приводит его к их размеру; общий для обоих
+/// рисунков, поэтому сам глаз в паре не меняет величину — перечёркнутый
+/// лишь добавляет к нему косую черту.
+const RASTER_ICON_FRAC: f64 = 0.82;
+
+/// Растровая иконка `size_px`×`size_px` из PNG: из исходника берётся только
+/// АЛЬФА, цвет заменяется на `color` (как у [`pinned_badge_rgba`]),
+/// рисунок вписывается в [`RASTER_ICON_FRAC`] стороны и центрируется.
+fn eye_rgba(png: &[u8], size_px: u32, color: [u8; 3]) -> Vec<u8> {
+    let mut out = vec![0u8; (size_px as usize) * (size_px as usize) * 4];
+    let decoded = match image::load_from_memory(png) {
+        Ok(img) => img.into_rgba8(),
+        Err(e) => {
+            // Битый ресурс — не повод ронять оверлей (тот же принцип, что у
+            // булавки): пустая иконка честнее паники, причина видна в логе.
+            tracing::warn!(error = %e, "иконка-глаз не декодировалась");
+            return out;
+        }
+    };
+    let inner = ((f64::from(size_px) * RASTER_ICON_FRAC).round() as u32).clamp(1, size_px);
+    let scaled = image::imageops::resize(
+        &decoded,
+        inner,
+        inner,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let off = (size_px - inner) / 2;
+    for y in 0..inner {
+        for x in 0..inner {
+            let alpha = scaled.get_pixel(x, y).0[3];
+            let i = (((y + off) * size_px + (x + off)) as usize) * 4;
+            out[i] = color[0];
+            out[i + 1] = color[1];
+            out[i + 2] = color[2];
+            out[i + 3] = alpha;
+        }
+    }
+    out
+}
+
 /// Цвет иконки.
 ///
 /// Палитра — монохром Source VGUI (2026-08-23, перевод тулбаров на
@@ -131,15 +183,18 @@ fn color_of(icon: Icon) -> [u8; 3] {
         // Единственный цветной акцент: удаление необратимо, и форма урны
         // сама по себе этого не сообщает.
         Icon::Delete => [0xe0, 0x76, 0x76],
-        Icon::Layers
+        // Обе иконки видимости — светлые: состояние читается формой
+        // (перечёркнут или нет), а приглушать её на тёмном стекле значило
+        // бы прятать саму кнопку.
+        Icon::AllVisible
+        | Icon::AllHidden
+        | Icon::Layers
         | Icon::Groups
         | Icon::Eye
         | Icon::OrderUp
         | Icon::OrderDown
         | Icon::Duplicate
         | Icon::FileOpen
-        | Icon::ShowAll
-        | Icon::HideAll
         | Icon::PresetSave
         | Icon::PresetLoad
         | Icon::Settings
@@ -362,19 +417,6 @@ fn draw_file_open(cv: &mut Canvas, s: f64) {
         (0.72 * s, 0.70 * s),
         (0.28 * s, 0.70 * s),
     );
-}
-
-/// «Показать все»: глаз с плюсом.
-fn draw_show_all(cv: &mut Canvas, s: f64) {
-    stroke_ellipse(cv, 0.5 * s, 0.5 * s, 0.33 * s, 0.21 * s, 0.09 * s);
-    line(cv, 0.5 * s, 0.42 * s, 0.5 * s, 0.58 * s, 0.08 * s);
-    line(cv, 0.42 * s, 0.5 * s, 0.58 * s, 0.5 * s, 0.08 * s);
-}
-
-/// «Скрыть все»: глаз с минусом.
-fn draw_hide_all(cv: &mut Canvas, s: f64) {
-    stroke_ellipse(cv, 0.5 * s, 0.5 * s, 0.33 * s, 0.21 * s, 0.09 * s);
-    line(cv, 0.40 * s, 0.5 * s, 0.60 * s, 0.5 * s, 0.09 * s);
 }
 
 /// «Сохранить пресет»: стрелка вниз в лоток.
@@ -648,8 +690,7 @@ fn draw_lock_open(cv: &mut Canvas, s: f64) {
 }
 
 /// «Плюс» — добавление правила соседства в панели свойств закреплённого
-/// окна: два пересекающихся штриха (та же геометрия плюса, что у
-/// `draw_show_all`, но без глаза).
+/// окна: два пересекающихся штриха.
 fn draw_plus(cv: &mut Canvas, s: f64) {
     line(cv, 0.5 * s, 0.40 * s, 0.5 * s, 0.60 * s, 0.10 * s);
     line(cv, 0.40 * s, 0.5 * s, 0.60 * s, 0.5 * s, 0.10 * s);

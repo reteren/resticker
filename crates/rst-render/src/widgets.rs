@@ -70,10 +70,15 @@ pub enum Icon {
     Delete,
     /// «Загрузить файл» (SPEC 3.8).
     FileOpen,
-    /// «Показать все стикеры» (SPEC 3.8).
-    ShowAll,
-    /// «Скрыть все стикеры» (SPEC 3.8).
-    HideAll,
+    /// «Все стикеры сейчас видны» — открытый глаз (SPEC 3.8, кнопка
+    /// `cursor_panel::BTN_TOGGLE_ALL`). Пара `AllVisible`/`AllHidden`
+    /// отражает СОСТОЯНИЕ, как `Eye`/`EyeOff`, а не предстоящее действие:
+    /// так попросил пользователь (2026-08-31, «закрытый глаз когда окна
+    /// скрыты и открытый когда всё видно»), и до этого кнопка показывала
+    /// действие — глаз с минусом на видимых стикерах.
+    AllVisible,
+    /// «Все стикеры сейчас скрыты» — перечёркнутый глаз.
+    AllHidden,
     /// «Сохранить пресет» (SPEC 3.8).
     PresetSave,
     /// «Загрузить пресет» (SPEC 3.8).
@@ -131,8 +136,8 @@ impl Icon {
         Icon::Duplicate,
         Icon::Delete,
         Icon::FileOpen,
-        Icon::ShowAll,
-        Icon::HideAll,
+        Icon::AllVisible,
+        Icon::AllHidden,
         Icon::PresetSave,
         Icon::PresetLoad,
         Icon::Settings,

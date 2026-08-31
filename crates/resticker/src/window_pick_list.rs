@@ -91,12 +91,22 @@ pub fn sorted_snapshot(snapshot: &[WindowInfo]) -> Vec<WindowInfo> {
 /// Снимок, из которого убраны окна, не годящиеся для закрепления
 /// (редизайн пинов, SPEC.md «Закрепление окна»): денайлистовые
 /// (`cfg.settings.denylist`, предикат [`is_denylisted`] — те же
-/// процесс/заголовок-правила, что у хоткей-пина) и свёрнутые (rect от DWM
-/// мусорный, пинить нечего — тот же принцип, что у `window_picker`/
-/// окклюдеров). Порядок снимка сохраняется — сортировка по z-order
-/// ([`sorted_snapshot`]) накладывается ПОВЕРХ этого фильтра, и индексы
-/// строк должны считаться по одинаково отфильтрованному списку и в билдере,
-/// и при декодировании клика (координатор, `handle_window_pick_list_up`).
+/// процесс/заголовок-правила, что у хоткей-пина). Порядок снимка
+/// сохраняется — сортировка по z-order ([`sorted_snapshot`]) накладывается
+/// ПОВЕРХ этого фильтра, и индексы строк должны считаться по одинаково
+/// отфильтрованному списку и в билдере, и при декодировании клика
+/// (координатор, `handle_window_pick_list_up`).
+///
+/// Свёрнутые окна ОСТАЮТСЯ в списке (живой репорт пользователя со
+/// скриншотом, 2026-08-31: «почему не показываются вообще окна… когда я
+/// хочу выбрать окно» — на десктопе без единого развёрнутого окна панель
+/// честно писала «нет окон», хотя у пользователя открыты Opera, Telegram,
+/// Discord и Orca, просто свёрнутые). Прежняя отбраковка исходила из того,
+/// что у свёрнутого окна мусорный rect от DWM и пинить нечего; настоящий
+/// ответ — не прятать окно от пользователя, а РАЗВЕРНУТЬ его при
+/// закреплении: место, куда оно вернётся, известно заранее из
+/// `WINDOWPLACEMENT` ([`rst_win32::window_enum::restored_rect`]), и
+/// координатор так и делает (`pin_window`).
 ///
 /// Процесс для денайлиста — полный путь к exe, как его понимают
 /// окклюдеры (`path_eq_ignore_case`: правило матчит и по полному пути, и по
@@ -104,9 +114,7 @@ pub fn sorted_snapshot(snapshot: &[WindowInfo]) -> Vec<WindowInfo> {
 pub fn eligible_snapshot(snapshot: &[WindowInfo], denylist: &[OverlapRule]) -> Vec<WindowInfo> {
     snapshot
         .iter()
-        .filter(|w| {
-            !w.iconic && !is_denylisted(window_exe_path(w).as_deref(), Some(&w.title), denylist)
-        })
+        .filter(|w| !is_denylisted(window_exe_path(w).as_deref(), Some(&w.title), denylist))
         .cloned()
         .collect()
 }
@@ -283,6 +291,10 @@ struct RowContent {
     icon_rect: Box2D,
     text: String,
     icon: Option<(u64, WindowIcon)>,
+    /// Непрозрачность содержимого строки — токен §2.3. Свёрнутое окно
+    /// приглушено: оно в списке есть и закрепить его можно, но сейчас его
+    /// на экране нет, и строка не должна выглядеть наравне с открытыми.
+    opacity: f64,
 }
 
 impl Widget for RowContent {
@@ -317,7 +329,7 @@ impl Widget for RowContent {
                 width: icon.width,
                 height: icon.height,
                 rgba: icon.rgba.clone(),
-                opacity: 1.0,
+                opacity: self.opacity,
             }),
             // Слота без иконки — утопленный жёлоб (§2.2 SUNKEN_BG): тёмная
             // ямка читается как «сюда встанет иконка», а не как грязь.
@@ -328,7 +340,7 @@ impl Widget for RowContent {
                 rect: self.text_rect,
                 text: self.text.clone(),
                 color: theme::TEXT,
-                opacity: theme::TEXT_OPACITY,
+                opacity: self.opacity,
             });
         }
     }
@@ -418,6 +430,11 @@ pub fn build(sorted: &[WindowInfo], scroll: usize, frame: Box2D) -> PickListPane
             },
             text: label,
             icon: window.icon.clone().map(|icon| (icon_key(window), icon)),
+            opacity: if window.iconic {
+                theme::TEXT_DIM_OPACITY
+            } else {
+                theme::TEXT_OPACITY
+            },
         });
     }
 
@@ -738,16 +755,44 @@ mod tests {
         );
     }
 
+    /// Свёрнутое окно — тоже окно пользователя (репорт со скриншотом,
+    /// 2026-08-31): на десктопе без единого развёрнутого окна панель писала
+    /// «нет окон», хотя открыто было полдюжины.
     #[test]
-    fn eligible_snapshot_removes_iconic_windows() {
+    fn eligible_snapshot_keeps_iconic_windows() {
         let mut minimized = window(r"C:\Apps\app.exe", "Min", 0);
         minimized.iconic = true;
         let normal = window(r"C:\Apps\app.exe", "Normal", 1);
-        let eligible = eligible_snapshot(&[minimized, normal.clone()], &[]);
+        let eligible = eligible_snapshot(&[minimized.clone(), normal.clone()], &[]);
         assert_eq!(
             eligible,
-            vec![normal],
-            "свёрнутые окна не предлагаются к закреплению"
+            vec![minimized, normal],
+            "свёрнутые окна остаются в списке — закрепление их развернёт"
+        );
+    }
+
+    /// Свёрнутая строка приглушена: окно есть, но его сейчас не видно, и
+    /// наравне с открытыми она стоять не должна.
+    #[test]
+    fn an_iconic_row_is_dimmer_than_an_open_one() {
+        let mut minimized = window(r"C:\Apps\a.exe", "Min", 0);
+        minimized.iconic = true;
+        let snapshot = [minimized, window(r"C:\Apps\b.exe", "Open", 1)];
+        let sorted = sorted_snapshot(&snapshot);
+        let p = build(&sorted, 0, frame(height(sorted.len())));
+        let mut out = Vec::new();
+        p.panel.draw(&mut out);
+        let opacity_of = |needle: &str| {
+            out.iter()
+                .find_map(|prim| match prim {
+                    Primitive::Text { text, opacity, .. } if text == needle => Some(*opacity),
+                    _ => None,
+                })
+                .expect("надпись строки")
+        };
+        assert!(
+            opacity_of("Min") < opacity_of("Open"),
+            "свёрнутая строка обязана быть приглушена"
         );
     }
 

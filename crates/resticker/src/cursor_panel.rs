@@ -129,10 +129,14 @@ pub fn build_cursor_panel(screen: &DipRect, all_visible: bool, progress: f64) ->
     // свободно плавающая панель у края экрана читается как карточка.
     let mut panel = Panel::new(CURSOR_PANEL_ID, frame).with_corner_radius(theme::RADIUS_CARD);
 
+    // Иконка показывает СОСТОЯНИЕ, а не предстоящее действие (просьба
+    // пользователя 2026-08-31): всё видно — открытый глаз, всё скрыто —
+    // перечёркнутый. Прежняя пара была наоборот, «что произойдёт по
+    // клику», и на видимых стикерах висел глаз с минусом.
     let toggle_icon = if all_visible {
-        Icon::HideAll
+        Icon::AllVisible
     } else {
-        Icon::ShowAll
+        Icon::AllHidden
     };
     let buttons = [
         (BTN_LOAD_FILE, Icon::FileOpen),
@@ -306,7 +310,7 @@ mod tests {
 
     #[test]
     fn icons_match_spec_and_toggle_state() {
-        // Всё видимо → кнопка-переключатель предлагает «скрыть все».
+        // Всё видимо → открытый глаз.
         let panel = build_cursor_panel(&screen(), true, 1.0);
         assert_eq!(
             icons(&panel),
@@ -315,12 +319,12 @@ mod tests {
                 Icon::Layers,
                 Icon::PresetLoad,
                 Icon::Groups,
-                Icon::HideAll,
+                Icon::AllVisible,
                 Icon::Settings,
                 Icon::Exit
             ]
         );
-        // Часть скрыта → предлагает «показать все».
+        // Часть скрыта → перечёркнутый глаз.
         let panel = build_cursor_panel(&screen(), false, 1.0);
         assert_eq!(
             icons(&panel),
@@ -329,7 +333,7 @@ mod tests {
                 Icon::Layers,
                 Icon::PresetLoad,
                 Icon::Groups,
-                Icon::ShowAll,
+                Icon::AllHidden,
                 Icon::Settings,
                 Icon::Exit
             ]

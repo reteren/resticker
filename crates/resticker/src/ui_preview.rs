@@ -472,3 +472,4 @@ fn ui_preview_png() {
     std::fs::write(&path, encode_png(&canvas)).expect("записать превью");
     println!("превью UI: {path}");
 }
+
