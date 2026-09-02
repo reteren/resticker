@@ -87,6 +87,8 @@ function renderGeneral() {
   const fps = draftSettings.battery_fps_limit ?? 30;
   document.getElementById('battery-fps-limit').value = fps;
   document.getElementById('battery-fps-limit-value').textContent = String(fps);
+  document.getElementById('mitosis-max-memory-mb').value =
+    draftSettings.mitosis_max_memory_mb ?? 4096;
 }
 
 const GENERAL_CHECKBOXES = [
@@ -131,6 +133,30 @@ fpsSlider.addEventListener('input', () => {
   draftSettings.battery_fps_limit = Number(fpsSlider.value);
 });
 
+// Потолок приватной памяти для митоза (M9, settings.mitosis_max_memory_mb) —
+// число, как snap-shrink-pct, а не слайдер: диапазон в 131072 ступени по
+// 512 МБ ползунком не передать. Нижняя граница 512 МБ не случайна: митоз
+// запускает ВТОРОЙ экземпляр приложения, и лимит ниже удвоенного веса
+// лёгкого процесса отказывал бы всему подряд.
+const mitosisMemoryInput = document.getElementById('mitosis-max-memory-mb');
+const MITOSIS_MEMORY_MIN = 512;
+const MITOSIS_MEMORY_MAX = 65536;
+mitosisMemoryInput.addEventListener('input', () => {
+  const raw = Number(mitosisMemoryInput.value);
+  // Пустое поле и мусор — это дефолт 4096, а не NaN: NaN уехал бы в конфиг
+  // и вернулся бы оттуда `null`, обнулив настройку молча и не там, где её
+  // меняли (тот же приём, что у snap-shrink-pct).
+  const mb = Number.isFinite(raw)
+    ? Math.min(Math.max(Math.round(raw), MITOSIS_MEMORY_MIN), MITOSIS_MEMORY_MAX)
+    : 4096;
+  draftSettings.mitosis_max_memory_mb = mb;
+});
+// Правку показываем только после ухода из поля: подставлять кламп прямо во
+// время набора значит вырывать курсор из-под пальцев на каждой цифре.
+mitosisMemoryInput.addEventListener('blur', () => {
+  mitosisMemoryInput.value = draftSettings.mitosis_max_memory_mb ?? 4096;
+});
+
 // ==== Вкладка «Управление» (хоткеи) ====
 
 const HOTKEY_FIELDS = [
@@ -138,6 +164,7 @@ const HOTKEY_FIELDS = [
   ['hotkey-toggle-all', 'toggle_all_stickers'],
   ['hotkey-mute-all', 'mute_all'],
   ['hotkey-pin', 'pin_focused_window'],
+  ['hotkey-mitosis', 'window_mitosis'],
   ['hotkey-unpin-all', 'unpin_all'],
   ['hotkey-groups-menu', 'edit_groups_menu'],
   ['hotkey-delete-group', 'delete_open_group'],

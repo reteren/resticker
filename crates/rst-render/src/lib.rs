@@ -68,8 +68,8 @@ pub use widgets::{
     PINNED_ROW_FIELD_BITS, PINNED_RULE_ROW_H, PINNED_SECTION_ROW_H, PINNED_VISIBLE_RULES, Panel,
     PinnedPanel, PinnedRowField, PointerEvent, Primitive, ScrollBar, Slider, TextField, Widget,
     WidgetId, box_contains, build_pinned_lock_panel, build_pinned_panel, decode_pinned_row_id,
-    glass_card, glass_control, glass_on, glass_panel, glass_sunken, lock_indicator, pin_indicator,
-    pinned_lock_panel_height, pinned_row_id, theme, tooltip_frame,
+    glass_card, glass_control, glass_danger, glass_on, glass_panel, glass_sunken, lock_indicator,
+    pin_indicator, pinned_lock_panel_height, pinned_row_id, theme, tooltip_frame,
 };
 pub use window_highlight::{HIGHLIGHT_THICKNESS_DIP, HighlightKind, WindowHighlight};
 pub use window_target::{PresentSync, WindowTarget};

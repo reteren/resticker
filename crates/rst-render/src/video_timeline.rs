@@ -37,15 +37,27 @@ use rst_core::hittest::{to_local, to_world};
 use rst_core::ui_motion::{Phase, lerp};
 
 use crate::{
-    Box2D, PointerEvent, Primitive, Widget, WidgetId, glass::Surface, glass_control, glass_sunken,
-    text_size, theme,
+    Box2D, LINE_HEIGHT, PointerEvent, Primitive, Widget, WidgetId, glass::Surface, glass_control,
+    glass_sunken, text_size, theme,
 };
 
 /// Отступ полосы от краёв стикера, DIP (в §3 величины нет — это вёрстка
 /// полосы поверх видео, а не корпуса панели).
 pub const TIMELINE_MARGIN: f64 = 8.0;
-/// Высота полосы, DIP: дорожка с ручкой плюс подписи времени.
-pub const TIMELINE_HEIGHT: f64 = 24.0;
+/// Зазор между подписями времени и дорожкой, DIP: подписи прижаты к верху
+/// плашки, дорожка с ручкой — к низу, и без зазора они визуально слипаются.
+/// Высота плашки выводится из этого зазора ([`TIMELINE_HEIGHT`]), поэтому
+/// правка зазора честно пересчитывает высоту, а не рискует наложением текста
+/// на дорожку при следующей смене шрифта.
+pub const TIMELINE_LABEL_GAP: f64 = 2.0;
+/// Высота полосы, DIP: строка подписей, зазор и ручка — ВЫВОДИТСЯ из того,
+/// что кладётся внутрь, а не магическим числом. Прежние 24 DIP работали ровно
+/// пока `LINE_HEIGHT` и `TIMELINE_KNOB` совпадали с ожиданиями вёрстки; смена
+/// шрифта положила подписи ПОВЕРХ дорожки (репорт 2026-09-01), потому что
+/// высота не знала, что внутри. `LINE_HEIGHT + TIMELINE_LABEL_GAP +
+/// TIMELINE_KNOB` — высота следует за содержимым, и следующая правка шрифта
+/// или ручки пересчитает её сама.
+pub const TIMELINE_HEIGHT: f64 = LINE_HEIGHT + TIMELINE_LABEL_GAP + TIMELINE_KNOB;
 /// Минимальная ширина полосы, DIP. Уже некуда: подписи времени и ручка
 /// сливаются в кашу, рисовать полосу на таком стикере бессмысленно —
 /// [`timeline_bounds`] вернёт `None`.
@@ -270,6 +282,14 @@ impl Widget for VideoTimeline {
         let hover_t = self.hover_phase.eased();
         let press_t = self.press_phase.eased();
         let active_t = self.active_t();
+        // Вертикальная вёрстка плашки: подписи прижаты к верху, дорожка с
+        // ручкой — к низу, между ними ровно TIMELINE_LABEL_GAP (репорт
+        // 2026-09-01: всё рисовалось на ly = 0 и подпись «35:46» лежала
+        // ПОВЕРХ дорожки, читалась как каша). Оба центра выводятся из
+        // TIMELINE_HEIGHT — высота плашки собрана из тех же трёх частей, что
+        // лежат внутрь, поэтому разнесение гарантировано самими константами.
+        let label_ly = -(TIMELINE_HEIGHT / 2.0) + LINE_HEIGHT / 2.0;
+        let track_ly = (TIMELINE_HEIGHT / 2.0) - TIMELINE_KNOB / 2.0;
         // Порядок «нижний — первым»: жёлоб, подсветка наведения, дорожка,
         // заливка, ручка, подписи (подписи поверх всего — их должно быть
         // видно всегда).
@@ -295,7 +315,7 @@ impl Widget for VideoTimeline {
         // (плавно, по фазе).
         glass_sunken(
             out,
-            self.local_rect((x0 + x1) / 2.0, 0.0, x1 - x0, self.track_h()),
+            self.local_rect((x0 + x1) / 2.0, track_ly, x1 - x0, self.track_h()),
             theme::RADIUS_TIGHT,
             TIMELINE_BG_OPACITY,
         );
@@ -303,7 +323,7 @@ impl Widget for VideoTimeline {
             // Уже проигранное — белое (§2.4: всё, что было акцентом, стало
             // белым светом разной силы).
             out.push(Primitive::Fill {
-                rect: self.local_rect((x0 + kx) / 2.0, 0.0, kx - x0, self.track_h()),
+                rect: self.local_rect((x0 + kx) / 2.0, track_ly, kx - x0, self.track_h()),
                 color: theme::TEXT,
                 opacity: 1.0,
             });
@@ -314,7 +334,7 @@ impl Widget for VideoTimeline {
         // теперь круг даёт сам радиус: 10 × 10 при RADIUS_CTRL 10 — диск.
         glass_control(
             out,
-            self.local_rect(kx, 0.0, TIMELINE_KNOB, TIMELINE_KNOB),
+            self.local_rect(kx, track_ly, TIMELINE_KNOB, TIMELINE_KNOB),
             theme::RADIUS_CTRL,
             hover_t,
             press_t,
@@ -322,7 +342,8 @@ impl Widget for VideoTimeline {
             1.0,
         );
         // Подписи времени: слева — текущая позиция, справа — длительность
-        // (выровнены по краям полосы, вертикально — по центру дорожки).
+        // (выровнены по краям полосы, вертикально — прижаты к верху плашки,
+        // см. `label_ly`).
         let (left_text, right_text) = (
             format_time(self.position()),
             format_time(self.duration_secs),
@@ -332,7 +353,7 @@ impl Widget for VideoTimeline {
         out.push(Primitive::Text {
             rect: self.local_rect(
                 -self.bounds.w / 2.0 + TIMELINE_MARGIN + lw / 2.0,
-                0.0,
+                label_ly,
                 lw,
                 lh,
             ),
@@ -343,7 +364,7 @@ impl Widget for VideoTimeline {
         out.push(Primitive::Text {
             rect: self.local_rect(
                 self.bounds.w / 2.0 - TIMELINE_MARGIN - rw / 2.0,
-                0.0,
+                label_ly,
                 rw,
                 rh,
             ),
@@ -806,5 +827,109 @@ mod tests {
             "после ухода курсора подсветка гаснет"
         );
         assert_eq!(track_h(&out), TIMELINE_TRACK_H);
+    }
+
+    /// Подписи времени и ручка НЕ пересекаются по вертикали: подписи прижаты
+    /// к верху плашки, ручка к низу, между ними зазор [`TIMELINE_LABEL_GAP`]
+    /// (репорт 2026-09-01 — раньше всё рисовалось на одной линии и подпись
+    /// лежала ПОВЕРХ дорожки). Интервалы [cy - h/2, cy + h/2] берём из
+    /// выданных примитивов, а не из формул — проверяется фактическая вёрстка.
+    #[test]
+    fn labels_and_knob_do_not_overlap_vertically() {
+        let t = tl();
+        let mut out = Vec::new();
+        t.draw(&mut out);
+        let label = out
+            .iter()
+            .find_map(|p| match p {
+                Primitive::Text { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("подпись времени присутствует");
+        let knob = out
+            .iter()
+            .find_map(|p| match p {
+                Primitive::Glass {
+                    surface: Surface::ControlPrimary,
+                    rect,
+                    ..
+                } => Some(*rect),
+                _ => None,
+            })
+            .expect("ручка присутствует");
+        let label_bottom = label.cy + label.h / 2.0;
+        let knob_top = knob.cy - knob.h / 2.0;
+        assert!(
+            label_bottom <= knob_top,
+            "подпись [{}, {}] должна заканчиваться выше ручки [{}, {}]",
+            label.cy - label.h / 2.0,
+            label_bottom,
+            knob_top,
+            knob.cy + knob.h / 2.0
+        );
+    }
+
+    /// И подписи, и ручка целиком лежат внутри плашки `bounds`: прижатые к
+    /// краям элементы не должны вылезать за жёлоб.
+    #[test]
+    fn labels_and_knob_stay_inside_bounds() {
+        let t = tl();
+        let mut out = Vec::new();
+        t.draw(&mut out);
+        let check_inside = |rect: Box2D, name: &str| {
+            let top = rect.cy - rect.h / 2.0;
+            let bottom = rect.cy + rect.h / 2.0;
+            assert!(
+                top >= t.bounds.cy - t.bounds.h / 2.0,
+                "{name} вылезла за верх плашки"
+            );
+            assert!(
+                bottom <= t.bounds.cy + t.bounds.h / 2.0,
+                "{name} вылезла за низ плашки"
+            );
+        };
+        for p in &out {
+            match p {
+                Primitive::Text { rect, .. } => check_inside(*rect, "подпись"),
+                Primitive::Glass {
+                    surface: Surface::ControlPrimary,
+                    rect,
+                    ..
+                } => check_inside(*rect, "ручка"),
+                _ => {}
+            }
+        }
+    }
+
+    /// Дорожка прижата к низу плашки, подписи — к верху: центры лежат по
+    /// разные стороны центра плашки, а не все на одной линии (было до бага).
+    #[test]
+    fn labels_top_track_bottom() {
+        let t = tl();
+        let mut out = Vec::new();
+        t.draw(&mut out);
+        let label_cy = out
+            .iter()
+            .find_map(|p| match p {
+                Primitive::Text { rect, .. } => Some(rect.cy),
+                _ => None,
+            })
+            .expect("подпись присутствует");
+        let track_cy = out
+            .iter()
+            .find_map(|p| match p {
+                Primitive::Glass {
+                    surface: Surface::Sunken,
+                    rect,
+                    ..
+                } if rect.h < 10.0 => Some(rect.cy),
+                _ => None,
+            })
+            .expect("дорожка присутствует");
+        assert!(
+            label_cy < t.bounds.cy && track_cy > t.bounds.cy,
+            "подпись ({label_cy}) должна быть выше центра плашки ({}), дорожка ({track_cy}) — ниже",
+            t.bounds.cy
+        );
     }
 }

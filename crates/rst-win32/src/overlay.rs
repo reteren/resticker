@@ -24,6 +24,7 @@ use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{
     COLORREF, ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, DeleteObject, RGN_DIFF, SetWindowRgn,
 };
@@ -31,6 +32,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
 };
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT,
@@ -38,17 +40,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GW_HWNDPREV, GWL_EXSTYLE,
     GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindow, GetWindowDisplayAffinity,
-    GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE,
-    WDA_NONE, WHEEL_DELTA, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR,
-    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible,
+    KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA,
+    WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use windows::core::{PCWSTR, w};
 
@@ -142,6 +144,7 @@ fn cursor_shape_to_wparam(shape: CursorShape) -> WPARAM {
         CursorShape::SizeWE => 3,
         CursorShape::SizeNESW => 4,
         CursorShape::SizeNWSE => 5,
+        CursorShape::Cross => 6,
         CursorShape::Rotate(angle_deg) => ROTATE_WPARAM_BASE + angle_deg.rem_euclid(360) as usize,
     })
 }
@@ -154,6 +157,7 @@ fn cursor_shape_from_wparam(wparam: WPARAM) -> Option<CursorShape> {
         3 => CursorShape::SizeWE,
         4 => CursorShape::SizeNESW,
         5 => CursorShape::SizeNWSE,
+        6 => CursorShape::Cross,
         n @ ROTATE_WPARAM_BASE..=ROTATE_WPARAM_MAX => {
             CursorShape::Rotate((n - ROTATE_WPARAM_BASE) as i32)
         }
@@ -176,6 +180,9 @@ pub enum HotkeyName {
     MuteAll,
     /// Хоткей «закрепить/открепить сфокусированное окно» (редизайн пинов).
     PinFocusedWindow,
+    /// Хоткей режима резки окон — «митоз»
+    /// (docs/M9_WINDOW_MITOSIS_DESIGN.md).
+    WindowMitosis,
 }
 
 /// Безопасное событие оверлей-окна для координатора (docs/M2_INTEGRATION_PLAN.md,
@@ -270,6 +277,11 @@ pub enum OverlayEvent {
     SystemSuspending,
     /// Система вышла из сна (`PBT_APMRESUMESUSPEND` / `PBT_APMRESUMEAUTOMATIC`).
     SystemResumed,
+    /// Включить или выключить режим резки окон — «митоз» (`Ctrl+Alt+F`,
+    /// docs/M9_WINDOW_MITOSIS_DESIGN.md). Переключатель: одно и то же
+    /// событие и входит в режим, и выходит из него — решает координатор по
+    /// тому, активен ли режим сейчас.
+    ToggleMitosisMode,
 }
 
 /// Оверлей-окно на один монитор и его поток сообщений.
@@ -797,6 +809,213 @@ impl Drop for OverlayWindow {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Удержание оверлея наверху topmost-полосы
+// ---------------------------------------------------------------------------
+
+/// Идентификатор таймера, который держит оверлей наверху topmost-полосы.
+const TOPMOST_TIMER_ID: usize = 1;
+
+/// Период проверки z-order, мс.
+///
+/// Сама проверка стоит микросекунды (`GetWindow` — 0.3–0.5 мкс на окно,
+/// замер 2026-08-21), поэтому период выбран по времени реакции глаза, а не
+/// по цене: накрытый чужим окном стикер возвращается наверх за долю секунды
+/// и это читается как «не пропадал».
+const TOPMOST_TIMER_MS: u32 = 400;
+
+/// Окно меньше этого по любой стороне за помеху не считается: в
+/// topmost-полосе постоянно висят служебные окна 1×1 (замер 2026-09-02: два
+/// `ThumbnailDeviceHelperWnd` проводника, всегда выше всех). Они ничего не
+/// закрывают, а реагировать на них значило бы дёргать `SetWindowPos` каждые
+/// [`TOPMOST_TIMER_MS`] до конца сеанса.
+const TOPMOST_MIN_INTRUDER_PX: i32 = 8;
+
+/// Сколько тиков подряд одно и то же чужое окно отвоёвывает верх, прежде чем
+/// мы перестаём с ним бороться.
+///
+/// Приложение, которое тоже держит себя наверху по таймеру, иначе устроило бы
+/// с нами бесконечную перестановку — мигание несколько раз в секунду, которое
+/// выглядит хуже честно уступленного верха.
+const TOPMOST_WAR_STRIKES: u32 = 8;
+
+/// Решение «возвращаться ли наверх» на один тик таймера — без Win32, чтобы
+/// перестановочная война проверялась тестом, а не глазами.
+#[derive(Debug, Default)]
+struct TopmostGuard {
+    /// Кого поднимали на прошлом тике.
+    last: Option<usize>,
+    /// Сколько тиков подряд он возвращается.
+    strikes: u32,
+    /// Кому уступили верх: с этим окном больше не боремся, пока оно не уйдёт
+    /// с нашей дороги само.
+    surrendered: Option<usize>,
+}
+
+impl TopmostGuard {
+    /// `intruder` — чужое видимое окно над оверлеем, реально его
+    /// закрывающее; `None` — над нами чисто. `true` — сейчас стоит вызвать
+    /// `SetWindowPos(HWND_TOPMOST)`.
+    fn decide(&mut self, intruder: Option<usize>) -> bool {
+        let Some(hwnd) = intruder else {
+            // Верх наш — счётчики прошлой борьбы больше ни о чём не говорят.
+            *self = Self::default();
+            return false;
+        };
+        if self.last != Some(hwnd) {
+            self.last = Some(hwnd);
+            self.strikes = 0;
+            self.surrendered = None;
+        }
+        if self.surrendered == Some(hwnd) {
+            return false;
+        }
+        self.strikes += 1;
+        if self.strikes > TOPMOST_WAR_STRIKES {
+            self.surrendered = Some(hwnd);
+            tracing::warn!(
+                hwnd,
+                "чужое окно удерживает верх topmost-полосы — уступаем, чтобы не мигать"
+            );
+            return false;
+        }
+        true
+    }
+}
+
+/// Чужое окно `other` закрывает оверлей `ours`? Оба прямоугольника — в
+/// экранных координатах с семантикой `RECT` (`right`/`bottom` исключительно).
+fn intruder_covers(ours: (i32, i32, i32, i32), other: (i32, i32, i32, i32)) -> bool {
+    let (l, t, r, b) = other;
+    if r - l < TOPMOST_MIN_INTRUDER_PX || b - t < TOPMOST_MIN_INTRUDER_PX {
+        return false;
+    }
+    let (ol, ot, orr, ob) = ours;
+    l < orr && r > ol && t < ob && b > ot
+}
+
+/// Одно окно над нами: чужое, видимое, не скрытое DWM и пересекается с
+/// оверлеем?
+///
+/// # Safety
+/// `other` — окно, полученное обходом z-order, живо на время вызова.
+unsafe fn covers_overlay(other: HWND, our_pid: u32, ours: (i32, i32, i32, i32)) -> bool {
+    // SAFETY: чтение свойств живого окна.
+    if !unsafe { IsWindowVisible(other) }.as_bool() {
+        return false;
+    }
+    let mut pid = 0u32;
+    // SAFETY: то же; pid — наша переменная на стеке.
+    unsafe { GetWindowThreadProcessId(other, Some(&mut pid)) };
+    if pid == our_pid {
+        // Наши же оверлеи на соседних мониторах помехой не считаются.
+        return false;
+    }
+    let mut rect = RECT::default();
+    // SAFETY: то же.
+    if unsafe { GetWindowRect(other, &mut rect) }.is_err() {
+        return false;
+    }
+    if !intruder_covers(ours, (rect.left, rect.top, rect.right, rect.bottom)) {
+        return false;
+    }
+    // Скрытые DWM окна (свёрнутые UWP и прочее) видимы по `IsWindowVisible`,
+    // но не нарисованы — тот же фильтр, что у перечисления окон
+    // (`window_enum::is_real_window`).
+    let mut cloaked = 0u32;
+    // SAFETY: DWMWA_CLOAKED пишет ровно `u32` по переданному указателю.
+    let cloaked_ok = unsafe {
+        DwmGetWindowAttribute(
+            other,
+            DWMWA_CLOAKED,
+            (&raw mut cloaked).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
+    .is_ok();
+    !(cloaked_ok && cloaked != 0)
+}
+
+/// Найти над оверлеем чужое окно, которое его закрывает.
+///
+/// Всё, что стоит выше нас, — тоже topmost (система держит полосу цельной),
+/// поэтому стиль не проверяем: достаточно, что окно видимо, не наше, не
+/// скрыто DWM и пересекается с нами.
+///
+/// # Safety
+/// `hwnd` — живое окно оверлея.
+unsafe fn intruder_above(hwnd: HWND) -> Option<usize> {
+    let mut ours = RECT::default();
+    // SAFETY: наше живое окно.
+    if unsafe { GetWindowRect(hwnd, &mut ours) }.is_err() {
+        return None;
+    }
+    let ours = (ours.left, ours.top, ours.right, ours.bottom);
+    // SAFETY: чтение идентификатора собственного процесса.
+    let our_pid = unsafe { GetCurrentProcessId() };
+    // SAFETY: чтение z-order живого окна.
+    let mut above = unsafe { GetWindow(hwnd, GW_HWNDPREV) };
+    while let Ok(other) = above {
+        if other.0.is_null() {
+            break;
+        }
+        // SAFETY: `other` получен обходом z-order и живёт на время проверки.
+        if unsafe { covers_overlay(other, our_pid, ours) } {
+            return Some(other.0 as usize);
+        }
+        // SAFETY: то же.
+        above = unsafe { GetWindow(other, GW_HWNDPREV) };
+    }
+    None
+}
+
+/// Тик таймера: вернуть оверлей наверх topmost-полосы, если его оттуда
+/// вытеснили.
+///
+/// `WS_EX_TOPMOST` — это не «выше всех», а «в верхней полосе». Любое чужое
+/// topmost-окно, созданное или активированное позже нашего, встаёт НАД
+/// оверлеем и остаётся там навсегда: стикер оказывается «между окнами» — над
+/// обычными, под этим. Замер 2026-09-02: чужое topmost-окно перекрывает
+/// оверлей, и через восемь секунд resticker сам наверх не возвращается.
+/// Заметнее всего после перезагрузки компьютера — оверлей стартует рано, а
+/// автозапуск чужих приложений происходит позже (репорт пользователя
+/// 2026-09-02: «после перезапуска стикеры отображаются только между
+/// некоторыми окнами»).
+///
+/// Здесь, на потоке окна по таймеру, а не у координатора: у координатора нет
+/// собственного пульса — его цикл спит на `recv_timeout` до часа
+/// (`IDLE_POLL`), а трекер окон на конфиге, где все стикеры `Always`, не
+/// просыпается вовсе (`tracker_mask_needed`). То есть ровно в том случае,
+/// который здесь чинится, поднимать оверлей было бы некому.
+///
+/// [`OverlayWindow::raise_above_pinned`] этого не заменяет: та функция знает
+/// только про НАШИ закреплённые окна и молчит, когда их нет.
+///
+/// # Safety
+/// `hwnd` — живое окно оверлея.
+unsafe fn keep_topmost(hwnd: HWND, guard: &mut TopmostGuard) {
+    // SAFETY: наше живое окно.
+    let intruder = unsafe { intruder_above(hwnd) };
+    if !guard.decide(intruder) {
+        return;
+    }
+    // SAFETY: наше окно; без активации, движения и изменения размера.
+    let raised = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+    if let Err(e) = raised {
+        tracing::warn!(error = %e, "не удалось вернуть оверлей наверх topmost-полосы");
+    }
+}
+
 /// Состояние, живущее на потоке оверлея между сообщениями: захват мыши,
 /// курсор и канал событий. Хранится через `GWLP_USERDATA` (стандартный Win32
 /// паттерн — `wndproc` не может захватывать переменные, это `extern "system"
@@ -823,9 +1042,23 @@ struct WndState {
     /// разошлись бы ровно так, как это уже случалось (см. доккомент у
     /// `install_hotkeys`).
     owned: std::collections::HashSet<i32>,
+    /// Id, которые обслуживает низкоуровневый клавиатурный хук
+    /// ([`crate::hotkey_hook`]) вместо `RegisterHotKey`, — те, чьи
+    /// комбинации занял кто-то другой. Разбираются они ровно так же, как
+    /// настоящие: хук кладёт в очередь то же самое `WM_HOTKEY`.
+    hooked: std::collections::HashSet<i32>,
+    /// Постоянные комбинации, которые не отдала `RegisterHotKey`.
+    fallback_permanent: Vec<(i32, HotkeyCombo)>,
+    /// То же для временных медиа-клавиш (пробел/PgUp/PgDn на видео-стикере
+    /// под курсором). Отдельный вектор, потому что живут они по другому
+    /// расписанию — включаются и гаснут по наведению курсора, и путать их с
+    /// постоянными нельзя: набор хука собирается из обоих сразу.
+    fallback_media: Vec<(i32, HotkeyCombo)>,
     /// Верхняя половина суррогатной пары из предыдущего `WM_CHAR`: символы
     /// вне BMP (эмодзи) Windows шлёт двумя сообщениями.
     pending_surrogate: Option<u16>,
+    /// Состояние удержания верха topmost-полосы ([`keep_topmost`]).
+    topmost: TopmostGuard,
 }
 
 /// Собрать символ из `WM_CHAR`: обычный код возвращается сразу, суррогатная
@@ -890,6 +1123,10 @@ fn hotkey_name_of(id: i32) -> Option<HotkeyName> {
         TOGGLE_ALL_HOTKEY_ID => Some(HotkeyName::ToggleAllStickers),
         MUTE_ALL_HOTKEY_ID => Some(HotkeyName::MuteAll),
         PIN_FOCUSED_HOTKEY_ID => Some(HotkeyName::PinFocusedWindow),
+        // Митоз регистрируется пакетом хоткеев групп, но конфликт по нему
+        // сообщать НАДО: это самостоятельная функция программы, а не
+        // одна из девяти взаимозаменяемых цифр.
+        crate::hotkey::MITOSIS_HOTKEY_ID => Some(HotkeyName::WindowMitosis),
         _ => None,
     }
 }
@@ -915,7 +1152,49 @@ struct HotkeysInstallReport {
 /// Пакетная регистрация (`RegisteredHotkeySet::register_all`) изолирует
 /// конфликты: один занятый хоткей не мешает остальным, а его id и комбинация
 /// попадают в отчёт.
+/// Пересобрать набор комбинаций низкоуровневого хука из обоих источников и
+/// обновить список id, которые он обслуживает.
+///
+/// Одной функцией, а не двумя по месту: хук в потоке ОДИН, и его набор —
+/// объединение постоянных и медиа-комбинаций. Обновлять его из двух мест
+/// независимо значило бы, что второе стирает работу первого.
+fn refresh_hotkey_hook(state: &mut WndState) {
+    let mut combos = state.fallback_permanent.clone();
+    combos.extend(state.fallback_media.iter().cloned());
+    state.hooked = combos.iter().map(|(id, _)| *id).collect();
+    crate::hotkey_hook::set_fallback_combos(combos);
+}
+
+/// Комбинации, которые не удалось зарегистрировать, — вход для хука.
+///
+/// Отчёт несёт id и текстовый вид комбинации, а хуку нужна разобранная
+/// [`HotkeyCombo`]; берём её из того же набора, который и пытались
+/// зарегистрировать, — так исключён разбор строки обратно.
+fn conflicting_combos(
+    combos: &[(i32, HotkeyCombo)],
+    report: &HotkeysInstallReport,
+) -> Vec<(i32, HotkeyCombo)> {
+    report
+        .conflicts
+        .iter()
+        .filter_map(|c| combos.iter().find(|(id, _)| *id == c.id).cloned())
+        .collect()
+}
+
 fn install_hotkeys(state: &mut WndState, combos: &[(i32, HotkeyCombo)]) -> HotkeysInstallReport {
+    let report = register_hotkeys(state, combos);
+    // Занятые комбинации не теряются: их подхватывает низкоуровневый хук
+    // ([`crate::hotkey_hook`]). Здесь, а не у вызывающего, потому что
+    // вызывающих двое (создание окна и перерегистрация из настроек), и
+    // забытый вызов в одном из них выглядел бы как «хоткей работает, пока
+    // не откроешь настройки».
+    state.fallback_permanent = conflicting_combos(combos, &report);
+    refresh_hotkey_hook(state);
+    report
+}
+
+/// Собственно регистрация набора через `RegisterHotKey` — без запасного пути.
+fn register_hotkeys(state: &mut WndState, combos: &[(i32, HotkeyCombo)]) -> HotkeysInstallReport {
     // Снятие прежних — Drop зовёт UnregisterHotKey на этом же потоке.
     state.hotkeys.clear();
     state.owned.clear();
@@ -984,7 +1263,11 @@ fn run_message_loop(
         media_hotkeys: Vec::new(),
         hotkeys: Vec::new(),
         owned: std::collections::HashSet::new(),
+        hooked: std::collections::HashSet::new(),
+        fallback_permanent: Vec::new(),
+        fallback_media: Vec::new(),
         pending_surrogate: None,
+        topmost: TopmostGuard::default(),
     });
     // SAFETY: hwnd — наше окно этого потока; указатель освобождается в
     // WM_NCDESTROY ниже (единственное место, где он читается и дропается).
@@ -1088,7 +1371,7 @@ fn run_message_loop(
             // `WM_APP_MEDIA_HOTKEYS`), поэтому их id в набор не входят —
             // для них проверка владения не нужна и была бы неверной.
             let media = (MEDIA_PLAY_PAUSE_HOTKEY_ID..=MEDIA_VOLUME_DOWN_HOTKEY_ID).contains(&id);
-            if !media && !state.owned.contains(&id) {
+            if !media && !state.owned.contains(&id) && !state.hooked.contains(&id) {
                 continue;
             }
             if id == EDIT_HOTKEY_ID {
@@ -1111,6 +1394,8 @@ fn run_message_loop(
                 let _ = hotkey_tx.send(OverlayEvent::DeleteOpenGroup);
             } else if id == crate::hotkey::UNPIN_ALL_HOTKEY_ID {
                 let _ = hotkey_tx.send(OverlayEvent::UnpinAll);
+            } else if id == crate::hotkey::MITOSIS_HOTKEY_ID {
+                let _ = hotkey_tx.send(OverlayEvent::ToggleMitosisMode);
             } else if id == crate::hotkey::PIN_OPEN_GROUP_HOTKEY_ID {
                 // ДО `group_number_of`: id 20 вне диапазона открытия (8..=16),
                 // но ветка держится рядом с unpin_all, где живёт её константа.
@@ -1254,6 +1539,15 @@ fn create_window(bounds_px: Rect) -> Result<HWND, Win32Error> {
     // клик-прозрачное, показ безопасен.
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
+    }
+
+    // Таймер, возвращающий оверлей наверх topmost-полосы (см.
+    // [`keep_topmost`]). Отказ окно не ломает — стикеры просто теряют
+    // способность возвращаться из-под чужих topmost-окон, поэтому warn, а не
+    // ошибка создания.
+    // SAFETY: hwnd — окно этого потока; таймер снимается в WM_DESTROY.
+    if unsafe { SetTimer(Some(hwnd), TOPMOST_TIMER_ID, TOPMOST_TIMER_MS, None) } == 0 {
+        tracing::warn!("SetTimer не удался — оверлей не сможет сам возвращаться наверх");
     }
 
     // Сессионные события (блокировка/разблокировка, сон/пробуждение) —
@@ -1442,6 +1736,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Снятие — просто отпустить владельцев (Drop зовёт
                 // UnregisterHotKey на этом же потоке).
                 state.media_hotkeys.clear();
+                state.fallback_media.clear();
                 if wparam.0 != 0 {
                     for (id, vk) in [
                         (MEDIA_PLAY_PAUSE_HOTKEY_ID, VK_SPACE),
@@ -1455,15 +1750,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             win: false,
                             vk,
                         };
-                        // Клавишу уже держит другая программа — молча
-                        // остаёмся без этого сочетания: ругаться на каждое
-                        // наведение курсора нельзя, а остальные продолжают
-                        // работать.
-                        if let Ok(h) = crate::hotkey::RegisteredHotkey::register(id, combo) {
-                            state.media_hotkeys.push(h);
+                        // Клавишу уже держит другая программа — уходим на
+                        // низкоуровневый хук, а не остаёмся без сочетания.
+                        // Голые пробел и PgUp/PgDn заняты чаще любых других
+                        // (репорт пользователя 2026-09-01: громкость видео
+                        // не менялась вовсе), и «молча не работает» здесь —
+                        // худший из возможных исходов.
+                        match crate::hotkey::RegisteredHotkey::register(id, combo) {
+                            Ok(h) => state.media_hotkeys.push(h),
+                            Err(e) => {
+                                tracing::info!(
+                                    id,
+                                    error = %e,
+                                    "медиа-клавиша занята — уходим на клавиатурный хук"
+                                );
+                                state.fallback_media.push((id, combo));
+                            }
                         }
                     }
                 }
+                refresh_hotkey_hook(state);
             }
             LRESULT(0)
         }
@@ -1580,7 +1886,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
+        WM_TIMER if wparam.0 == TOPMOST_TIMER_ID => {
+            // SAFETY: state_ptr живёт до WM_NCDESTROY; hwnd — наше окно.
+            if let Some(state) = unsafe { state_ptr.as_mut() } {
+                unsafe { keep_topmost(hwnd, &mut state.topmost) };
+            }
+            LRESULT(0)
+        }
         WM_NCDESTROY => {
+            // Хук снимается вместе с окном: он привязан к этому потоку, а
+            // поток вот-вот закончится. Оставленный хук Windows выбросит
+            // сама, но до того каждое нажатие в системе ходило бы в мёртвый
+            // колбэк.
+            crate::hotkey_hook::clear();
             if !state_ptr.is_null() {
                 // SAFETY: последнее использование этого указателя — окно
                 // уничтожается, WM_NCDESTROY приходит ровно один раз.
@@ -1591,6 +1909,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_DESTROY => {
+            // Таймер удержания верха — парно к `SetTimer` в create_window.
+            // SAFETY: hwnd валиден в WM_DESTROY.
+            let _ = unsafe { KillTimer(Some(hwnd), TOPMOST_TIMER_ID) };
             // Снять регистрацию сессионных уведомлений (парно к регистрации
             // в create_window); окно в WM_DESTROY ещё валидно, ошибка
             // игнорируется — окно и так уничтожается.
@@ -1607,6 +1928,82 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 #[cfg(test)]
 mod tests {
+
+    // --- Удержание верха topmost-полосы (репорт пользователя 2026-09-02) ---
+
+    /// Служебные окна 1×1, вечно висящие над всеми (`ThumbnailDeviceHelperWnd`
+    /// проводника), помехой не считаются: иначе оверлей дёргал бы
+    /// `SetWindowPos` каждые 400 мс до конца сеанса.
+    #[test]
+    fn tiny_helper_windows_are_not_intruders() {
+        let ours = (0, 0, 2560, 1440);
+        assert!(!intruder_covers(ours, (0, 0, 1, 1)));
+        // Порог — по КАЖДОЙ стороне: узкая полоска во весь экран тоже мимо.
+        assert!(!intruder_covers(
+            ours,
+            (0, 0, 2560, TOPMOST_MIN_INTRUDER_PX - 1)
+        ));
+        assert!(intruder_covers(ours, (0, 0, 2560, TOPMOST_MIN_INTRUDER_PX)));
+    }
+
+    /// Чужое topmost-окно на СОСЕДНЕМ мониторе нас не закрывает — за верх с
+    /// ним бороться незачем.
+    #[test]
+    fn a_window_on_another_monitor_is_not_an_intruder() {
+        let ours = (0, 0, 2560, 1440);
+        assert!(!intruder_covers(ours, (-1920, 357, 0, 1437)));
+        // Кромка в кромку — тоже не пересечение (RECT полуоткрыт справа).
+        assert!(!intruder_covers(ours, (2560, 0, 3000, 400)));
+        assert!(intruder_covers(ours, (2400, 0, 3000, 400)));
+    }
+
+    /// Обычный случай: чужое окно всплыло над нами — поднимаемся, и на
+    /// следующем тике над нами уже чисто.
+    #[test]
+    fn topmost_guard_raises_once_and_calms_down() {
+        let mut guard = TopmostGuard::default();
+        assert!(guard.decide(Some(0x1234)));
+        assert!(!guard.decide(None));
+        // Тот же нарушитель позже — снова поднимаемся: счётчик обнулён.
+        assert!(guard.decide(Some(0x1234)));
+    }
+
+    /// Приложение, которое тоже держит себя наверху по таймеру, отвоёвывает
+    /// верх каждый тик. После [`TOPMOST_WAR_STRIKES`] попыток уступаем —
+    /// мигание несколько раз в секунду хуже, чем чужое окно сверху.
+    #[test]
+    fn topmost_guard_gives_up_on_a_window_that_keeps_winning() {
+        let mut guard = TopmostGuard::default();
+        for attempt in 1..=TOPMOST_WAR_STRIKES {
+            assert!(
+                guard.decide(Some(0x1234)),
+                "попытка {attempt} должна быть боевой"
+            );
+        }
+        assert!(!guard.decide(Some(0x1234)), "дальше — капитуляция");
+        assert!(
+            !guard.decide(Some(0x1234)),
+            "и она не отменяется сама собой"
+        );
+    }
+
+    /// Капитуляция привязана к конкретному окну: другое окно на его месте
+    /// получает свой полный набор попыток, а уход прежнего сбрасывает всё.
+    #[test]
+    fn topmost_guard_surrender_is_per_window() {
+        let mut guard = TopmostGuard::default();
+        for _ in 0..=TOPMOST_WAR_STRIKES {
+            guard.decide(Some(0x1234));
+        }
+        assert!(!guard.decide(Some(0x1234)));
+        assert!(
+            guard.decide(Some(0x5678)),
+            "другой нарушитель — другой счёт"
+        );
+        // Ушли оба — прежняя капитуляция забыта.
+        assert!(!guard.decide(None));
+        assert!(guard.decide(Some(0x1234)));
+    }
 
     #[test]
     fn wm_char_returns_plain_characters() {
@@ -1684,7 +2081,12 @@ mod tests {
 
     #[test]
     fn cursor_shape_from_wparam_rejects_out_of_range() {
-        assert_eq!(cursor_shape_from_wparam(WPARAM(6)), None);
+        // 6 — `CursorShape::Cross` (митоз), первый свободный код теперь 7.
+        assert_eq!(
+            cursor_shape_from_wparam(WPARAM(6)),
+            Some(CursorShape::Cross)
+        );
+        assert_eq!(cursor_shape_from_wparam(WPARAM(7)), None);
         assert_eq!(cursor_shape_from_wparam(WPARAM(999)), None);
         assert_eq!(
             cursor_shape_from_wparam(WPARAM(ROTATE_WPARAM_MAX + 1)),
@@ -1920,7 +2322,11 @@ mod tests {
             media_hotkeys: Vec::new(),
             hotkeys: Vec::new(),
             owned: std::collections::HashSet::new(),
+            hooked: std::collections::HashSet::new(),
+            fallback_permanent: Vec::new(),
+            fallback_media: Vec::new(),
             pending_surrogate: None,
+            topmost: TopmostGuard::default(),
         };
         let mut state = Box::new(state);
 

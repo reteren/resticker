@@ -40,6 +40,7 @@ use rst_core::group_visibility::{
     GroupVisibilityEvent, MemberFacts, WindowAction, WindowDecision, decide_visibility,
 };
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
+use rst_core::mitosis::{self, MitosisRefusal, PixRect, SplitAxis};
 use rst_core::model::{
     Config, GroupPlace, Hotkeys, MediaType, MonitorId, OverlapRule, Placement, Rect, Settings,
     Sticker, StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode, VisibilityRule,
@@ -58,7 +59,7 @@ use rst_media::animation as media_animation;
 use rst_media::paste;
 use rst_render::glass::Surface;
 use rst_render::{
-    Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon, Key, Label,
+    Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon, Key,
     NumericField, Panel, PinnedRowField, PointerEvent, PresentSync, Primitive, RenderError,
     SelectionBox, Slider, Sprite, TextField, Texture, TextureAtlas, VideoTextures, Widget,
     WidgetId, WindowHighlight, WindowTarget, edit_overlay, lock_indicator, marquee_visuals,
@@ -80,7 +81,8 @@ use uuid::Uuid;
 use crate::{
     confirm_dialog, cursor_panel, gap_panel, group_manager, group_strip,
     groups::{self, GroupEditor, GroupsState},
-    monitor_badge, preset_picker, preset_strip, toolbar, window_pick_list, window_picker,
+    mitosis_overlay, monitor_badge, preset_picker, preset_strip, toolbar, window_pick_list,
+    window_picker,
 };
 
 /// Мост к `Device`/`WindowTarget` (M3 step 2 разделил `rst_render::Renderer`
@@ -768,19 +770,19 @@ impl PinFlash {
     }
 }
 
-/// Длительность показа баннера предупреждений оверлея (конфликт хоткея и
-/// т.п.) — короткоживущий, авто-dismiss; шаг перепланирования — тот же
-/// `PIN_FLASH_STEP` (16 мс ≈ 60 Гц).
-const BANNER_DURATION: Duration = Duration::from_secs(5);
+/// Длительность показа баннера предупреждений оверлея (конфликт хоткея,
+/// отказ митоза и т.п.) — короткоживущий, авто-dismiss.
+///
+/// 2.5 секунды по запросу пользователя 2026-09-01: прежние пять он читал
+/// как «плашка вечная». Текста в баннере одна строка, и дольше держать её
+/// поверх чужого окна незачем.
+const BANNER_DURATION: Duration = Duration::from_millis(2500);
 /// Высота баннера, DIP.
 const BANNER_HEIGHT: f64 = 28.0;
 /// Внутренний отступ текста баннера, DIP.
 const BANNER_PAD: f64 = 12.0;
 /// Зазор баннера от верхнего края монитора, DIP.
 const BANNER_TOP_GAP: f64 = 8.0;
-/// `WidgetId` панели баннера (локальное пространство оверлея, свободное от
-/// остальных панелей: PINNED_* — 300+, toolbar/picker/preset — свои базы).
-const BANNER_PANEL_ID: WidgetId = 901;
 
 /// Короткоживущий баннер-предупреждение, который resticker рисует САМ в
 /// оверлее (решение координатора 2026-08-18: tray-баллун `Shell_NotifyIcon`
@@ -796,9 +798,17 @@ struct BannerState {
 }
 
 impl BannerState {
+    /// Когда координатору надо проснуться ради этого баннера — РОВНО в
+    /// момент истечения, а не через шаг анимации.
+    ///
+    /// Баннер не анимируется: он появляется и исчезает целиком, и будить
+    /// координатор шестьдесят раз в секунду ради неподвижной надписи —
+    /// прямое нарушение «в покое не просыпаемся» (SPEC.md раздел 13). Раньше
+    /// здесь стоял `now + PIN_FLASH_STEP` по образцу пульса рамки, которому
+    /// кадры действительно нужны.
     fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        (now.saturating_duration_since(self.shown_at) < BANNER_DURATION)
-            .then(|| now + PIN_FLASH_STEP)
+        let elapsed = now.saturating_duration_since(self.shown_at);
+        (elapsed < BANNER_DURATION).then(|| now + (BANNER_DURATION - elapsed))
     }
 
     fn expired(&self, now: Instant) -> bool {
@@ -816,6 +826,440 @@ fn show_banner(edit: &mut EditState, monitor_id: &MonitorId, text: String) {
         monitor_id: monitor_id.clone(),
         shown_at: Instant::now(),
     });
+}
+
+// ---------------------------------------------------------------------------
+// Митоз окон (docs/M9_WINDOW_MITOSIS_DESIGN.md)
+// ---------------------------------------------------------------------------
+
+/// Период опроса перечисления окон в ожидании второго экземпляра.
+///
+/// Замер на живой машине 2026-09-01 (`docs/M9_MITOSIS_FIELD_NOTES.md` §3):
+/// окно «Блокнота» появляется через 329 мс, окно Проводника — через 701 мс.
+/// 150 мс дают несколько проб на этом интервале и при этом не превращают
+/// ожидание в непрерывное перечисление всех окон системы.
+const MITOSIS_POLL: Duration = Duration::from_millis(150);
+
+/// Сколько ждать окна второго экземпляра, прежде чем признать отказ.
+///
+/// Четыре секунды — впятеро больше замеренных 0.3-0.7 с, чтобы холодный
+/// старт приложения с диска не читался как «second window will never come»,
+/// и вдвое меньше прежних восьми: всё это время окно СТОИТ УЖАТЫМ, и
+/// именно оно читалось у пользователя как «программа просто порезала окно
+/// и ничего не открыла» (репорт 2026-09-01). Приложения, для которых
+/// ожидание заведомо напрасно, теперь отсекаются заранее списком
+/// `settings.mitosis_single_instance_apps`, так что полный таймаут платится
+/// не больше двух раз на приложение.
+const MITOSIS_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Сколько подряд отказов «второго окна не появилось» по одному exe заносят
+/// приложение в `settings.mitosis_single_instance_apps` навсегда.
+///
+/// Два, а не один: единичный отказ бывает и у нормального приложения —
+/// холодный старт с диска не уложился в [`MITOSIS_TIMEOUT`]. Запрет по одной
+/// осечке отобрал бы функцию у приложения, которое на самом деле работает,
+/// и вернуть её можно было бы только правкой config.json.
+const MITOSIS_STRIKES_TO_DISABLE: u32 = 2;
+
+/// Включить режим резки окон на мониторе `monitor_id`.
+///
+/// Кликопрозрачность снимается ровно тем же приёмом, что в режиме
+/// редактирования: на инициаторе — `set_click_through` (он же забирает
+/// фокус, без чего не придут `Esc` и `Tab`), на остальных мониторах —
+/// `set_interactive` без `SetForegroundWindow`. Два `SetForegroundWindow`
+/// подряд на разные окна дерутся между собой, поэтому «главный» монитор
+/// обязан быть один (см. [`sync_other_monitors_edit_mode`]).
+fn enter_mitosis_mode(
+    edit: &mut EditState,
+    monitors_map: &HashMap<MonitorId, MonitorState>,
+    monitor_id: &MonitorId,
+) {
+    for (id, ms) in monitors_map.iter() {
+        if id == monitor_id {
+            ms.overlay.set_click_through(false);
+        } else {
+            ms.overlay.set_interactive(true);
+        }
+        // Крест ставится на ВСЕ мониторы сразу, а не только на тот, где
+        // курсор сейчас: форма курсора живёт в окне, и курсор, переехавший
+        // на соседний монитор, иначе молча стал бы стрелкой посреди режима.
+        ms.overlay.post_cursor_shape(CursorShape::Cross);
+    }
+    edit.mitosis = Some(MitosisState {
+        initiator: monitor_id.clone(),
+        // Вертикаль по умолчанию: пользователь описал функцию словами
+        // «оригинал идёт влево, справа открывается второй раз» — это и есть
+        // вертикальный разрез, и открывать режим на другой оси значило бы
+        // каждый раз начинать с переключения.
+        axis: SplitAxis::Vertical,
+        hover: None,
+        cursor: None,
+    });
+}
+
+/// Выключить режим резки: вернуть кликопрозрачность и стрелку.
+///
+/// `edit.active` учитывается намеренно: режим редактирования тоже держит
+/// оверлей кликабельным, и слепое `set_click_through(true)` на выходе из
+/// резки обесклавило бы его, если резку почему-то включили поверх.
+fn exit_mitosis_mode(edit: &mut EditState, monitors_map: &HashMap<MonitorId, MonitorState>) {
+    if edit.mitosis.take().is_none() {
+        return;
+    }
+    for ms in monitors_map.values() {
+        if !edit.active {
+            ms.overlay.set_click_through(true);
+            ms.overlay.force_release_capture();
+        }
+        ms.overlay.post_cursor_shape(CursorShape::Arrow);
+    }
+}
+
+/// `WindowInfo::rect` → [`PixRect`]: один и тот же прямоугольник в двух
+/// крейтах (`rst-win32` знает Win32, `rst-core` платформенно чист), и
+/// перекладывание полей живёт в одном месте, а не в пяти вызовах.
+fn to_pix_rect(rect: &WindowRect) -> PixRect {
+    PixRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+    }
+}
+
+/// Обратная операция к [`to_pix_rect`].
+fn from_pix_rect(rect: PixRect) -> WindowRect {
+    WindowRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+    }
+}
+
+/// Имя файла exe в нижнем регистре — ключ списка одно-оконных приложений
+/// и счётчика отказов.
+///
+/// Имя, а не полный путь: путь у Discord и любого самообновляющегося
+/// приложения содержит номер версии и меняется на каждом обновлении, а имя
+/// файла переживает и обновление, и переустановку в другой каталог.
+fn exe_file_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_lowercase())
+}
+
+/// Числится ли приложение в списке одно-оконных
+/// (`settings.mitosis_single_instance_apps`).
+fn is_single_instance_app(cfg: &Config, exe: &Path) -> bool {
+    let Some(name) = exe_file_name(exe) else {
+        return false;
+    };
+    cfg.settings
+        .mitosis_single_instance_apps
+        .iter()
+        .any(|listed| listed.to_lowercase() == name)
+}
+
+/// Пересчитать окно под курсором, ось и долю разреза. `true` — картинка
+/// изменилась и кадр надо перерисовать.
+///
+/// Позиция курсора берётся глобальным `GetCursorPos`, а не из координат
+/// события: `window_at` работает в физических пикселях виртуального
+/// десктопа, и переводить туда локальную клиентскую точку через масштаб
+/// монитора значило бы повторить ту же арифметику с шансом ошибиться на
+/// границе мониторов.
+///
+/// Ось выбирается САМА, по тому, к какой стороне окна ушёл курсор
+/// ([`mitosis::axis_for_cursor`]) — требование пользователя 2026-09-01
+/// взамен переключения колесом. Гистерезис держит ось от дрожания на
+/// диагонали; текущее значение для него берётся из состояния, поэтому ось
+/// живёт в `MitosisState`, хотя и вычисляется заново на каждое движение.
+fn update_mitosis_hover(
+    edit: &mut EditState,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    cfg: &Config,
+) -> bool {
+    let Some(state) = edit.mitosis.as_mut() else {
+        return false;
+    };
+    let Ok(cursor) = rst_win32::window_pick::cursor_position() else {
+        return false;
+    };
+    let before = state
+        .hover
+        .as_ref()
+        .map(|h| (h.hwnd, h.fraction, h.blocked))
+        .map(|h| (h, state.axis));
+    state.cursor = monitor_dip_at(cursor.x, cursor.y, monitor_bounds)
+        .map(|(id, (dx, dy))| (id.clone(), dx, dy));
+
+    let target = rst_win32::window_pick::window_at(window_snapshot, cursor)
+        .and_then(|hwnd| window_snapshot.iter().find(|w| w.hwnd == hwnd))
+        // Денай-лист — тот же, что закрывает окна от закрепления: список
+        // окон, которые пользователь запретил трогать вообще. Резать их
+        // тем более нельзя (`window_pick_list::eligible_snapshot` фильтрует
+        // им же).
+        .filter(|w| {
+            !occluders::is_denylisted(
+                window_exe_path(w).as_deref(),
+                Some(&w.title),
+                &cfg.settings.denylist,
+            )
+        });
+
+    state.hover = target.map(|w| {
+        let pix = to_pix_rect(&w.rect);
+        // Ось — от положения курсора в ЭТОМ окне, а не в предыдущем: окна
+        // разного размера дают разную нормировку, и считать ось по чужому
+        // прямоугольнику значило бы перескакивать при переходе между окнами.
+        let axis = mitosis::axis_for_cursor(pix, cursor.x, cursor.y, state.axis);
+        state.axis = axis;
+        let fraction = mitosis::split_fraction(pix, axis, cursor.x, cursor.y);
+        // Проверяется ТОЛЬКО геометрия: вес процесса — это `OpenProcess`
+        // на каждое движение мыши, а от кадра к кадру он всё равно не
+        // меняется (окно либо тяжёлое, либо нет).
+        let blocked = matches!(
+            mitosis::preflight(pix, axis, fraction, None, u64::MAX, None),
+            Err(MitosisRefusal::TooSmall { .. })
+        );
+        MitosisHover {
+            hwnd: w.hwnd,
+            pid: w.pid,
+            // Пустой путь в снимке означает «процесс не отдал exe»
+            // (защищённый процесс) — запускать нечего.
+            exe_path: (!w.exe_path.as_os_str().is_empty()).then(|| w.exe_path.clone()),
+            rect: w.rect,
+            fraction,
+            blocked,
+        }
+    });
+    let after = state
+        .hover
+        .as_ref()
+        .map(|h| (h.hwnd, h.fraction, h.blocked))
+        .map(|h| (h, state.axis));
+    before != after
+}
+
+/// Начать разрез окна под курсором. `Some((отказ, приложение))` — не начали
+/// вовсе, оригинал не тронут; `None` — разрез пошёл, ответа ждём сообщением
+/// [`OverlayMessage::MitosisFinished`].
+///
+/// Порядок шагов задан требованием отклика: все проверки, которые можно
+/// сделать до движения окна, идут первыми — сначала список одно-оконных
+/// приложений (он дешевле всего и снимает самый заметный дефект: окно,
+/// ужатое впустую), затем вес процесса. Только потом оригинал ужимается
+/// СРАЗУ (пользователь видит результат клика в тот же кадр), и лишь затем
+/// запускается второй экземпляр — его окно приходит через сотни миллисекунд,
+/// и ждать его, ничего не показывая, значило бы отдать клик в пустоту. Цена —
+/// обязанность откатить оригинал на любом отказе после ужатия
+/// ([`MitosisPending`]).
+fn start_mitosis(
+    edit: &mut EditState,
+    cfg: &Config,
+    window_pins: &WindowPins,
+    window_snapshot: &[WindowInfo],
+    tx: &Sender<OverlayMessage>,
+) -> Option<(MitosisRefusal, Option<String>)> {
+    let state = edit.mitosis.as_ref()?;
+    let monitor_id = state.initiator.clone();
+    let axis = state.axis;
+    let hover = state.hover.as_ref()?;
+    let (hwnd, pid, rect, fraction) = (hover.hwnd, hover.pid, hover.rect, hover.fraction);
+    let Some(exe_path) = hover.exe_path.clone() else {
+        return Some((MitosisRefusal::NoExePath, None));
+    };
+    let exe_name = exe_file_name(&exe_path);
+
+    // Одно-оконное приложение отсекается ДО единого движения окна: иначе
+    // окно ужимается и стоит ужатым весь таймаут ожидания второго окна,
+    // которого не будет (репорт пользователя 2026-09-01 про Discord и
+    // Spotify).
+    if is_single_instance_app(cfg, &exe_path) {
+        return Some((MitosisRefusal::SingleInstanceApp, exe_name));
+    }
+
+    let pix = to_pix_rect(&rect);
+    let limit_bytes = u64::from(cfg.settings.mitosis_max_memory_mb) * 1024 * 1024;
+    let memory_bytes = rst_win32::window_mitosis::process_private_bytes(pid);
+    let available_bytes = rst_win32::window_mitosis::available_physical_bytes();
+    if let Err(refusal) = mitosis::preflight(
+        pix,
+        axis,
+        fraction,
+        memory_bytes,
+        limit_bytes,
+        available_bytes,
+    ) {
+        return Some((refusal, exe_name));
+    }
+
+    let (original, clone) = mitosis::split_rects(pix, axis, fraction);
+    let original_rect = from_pix_rect(original);
+    let clone_rect = from_pix_rect(clone);
+
+    // `set_dwm_bounds`, а не `move_resize`: цель задана границами DWM (то,
+    // что пользователь видит на экране), а `SetWindowPlacement` принимает
+    // границы окна вместе с невидимой рамкой изменения размера — половины
+    // разъехались бы на её толщину. Он же сам приводит развёрнутое окно в
+    // нормальное состояние, без чего разрезать максимизированное окно
+    // нельзя вовсе.
+    if !window_pins.set_dwm_bounds(hwnd_from_usize(hwnd), window_rect_to_win32(&original_rect)) {
+        tracing::warn!(hwnd, "не удалось ужать оригинал — митоз отменён");
+        return Some((MitosisRefusal::SpawnFailed, exe_name));
+    }
+
+    // Список уже существующих окон — то, относительно чего «новое окно»
+    // вообще имеет смысл. Снимается ДО запуска: любое окно, появившееся
+    // после, — кандидат.
+    let known: HashSet<usize> = window_snapshot.iter().map(|w| w.hwnd).collect();
+    let tx = tx.clone();
+    thread::spawn(move || {
+        let outcome = match rst_win32::window_mitosis::spawn_sibling(&exe_path) {
+            Err(e) => {
+                tracing::warn!(error = %e, path = %exe_path.display(), "второй экземпляр не запустился");
+                Err(MitosisRefusal::SpawnFailed)
+            }
+            Ok(sibling) => match rst_win32::window_mitosis::wait_for_sibling_window(
+                sibling.pid,
+                &exe_path,
+                &known,
+                MITOSIS_POLL,
+                MITOSIS_TIMEOUT,
+            ) {
+                Some(win) => Ok(win.hwnd),
+                None => Err(MitosisRefusal::NoSecondWindow),
+            },
+        };
+        let _ = tx.send(OverlayMessage::MitosisFinished(outcome));
+    });
+
+    edit.mitosis_pending = Some(MitosisPending {
+        original_hwnd: hwnd,
+        original_rect: rect,
+        clone_rect,
+        monitor_id,
+        exe_name,
+    });
+    None
+}
+
+/// Разобрать ответ фонового потока: поставить второе окно на его половину
+/// или вернуть оригинал на место и объяснить, почему митоза не вышло.
+///
+/// Здесь же список одно-оконных приложений и пополняется: ДВА подряд отказа
+/// `NoSecondWindow` по одному и тому же exe заносят приложение в настройки
+/// навсегда. Два, а не один, — единичный отказ бывает и у нормального
+/// приложения (холодный старт с диска не уложился в таймаут), и запрещать
+/// по одной осечке значило бы отобрать функцию у приложений, которые на
+/// самом деле работают. Успешный митоз счётчик обнуляет.
+fn finish_mitosis(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    window_pins: &WindowPins,
+    outcome: Result<usize, MitosisRefusal>,
+) {
+    let Some(pending) = edit.mitosis_pending.take() else {
+        return;
+    };
+    match outcome {
+        Ok(new_hwnd) => {
+            let placed = window_pins.set_dwm_bounds(
+                hwnd_from_usize(new_hwnd),
+                window_rect_to_win32(&pending.clone_rect),
+            );
+            if let Some(name) = &pending.exe_name {
+                edit.mitosis_failures.remove(name);
+            }
+            tracing::info!(
+                original = pending.original_hwnd,
+                clone = new_hwnd,
+                placed,
+                "митоз состоялся"
+            );
+        }
+        Err(refusal) => {
+            // Оригинал вернуть ОБЯЗАТЕЛЬНО: он ужат ещё в момент клика, и
+            // окно, оставшееся половиной без соседа, — хуже, чем если бы
+            // не произошло вообще ничего.
+            window_pins.set_dwm_bounds(
+                hwnd_from_usize(pending.original_hwnd),
+                window_rect_to_win32(&pending.original_rect),
+            );
+            tracing::info!(
+                hwnd = pending.original_hwnd,
+                refusal = ?refusal,
+                "митоз отклонён, оригинал возвращён"
+            );
+            let text = match (&pending.exe_name, refusal) {
+                (Some(name), MitosisRefusal::NoSecondWindow)
+                    if remember_single_instance_failure(edit, cfg, config_path, name) =>
+                {
+                    crate::i18n::mitosis_app_disabled(name)
+                }
+                (name, refusal) => crate::i18n::mitosis_refusal(refusal, name.as_deref()),
+            };
+            show_banner(edit, &pending.monitor_id, text);
+        }
+    }
+}
+
+/// Засчитать приложению отказ «второго окна не будет». `true` — это был
+/// второй подряд, приложение занесено в `settings.mitosis_single_instance_apps`
+/// и конфиг сохранён.
+fn remember_single_instance_failure(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    exe_name: &str,
+) -> bool {
+    let strikes = edit
+        .mitosis_failures
+        .entry(exe_name.to_string())
+        .or_insert(0);
+    *strikes += 1;
+    if *strikes < MITOSIS_STRIKES_TO_DISABLE {
+        return false;
+    }
+    edit.mitosis_failures.remove(exe_name);
+    if cfg
+        .settings
+        .mitosis_single_instance_apps
+        .iter()
+        .any(|listed| listed.to_lowercase() == exe_name)
+    {
+        return false;
+    }
+    cfg.settings
+        .mitosis_single_instance_apps
+        .push(exe_name.to_string());
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, "не удалось сохранить список одно-оконных приложений");
+    }
+    tracing::info!(
+        app = exe_name,
+        "приложение занесено в одно-оконные — митоз для него выключен"
+    );
+    true
+}
+
+/// `WindowRect` → Win32 `RECT` (полуоткрытые границы, как везде в Win32).
+fn window_rect_to_win32(rect: &WindowRect) -> RECT {
+    RECT {
+        left: rect.x,
+        top: rect.y,
+        right: rect.x + rect.w,
+        bottom: rect.y + rect.h,
+    }
+}
+
+/// `usize`-хэндл снимка окон → `HWND`. Хэндл в снимке хранится числом
+/// (`WindowInfo::hwnd`), а Win32-вызовы принимают указательный тип.
+fn hwnd_from_usize(hwnd: usize) -> HWND {
+    HWND(hwnd as *mut core::ffi::c_void)
 }
 
 pub enum OverlayCommand {
@@ -963,6 +1407,15 @@ enum OverlayMessage {
     /// читалось как рывок (замер в приложении 2026-08-22: период кадров
     /// 17 мс, интервалы показа — 17 мс, но раз в секунду 25 мс).
     VideoFrameReady,
+    /// Фоновый поток митоза закончил ожидание второго окна
+    /// (docs/M9_WINDOW_MITOSIS_DESIGN.md §4.4): `Ok(hwnd)` — новое окно
+    /// появилось и его надо поставить на вторую половину, `Err(refusal)` —
+    /// второго окна не будет, оригинал возвращается на место.
+    ///
+    /// Сообщением, а не прямым вызовом: ожидание блокирующее (опрос
+    /// перечисления окон до восьми секунд), а координатор — единственный
+    /// писатель состояния и не имеет права спать ни на кадр.
+    MitosisFinished(Result<usize, MitosisRefusal>),
 }
 
 /// Период тика автомата потери монитора (M3_HOTPLUG_DESIGN.md §1):
@@ -1562,6 +2015,82 @@ struct EditState {
     /// `handle_cursor_panel_up`, — чтобы обработчики UI могли слать запрос
     /// через `edit`.
     coordinator_tx: Sender<CoordinatorRequest>,
+    /// Активный режим резки окон — «митоз» (`Ctrl+Alt+F`,
+    /// docs/M9_WINDOW_MITOSIS_DESIGN.md). `None` — режим выключен, и это
+    /// подавляющую часть времени: режим живёт от хоткея до одного разреза.
+    ///
+    /// Живёт в `EditState`, хотя к режиму редактирования отношения не
+    /// имеет, по той же причине, что `banner` и `pinned_windows`: это
+    /// единственное состояние, которое видит и цикл `run()`, и `redraw()`,
+    /// и обработчики ввода. Отдельная структура рядом означала бы четвёртый
+    /// параметр в половине сигнатур файла.
+    mitosis: Option<MitosisState>,
+    /// Разрез, который уже начался: оригинал ужат, второй экземпляр
+    /// запущен, ждём его окно в фоновом потоке. Переживает выключение
+    /// самого режима (он гаснет сразу по клику), потому что несёт то, без
+    /// чего невозможен откат.
+    mitosis_pending: Option<MitosisPending>,
+    /// Сколько раз подряд приложение (ключ — имя файла exe в нижнем
+    /// регистре) не показало второго окна. На
+    /// [`MITOSIS_STRIKES_TO_DISABLE`] оно уезжает в
+    /// `settings.mitosis_single_instance_apps`, успешный митоз счётчик
+    /// обнуляет.
+    ///
+    /// Рантайм, не конфиг: это черновик наблюдения, а не решение. В
+    /// config.json попадает только итог — сам список.
+    mitosis_failures: HashMap<String, u32>,
+}
+
+/// Состояние режима резки окон (`docs/M9_WINDOW_MITOSIS_DESIGN.md`).
+struct MitosisState {
+    /// Монитор, с которого режим включили: на нём снимается
+    /// кликопрозрачность вместе с фокусом (`set_click_through`), остальные
+    /// переводятся `set_interactive` — ровно как в режиме редактирования
+    /// (см. [`sync_other_monitors_edit_mode`]). Два `SetForegroundWindow`
+    /// подряд на разные окна дерутся между собой, поэтому «главный» монитор
+    /// обязан быть один.
+    initiator: MonitorId,
+    /// Текущая ось разреза; переключается колесом мыши и `Tab`.
+    axis: SplitAxis,
+    /// Окно под курсором и доля разреза на нём — пересчитывается на каждое
+    /// движение мыши. `None` — курсор не над чужим окном (рисовать нечего,
+    /// клик ничего не делает).
+    hover: Option<MitosisHover>,
+    /// Где сейчас курсор: монитор и DIP-координаты на нём — для подсказки
+    /// «Wheel — axis · Esc — cancel», которая едет за курсором.
+    cursor: Option<(MonitorId, f64, f64)>,
+}
+
+/// Окно, над которым сейчас курсор в режиме резки.
+struct MitosisHover {
+    hwnd: usize,
+    pid: u32,
+    exe_path: Option<PathBuf>,
+    /// Прямоугольник окна, физические пиксели виртуального десктопа
+    /// (`WindowInfo::rect` — границы DWM, а не `GetWindowRect`).
+    rect: WindowRect,
+    /// Доля разреза вдоль текущей оси, уже зажатая в ±25 % от центра
+    /// ([`rst_core::mitosis::split_fraction`]).
+    fraction: f64,
+    /// Отказ, который уже виден по геометрии (половина слишком мала) —
+    /// предпросмотр красный, клик заведомо не сработает. Проверять память
+    /// на каждое движение мыши незачем: это `OpenProcess` на каждый кадр.
+    blocked: bool,
+}
+
+/// Начатый разрез, ждущий второго окна.
+struct MitosisPending {
+    original_hwnd: usize,
+    /// Куда вернуть оригинал, если второе окно так и не появится.
+    original_rect: WindowRect,
+    /// Куда поставить второе окно, когда оно появится.
+    clone_rect: WindowRect,
+    /// Монитор, на котором показывать баннер отказа — тот, с которого
+    /// резали: там сейчас смотрит пользователь.
+    monitor_id: MonitorId,
+    /// Имя файла exe в нижнем регистре — ключ счётчика отказов и списка
+    /// одно-оконных приложений. `None` — путь не прочитался.
+    exe_name: Option<String>,
 }
 
 /// Кто получает события указателя после `MouseDown` (docs/M2_WIRING_PLAN.md,
@@ -2648,6 +3177,9 @@ fn run(
         pinned_unmaximized_at: HashMap::new(),
         pinned_follow_until: None,
         banner: None,
+        mitosis: None,
+        mitosis_pending: None,
+        mitosis_failures: HashMap::new(),
         pending_animation: None,
         pending_video: None,
         marquee: None,
@@ -2765,6 +3297,24 @@ fn run(
         let (msg, leftover) = coalesce_mouse_move(&rx, msg);
         pending = leftover;
         let mut need_redraw = false;
+        // Истёкший баннер снимается на ЛЮБОМ сообщении, а не только на тике
+        // анимации, где эта проверка жила раньше. Причина — живой репорт
+        // 2026-09-01 («плашка вечная»): тик приходит, только пока
+        // планировщику кто-то заказал дедлайн, и стоило дедлайну потеряться
+        // (или прийти раньше, чем баннер успел истечь), как надпись
+        // оставалась на экране до следующего чужого события. Здесь она
+        // гаснет от чего угодно — вплоть до секундного `Tick` автомата
+        // мониторов.
+        if edit
+            .banner
+            .as_ref()
+            .is_some_and(|b| b.expired(Instant::now()))
+        {
+            edit.banner = None;
+            // Истёкший баннер обязан исчезнуть С ЭКРАНА, а для этого нужен
+            // ещё один кадр — сам по себе он не перерисуется.
+            need_redraw = true;
+        }
         // Тип сообщения нужен внутри веток (счётчик сигналов декодера), а
         // сам `msg` в них уже перемещён — фиксируем до разбора.
         let is_frame_ready = matches!(msg, OverlayMessage::VideoFrameReady);
@@ -3288,6 +3838,70 @@ fn run(
                 sync_other_monitors_edit_mode(&monitors_map, &monitor_id, edit.active);
                 need_redraw = true;
             }
+            OverlayMessage::Event(monitor_id, OverlayEvent::ToggleMitosisMode) => {
+                // След в журнале по тому же поводу, что у режима
+                // редактирования: если режим «не включается», по строке
+                // сразу видно, доехал ли хоткей до координатора вообще.
+                tracing::info!(
+                    monitor = %monitor_id.0,
+                    was_active = edit.mitosis.is_some(),
+                    edit_mode = edit.active,
+                    "хоткей режима резки окон"
+                );
+                if edit.mitosis.is_some() {
+                    // Без `continue`: он унёс бы выполнение мимо перерисовки
+                    // в конце тела цикла, и предпросмотр разреза остался бы
+                    // на экране после выхода из режима (тот же капкан, что
+                    // у панели зазора — см. её ветку ниже).
+                    exit_mitosis_mode(&mut edit, &monitors_map);
+                    need_redraw = true;
+                } else {
+                    // Два полноэкранных режима одновременно — экран, на котором
+                    // ничего не понятно (тот же вывод, что для меню групп выше):
+                    // резка перехватывает мышь на всех мониторах, и режим
+                    // редактирования под ней выглядел бы зависшим. Режим
+                    // редактирования уступает — выходим из него ровно тем же
+                    // путём, что и по его собственному хоткею.
+                    if edit.active {
+                        if let Some(ms) = monitors_map.get_mut(&monitor_id) {
+                            let renderer = Renderer {
+                                device: &device,
+                                target: &mut ms.target,
+                            };
+                            toggle_edit_mode(
+                                &ms.overlay,
+                                &mut edit,
+                                &mut cfg,
+                                &mut sprites,
+                                &mut animations,
+                                &mut videos,
+                                audio_mixer.as_ref(),
+                                &renderer,
+                                &config_path,
+                                &monitor_geometry,
+                                &monitor_bounds,
+                                &mut window_pins,
+                                &window_snapshot,
+                            );
+                            sync_other_monitors_edit_mode(&monitors_map, &monitor_id, edit.active);
+                        }
+                    }
+                    if edit.group_editor.is_some() {
+                        close_group_editor(&mut groups, &mut edit, &monitors_map);
+                    }
+                    edit.gap_panel.take();
+                    enter_mitosis_mode(&mut edit, &monitors_map, &monitor_id);
+                    // Первое наведение считается сразу, не дожидаясь движения
+                    // мыши: курсор уже где-то стоит, и режим, включившийся
+                    // «пустым», читался бы как неработающий.
+                    update_mitosis_hover(&mut edit, &window_snapshot, &monitor_bounds, &cfg);
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::MitosisFinished(outcome) => {
+                finish_mitosis(&mut edit, &mut cfg, &config_path, &window_pins, outcome);
+                need_redraw = true;
+            }
             OverlayMessage::Event(_, OverlayEvent::ToggleAllStickers) => {
                 // Глобальный хоткей работает независимо от режима
                 // редактирования (M2b7) — та же логика, что у BTN_TOGGLE_ALL
@@ -3323,17 +3937,20 @@ fn run(
             OverlayMessage::Event(_, OverlayEvent::MediaPlayPause)
             | OverlayMessage::Event(_, OverlayEvent::MediaVolumeUp)
             | OverlayMessage::Event(_, OverlayEvent::MediaVolumeDown) => {
-                // Пробел/PgUp/PgDn на видео-стикере ПОД КУРСОРОМ вне режима
-                // редактирования (запрос пользователя 2026-08-22). Цель —
-                // тот же стикер, которому сейчас показана полоса перемотки:
-                // хоткеи и включены ровно на это время (см.
-                // `OverlayWindow::set_media_hotkeys`), другого понятия
-                // «выбранного» стикера вне режима редактирования нет.
-                let target = edit
-                    .video_timeline
-                    .as_ref()
-                    .filter(|t| t.hover_mode)
-                    .map(|t| t.sticker_id);
+                // Пробел/PgUp/PgDn — по видео-стикеру под курсором (вне
+                // режима редактирования) или по выделенному (в режиме).
+                // Цель считается ТЕМ ЖЕ [`media_keys_target`], которым эти
+                // клавиши включались: два разных правила разошлись бы, и
+                // клавиша срабатывала бы вхолостую.
+                let target = media_keys_target(
+                    &edit,
+                    &cfg,
+                    &monitor_bounds,
+                    rst_win32::window_pick::cursor_position()
+                        .ok()
+                        .map(|c| (c.x, c.y)),
+                )
+                .map(|(id, _)| id);
                 if let Some(id) = target {
                     let delta = match msg {
                         OverlayMessage::Event(_, OverlayEvent::MediaVolumeUp) => {
@@ -3850,7 +4467,54 @@ fn run(
                 // ради полосы перемотки (`set_hover_click_target`) или ради
                 // панели зазора (`open_gap_panel`). В сцену они не уходят:
                 // вне режима редактирования стикеры не двигают и не выделяют.
-                if edit.group_editor.is_some() {
+                if edit.mitosis.is_some() {
+                    // Режим резки окон. Мышь здесь не редактирует сцену
+                    // вообще: оверлей стал кликабельным только ради выбора
+                    // чужого окна, и любое событие, кроме перечисленных,
+                    // осмысленно проглатывается.
+                    match event {
+                        InputEvent::MouseMove { .. } => {
+                            // Перерисовка на КАЖДОЕ движение, а не только на
+                            // смену окна: подсказка едет за курсором, и без
+                            // этого она отставала бы от него на кадр.
+                            update_mitosis_hover(
+                                &mut edit,
+                                &window_snapshot,
+                                &monitor_bounds,
+                                &cfg,
+                            );
+                            need_redraw = true;
+                        }
+                        InputEvent::MouseDown { .. } => {
+                            // Режим гаснет ВСЕГДА, состоялся разрез или нет
+                            // (требование пользователя: одно нажатие — один
+                            // разрез). Баннер отказа поэтому показывается уже
+                            // после выхода из режима.
+                            let refusal =
+                                start_mitosis(&mut edit, &cfg, &window_pins, &window_snapshot, &tx);
+                            let initiator = edit
+                                .mitosis
+                                .as_ref()
+                                .map(|s| s.initiator.clone())
+                                .unwrap_or_else(|| monitor_id.clone());
+                            exit_mitosis_mode(&mut edit, &monitors_map);
+                            if let Some((refusal, app)) = refusal {
+                                show_banner(
+                                    &mut edit,
+                                    &initiator,
+                                    crate::i18n::mitosis_refusal(refusal, app.as_deref()),
+                                );
+                            }
+                            need_redraw = true;
+                        }
+                        // Колесо больше не переключает ось (её выбирает сам
+                        // курсор — [`update_mitosis_hover`]), но и в сцену
+                        // уходить ему здесь незачем.
+                        InputEvent::MouseWheel { .. }
+                        | InputEvent::MouseUp { .. }
+                        | InputEvent::CaptureLost => {}
+                    }
+                } else if edit.group_editor.is_some() {
                     let scale = monitors_map.get(&monitor_id).map(|ms| ms.scale);
                     if let Some(scale) = scale
                         && handle_group_editor_input(
@@ -3911,6 +4575,21 @@ fn run(
             }
             // Меню групп ловит `Esc` раньше всех: оно перекрывает экран
             // целиком, и выйти из него надо в первую очередь.
+            // Клавиатура режима резки окон. Идёт ПЕРЕД клавиатурой меню
+            // групп: режимы взаимоисключающие (вход в резку закрывает меню),
+            // но порядок веток — единственное, что это гарантирует, если
+            // взаимоисключение однажды нарушат.
+            OverlayMessage::Event(
+                _,
+                OverlayEvent::Key {
+                    vk: VK_ESCAPE,
+                    pressed: true,
+                    ..
+                },
+            ) if edit.mitosis.is_some() => {
+                exit_mitosis_mode(&mut edit, &monitors_map);
+                need_redraw = true;
+            }
             OverlayMessage::Event(
                 _,
                 OverlayEvent::Key {
@@ -4439,17 +5118,6 @@ fn run(
                         );
                     }
                 }
-                // Баннер предупреждений (конфликт хоткея и т.п.) — тот же
-                // паттерн: жив — редрав нужен, истёк — вычищаем.
-                if edit.banner.as_ref().is_some_and(|b| !b.expired(now)) {
-                    need_redraw = true;
-                }
-                if edit.banner.as_ref().is_some_and(|b| b.expired(now)) {
-                    edit.banner = None;
-                    // Тот же случай, что у пульса: истёкший баннер обязан
-                    // исчезнуть с экрана, а для этого нужен ещё один кадр.
-                    need_redraw = true;
-                }
                 // Тултип ещё анимируется (задержка показа или плавное
                 // появление, фидбэк пользователя 2026-08-10) — редрав нужен,
                 // даже если ни одна анимация стикера/видео сейчас не тикает.
@@ -4832,11 +5500,15 @@ fn run(
             // полосу: клавиши логично работают со всего стикера, на который
             // смотришь. Хоткей забирает клавишу у всей системы, поэтому
             // условие узкое и снимается сразу, как курсор ушёл.
-            let want_media = edit
-                .video_timeline
-                .as_ref()
-                .filter(|t| t.hover_mode)
-                .map(|t| t.monitor_id.clone());
+            let want_media = media_keys_target(
+                &edit,
+                &cfg,
+                &monitor_bounds,
+                rst_win32::window_pick::cursor_position()
+                    .ok()
+                    .map(|c| (c.x, c.y)),
+            )
+            .map(|(_, monitor_id)| monitor_id);
             if want_media != edit.media_hotkeys_on {
                 if let Some(old) = edit.media_hotkeys_on.take() {
                     if let Some(ms) = monitors_map.get(&old) {
@@ -6890,6 +7562,11 @@ fn tracker_mask_needed(cfg: &Config, edit: &EditState, groups: &GroupsState) -> 
         || snap_gap_covers_free_windows(cfg)
         || edit.window_picker.is_some()
         || edit.window_pick_list.is_some()
+        // Режим резки окон живёт целиком на снимке трекера: без живого
+        // снимка `window_at` не найдёт под курсором ни одного окна, и режим
+        // выглядел бы сломанным — ровно тот же случай, что у списка выбора
+        // окна выше (docs/M9_WINDOW_MITOSIS_DESIGN.md §5).
+        || edit.mitosis.is_some()
         || !edit.pinned_windows.is_empty()
         || groups.shown_group().is_some()
 }
@@ -7410,6 +8087,55 @@ fn video_timeline_target(
         // который человек и видит под курсором.
         .max_by_key(|s| s.order)
         .map(|s| (s.id, monitor_id.clone(), true))
+}
+
+/// Видео-стикер, которым сейчас управляют медиа-клавиши (пробел, PgUp,
+/// PgDn), и монитор, на котором он лежит.
+///
+/// ОТДЕЛЬНО от [`video_timeline_target`], хотя правило похоже. Раньше это
+/// была одна и та же цель, и громкость оказалась заложницей чужой
+/// настройки: полоса перемотки показывается только при
+/// `playback.show_timeline`, а вместе с ней пропадали и клавиши. У
+/// пользователя ровно так и вышло — замер его `config.json` 2026-09-01:
+/// `show_timeline: false`, и PgUp/PgDn не работали вовсе, хотя к полосе
+/// перемотки никакого отношения не имеют.
+///
+/// Отличия от полосы, каждое намеренное:
+/// * `show_timeline` НЕ учитывается — это настройка про полосу, а не про звук;
+/// * в режиме редактирования целью служит ВЫДЕЛЕННЫЙ стикер, а не наведённый:
+///   там есть настоящее понятие выделения, и тянуться мышью к стикеру, чтобы
+///   убавить ему звук, незачем;
+/// * длительность не требуется: громкость и пауза осмысленны и для видео,
+///   у которого длительность не прочиталась, — перематывать нечего, а
+///   слушать есть что.
+fn media_keys_target(
+    edit: &EditState,
+    cfg: &Config,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    cursor: Option<(i32, i32)>,
+) -> Option<(Uuid, MonitorId)> {
+    if edit.active {
+        let [id] = edit.selection.ids() else {
+            return None;
+        };
+        let sticker = cfg.stickers.iter().find(|s| s.id == *id)?;
+        return sticker_is_video(sticker).then(|| (*id, sticker.placement.monitor_id.clone()));
+    }
+    let (cx, cy) = cursor?;
+    let (monitor_id, dip) = monitor_dip_at(cx, cy, monitor_bounds)?;
+    cfg.stickers
+        .iter()
+        .filter(|s| s.enabled && s.visible)
+        .filter(|s| sticker_is_video(s))
+        .filter(|s| s.placement.monitor_id == *monitor_id)
+        .filter(|s| {
+            let r = hittest::aabb(&s.placement, s.transform.rotation);
+            dip.0 >= r.x && dip.0 <= r.x + r.w && dip.1 >= r.y && dip.1 <= r.y + r.h
+        })
+        // Стикеры перекрываются — клавиши достаются верхнему, тому же,
+        // который человек и видит под курсором.
+        .max_by_key(|s| s.order)
+        .map(|s| (s.id, monitor_id.clone()))
 }
 
 /// Стикер — видеофайл.
@@ -8735,7 +9461,7 @@ fn handle_window_picker_up(
                     .find(|p| p.hwnd == hwnd)
                     .map(|p| host_rules_as_visibility(&p.hosts))
                     .unwrap_or_else(|| host_rules_as_visibility(&HostFilter::Anywhere));
-                window_picker::toggle_process_group(&current, group, window_snapshot)
+                window_picker::toggle_process_group(&current, group)
             };
             if let Some(updated) = updated {
                 apply_host_rules(edit, hwnd, updated, window_snapshot, monitor_bounds);
@@ -8749,9 +9475,7 @@ fn handle_window_picker_up(
             .iter_mut()
             .find(|s| s.id == sticker_id)
             .expect("наличие стикера проверено выше");
-        if let Some(new_rule) =
-            window_picker::toggle_process_group(&sticker.visibility, group, window_snapshot)
-        {
+        if let Some(new_rule) = window_picker::toggle_process_group(&sticker.visibility, group) {
             sticker.visibility = new_rule;
         }
         if let Err(e) = config::save(cfg, config_path) {
@@ -9992,6 +10716,16 @@ fn apply_visibility_decisions(
     changed
 }
 
+/// Какую группу надо закрыть перед открытием `opening` — `None`, если
+/// закрывать нечего (открывают ту же самую или ни одна не показана).
+///
+/// Отдельная функция ради теста: сам [`toggle_group_by_number`] тянет за
+/// собой `WindowPins` и живые окна, а вся суть починки — вот это одно
+/// решение (репорт пользователя 2026-09-01).
+fn group_to_close_before_opening(groups: &GroupsState, opening: Uuid) -> Option<Uuid> {
+    groups.shown_group().filter(|id| *id != opening)
+}
+
 /// Хоткей `Ctrl+Shift+<номер>`: показать группу или спрятать её.
 ///
 /// Это ПЕРЕКЛЮЧАТЕЛЬ, а не «открыть». Пользователь описал поведение так:
@@ -10019,11 +10753,55 @@ fn toggle_group_by_number(
         return false;
     };
     let group = cfg.groups[index].clone();
+    let foreground_hwnd = rst_win32::window_enum::foreground_hwnd();
+
+    // Открытие ДРУГОЙ группы закрывает предыдущую — репорт пользователя
+    // 2026-09-01: «открываю 2, потом 1, потом снова 2 — и вместо открытия
+    // она закрывается».
+    //
+    // Причина именно в этом: признак `shown` живёт НА КАЖДУЮ ГРУППУ
+    // отдельно (`GroupsState::visibility`), а «открыть другую группу»
+    // сбрасывало только `active`. Группа 2 оставалась помеченной как
+    // показанная, хотя на экране её уже накрыла группа 1, и её же хоткей
+    // честно отрабатывал переключателем — то есть прятал.
+    //
+    // Закрываем ДО `open_group`: факты о членах предыдущей группы читаются
+    // из её карты окон (`groups.open()`), а `open_group` эту карту заменит,
+    // и после него закрывать было бы уже нечего и нечем.
+    if let Some(previous_id) = group_to_close_before_opening(groups, group.id) {
+        if let Some(previous) = cfg.groups.iter().find(|g| g.id == previous_id).cloned() {
+            let previous_facts =
+                group_member_facts(&previous, groups, edit, windows, foreground_hwnd);
+            // Тот же `HotkeyPressed`, что и у явного закрытия: событие
+            // «спрятать» в машине видимости одно, и заводить второе значило
+            // бы держать два пути к одному состоянию.
+            let (previous_next, previous_decisions) = decide_visibility(
+                GroupVisibilityEvent::HotkeyPressed,
+                groups.visibility(previous_id),
+                &previous_facts,
+            );
+            groups.set_visibility(previous_id, previous_next);
+            apply_visibility_decisions(
+                &previous_decisions,
+                cfg,
+                edit,
+                window_pins,
+                monitor_bounds,
+                windows,
+            );
+            tracing::info!(
+                number = previous.number,
+                shown = previous_next.shown,
+                "предыдущая группа закрыта — открывается другая"
+            );
+        }
+    }
+
     let live = live_windows_for_match(windows);
     groups.open_group(&group, &live);
     report_unmatched_members(&group, groups, live.len());
 
-    let foreground = rst_win32::window_enum::foreground_hwnd();
+    let foreground = foreground_hwnd;
     let facts = group_member_facts(&group, groups, edit, windows, foreground);
     let state = groups.visibility(group.id);
     let (next, decisions) = decide_visibility(GroupVisibilityEvent::HotkeyPressed, state, &facts);
@@ -11822,6 +12600,11 @@ fn apply_host_rules(
     // окне») ограничение включает. Пустой список запереть окно не может:
     // [`pinned_window::host_action`] всегда уступает явному вызову
     // пользователем, так что окно возвращается с панели задач.
+    //
+    // Формы «все, кроме» у правил соседства нет — панель могла отдать её,
+    // если пользователь снял одну галочку из состояния «выбраны все»;
+    // разворачиваем по снимку окон (см. `window_picker::denylist_as_allowlist`).
+    let updated = window_picker::denylist_as_allowlist(&updated, window_snapshot);
     let hosts = match updated.mode {
         VisibilityMode::Always => HostFilter::Anywhere,
         _ => HostFilter::Only(updated.rules),
@@ -13591,6 +14374,36 @@ fn handle_input(
     }
 }
 
+/// Соседи для магнита: ось-выровненные габариты остальных видимых стикеров
+/// ЭТОГО монитора.
+///
+/// Выделенные исключены намеренно: при мультивыделении они едут вместе с
+/// перетаскиваемым, и магнитить его к ним значило бы магнитить его к самому
+/// себе — стикер прилипал бы к спутнику и тащил его дальше.
+fn snap_peers(cfg: &Config, edit: &EditState, monitor_id: &MonitorId) -> Vec<DipRect> {
+    cfg.stickers
+        .iter()
+        .filter(|s| {
+            s.visible && s.placement.monitor_id == *monitor_id && !edit.selection.contains(s.id)
+        })
+        .map(|s| hittest::aabb(&s.placement, s.transform.rotation))
+        .collect()
+}
+
+/// Выключен ли магнит на этот жест зажатым модификатором.
+///
+/// `Alt` — по запросу пользователя 2026-09-01; `Ctrl` работал так с M2 и
+/// остаётся (SPEC 3.4). Два клавиши на одно действие здесь не путаница, а
+/// снисходительность: обе под большим пальцем, и промах не наказывается.
+///
+/// В ресайзе `Ctrl` занят другим — он инвертирует блокировку пропорций, —
+/// поэтому там магнит снимает только `Alt`. Совпадение удачное: `Alt` в
+/// ресайзе означает «тянуть от центра», а при этом едут ОБЕ кромки сразу, и
+/// подтягивать к направляющей нечего — магнит там и не нужен.
+fn magnet_off(modifiers: Modifiers) -> bool {
+    modifiers.ctrl || modifiers.alt
+}
+
 /// Применить активный жест к текущей мировой точке курсора (DIP). Возвращает
 /// `true`, если нужна перерисовка (жест активен и стикер найден).
 #[allow(clippy::too_many_arguments)]
@@ -13648,8 +14461,18 @@ fn apply_gesture(
             let mut placement = start.placement.clone();
             placement.cx = dip_x - grab_dx;
             placement.cy = dip_y - grab_dy;
-            let snap_result =
-                snap::snap_placement(&placement, rotation, monitor, &edit.snap, modifiers.ctrl);
+            // Магнит не только к монитору, но и к СОСЕДНИМ стикерам
+            // (запрос пользователя 2026-09-01: «сделай такой же грид между
+            // стикерами, чтобы они липли друг к другу»).
+            let peers = snap_peers(cfg, edit, monitor_id);
+            let snap_result = snap::snap_placement_with_peers(
+                &placement,
+                rotation,
+                monitor,
+                &peers,
+                &edit.snap,
+                magnet_off(modifiers),
+            );
             placement.cx += snap_result.dx;
             placement.cy += snap_result.dy;
             let placement = snap::clamp_min_visible(&placement, rotation, monitor);
@@ -13694,6 +14517,47 @@ fn apply_gesture(
                 dm,
                 allow_mirror,
             );
+            // Магнит при изменении размера (запрос пользователя
+            // 2026-09-01): кромка, которую тянет ручка, садится на края и
+            // центры монитора и соседних стикеров — тем же порогом, что и
+            // при перемещении.
+            //
+            // Поправка идёт в СМЕЩЕНИЕ ПАЛЬЦА, а результат пересчитывается
+            // заново: только `transform_ops::resize` знает про блокировку
+            // пропорций, зеркалирование и минимальный размер, и исправлять
+            // её результат снаружи значило бы продублировать всё это и рано
+            // или поздно разойтись.
+            //
+            // Повёрнутый стикер магнит не трогает: ось-выровненные габариты
+            // повёрнутого прямоугольника — не его кромки, и «подтянуть
+            // правый край» для него не имеет смысла.
+            let rotated = result.transform.rotation != 0.0;
+            let result = if rotated {
+                result
+            } else {
+                let (sdx, sdy) = snap::snap_resize_delta(
+                    hittest::aabb(&result.placement, 0.0),
+                    monitor,
+                    &snap_peers(cfg, edit, monitor_id),
+                    snap::ResizeEdges::of(*handle),
+                    &edit.snap,
+                    // В ресайзе `Ctrl` занят пропорциями — магнит снимает
+                    // только `Alt` (см. [`magnet_off`]).
+                    modifiers.alt,
+                );
+                if sdx == 0.0 && sdy == 0.0 {
+                    result
+                } else {
+                    transform_ops::resize(
+                        &start.placement,
+                        &start.transform,
+                        *handle,
+                        (delta.0 + sdx, delta.1 + sdy),
+                        dm,
+                        allow_mirror,
+                    )
+                }
+            };
             let placement =
                 snap::clamp_min_visible(&result.placement, result.transform.rotation, monitor);
             apply_transform(cfg, sprites, id, placement, result.transform);
@@ -14327,6 +15191,56 @@ fn redraw(
         }
     }
 
+    // Предпросмотр разреза в режиме резки окон («митоз»,
+    // docs/M9_WINDOW_MITOSIS_DESIGN.md §4.3) — поверх сцены, но ПОД
+    // баннером: баннер объясняет отказ и обязан читаться даже поверх
+    // предпросмотра.
+    if let Some(mitosis_state) = &edit.mitosis {
+        let mut prims = Vec::new();
+        if let Some(hover) = &mitosis_state.hover {
+            if let Some(bounds) = monitor_bounds.get(monitor_id) {
+                let r = bounds.bounds_px;
+                // Окно, не задевающее этот монитор, не рисуется вовсе:
+                // окно живёт в координатах виртуального десктопа, и без
+                // этой отсечки каждый монитор гнал бы в кадр предпросмотр
+                // окна, стоящего на соседнем.
+                let intersects = hover.rect.x < r.x + r.w as i32
+                    && hover.rect.x + hover.rect.w > r.x
+                    && hover.rect.y < r.y + r.h as i32
+                    && hover.rect.y + hover.rect.h > r.y;
+                if intersects {
+                    let scale = bounds.scale;
+                    let dip = DipRect::new(
+                        f64::from(hover.rect.x - r.x) / scale,
+                        f64::from(hover.rect.y - r.y) / scale,
+                        f64::from(hover.rect.w) / scale,
+                        f64::from(hover.rect.h) / scale,
+                    );
+                    prims.extend(mitosis_overlay::split_preview(
+                        dip,
+                        mitosis_state.axis,
+                        hover.fraction,
+                        hover.blocked,
+                    ));
+                }
+            }
+        }
+        // Подсказка — только на том мониторе, где сейчас курсор: одна и та
+        // же плашка на всех экранах читалась бы как четыре разных сообщения.
+        if let Some((cursor_monitor, cx, cy)) = &mitosis_state.cursor {
+            if cursor_monitor == monitor_id {
+                let screen = screen_dip_rect((width_px, height_px), scale);
+                prims.extend(mitosis_overlay::cursor_hint(
+                    (*cx, *cy),
+                    (screen.w, screen.h),
+                ));
+            }
+        }
+        primitives_to_sprites(
+            &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+        );
+    }
+
     // Баннер предупреждений (решение координатора 2026-08-18: конфликт
     // хоткея и прочие критические сообщения — вместо невидимого на
     // Win11 25H2 tray-баллуна) — поверх всего, на своём мониторе, у
@@ -14343,15 +15257,26 @@ fn redraw(
                 h: BANNER_HEIGHT,
                 rotation: 0.0,
             };
-            let mut panel = Panel::new(BANNER_PANEL_ID, banner_frame);
-            panel.add_widget(Label::new(
-                0,
-                banner_frame.cx - tw / 2.0,
-                banner_frame.cy + (BANNER_HEIGHT - th) / 2.0,
-                &banner.text,
-            ));
+            // Красная плашка, а не обычное стекло (запрос пользователя
+            // 2026-09-01): баннер показывается ТОЛЬКО когда что-то не
+            // получилось, и цвет обязан сказать это раньше, чем текст будет
+            // прочитан. Собирается вручную, без `Panel`: панель рисует себя
+            // нейтральным стеклом, а подменять её поверхность значило бы
+            // тащить «тревожность» во все панели программы.
             let mut prims = Vec::new();
-            panel.draw(&mut prims);
+            rst_render::glass_danger(&mut prims, banner_frame, theme::RADIUS_CTRL, 1.0);
+            prims.push(Primitive::Text {
+                rect: Box2D {
+                    cx: banner_frame.cx,
+                    cy: banner_frame.cy,
+                    w: tw,
+                    h: th,
+                    rotation: 0.0,
+                },
+                text: banner.text.clone(),
+                color: theme::TEXT,
+                opacity: theme::TEXT_OPACITY,
+            });
             primitives_to_sprites(
                 &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
             );
@@ -15291,6 +16216,9 @@ mod tests {
             pinned_unmaximized_at: HashMap::new(),
             pinned_follow_until: None,
             banner: None,
+            mitosis: None,
+            mitosis_pending: None,
+            mitosis_failures: HashMap::new(),
             pending_animation: None,
             pending_video: None,
             marquee: None,
@@ -15719,6 +16647,389 @@ mod tests {
         cfg.stickers.push(sticker);
         let edit = mask_gate_edit_state();
         assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
+    }
+
+    /// Открытие ДРУГОЙ группы обязано закрыть предыдущую.
+    ///
+    /// Ровно тот сценарий, который сломался у пользователя 2026-09-01:
+    /// открыл 2, открыл 1, снова нажал 2 — и вместо открытия группа
+    /// закрывалась. Признак `shown` живёт на каждую группу отдельно, и
+    /// открытие другой сбрасывало только `active`: группа 2 оставалась
+    /// помеченной показанной, и её же хоткей честно отрабатывал
+    /// переключателем.
+    #[test]
+    fn opening_another_group_closes_the_previous_one() {
+        use rst_core::group_visibility::GroupVisibilityState;
+
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let group = |id: Uuid, number: u8| WindowGroup {
+            id,
+            number,
+            name: String::new(),
+            members: Vec::new(),
+            gap_pct: 0,
+        };
+
+        let mut groups = GroupsState::default();
+        // Ни одна не показана — закрывать нечего.
+        assert_eq!(group_to_close_before_opening(&groups, first), None);
+
+        groups.open_group(&group(first, 1), &[]);
+        groups.set_visibility(
+            first,
+            GroupVisibilityState {
+                shown: true,
+                pinned: false,
+            },
+        );
+        // Открывают другую — предыдущую надо закрыть.
+        assert_eq!(group_to_close_before_opening(&groups, second), Some(first));
+        // Открывают ту же самую — это обычный переключатель, закрывать
+        // отдельно нечего (иначе она закрылась бы дважды).
+        assert_eq!(group_to_close_before_opening(&groups, first), None);
+
+        // Спрятанная группа не «предыдущая»: прятать уже спрятанное не от
+        // чего, и лишний проход машины видимости трогал бы чужие окна зря.
+        groups.set_visibility(
+            first,
+            GroupVisibilityState {
+                shown: false,
+                pinned: false,
+            },
+        );
+        assert_eq!(group_to_close_before_opening(&groups, second), None);
+    }
+
+    // --- Магнит при изменении размера (запрос пользователя 2026-09-01) ---
+
+    /// Стикер-мишень и сосед справа, чья левая кромка стоит на 300.
+    fn resize_snap_harness() -> (Config, EditState, Uuid, Placement) {
+        let mut cfg = Config::default();
+        let target = zone_test_sticker(0.0); // 150..250 по X, 150..250 по Y
+        let id = target.id;
+        let start_placement = target.placement.clone();
+        let mut peer = zone_test_sticker(0.0);
+        peer.placement.cx = 400.0;
+        peer.placement.w = 200.0; // левая кромка 300
+        cfg.stickers.push(target.clone());
+        cfg.stickers.push(peer);
+
+        let mut edit = mask_gate_edit_state();
+        edit.active = true;
+        edit.selection.select(id);
+        edit.gesture = Some(Gesture::Resize {
+            start: GestureStart {
+                id,
+                placement: start_placement.clone(),
+                transform: target.transform,
+            },
+            handle: HandleKind::East,
+            grab: (250.0, 200.0),
+        });
+        (cfg, edit, id, start_placement)
+    }
+
+    fn run_resize(cfg: &mut Config, edit: &mut EditState, to_x: f64, modifiers: Modifiers) {
+        apply_gesture(
+            cfg,
+            &mut [],
+            edit,
+            (to_x, 200.0),
+            modifiers,
+            DipRect::new(0.0, 0.0, 1920.0, 1080.0),
+            &monitor_id("main"),
+        );
+    }
+
+    fn right_edge(cfg: &Config, id: Uuid) -> f64 {
+        let p = &cfg.stickers.iter().find(|s| s.id == id).unwrap().placement;
+        p.cx + p.w / 2.0
+    }
+
+    /// Тянутая кромка садится на левый край соседа: не «почти рядом», а
+    /// ровно впритык.
+    #[test]
+    fn resize_snaps_the_dragged_edge_to_a_neighbour() {
+        let (mut cfg, mut edit, id, _) = resize_snap_harness();
+        // Палец довёл правую кромку до 297 — сосед начинается на 300, это
+        // внутри порога 8 DIP.
+        run_resize(
+            &mut cfg,
+            &mut edit,
+            297.0,
+            Modifiers {
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+        );
+        assert!(
+            (right_edge(&cfg, id) - 300.0).abs() < 0.001,
+            "правая кромка должна сесть на 300, а не на {}",
+            right_edge(&cfg, id)
+        );
+    }
+
+    /// Зажатый `Alt` магнит снимает: кромка остаётся ровно там, куда её
+    /// довёл палец.
+    #[test]
+    fn alt_turns_the_resize_magnet_off() {
+        let (mut cfg, mut edit, id, start) = resize_snap_harness();
+        run_resize(
+            &mut cfg,
+            &mut edit,
+            297.0,
+            Modifiers {
+                shift: false,
+                ctrl: false,
+                alt: true,
+            },
+        );
+        // `Alt` в ресайзе означает ещё и «тянуть от центра», поэтому сверяем
+        // не с 297, а с тем, что даёт сама математика ресайза без магнита:
+        // проверяется именно ОТСУТСТВИЕ поправки.
+        let expected = transform_ops::resize(
+            &start,
+            &Transform::default(),
+            HandleKind::East,
+            (297.0 - 250.0, 0.0),
+            DragModifiers {
+                shift: false,
+                alt: true,
+            },
+            true,
+        );
+        let got = &cfg.stickers.iter().find(|s| s.id == id).unwrap().placement;
+        assert!(
+            (got.w - expected.placement.w).abs() < 0.001
+                && (got.cx - expected.placement.cx).abs() < 0.001,
+            "с Alt размер обязан совпасть с несмагниченным: ждали {:?}, получили {:?}",
+            expected.placement,
+            got
+        );
+        assert!(
+            (right_edge(&cfg, id) - 300.0).abs() > 0.5,
+            "с Alt кромка не должна прилипать к соседу"
+        );
+    }
+
+    /// Далёкий сосед не притягивает: 8 DIP — это 8, а не «примерно рядом».
+    #[test]
+    fn resize_leaves_a_distant_edge_alone() {
+        let (mut cfg, mut edit, id, _) = resize_snap_harness();
+        run_resize(
+            &mut cfg,
+            &mut edit,
+            280.0,
+            Modifiers {
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+        );
+        assert!(
+            (right_edge(&cfg, id) - 280.0).abs() < 0.001,
+            "кромка должна остаться на 280, получили {}",
+            right_edge(&cfg, id)
+        );
+    }
+
+    /// `Ctrl` и `Alt` — оба снимают магнит при ПЕРЕМЕЩЕНИИ; в ресайзе `Ctrl`
+    /// занят пропорциями, и там это решает отдельная ветка.
+    #[test]
+    fn either_modifier_turns_the_move_magnet_off() {
+        let m = |ctrl, alt| Modifiers {
+            shift: false,
+            ctrl,
+            alt,
+        };
+        assert!(!magnet_off(m(false, false)));
+        assert!(magnet_off(m(true, false)));
+        assert!(magnet_off(m(false, true)));
+        assert!(magnet_off(m(true, true)));
+    }
+
+    // --- Митоз: список одно-оконных приложений (репорт 2026-09-01) ---
+
+    #[test]
+    fn exe_file_name_is_lowercased_and_path_free() {
+        // Ключ списка — имя файла, а не путь: у самообновляющихся приложений
+        // (Discord и есть такой) в пути стоит номер версии, и после
+        // ближайшего обновления запрет по полному пути перестал бы
+        // действовать молча.
+        assert_eq!(
+            exe_file_name(Path::new(
+                r"C:\Users\x\AppData\Local\Discord\app-1.0.9\Discord.exe"
+            )),
+            Some("discord.exe".to_string())
+        );
+        assert_eq!(exe_file_name(Path::new("")), None);
+    }
+
+    #[test]
+    fn single_instance_list_matches_case_insensitively() {
+        let mut cfg = Config::default();
+        // Дефолт списка — ровно то, что пользователь назвал по живому опыту.
+        assert!(is_single_instance_app(
+            &cfg,
+            Path::new(r"C:\Program Files\Spotify\Spotify.exe")
+        ));
+        assert!(!is_single_instance_app(
+            &cfg,
+            Path::new(r"C:\Windows\explorer.exe")
+        ));
+        cfg.settings
+            .mitosis_single_instance_apps
+            .push("EXPLORER.EXE".to_string());
+        assert!(is_single_instance_app(
+            &cfg,
+            Path::new(r"C:\Windows\explorer.exe")
+        ));
+    }
+
+    #[test]
+    fn one_failure_does_not_disable_an_app_but_two_do() {
+        // Суть выбора «два, а не один»: холодный старт приложения с диска
+        // может не уложиться в таймаут один раз, и запрет по единственной
+        // осечке отобрал бы митоз у приложения, которое работает.
+        let dir = std::env::temp_dir().join(format!("rst-mitosis-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("временный каталог");
+        let path = dir.join("config.json");
+        let mut cfg = Config::default();
+        let mut edit = mask_gate_edit_state();
+
+        assert!(!remember_single_instance_failure(
+            &mut edit,
+            &mut cfg,
+            &path,
+            "slack.exe"
+        ));
+        assert!(
+            !cfg.settings
+                .mitosis_single_instance_apps
+                .iter()
+                .any(|a| a == "slack.exe")
+        );
+
+        assert!(remember_single_instance_failure(
+            &mut edit,
+            &mut cfg,
+            &path,
+            "slack.exe"
+        ));
+        assert!(
+            cfg.settings
+                .mitosis_single_instance_apps
+                .iter()
+                .any(|a| a == "slack.exe")
+        );
+        // Счётчик снят: второй раз то же приложение уже отсекается списком,
+        // и копить по нему страйки больше незачем.
+        assert!(!edit.mitosis_failures.contains_key("slack.exe"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_split_clears_the_failure_streak() {
+        // Одна осечка не должна дожидаться второй через час работы: успешный
+        // митоз того же приложения обнуляет счётчик, иначе «один отказ утром
+        // + один вечером» запретили бы приложение, которое всё это время
+        // прекрасно резалось.
+        let dir = std::env::temp_dir().join(format!("rst-mitosis-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("временный каталог");
+        let path = dir.join("config.json");
+        let mut cfg = Config::default();
+        let mut edit = mask_gate_edit_state();
+        remember_single_instance_failure(&mut edit, &mut cfg, &path, "code.exe");
+        assert_eq!(edit.mitosis_failures.get("code.exe"), Some(&1));
+
+        edit.mitosis_pending = Some(MitosisPending {
+            original_hwnd: 1,
+            original_rect: WindowRect::default(),
+            clone_rect: WindowRect::default(),
+            monitor_id: monitor_id("main"),
+            exe_name: Some("code.exe".to_string()),
+        });
+        finish_mitosis(&mut edit, &mut cfg, &path, &WindowPins::new(), Ok(2));
+        assert!(!edit.mitosis_failures.contains_key("code.exe"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tracker_mask_needed_true_while_mitosis_mode_active() {
+        // Режим резки окон целиком построен на снимке трекера: `window_at`
+        // ищет окно под курсором именно в нём. На чистом конфиге (ни одного
+        // стикера, ни одной панели) трекер спит, и без этого условия режим
+        // включался бы, но не находил НИ ОДНОГО окна — то есть выглядел бы
+        // сломанным (тот же класс бага, что уже случился со списком выбора
+        // окна, см. `tracker_mask_needed_true_while_window_pick_list_open`).
+        let cfg = Config::default();
+        let mut edit = mask_gate_edit_state();
+        assert!(!tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
+        edit.mitosis = Some(MitosisState {
+            initiator: monitor_id("main"),
+            axis: SplitAxis::Vertical,
+            hover: None,
+            cursor: None,
+        });
+        assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
+    }
+
+    #[test]
+    fn pix_rect_round_trips_through_core_geometry() {
+        // Прямоугольник ходит из снимка окон в `rst-core` и обратно на
+        // каждый разрез; потеря или перестановка поля здесь означала бы
+        // окно, поставленное не туда, — и заметно это стало бы только на
+        // живой машине.
+        let rect = WindowRect {
+            x: -1920,
+            y: 357,
+            w: 1280,
+            h: 720,
+        };
+        assert_eq!(from_pix_rect(to_pix_rect(&rect)), rect);
+    }
+
+    #[test]
+    fn window_rect_becomes_half_open_win32_rect() {
+        // Win32 везде полуоткрытые границы: right/bottom — первая точка ЗА
+        // прямоугольником. Ошибка на единицу здесь — окно на пиксель шире
+        // соседа, то есть щель или нахлёст ровно посередине экрана.
+        let r = window_rect_to_win32(&WindowRect {
+            x: 100,
+            y: 200,
+            w: 640,
+            h: 480,
+        });
+        assert_eq!((r.left, r.top, r.right, r.bottom), (100, 200, 740, 680));
+    }
+
+    #[test]
+    fn split_of_a_real_window_covers_it_without_gap_or_overlap() {
+        // Сквозная проверка того, ради чего вообще существует митоз: две
+        // половины обязаны покрыть исходное окно ровно, без щели между
+        // ними и без нахлёста. Считается тем же кодом, что и в
+        // `start_mitosis`.
+        let rect = WindowRect {
+            x: 640,
+            y: 100,
+            w: 1281, // нечётная ширина — округление доли обязано её пережить
+            h: 900,
+        };
+        let pix = to_pix_rect(&rect);
+        let fraction = mitosis::split_fraction(pix, SplitAxis::Vertical, 900, 500);
+        let (a, b) = mitosis::split_rects(pix, SplitAxis::Vertical, fraction);
+        let (left, right) = (from_pix_rect(a), from_pix_rect(b));
+        assert_eq!(left.x, rect.x);
+        assert_eq!(
+            left.x + left.w,
+            right.x,
+            "щель или нахлёст между половинами"
+        );
+        assert_eq!(right.x + right.w, rect.x + rect.w, "правый край уехал");
+        assert_eq!(left.h, rect.h);
+        assert_eq!(right.h, rect.h);
     }
 
     #[test]
@@ -18714,6 +20025,88 @@ mod tests {
         )])
     }
 
+    /// Медиа-клавиши НЕ зависят от настройки полосы перемотки.
+    ///
+    /// Ровно тот баг, который поймал пользователь 2026-09-01: у его
+    /// видео-стикера `show_timeline: false` (замер `config.json`), и
+    /// PgUp/PgDn не работали вовсе — хотя к полосе перемотки громкость
+    /// отношения не имеет. Полоса при тех же данных цели не даёт, и это
+    /// правильно: настройка про неё и есть.
+    #[test]
+    fn media_keys_ignore_the_timeline_setting() {
+        let mut cfg = Config::default();
+        let mut sticker = video_sticker("main", 500.0, 500.0, 400.0, 300.0);
+        sticker.playback.show_timeline = false;
+        let id = sticker.id;
+        cfg.stickers.push(sticker);
+        let mut edit = mask_gate_edit_state();
+        // Вне режима редактирования: цель берётся по курсору.
+        edit.active = false;
+        let cursor = Some((500, 500));
+
+        assert_eq!(
+            media_keys_target(&edit, &cfg, &one_monitor(), cursor).map(|(id, _)| id),
+            Some(id),
+            "громкость обязана работать при выключенной полосе"
+        );
+        assert_eq!(
+            video_timeline_target(&edit, &cfg, &|_| true, &one_monitor(), cursor),
+            None,
+            "полоса при выключенной настройке не показывается — это её право"
+        );
+    }
+
+    /// В режиме редактирования цель медиа-клавиш — ВЫДЕЛЕННЫЙ стикер, а не
+    /// тот, что под курсором: тянуться мышью к стикеру, чтобы убавить ему
+    /// звук, там незачем.
+    #[test]
+    fn media_keys_follow_selection_in_edit_mode() {
+        let mut cfg = Config::default();
+        let sticker = video_sticker("main", 500.0, 500.0, 400.0, 300.0);
+        let id = sticker.id;
+        cfg.stickers.push(sticker);
+        let mut edit = mask_gate_edit_state();
+        edit.active = true;
+        edit.selection.select(id);
+
+        // Курсор в другом углу экрана — цель всё равно выделенный стикер.
+        assert_eq!(
+            media_keys_target(&edit, &cfg, &one_monitor(), Some((10, 10))).map(|(id, _)| id),
+            Some(id)
+        );
+    }
+
+    /// Скрытый стикер целью не становится: его нет на экране, наводиться
+    /// не на что, а звук у него и так приглушён настройкой
+    /// `mute_invisible_stickers`.
+    #[test]
+    fn media_keys_skip_a_hidden_sticker() {
+        let mut cfg = Config::default();
+        let mut sticker = video_sticker("main", 500.0, 500.0, 400.0, 300.0);
+        sticker.visible = false;
+        cfg.stickers.push(sticker);
+        let mut edit = mask_gate_edit_state();
+        edit.active = false;
+        assert_eq!(
+            media_keys_target(&edit, &cfg, &one_monitor(), Some((500, 500))),
+            None
+        );
+    }
+
+    /// Не-видео под курсором клавиши не забирает: пробел и PgUp/PgDn
+    /// перехватываются у всей системы, и держать их ради картинки нельзя.
+    #[test]
+    fn media_keys_ignore_a_picture() {
+        let mut cfg = Config::default();
+        cfg.stickers.push(zone_test_sticker(0.0));
+        let mut edit = mask_gate_edit_state();
+        edit.active = false;
+        assert_eq!(
+            media_keys_target(&edit, &cfg, &one_monitor(), Some((200, 200))),
+            None
+        );
+    }
+
     /// В режиме редактирования полоса принадлежит выделенному видео —
     /// независимо от того, где курсор: там она часть редактирования.
     #[test]
@@ -19271,6 +20664,9 @@ mod tests {
             pinned_unmaximized_at: HashMap::new(),
             pinned_follow_until: None,
             banner: None,
+            mitosis: None,
+            mitosis_pending: None,
+            mitosis_failures: HashMap::new(),
             pending_animation: None,
             pending_video: None,
             marquee: None,

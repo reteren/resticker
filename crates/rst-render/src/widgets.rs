@@ -446,6 +446,18 @@ pub fn glass_control(
     }
 }
 
+/// Тревожная плашка отказа (§4, `Surface::Danger`) — красное тело, свет и
+/// кромки те же, что у обычной панели.
+pub fn glass_danger(out: &mut Vec<Primitive>, rect: Box2D, radius: f64, opacity: f64) {
+    out.push(Primitive::Glass {
+        rect,
+        radius,
+        surface: Surface::Danger,
+        glow: 0.0,
+        opacity,
+    });
+}
+
 /// Утопленная поверхность: поле ввода, жёлоб ползунка (§4, `Surface::Sunken`).
 pub fn glass_sunken(out: &mut Vec<Primitive>, rect: Box2D, radius: f64, opacity: f64) {
     out.push(Primitive::Glass {

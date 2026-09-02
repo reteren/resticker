@@ -59,6 +59,13 @@ pub fn window_is_checked(visibility: &VisibilityRule, window: &WindowInfo) -> bo
         // так, чтобы по умолчанию были выбраны все окна»).
         return true;
     }
+    if visibility.mode == VisibilityMode::OverlapDenylist {
+        // «Все, кроме перечисленных» — галочка снята ровно у перечисленных.
+        return !visibility
+            .rules
+            .iter()
+            .any(|r| rule_matches(r, &candidate(window)));
+    }
     if visibility.mode != VisibilityMode::OverlapAllowlist {
         return false;
     }
@@ -79,7 +86,9 @@ pub fn process_is_checked(visibility: &VisibilityRule, group: &ProcessGroup) -> 
     if visibility.mode == VisibilityMode::Always {
         return true; // см. `window_is_checked`
     }
-    if visibility.mode != VisibilityMode::OverlapAllowlist {
+    if visibility.mode != VisibilityMode::OverlapAllowlist
+        && visibility.mode != VisibilityMode::OverlapDenylist
+    {
         return false;
     }
     let Some(exe_path) = group
@@ -95,7 +104,14 @@ pub fn process_is_checked(visibility: &VisibilityRule, group: &ProcessGroup) -> 
         title: String::new(),
         class: String::new(),
     };
-    visibility.rules.iter().any(|r| rule_matches(r, &candidate))
+    let listed = visibility.rules.iter().any(|r| rule_matches(r, &candidate));
+    // В режиме «все, кроме» список читается наоборот: перечисленный процесс —
+    // это снятая галочка.
+    if visibility.mode == VisibilityMode::OverlapDenylist {
+        !listed
+    } else {
+        listed
+    }
 }
 
 /// Сгруппировать снимок окон по процессам (дизайн §3): ключ — короткое имя
@@ -139,44 +155,67 @@ pub fn group_by_process(snapshot: &[WindowInfo]) -> Vec<ProcessGroup> {
 /// Режим при снятии не возвращается (§2.3: пустой allow-list — валидный
 /// «только рабочий стол»).
 ///
+/// Из состояния «выбраны все» ([`VisibilityMode::Always`]) снятие уходит в
+/// зеркальный [`VisibilityMode::OverlapDenylist`] — «все, кроме этого», — и
+/// возвращается обратно в `Always`, когда исключений не осталось. Снимок
+/// окон для этого не нужен и намеренно НЕ принимается: именно попытка
+/// выразить «все остальные» перечислением запущенных процессов и делала
+/// правило протухающим (репорт пользователя 2026-09-02).
+///
 /// `None` — no-op: группа «процесс неизвестен» (записывать в `process_name`
 /// нечего, §2.3).
 pub fn toggle_process_group(
     visibility: &VisibilityRule,
     group: &ProcessGroup,
-    snapshot: &[WindowInfo],
 ) -> Option<VisibilityRule> {
     let name = group.process_name.as_deref()?;
     if visibility.mode == VisibilityMode::Always {
-        // Снятие галочки из состояния «выбраны все»: материализуем список
-        // из всех остальных процессов снимка. Без этого шага снятие было бы
-        //но-опом — в режиме `Always` списка правил ещё не существует.
-        let mut rules = Vec::new();
-        for other in group_by_process(snapshot) {
-            let Some(other_name) = other.process_name else {
-                continue;
-            };
-            if other_name.eq_ignore_ascii_case(name) {
-                continue;
-            }
-            rules.push(OverlapRule {
-                process_name: Some(other_name),
+        // Снятие галочки из состояния «выбраны все» — это ИСКЛЮЧЕНИЕ, а не
+        // список разрешений: записываем один снятый процесс, а «все
+        // остальные» остаются определением, а не перечислением.
+        //
+        // Раньше здесь материализовался снимок всех прочих процессов, и с
+        // этого момента «все» означало «все, которые были запущены в ту
+        // секунду»: окно, открытое позже — тем более после перезагрузки
+        // компьютера, — в список не попадало, и стикер уходил под него
+        // (репорт пользователя 2026-09-02).
+        return Some(VisibilityRule {
+            mode: VisibilityMode::OverlapDenylist,
+            rules: vec![OverlapRule {
+                process_name: Some(name.to_string()),
                 title_pattern: None,
-            });
+            }],
+        });
+    }
+    if visibility.mode == VisibilityMode::OverlapDenylist {
+        let mut rules = visibility.rules.clone();
+        if process_is_checked(visibility, group) {
+            // Снять галочку — добавить процесс в исключения.
+            if !has_process_rule(&rules, name) {
+                rules.push(OverlapRule {
+                    process_name: Some(name.to_string()),
+                    title_pattern: None,
+                });
+            }
+        } else {
+            retain_without_process(&mut rules, name);
+            if rules.is_empty() {
+                // Исключений не осталось — это снова честное «все», включая
+                // те окна, которых пока нет.
+                return Some(VisibilityRule {
+                    mode: VisibilityMode::Always,
+                    rules,
+                });
+            }
         }
         return Some(VisibilityRule {
-            mode: VisibilityMode::OverlapAllowlist,
+            mode: VisibilityMode::OverlapDenylist,
             rules,
         });
     }
     if process_is_checked(visibility, group) {
         let mut rules = visibility.rules.clone();
-        rules.retain(|r| {
-            !(r.title_pattern.is_none()
-                && r.process_name
-                    .as_deref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name)))
-        });
+        retain_without_process(&mut rules, name);
         Some(VisibilityRule {
             mode: visibility.mode,
             rules,
@@ -185,12 +224,7 @@ pub fn toggle_process_group(
         let mut rules = visibility.rules.clone();
         // Защита от дубля при переходе режима: правила могли уже лежать в
         // конфиге при `Always`/`Desktop` (is_checked там всегда false).
-        if !rules.iter().any(|r| {
-            r.title_pattern.is_none()
-                && r.process_name
-                    .as_deref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        }) {
+        if !has_process_rule(&rules, name) {
             rules.push(OverlapRule {
                 process_name: Some(name.to_string()),
                 title_pattern: None,
@@ -203,45 +237,98 @@ pub fn toggle_process_group(
     }
 }
 
+/// В списке есть правило ровно на этот процесс (по имени exe, без шаблона
+/// заголовка)?
+fn has_process_rule(rules: &[OverlapRule], name: &str) -> bool {
+    rules.iter().any(|r| is_process_rule(r, name))
+}
+
+/// Убрать из списка правило ровно на этот процесс.
+fn retain_without_process(rules: &mut Vec<OverlapRule>, name: &str) {
+    rules.retain(|r| !is_process_rule(r, name));
+}
+
+/// Правило — это «весь процесс `name`»: имя exe без шаблона заголовка.
+/// Title-правило конкретного окна процесс целиком не описывает.
+fn is_process_rule(rule: &OverlapRule, name: &str) -> bool {
+    rule.title_pattern.is_none()
+        && rule
+            .process_name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+}
+
 /// «Выбрать все» — переключатель (SPEC.md §4.2, дословно): если выбрано не
 /// всё — выбрать всё; если всё — снять выделение полностью (дизайн §4).
 ///
 /// «Выбрано всё» = каждое выразимое окно снимка матчится правилом; строки
 /// protected process (без чекбокса по определению) в подсчёте не участвуют.
-/// Полный набор правил заменяет текущий: на каждую непустую группу —
-/// `process_name`-правило, на окна группы «процесс неизвестен» — точные
-/// title-правила (по одному на окно, только с непустым заголовком);
-/// `mode` становится `OverlapAllowlist` (то же «первое изменение», §2.3).
-/// Снятие — `rules.clear()` без смены режима.
+///
+/// «Выбрать все» даёт `{Always, []}` — то самое «список целей: все» из
+/// SPEC 4.1, а не перечисление. Раньше здесь материализовался снимок: на
+/// каждый запущенный процесс по правилу. Такой список описывал не «все
+/// окна», а «окна, запущенные в момент нажатия», и первое же новое окно
+/// оказывалось не выбранным — после перезагрузки компьютера это ВСЕ окна
+/// сразу, потому что процессы поднимаются заново, а часть приложений
+/// добавляется (репорт пользователя 2026-09-02: «перезапустил комп — стикеры
+/// отображаются только между некоторыми окнами»).
+///
+/// Снятие — пустой allow-list: режим обязательно `OverlapAllowlist`, в
+/// `Always` пустой список означал бы «выбраны все» (см. [`window_is_checked`]),
+/// то есть кнопка не делала бы ничего.
 pub fn toggle_select_all(visibility: &VisibilityRule, snapshot: &[WindowInfo]) -> VisibilityRule {
     let all_checked = snapshot
         .iter()
         .all(|w| !window_can_express_rule(w) || window_is_checked(visibility, w));
-    if all_checked {
-        // «Снять все» — пустой allow-list. Режим обязательно
-        // `OverlapAllowlist`: в `Always` пустой список правил означал бы
-        // «выбраны все» (см. `window_is_checked`), то есть кнопка не делала
-        // бы ничего.
-        return VisibilityRule {
-            mode: VisibilityMode::OverlapAllowlist,
-            rules: Vec::new(),
-        };
+    let mode = if all_checked {
+        VisibilityMode::OverlapAllowlist
+    } else {
+        VisibilityMode::Always
+    };
+    VisibilityRule {
+        mode,
+        rules: Vec::new(),
+    }
+}
+
+/// Развернуть «все, кроме» в список разрешений по снимку окон.
+///
+/// Нужно ровно одному потребителю — правилам соседства ЗАКРЕПЛЁННОГО окна
+/// ([`rst_core::pinned_window::HostFilter`]), где формы «везде, кроме» нет:
+/// там список хозяев либо отсутствует целиком (`Anywhere`), либо перечисляет
+/// разрешённых (`Only`). Снимок здесь протухает так же, как протухал у
+/// «Выбрать все», но правила соседства — рантайм-состояние конкретного
+/// `HWND`: они не переживают ни перезапуск программы, ни тем более
+/// перезагрузку компьютера, и портиться со временем им негде.
+///
+/// Все прочие режимы возвращаются как есть.
+pub fn denylist_as_allowlist(
+    visibility: &VisibilityRule,
+    snapshot: &[WindowInfo],
+) -> VisibilityRule {
+    if visibility.mode != VisibilityMode::OverlapDenylist {
+        return visibility.clone();
     }
     let mut rules = Vec::new();
     for group in group_by_process(snapshot) {
         match &group.process_name {
-            Some(name) => rules.push(OverlapRule {
-                process_name: Some(name.clone()),
-                title_pattern: None,
-            }),
+            Some(name) => {
+                if !has_process_rule(&visibility.rules, name) {
+                    rules.push(OverlapRule {
+                        process_name: Some(name.clone()),
+                        title_pattern: None,
+                    });
+                }
+            }
             None => {
                 for w in &group.windows {
-                    if !w.title.is_empty() {
-                        rules.push(OverlapRule {
-                            process_name: None,
-                            title_pattern: Some(w.title.clone()),
-                        });
+                    if w.title.is_empty() || !window_is_checked(visibility, w) {
+                        continue;
                     }
+                    rules.push(OverlapRule {
+                        process_name: None,
+                        title_pattern: Some(w.title.clone()),
+                    });
                 }
             }
         }
@@ -257,19 +344,15 @@ pub fn toggle_select_all(visibility: &VisibilityRule, snapshot: &[WindowInfo]) -
 /// тождествен `Desktop` (occluders.rs, тест
 /// `allowlist_empty_rules_is_desktop_equivalent`).
 ///
-/// Не новая бизнес-логика — переиспользует существующий путь «Снять все»:
-/// [`toggle_select_all`] с пустым снимком заведомо идёт в ветку «всё
-/// выбрано» (пустое «все» истинно по определению) и чистит правила — тот же
-/// результат, что у кнопки «Снять все». Единственная правка — режим
-/// безусловно `OverlapAllowlist`: переключатель «Снять все» сохраняет
-/// текущий режим, а в `Always` при пустом снимке вернул бы `{Always, []}` —
-/// обратная семантика (Always — «всегда виден», не «только рабочий стол»;
-/// дизайн §2.3).
-pub fn apply_desktop_only_preset(visibility: &VisibilityRule) -> VisibilityRule {
-    let cleared = toggle_select_all(visibility, &[]);
+/// Не новая бизнес-логика — тот же результат, что у кнопки «Снять все»,
+/// но с постоянной подписью вместо чтения состояния списка. Аргумент
+/// `visibility` не читается: результат не зависит от текущего правила, а
+/// параметр оставлен ради единообразия с соседями по модулю (и ради
+/// вызывающего кода, который передаёт правило стикера всем трём).
+pub fn apply_desktop_only_preset(_visibility: &VisibilityRule) -> VisibilityRule {
     VisibilityRule {
         mode: VisibilityMode::OverlapAllowlist,
-        rules: cleared.rules,
+        rules: Vec::new(),
     }
 }
 
@@ -974,7 +1057,7 @@ mod tests {
             ],
         };
         let v = allowlist(vec![]);
-        let on = toggle_process_group(&v, &group, &group.windows).unwrap();
+        let on = toggle_process_group(&v, &group).unwrap();
         assert_eq!(on.mode, VisibilityMode::OverlapAllowlist);
         assert_eq!(on.rules, vec![rule(Some("chrome.exe"), None)]);
         for w in &group.windows {
@@ -982,18 +1065,20 @@ mod tests {
         }
         assert!(process_is_checked(&on, &group));
 
-        let off = toggle_process_group(&on, &group, &group.windows).unwrap();
+        let off = toggle_process_group(&on, &group).unwrap();
         assert!(off.rules.is_empty(), "round-trip снял правило");
         for w in &group.windows {
             assert!(!window_is_checked(&off, w));
         }
     }
 
-    /// Снятие галочки из состояния «выбраны все» (`Always`) материализует
-    /// список из ВСЕХ ОСТАЛЬНЫХ процессов снимка — иначе клик был бы
-    /// но-опом: в `Always` списка правил ещё не существует.
+    /// Снятие галочки из состояния «выбраны все» (`Always`) записывает
+    /// ИСКЛЮЧЕНИЕ, а не список из всех остальных процессов снимка: «все
+    /// остальные» обязаны остаться определением, иначе правило описывает
+    /// лишь те окна, что были запущены в секунду клика (репорт пользователя
+    /// 2026-09-02).
     #[test]
-    fn toggle_process_from_always_materializes_the_rest() {
+    fn toggle_process_from_always_records_an_exception() {
         let snapshot = [
             window(1, r"C:\Apps\app.exe", "t", 1, 1),
             window(2, r"C:\Apps\other.exe", "t2", 2, 2),
@@ -1006,14 +1091,75 @@ mod tests {
             mode: VisibilityMode::Always,
             rules: vec![],
         };
-        let off = toggle_process_group(&v, &group, &snapshot).unwrap();
-        assert_eq!(off.mode, VisibilityMode::OverlapAllowlist);
+        let off = toggle_process_group(&v, &group).unwrap();
+        assert_eq!(off.mode, VisibilityMode::OverlapDenylist);
         assert_eq!(
             off.rules,
-            vec![rule(Some("other.exe"), None)],
-            "снятый процесс выпадает, остальные остаются выбранными"
+            vec![rule(Some("app.exe"), None)],
+            "в списке — ровно снятый процесс"
         );
         assert!(!process_is_checked(&off, &group), "галочка снята");
+        assert!(
+            window_is_checked(&off, &snapshot[1]),
+            "все прочие остаются выбранными"
+        );
+        // И, главное, приложение, которого в снимке не было вовсе.
+        let newcomer = window(3, r"C:\Apps\launched-later.exe", "t3", 3, 3);
+        assert!(
+            window_is_checked(&off, &newcomer),
+            "окно, открытое позже, обязано остаться выбранным"
+        );
+    }
+
+    /// Возврат галочки на место убирает исключение, и правило снова
+    /// становится честным «все» — а не списком из двух процессов, которые
+    /// оказались запущены.
+    #[test]
+    fn toggle_process_back_returns_to_always() {
+        let snapshot = [window(1, r"C:\Apps\app.exe", "t", 1, 1)];
+        let group = ProcessGroup {
+            process_name: Some("app.exe".to_string()),
+            windows: vec![snapshot[0].clone()],
+        };
+        let off = toggle_process_group(
+            &VisibilityRule {
+                mode: VisibilityMode::Always,
+                rules: vec![],
+            },
+            &group,
+        )
+        .unwrap();
+        let on = toggle_process_group(&off, &group).unwrap();
+        assert_eq!(on.mode, VisibilityMode::Always);
+        assert!(on.rules.is_empty());
+    }
+
+    /// Второе исключение ложится рядом с первым, а не заменяет его.
+    #[test]
+    fn exceptions_accumulate() {
+        let a = ProcessGroup {
+            process_name: Some("app.exe".to_string()),
+            windows: vec![window(1, r"C:\Apps\app.exe", "t", 1, 1)],
+        };
+        let b = ProcessGroup {
+            process_name: Some("other.exe".to_string()),
+            windows: vec![window(2, r"C:\Apps\other.exe", "t2", 2, 2)],
+        };
+        let all = VisibilityRule {
+            mode: VisibilityMode::Always,
+            rules: vec![],
+        };
+        let one = toggle_process_group(&all, &a).unwrap();
+        let two = toggle_process_group(&one, &b).unwrap();
+        assert_eq!(two.mode, VisibilityMode::OverlapDenylist);
+        assert_eq!(
+            two.rules,
+            vec![rule(Some("app.exe"), None), rule(Some("other.exe"), None)]
+        );
+        // Снятие одного из двух оставляет режим исключений.
+        let back = toggle_process_group(&two, &a).unwrap();
+        assert_eq!(back.mode, VisibilityMode::OverlapDenylist);
+        assert_eq!(back.rules, vec![rule(Some("other.exe"), None)]);
     }
 
     #[test]
@@ -1026,7 +1172,7 @@ mod tests {
             mode: VisibilityMode::Desktop,
             rules: vec![],
         };
-        let on = toggle_process_group(&v, &group, &group.windows).unwrap();
+        let on = toggle_process_group(&v, &group).unwrap();
         assert_eq!(on.mode, VisibilityMode::OverlapAllowlist);
     }
 
@@ -1041,7 +1187,7 @@ mod tests {
             mode: VisibilityMode::Desktop,
             rules: vec![rule(Some("app.exe"), None)],
         };
-        let on = toggle_process_group(&v, &group, &group.windows).unwrap();
+        let on = toggle_process_group(&v, &group).unwrap();
         assert_eq!(on.rules, vec![rule(Some("app.exe"), None)], "без дубля");
         assert_eq!(on.mode, VisibilityMode::OverlapAllowlist);
     }
@@ -1053,7 +1199,7 @@ mod tests {
             windows: vec![window(1, r"C:\Apps\app.exe", "t", 1, 1)],
         };
         let v = allowlist(vec![rule(Some("app.exe"), None)]);
-        let off = toggle_process_group(&v, &group, &group.windows).unwrap();
+        let off = toggle_process_group(&v, &group).unwrap();
         assert_eq!(
             off.mode,
             VisibilityMode::OverlapAllowlist,
@@ -1072,7 +1218,7 @@ mod tests {
             rule(None, Some("Settings")),
             rule(None, Some("*Notepad")),
         ]);
-        let off = toggle_process_group(&v, &group, &group.windows).unwrap();
+        let off = toggle_process_group(&v, &group).unwrap();
         assert_eq!(
             off.rules,
             vec![rule(None, Some("Settings")), rule(None, Some("*Notepad"))],
@@ -1087,7 +1233,7 @@ mod tests {
             windows: vec![window(1, r"C:\Apps\chrome.exe", "t", 1, 1)],
         };
         let v = allowlist(vec![rule(Some("CHROME.EXE"), None)]);
-        let off = toggle_process_group(&v, &group, &group.windows).unwrap();
+        let off = toggle_process_group(&v, &group).unwrap();
         assert!(off.rules.is_empty(), "регистронезависимо");
     }
 
@@ -1103,7 +1249,7 @@ mod tests {
             title_pattern: Some("*".to_string()),
         };
         let v = allowlist(vec![combined.clone()]);
-        let off = toggle_process_group(&v, &group, &group.windows).unwrap();
+        let off = toggle_process_group(&v, &group).unwrap();
         assert_eq!(off.rules, vec![combined]);
     }
 
@@ -1115,7 +1261,7 @@ mod tests {
         };
         let v = allowlist(vec![]);
         assert_eq!(
-            toggle_process_group(&v, &group, &group.windows),
+            toggle_process_group(&v, &group),
             None,
             "no-op без имени процесса"
         );
@@ -1123,8 +1269,10 @@ mod tests {
 
     // --- «выбрать все» (дизайн §4) ---
 
+    /// «Выбрать все» — это режим «все» (SPEC 4.1, «список целей: все»), а не
+    /// перечисление запущенных процессов.
     #[test]
-    fn select_all_from_empty_builds_full_ruleset() {
+    fn select_all_means_the_mode_not_a_snapshot() {
         let snapshot = [
             window(1, r"C:\Apps\alpha.exe", "t", 10, 1),
             window(2, r"C:\Apps\zebra.exe", "t", 20, 2),
@@ -1132,16 +1280,29 @@ mod tests {
         ];
         let v = allowlist(vec![]);
         let all = toggle_select_all(&v, &snapshot);
-        assert_eq!(all.mode, VisibilityMode::OverlapAllowlist);
-        assert_eq!(
-            all.rules,
-            vec![
-                rule(Some("alpha.exe"), None),
-                rule(Some("zebra.exe"), None),
-                rule(None, Some("Настройки")),
-            ]
-        );
+        assert_eq!(all.mode, VisibilityMode::Always);
+        assert!(all.rules.is_empty(), "перечислять нечего — выбраны все");
         assert!(snapshot.iter().all(|w| window_is_checked(&all, w)));
+    }
+
+    /// Регрессия репорта 2026-09-02: после «выбрать все» и перезагрузки
+    /// компьютера окна поднимаются заново, часть приложений добавляется —
+    /// и все они обязаны остаться выбранными.
+    #[test]
+    fn select_all_still_covers_windows_that_did_not_exist_yet() {
+        let snapshot = [window(1, r"C:\Apps\alpha.exe", "t", 10, 1)];
+        let all = toggle_select_all(&allowlist(vec![]), &snapshot);
+        // Тот же процесс, но окно пересоздано после перезагрузки — другой
+        // HWND, другой заголовок; и совсем новое приложение рядом.
+        let after_reboot = [
+            window(99, r"C:\Apps\alpha.exe", "другой заголовок", 10, 1),
+            window(100, r"C:\Apps\installed-later.exe", "t", 20, 2),
+            window(101, "", "Окно защищённого процесса", 30, 3),
+        ];
+        assert!(
+            after_reboot.iter().all(|w| window_is_checked(&all, w)),
+            "после перезагрузки выбранными обязаны остаться все окна"
+        );
     }
 
     #[test]
@@ -1159,14 +1320,38 @@ mod tests {
             window(1, r"C:\Apps\alpha.exe", "t", 10, 1),
             window(2, r"C:\Apps\zebra.exe", "t", 20, 2),
         ];
-        // Выбрано не всё (zebra без правила) — «выбрать всё» строит полный
-        // набор, заменяя частичный.
+        // Выбрано не всё (zebra без правила) — «выбрать всё» заменяет
+        // частичный список режимом «все».
         let v = allowlist(vec![rule(Some("alpha.exe"), None)]);
         let all = toggle_select_all(&v, &snapshot);
+        assert_eq!(all.mode, VisibilityMode::Always);
+        assert!(all.rules.is_empty());
+        assert!(snapshot.iter().all(|w| window_is_checked(&all, w)));
+    }
+
+    /// Разворачивание «все, кроме» в список разрешений — только для правил
+    /// соседства закреплённого окна, у которых такой формы нет.
+    #[test]
+    fn denylist_expands_to_everything_else_in_the_snapshot() {
+        let snapshot = [
+            window(1, r"C:\Apps\alpha.exe", "t", 10, 1),
+            window(2, r"C:\Apps\zebra.exe", "t", 20, 2),
+            window(3, "", "Настройки", 30, 3),
+        ];
+        let denied = VisibilityRule {
+            mode: VisibilityMode::OverlapDenylist,
+            rules: vec![rule(Some("alpha.exe"), None)],
+        };
+        let expanded = denylist_as_allowlist(&denied, &snapshot);
+        assert_eq!(expanded.mode, VisibilityMode::OverlapAllowlist);
         assert_eq!(
-            all.rules,
-            vec![rule(Some("alpha.exe"), None), rule(Some("zebra.exe"), None)]
+            expanded.rules,
+            vec![rule(Some("zebra.exe"), None), rule(None, Some("Настройки"))],
+            "остаются все, кроме исключённого"
         );
+        // Прочие режимы функция не трогает.
+        let untouched = allowlist(vec![rule(Some("alpha.exe"), None)]);
+        assert_eq!(denylist_as_allowlist(&untouched, &snapshot), untouched);
     }
 
     /// В `Always` уже выбрано всё, поэтому переключатель работает как

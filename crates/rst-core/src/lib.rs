@@ -17,6 +17,7 @@ pub mod group_shape;
 pub mod group_visibility;
 pub mod hittest;
 pub mod migration;
+pub mod mitosis;
 pub mod model;
 pub mod monitor_loss;
 pub mod monitor_rebind;

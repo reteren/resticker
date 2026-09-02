@@ -75,6 +75,64 @@ pub fn onboarding_notification(hotkey: &str) -> (String, String) {
 
 /// Название конфликтующего хоткея в тексте тоста — какое действие сейчас
 /// недоступно.
+/// Текст баннера, когда митоз окна не состоялся
+/// (docs/M9_WINDOW_MITOSIS_DESIGN.md §3). `app` — имя файла exe, если оно
+/// известно: назвать приложение поимённо стоит дороже, чем «это окно».
+///
+/// Каждая формулировка называет ПРИЧИНУ и, где это уместно, число, которое
+/// её вызвало: «не получилось» без причины оставляет пользователя гадать,
+/// сломана программа или он выбрал не то окно. Мегабайты, а не байты, —
+/// потолок в настройках задан в мегабайтах, и два разных порядка величины
+/// в одном сообщении читались бы как ошибка.
+pub fn mitosis_refusal(refusal: rst_core::mitosis::MitosisRefusal, app: Option<&str>) -> String {
+    use rst_core::mitosis::MitosisRefusal;
+    const MB: u64 = 1024 * 1024;
+    let name = app.unwrap_or("this app");
+    match refusal {
+        MitosisRefusal::TooHeavy { bytes, limit_bytes } => format!(
+            "Mitosis refused: {name} holds {} MB, over the {} MB limit. Splitting it would launch a second copy.",
+            bytes / MB,
+            limit_bytes / MB
+        ),
+        MitosisRefusal::NotEnoughMemory {
+            bytes,
+            available_bytes,
+        } => format!(
+            "Mitosis refused: a second copy needs about {} MB, and only {} MB of RAM is free.",
+            bytes / MB,
+            available_bytes / MB
+        ),
+        MitosisRefusal::TooSmall { half_px, min_px } => format!(
+            "Mitosis refused: a {half_px} px half is below the {min_px} px minimum. Cut closer to the middle, or pick a bigger window."
+        ),
+        MitosisRefusal::NoExePath => {
+            "Mitosis refused: this window's program cannot be identified, so a second copy cannot be started.".to_string()
+        }
+        MitosisRefusal::SpawnFailed => {
+            "Mitosis failed: the second copy could not be started. The window was restored.".to_string()
+        }
+        MitosisRefusal::NoSecondWindow => format!(
+            "Mitosis failed: {name} did not open a second window. The window was restored."
+        ),
+        MitosisRefusal::SingleInstanceApp => format!(
+            "Mitosis is off for {name}: it only ever opens one window. Remove it from mitosis_single_instance_apps in config.json to try again."
+        ),
+    }
+}
+
+/// Баннер в тот момент, когда приложение попало в список одно-оконных
+/// ([`mitosis_refusal`], `SingleInstanceApp`) — то есть после ВТОРОГО подряд
+/// отказа по одному и тому же exe.
+///
+/// Отдельный текст, а не тот же самый: пользователю важно понять, что
+/// изменилось состояние программы, а не просто повторилась неудача, — иначе
+/// он не свяжет будущий мгновенный отказ с этим моментом.
+pub fn mitosis_app_disabled(app: &str) -> String {
+    format!(
+        "{app} did not open a second window twice in a row — mitosis is now off for it. Undo that in config.json (mitosis_single_instance_apps)."
+    )
+}
+
 fn hotkey_action_label(name: rst_win32::overlay::HotkeyName) -> &'static str {
     use rst_win32::overlay::HotkeyName;
     match name {
@@ -82,6 +140,7 @@ fn hotkey_action_label(name: rst_win32::overlay::HotkeyName) -> &'static str {
         HotkeyName::ToggleAllStickers => "showing/hiding all stickers",
         HotkeyName::MuteAll => "muting all stickers",
         HotkeyName::PinFocusedWindow => "pinning/unpinning the focused window",
+        HotkeyName::WindowMitosis => "window mitosis (split a window in two)",
     }
 }
 

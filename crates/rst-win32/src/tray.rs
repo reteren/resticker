@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
@@ -14,11 +14,13 @@ use windows::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, BACKGROUND_MODE, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW,
     CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_LEFT, DT_NOPREFIX,
     DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FF_DONTCARE, FW_MEDIUM, FillRect, GetDC,
-    GetTextExtentPoint32W, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, PS_NULL, ReleaseDC, RoundRect,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    GetTextExtentPoint32W, HBRUSH, HDC, HFONT, OUT_DEFAULT_PRECIS, PS_NULL, Polygon, ReleaseDC,
+    RoundRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED};
+use windows::Win32::UI::Controls::{
+    DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED, ODS_GRAYED, ODS_SELECTED,
+};
 use windows::Win32::UI::Shell::{
     ExtractIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -430,51 +432,84 @@ fn remove_notify_icon(hwnd: HWND) -> Result<(), Win32Error> {
 
 /// Палитра и метрики контекстного меню трея — спецификация Dark Liquid Glass (§2, §3).
 ///
-/// GDI не поддерживает альфа-прозрачность (alpha blending) для стандартных
-/// всплывающих меню Win32, поэтому полупрозрачные токены палитры (§2) приведены
-/// к их непрозрачным эквивалентам поверх базового фона стекла GLASS_INK_DEEP.
+/// GDI не умеет ни альфа-канала для всплывающих меню Win32, ни размытия
+/// подложки, поэтому «прозрачное стекло» здесь воспроизводится НЕПРОЗРАЧНЫМ
+/// эквивалентом: каждый токен палитры заранее смешан с базовым фоном
+/// `GLASS_INK_DEEP`. Смешивает [`over_base`] — по тем же альфам, что и
+/// растровый генератор стекла (`rst_render::glass`), чтобы меню и панели
+/// оверлея не разъезжались по цвету при правке токенов.
+///
+/// Всё меню уменьшено на 25 % от прежних размеров, а кегль — ещё на 15 %
+/// сверх этого (запрос пользователя 2026-09-01: меню выбивалось из
+/// программы и было слишком крупным).
 mod menu_style {
-    /// Фон меню (§2.1 `GLASS_INK_DEEP` = `#050507` @ 0.74, непрозрачный эквивалент).
-    /// COLORREF: 0x00bbggrr -> R=0x05, G=0x05, B=0x07.
-    pub const BG: u32 = 0x0007_0505;
+    /// Фон меню (§2.1 `GLASS_INK_DEEP` = `#050507`), поверх которого
+    /// смешаны все остальные токены.
+    ///
+    /// Ровный, без вертикального градиента и зеркального блика, хотя
+    /// растровое стекло оверлея их рисует. Причина не в лени, а в GDI:
+    /// заливать градиент в меню можно только построчно сплошным цветом, и на
+    /// высоте в полторы сотни пикселей десяток доступных ступеней читается
+    /// полосами — «странные засветы» из репорта пользователя 2026-09-02.
+    /// Прозрачности у меню тоже нет — см. [`apply_menu_window_rounding`].
+    pub const BASE: [u8; 3] = [0x05, 0x05, 0x07];
 
-    /// Строка под курсором (§2.2 `CTRL_BG_HOVER` = `#FFFFFF` @ 0.105 поверх `#050507` -> `#1F1F21`).
-    /// COLORREF: R=0x1F, G=0x1F, B=0x21.
-    pub const CTRL_BG_HOVER: u32 = 0x0021_1F1F;
+    /// §2.2 `CTRL_BG` — тело пункта в покое.
+    pub const CTRL_BG_ALPHA: f64 = 0.045;
+    /// §2.2 `CTRL_BG_HOVER` — тело пункта под курсором.
+    pub const CTRL_BG_HOVER_ALPHA: f64 = 0.105;
+    /// §2.1 `RIM_TOP` — внутренняя верхняя кромка пункта под курсором.
+    pub const RIM_TOP_ALPHA: f64 = 0.34;
+    /// §2.1 `STROKE` — разделитель.
+    pub const STROKE_ALPHA: f64 = 0.12;
+    /// §2.3 `TEXT` — подпись пункта.
+    pub const TEXT_ALPHA: f64 = 0.97;
+    /// §2.3 `TEXT_DIM` — второстепенное: стрелка подменю, недоступный пункт.
+    pub const TEXT_DIM_ALPHA: f64 = 0.66;
 
-    /// Волосяная кромка сверху строки при наведении (§2.1 `RIM_TOP` = `#FFFFFF` @ 0.34
-    /// поверх `CTRL_BG_HOVER` `#1F1F21` -> `#6B6B6C`).
-    /// COLORREF: R=0x6B, G=0x6B, B=0x6C.
-    pub const RIM_TOP: u32 = 0x006C_6B6B;
+    /// Радиус скругления плашки пункта (§3 `RADIUS_CTRL` 10 DIP, −25 %).
+    pub const RADIUS_CTRL: i32 = 8;
 
-    /// Разделитель (§2.1 `STROKE` = `#FFFFFF` @ 0.12 поверх `#050507` -> `#232325`).
-    /// COLORREF: R=0x23, G=0x23, B=0x25.
-    pub const STROKE: u32 = 0x0025_2323;
+    /// Горизонтальный отступ подписи внутри пункта (§3 `PAD_CTRL_X`, −25 %).
+    pub const PAD_CTRL_X: i32 = 9;
 
-    /// Текст пункта меню (§2.3 `TEXT` = `#FFFFFF` @ 0.97 -> `#F7F7F7`).
-    /// COLORREF: R=0xF7, G=0xF7, B=0xF7.
-    pub const TEXT: u32 = 0x00F7_F7F7;
+    /// Боковой отступ плашки от внешнего края меню, px.
+    pub const MARGIN_X: i32 = 3;
 
-    /// Радиус скругления строки под курсором (§3 `RADIUS_CTRL` = 10 DIP).
-    pub const RADIUS_CTRL: i32 = 10;
-
-    /// Горизонтальный отступ подписи внутри пункта (§3 `PAD_CTRL_X` = 12 DIP).
-    pub const PAD_CTRL_X: i32 = 12;
-
-    /// Боковой отступ плашки контрола от внешнего края меню, px.
-    pub const MARGIN_X: i32 = 4;
-
-    /// Вертикальный зазор между пунктами меню, px.
+    /// Вертикальный зазор между плашками пунктов, px.
     pub const MARGIN_Y: i32 = 2;
 
-    /// Высота пункта меню (§3: просторный пункт, дышит), px.
-    pub const ITEM_H: i32 = 34;
+    /// Высота пункта меню, px (было 34, −25 %).
+    pub const ITEM_H: i32 = 26;
 
-    /// Высота разделителя, px (1px волосяная линия по центру).
-    pub const SEPARATOR_H: i32 = 9;
+    /// Высота разделителя, px (было 9, −25 %).
+    pub const SEPARATOR_H: i32 = 7;
 
-    /// Кегль подписи по §6: 12.5 DIP при 96 DPI (CreateFontW: -17 px em-height).
-    pub const FONT_PX: i32 = -17;
+    /// Ширина поля под стрелку подменю справа от подписи, px.
+    ///
+    /// Owner-draw отменяет системную отрисовку пункта ЦЕЛИКОМ, включая
+    /// стрелку подменю: без своей у «Presets» не было никакого признака,
+    /// что за ним что-то есть.
+    pub const SUBMENU_ARROW_W: i32 = 10;
+
+    /// Кегль подписи, px em-height для `CreateFontW` (было −17: −25 %, затем
+    /// ещё −15 % по запросу пользователя).
+    pub const FONT_PX: i32 = -11;
+
+    /// Белый поверх произвольного цвета — COLORREF (`0x00bbggrr`).
+    ///
+    /// Это и есть перевод полупрозрачного токена палитры в непрозрачный: у
+    /// меню Win32 альфы нет, а цвет подложки в каждой точке мы знаем сами
+    /// (плоский [`BASE`]), поэтому смешиваем заранее.
+    pub fn blend(base: [u8; 3], alpha: f64) -> u32 {
+        let mix = |c: u8| -> u32 { (f64::from(c) + (255.0 - f64::from(c)) * alpha + 0.5) as u32 };
+        mix(base[0]) | (mix(base[1]) << 8) | (mix(base[2]) << 16)
+    }
+
+    /// COLORREF из RGB-тройки.
+    pub const fn colorref(rgb: [u8; 3]) -> u32 {
+        rgb[0] as u32 | ((rgb[1] as u32) << 8) | ((rgb[2] as u32) << 16)
+    }
 }
 
 /// Данные пункта для owner-draw: Win32 хранит только `dwItemData`, поэтому
@@ -482,6 +517,8 @@ mod menu_style {
 struct OwnerDrawItem {
     label: Vec<u16>,
     separator: bool,
+    /// Есть вложенное подменю — рисуем стрелку справа.
+    submenu: bool,
 }
 
 /// Ресурсы, которые обязаны пережить показ меню: подписи пунктов, кисть
@@ -596,11 +633,24 @@ fn on_measure_item(hwnd: HWND, lparam: LPARAM, font: HFONT) {
         ReleaseDC(Some(hwnd), hdc);
         size.cx
     };
-    mis.itemWidth = (width + 2 * (menu_style::PAD_CTRL_X + menu_style::MARGIN_X)) as u32;
+    let arrow = if item.submenu {
+        menu_style::SUBMENU_ARROW_W
+    } else {
+        0
+    };
+    mis.itemWidth = (width + arrow + 2 * (menu_style::PAD_CTRL_X + menu_style::MARGIN_X)) as u32;
     mis.itemHeight = menu_style::ITEM_H as u32;
 }
 
-/// Обработчик `WM_DRAWITEM`: фон, скруглённая подсветка, кромка, подпись, разделитель.
+/// Обработчик `WM_DRAWITEM`: стекло, плашка пункта, кромка, подпись,
+/// стрелка подменю, разделитель.
+///
+/// Пункт рисует не только себя, но и СВОЮ ПОЛОСУ ОБЩЕГО ФОНА: меню — это
+/// одна стеклянная плита с вертикальным градиентом и бликом, а Win32 даёт
+/// нам кисть только на весь фон сразу (`MIM_BACKGROUND`, один сплошной
+/// цвет) и вызовы отрисовки по одному пункту. Поэтому каждый пункт знает
+/// своё смещение в меню и общую высоту ([`OwnerDrawItem`]) и заливает свои
+/// строки нужным срезом градиента — снаружи это читается как цельная плита.
 fn on_draw_item(lparam: LPARAM, font: HFONT) {
     let Some(dis) = (unsafe { (lparam.0 as *const DRAWITEMSTRUCT).as_ref() }) else {
         return;
@@ -612,17 +662,21 @@ fn on_draw_item(lparam: LPARAM, font: HFONT) {
     let hdc = dis.hDC;
     let rect = dis.rcItem;
     let selected = dis.itemState.0 & ODS_SELECTED.0 != 0;
+    let disabled = dis.itemState.0 & (ODS_DISABLED.0 | ODS_GRAYED.0) != 0;
 
     // SAFETY: hdc принадлежит системе на время обработки сообщения; все
     // созданные объекты удаляются здесь же, выбранные — возвращаются.
     unsafe {
-        // Фоновая заливка пункта цветом стекла GLASS_INK_DEEP (§2.1)
-        let bg = CreateSolidBrush(COLORREF(menu_style::BG));
-        FillRect(hdc, &rect, bg);
-        let _ = DeleteObject(bg.into());
+        // Тело материала (§4, слой 1) — ровной заливкой; градиент и блик
+        // сюда не идут, см. доккоммент [`menu_style::BASE`].
+        let mid_bg = menu_style::BASE;
+        let body = CreateSolidBrush(COLORREF(menu_style::colorref(mid_bg)));
+        FillRect(hdc, &rect, body);
+        let _ = DeleteObject(body.into());
 
         if item.separator {
-            // Волосяная линия STROKE (1 px) с боковыми отступами PAD_CTRL_X, без объёма/канавки VGUI (§2.1, §4)
+            // Волосяная линия STROKE (1 px) с боковыми отступами PAD_CTRL_X,
+            // без объёма и канавки старого VGUI (§2.1, §4).
             let mid = (rect.top + rect.bottom) / 2;
             let line = RECT {
                 left: rect.left + menu_style::PAD_CTRL_X,
@@ -630,7 +684,10 @@ fn on_draw_item(lparam: LPARAM, font: HFONT) {
                 right: rect.right - menu_style::PAD_CTRL_X,
                 bottom: mid + 1,
             };
-            let stroke_brush = CreateSolidBrush(COLORREF(menu_style::STROKE));
+            let stroke_brush = CreateSolidBrush(COLORREF(menu_style::blend(
+                mid_bg,
+                menu_style::STROKE_ALPHA,
+            )));
             FillRect(hdc, &line, stroke_brush);
             let _ = DeleteObject(stroke_brush.into());
             return;
@@ -643,10 +700,20 @@ fn on_draw_item(lparam: LPARAM, font: HFONT) {
             bottom: rect.bottom - menu_style::MARGIN_Y,
         };
 
-        if selected {
-            // Строка под курсором: плашка CTRL_BG_HOVER со скруглением RADIUS_CTRL (§2.2, §3).
-            // Используем PS_NULL pen, чтобы RoundRect заполнил форму без стандартной чёрной рамки GDI.
-            let face_brush = CreateSolidBrush(COLORREF(menu_style::CTRL_BG_HOVER));
+        // Плашка есть у КАЖДОГО доступного пункта, а не только у наведённого
+        // (репорт пользователя 2026-09-01: «кнопки не оформлены»). В покое
+        // это `CTRL_BG` — почти невидимая, ровно настолько, чтобы пункт
+        // читался отдельным телом, а не строкой текста на фоне; под
+        // курсором она разгорается до `CTRL_BG_HOVER` и получает кромку.
+        if !disabled {
+            let face_alpha = if selected {
+                menu_style::CTRL_BG_HOVER_ALPHA
+            } else {
+                menu_style::CTRL_BG_ALPHA
+            };
+            let face_brush = CreateSolidBrush(COLORREF(menu_style::blend(mid_bg, face_alpha)));
+            // PS_NULL — чтобы RoundRect залил форму без стандартной чёрной
+            // рамки GDI.
             let null_pen = CreatePen(PS_NULL, 0, COLORREF(0));
             let old_brush = SelectObject(hdc, face_brush.into());
             let old_pen = SelectObject(hdc, null_pen.into());
@@ -667,25 +734,47 @@ fn on_draw_item(lparam: LPARAM, font: HFONT) {
             let _ = DeleteObject(face_brush.into());
             let _ = DeleteObject(null_pen.into());
 
-            // Волосяная кромка RIM_TOP сверху строки при наведении (§2.1, §4)
-            let rim_line = RECT {
-                left: button.left + menu_style::RADIUS_CTRL,
-                top: button.top,
-                right: button.right - menu_style::RADIUS_CTRL,
-                bottom: button.top + 1,
-            };
-            let rim_brush = CreateSolidBrush(COLORREF(menu_style::RIM_TOP));
-            FillRect(hdc, &rim_line, rim_brush);
-            let _ = DeleteObject(rim_brush.into());
+            if selected {
+                // Внутренняя верхняя кромка RIM_TOP (§2.1, §4) — «свет
+                // сверху» на приподнятом контроле.
+                let face = menu_style::blend(mid_bg, menu_style::CTRL_BG_HOVER_ALPHA);
+                let face_rgb = [
+                    (face & 0xff) as u8,
+                    ((face >> 8) & 0xff) as u8,
+                    ((face >> 16) & 0xff) as u8,
+                ];
+                let rim_line = RECT {
+                    left: button.left + menu_style::RADIUS_CTRL,
+                    top: button.top,
+                    right: button.right - menu_style::RADIUS_CTRL,
+                    bottom: button.top + 1,
+                };
+                let rim_brush = CreateSolidBrush(COLORREF(menu_style::blend(
+                    face_rgb,
+                    menu_style::RIM_TOP_ALPHA,
+                )));
+                FillRect(hdc, &rim_line, rim_brush);
+                let _ = DeleteObject(rim_brush.into());
+            }
         }
 
+        let text_alpha = if disabled {
+            menu_style::TEXT_DIM_ALPHA
+        } else {
+            menu_style::TEXT_ALPHA
+        };
         let old_font = SelectObject(hdc, font.into());
         let old_mode = SetBkMode(hdc, TRANSPARENT);
-        let old_color = SetTextColor(hdc, COLORREF(menu_style::TEXT));
+        let old_color = SetTextColor(hdc, COLORREF(menu_style::blend(mid_bg, text_alpha)));
+        let arrow_gutter = if item.submenu {
+            menu_style::SUBMENU_ARROW_W
+        } else {
+            0
+        };
         let mut text_rect = RECT {
             left: button.left + menu_style::PAD_CTRL_X,
             top: button.top,
-            right: button.right - menu_style::PAD_CTRL_X,
+            right: button.right - menu_style::PAD_CTRL_X - arrow_gutter,
             bottom: button.bottom,
         };
         let mut text: Vec<u16> = item.label.clone();
@@ -699,6 +788,49 @@ fn on_draw_item(lparam: LPARAM, font: HFONT) {
         SetTextColor(hdc, old_color);
         SetBkMode(hdc, BACKGROUND_MODE(old_mode as u32));
         SelectObject(hdc, old_font);
+
+        if item.submenu {
+            draw_submenu_arrow(hdc, &button, mid_bg);
+        }
+    }
+}
+
+/// Стрелка подменю у правого края пункта — маленький треугольник, а не
+/// символ шрифта: гарнитура меню задаётся извне ([`register_menu_font`]) и
+/// нужного глифа в ней может не оказаться вовсе.
+///
+/// # Safety
+/// `hdc` — валидный контекст на время обработки `WM_DRAWITEM`; все созданные
+/// объекты удаляются здесь же.
+unsafe fn draw_submenu_arrow(hdc: HDC, button: &RECT, bg: [u8; 3]) {
+    let cx = button.right - menu_style::PAD_CTRL_X - menu_style::SUBMENU_ARROW_W / 2;
+    let cy = (button.top + button.bottom) / 2;
+    let half_h = 4;
+    let half_w = 2;
+    let pts = [
+        POINT {
+            x: cx - half_w,
+            y: cy - half_h,
+        },
+        POINT {
+            x: cx + half_w,
+            y: cy,
+        },
+        POINT {
+            x: cx - half_w,
+            y: cy + half_h,
+        },
+    ];
+    unsafe {
+        let brush = CreateSolidBrush(COLORREF(menu_style::blend(bg, menu_style::TEXT_DIM_ALPHA)));
+        let null_pen = CreatePen(PS_NULL, 0, COLORREF(0));
+        let old_brush = SelectObject(hdc, brush.into());
+        let old_pen = SelectObject(hdc, null_pen.into());
+        let _ = Polygon(hdc, &pts);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(brush.into());
+        let _ = DeleteObject(null_pen.into());
     }
 }
 
@@ -726,6 +858,7 @@ fn build_hmenu(items: &[MenuItem], keep: &mut Vec<Box<OwnerDrawItem>>) -> Option
                 .chain(std::iter::once(0))
                 .collect(),
             separator: item.children.is_empty() && item.id == 0,
+            submenu: !item.children.is_empty(),
         });
         let data_ptr = PCWSTR((&raw const *data).cast());
         keep.push(data);
@@ -771,7 +904,9 @@ fn show_context_menu(hwnd: HWND) {
     // Фон самого окна меню (поля вокруг пунктов) — системный по умолчанию,
     // его задаёт только `MENUINFO`; сами пункты закрасит `WM_DRAWITEM`.
     // SAFETY: кисть живёт в `resources` до конца показа меню.
-    let background = unsafe { CreateSolidBrush(COLORREF(menu_style::BG)) };
+    // Поля вокруг пунктов (`MIM_BACKGROUND`) — тем же телом, что и сами
+    // пункты: фон меню ровный, разъезжаться нечему.
+    let background = unsafe { CreateSolidBrush(COLORREF(menu_style::colorref(menu_style::BASE))) };
     let resources = MenuResources {
         items: keep,
         background,
@@ -832,6 +967,16 @@ fn menu_font() -> HFONT {
 }
 
 /// Применить скругление DWM к системному окну всплывающего меню (`#32768`).
+///
+/// Прозрачности здесь НЕТ и, по всей видимости, быть не может. Попытка
+/// 2026-09-02 (`WS_EX_LAYERED` + `SetLayeredWindowAttributes` на это же
+/// окно) сломала меню на живой машине: оно уезжало в угол экрана и
+/// показывало пустую плашку вместо пунктов. Окно меню принадлежит не нам —
+/// его создаёт, размещает и рисует система внутри модального цикла
+/// `TrackPopupMenu`, и превращение его в слоёное посреди показа ломает и
+/// композицию содержимого, и позиционирование. Не повторять: настоящая
+/// прозрачность возможна только вместе с отказом от системного меню в
+/// пользу своей панели в оверлее.
 fn apply_menu_window_rounding() {
     // Всплывающее меню Win32 создаёт окно предопределённого класса "#32768".
     // Во время показа TrackPopupMenu окно меню создано на текущем потоке.
@@ -1065,17 +1210,38 @@ mod tests {
 
     #[test]
     fn menu_style_constants_match_spec() {
-        // Проверяем соответствие констант menu_style спецификации Dark Liquid Glass
-        assert_eq!(menu_style::BG, 0x0007_0505);
-        assert_eq!(menu_style::CTRL_BG_HOVER, 0x0021_1F1F);
-        assert_eq!(menu_style::RIM_TOP, 0x006C_6B6B);
-        assert_eq!(menu_style::STROKE, 0x0025_2323);
-        assert_eq!(menu_style::TEXT, 0x00F7_F7F7);
-        assert_eq!(menu_style::RADIUS_CTRL, 10);
-        assert_eq!(menu_style::PAD_CTRL_X, 12);
-        assert_eq!(menu_style::ITEM_H, 34);
-        assert_eq!(menu_style::SEPARATOR_H, 9);
-        assert_eq!(menu_style::FONT_PX, -17);
+        // Метрики — прежние, уменьшенные на 25 % (запрос пользователя
+        // 2026-09-01), кегль — ещё на 15 % сверх этого.
+        assert_eq!(menu_style::ITEM_H, 26, "34 - 25 %");
+        assert_eq!(menu_style::SEPARATOR_H, 7, "9 - 25 %");
+        assert_eq!(menu_style::PAD_CTRL_X, 9, "12 - 25 %");
+        assert_eq!(menu_style::RADIUS_CTRL, 8, "10 - 25 %");
+        assert_eq!(menu_style::FONT_PX, -11, "17 - 25 % - ещё 15 %");
+    }
+
+    /// Токены палитры переводятся в непрозрачные ровно тем же смешиванием,
+    /// что и в растровом стекле оверлея: расхождение здесь означало бы, что
+    /// меню и панели программы разного цвета.
+    #[test]
+    fn menu_palette_matches_the_glass_tokens() {
+        // Белый @0.97 поверх #050507 -> #F8F8F8 (текст, §2.3 TEXT).
+        // Прежняя таблица держала здесь #F7F7F7 — она была посчитана
+        // вручную и округлена вниз; расхождение в одну 255-ю невидимо, но
+        // теперь значение считается формулой, а не переписывается.
+        assert_eq!(
+            menu_style::blend(menu_style::BASE, menu_style::TEXT_ALPHA),
+            0x00F8_F8F8
+        );
+        // Белый @0.12 поверх той же базы -> #232325 (разделитель, §2.1 STROKE).
+        assert_eq!(
+            menu_style::blend(menu_style::BASE, menu_style::STROKE_ALPHA),
+            0x0025_2323
+        );
+        // Нулевая непрозрачность не меняет подложку вовсе.
+        assert_eq!(
+            menu_style::blend(menu_style::BASE, 0.0),
+            menu_style::colorref(menu_style::BASE)
+        );
     }
 
     #[test]

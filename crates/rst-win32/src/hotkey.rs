@@ -252,8 +252,20 @@ pub const UNPIN_ALL_HOTKEY_ID: i32 = 19;
 /// [`GROUP_OPEN_HOTKEY_ID_BASE`] — между ними чужих id нет.
 pub const PIN_OPEN_GROUP_HOTKEY_ID: i32 = 20;
 
+/// Хоткей режима резки окон — «митоз» (`Ctrl+Alt+F`,
+/// docs/M9_WINDOW_MITOSIS_DESIGN.md).
+///
+/// К группам отношения не имеет, но живёт в этой же нумерации и
+/// регистрируется тем же пакетом — по той же причине, что и
+/// [`UNPIN_ALL_HOTKEY_ID`]: занятая кем-то комбинация не должна утаскивать
+/// за собой остальные хоткеи программы.
+pub const MITOSIS_HOTKEY_ID: i32 = 21;
+
 /// Все хоткеи групп одним списком: девятка открытия плюс меню, удаление,
-/// «открепить всё» и «закрепить открытую группу».
+/// «открепить всё», «закрепить открытую группу» и режим резки окон.
+///
+/// Последние три к группам отношения не имеют и едут здесь только ради
+/// пакетной регистрации — см. доккомменты их констант.
 ///
 /// Собирается здесь, а не в оверлее, по той же причине, что и
 /// [`group_open_combos`]: разбор `WM_HOTKEY` и регистрация обязаны знать об
@@ -269,6 +281,7 @@ pub fn group_hotkey_combos(hotkeys: &Hotkeys) -> Vec<(i32, HotkeyCombo)> {
         (GROUP_DELETE_HOTKEY_ID, hotkeys.delete_open_group.as_deref()),
         (UNPIN_ALL_HOTKEY_ID, hotkeys.unpin_all.as_deref()),
         (PIN_OPEN_GROUP_HOTKEY_ID, hotkeys.pin_open_group.as_deref()),
+        (MITOSIS_HOTKEY_ID, hotkeys.window_mitosis.as_deref()),
     ] {
         if let Some(combo) = raw.and_then(|s| HotkeyCombo::parse(s).ok()) {
             combos.push((id, combo));
@@ -622,6 +635,21 @@ mod tests {
         assert!(c.ctrl && c.alt && c.shift && !c.win);
         assert_eq!(c.vk, 'T' as u32);
         assert_eq!(c.display_string(), "Ctrl+Alt+Shift+T");
+    }
+
+    #[test]
+    fn group_hotkey_combos_registers_window_mitosis_under_id_twenty_one() {
+        // Хоткей резки окон ездит в пакете групп только ради изоляции
+        // конфликтов (доккомент [`MITOSIS_HOTKEY_ID`]). Его легко потерять
+        // при следующей правке пакета, а потеря выглядит как «функция
+        // просто не включается» — поэтому проверяется отдельно.
+        let combos = group_hotkey_combos(&Hotkeys::default());
+        let (id, combo) = combos
+            .iter()
+            .find(|(id, _)| *id == MITOSIS_HOTKEY_ID)
+            .expect("хоткей митоза обязан регистрироваться");
+        assert_eq!(*id, 21);
+        assert_eq!(combo.display_string(), "Ctrl+Alt+F");
     }
 
     #[test]

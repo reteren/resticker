@@ -27,6 +27,13 @@ mod i18n;
 mod logging;
 #[allow(dead_code)]
 mod monitor_badge;
+// Чистый билдер примитивов предпросмотра разреза (M9, «Митоз окон», §4.3).
+// `dead_code`: подключает координатор в `overlay_manager.rs` отдельной задачей,
+// и до этого момента модуль никто не вызывает — а удалять его нельзя, это
+// готовый API для координатора; предупреждение снимется само при первом
+// использовании (тот же приём, что у `monitor_badge`).
+#[allow(dead_code)]
+mod mitosis_overlay;
 mod overlay_manager;
 mod preset_picker;
 mod preset_strip;

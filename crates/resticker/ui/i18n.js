@@ -103,6 +103,7 @@ const STRINGS = {
   'control.deleteGroup': 'Delete open group',
   'control.pinGroup': 'Keep open group on top',
   'control.pinFocusedWindow': 'Pin focused window',
+  'control.mitosis': 'Split a window in two (mitosis)',
   'control.pinSoundVolume': 'Pin sound volume',
   'general.snapGap': 'Snap gap, %',
   'general.snapGapHint':
@@ -132,6 +133,9 @@ const STRINGS = {
   'general.neverOverlapTaskbar': "Don't overlap the taskbar",
   'general.performanceLabel': 'Performance:',
   'general.fpsLimit': 'Overlay FPS limit',
+  'general.mitosisMemoryLimit': 'Mitosis memory limit, MB',
+  'general.mitosisMemoryLimitHint':
+    'A heavier app is refused: mitosis launches a second copy of it.',
 
   'footer.apply': 'Apply',
   'footer.applied': 'Applied',

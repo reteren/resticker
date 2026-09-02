@@ -44,6 +44,8 @@ pub enum Win32Error {
         "the virtual desktop manager is unavailable (needs Windows 10 1607+; on systems without virtual desktops the desktop check is not available): {0}"
     )]
     VirtualDesktopManagerUnavailable(String),
+    #[error("could not spawn the second instance: {0}")]
+    SiblingSpawnFailed(std::io::Error),
     #[error("registry: {0}")]
     Registry(#[from] std::io::Error),
     #[error("Win32: {0}")]

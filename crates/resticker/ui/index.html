@@ -165,6 +165,20 @@
                 </div>
 
                 <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="control.mitosis">Split a window in two (mitosis)</span>
+                  <input
+                    type="text"
+                    class="textInput hotkeyInput"
+                    id="hotkey-mitosis"
+                    readonly
+                    placeholder="Not set"
+                    data-i18n-placeholder="control.notSet"
+                    style="max-width: 170px"
+                  />
+                  <button class="button compact" id="clear-hotkey-mitosis" type="button">×</button>
+                </div>
+
+                <div class="inputGroup">
                   <span class="inputLabel" data-i18n="control.unpinAll">Unpin all windows</span>
                   <input
                     type="text"
@@ -364,6 +378,21 @@
                   />
                   <span class="sliderValue" id="battery-fps-limit-value">30</span>
                 </div>
+
+                <div class="inputGroup">
+                  <span class="inputLabel" data-i18n="general.mitosisMemoryLimit">Mitosis memory limit, MB</span>
+                  <input
+                    type="number"
+                    class="textInput numberInput"
+                    id="mitosis-max-memory-mb"
+                    min="512"
+                    max="65536"
+                    step="512"
+                  />
+                </div>
+                <p class="hint" data-i18n="general.mitosisMemoryLimitHint">
+                  A heavier app is refused: mitosis launches a second copy of it.
+                </p>
               </section>
             </div>
           </div>

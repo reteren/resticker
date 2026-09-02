@@ -59,6 +59,8 @@ pub fn is_occluder(
         // для маски (M4_PREP_NOTES §9, открытый вопрос сведения в модели).
         VisibilityMode::Desktop | VisibilityMode::NeverOverlap => true,
         VisibilityMode::OverlapAllowlist => !rules.iter().any(|r| rule_matches(r, window)),
+        // Зеркальное правило: окклюдеры — ровно перечисленные окна.
+        VisibilityMode::OverlapDenylist => rules.iter().any(|r| rule_matches(r, window)),
     }
 }
 
@@ -331,6 +333,62 @@ mod tests {
         let w = candidate(Some("chrome.exe"), "t", "c");
         assert!(!is_occluder(&w, VisibilityMode::Always, &[], false));
         assert!(!is_occluder(&w, VisibilityMode::Always, &[], true));
+    }
+
+    /// «Все, кроме»: окклюдеры — ровно перечисленные окна, всё остальное
+    /// стикер перекрывает, включая приложения, о которых правило ничего не
+    /// знает (в этом весь смысл — оно и не должно их знать).
+    #[test]
+    fn denylist_occludes_only_the_listed_windows() {
+        let listed = candidate(Some("chrome.exe"), "t", "c");
+        let other = candidate(Some("notepad.exe"), "t", "c");
+        let rules = [OverlapRule {
+            process_name: Some("chrome.exe".to_string()),
+            title_pattern: None,
+        }];
+        assert!(is_occluder(
+            &listed,
+            VisibilityMode::OverlapDenylist,
+            &rules,
+            false
+        ));
+        assert!(!is_occluder(
+            &other,
+            VisibilityMode::OverlapDenylist,
+            &rules,
+            false
+        ));
+    }
+
+    /// Пустой список исключений — тождественно `Always`: никто не окклюдер.
+    #[test]
+    fn denylist_without_rules_occludes_nothing() {
+        let w = candidate(Some("chrome.exe"), "t", "c");
+        assert!(!is_occluder(
+            &w,
+            VisibilityMode::OverlapDenylist,
+            &[],
+            false
+        ));
+    }
+
+    /// Глобальная галочка «никогда не перекрывать панель задач» сильнее
+    /// списка исключений — как и в allow-list (SPEC §4.3).
+    #[test]
+    fn denylist_still_respects_never_overlap_taskbar() {
+        let taskbar = candidate(Some("explorer.exe"), "", TASKBAR_WINDOW_CLASS);
+        assert!(is_occluder(
+            &taskbar,
+            VisibilityMode::OverlapDenylist,
+            &[],
+            true
+        ));
+        assert!(!is_occluder(
+            &taskbar,
+            VisibilityMode::OverlapDenylist,
+            &[],
+            false
+        ));
     }
 
     #[test]

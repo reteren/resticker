@@ -57,11 +57,16 @@ pub const EDIT_OVERLAY_OPACITY: f64 = 0.5;
 /// отличаться яркостью, а не тоном.
 pub const SELECTION_COLOR: [u8; 3] = [0x3c, 0x98, 0x98];
 
-/// Белый клеток шахматки скрытых стикеров (ROADMAP.md M2), RGB. Фуксия ушла
-/// вместе со старыми акцентами (§2.4: единственный «цвет» интерфейса — белый
-/// свет разной силы). Имя константы — наследие: оно экспортируется через
-/// `lib.rs`, менять его вне скоупа нельзя.
-pub const CHECKER_MAGENTA: [u8; 3] = [0xff, 0xff, 0xff];
+/// Фуксия клеток шахматки скрытых стикеров (ROADMAP.md M2), RGB.
+///
+/// Единственное сознательное исключение из §2.4 («цвет интерфейса — белый
+/// свет разной силы») наравне с бирюзой выделения. Редизайн увёл фуксию в
+/// белый, и пользователь вернул её обратно живым репортом 2026-09-01:
+/// чёрно-белая шахматка неотличима от самой картинки — а фуксия с чёрным
+/// читается как «здесь ничего нет» мгновенно и во всей индустрии
+/// одинаково (тот же приём, что альфа-канал в графических редакторах).
+/// Именно ради этого узнавания шахматка и существует.
+pub const CHECKER_MAGENTA: [u8; 3] = [0xff, 0x00, 0xff];
 
 /// Чёрный шахматки скрытых стикеров (ROADMAP.md M2), RGB.
 pub const CHECKER_BLACK: [u8; 3] = [0x00, 0x00, 0x00];
@@ -328,7 +333,10 @@ VSOut mainVS(uint vid : SV_VertexID) {
                    1.0 - (tr.y + local.y) / misc2.z * 2.0, 0.0, 1.0);
     return o;
 }
-static const float3 white = float3(1.0, 1.0, 1.0);
+// Те же два цвета, что у растрового пути `checkerboard_tile`: шейдер и
+// растр обязаны давать одну и ту же шахматку, иначе она поменяла бы цвет
+// при переключении пути отрисовки.
+static const float3 magenta = float3(1.0, 0.0, 1.0);
 static const float3 black = float3(0.0, 0.0, 0.0);
 float4 mainPS(VSOut i) : SV_Target {
     float2 cell = misc.xy * misc2.x;          // клетка в физических пикселях
@@ -338,8 +346,8 @@ float4 mainPS(VSOut i) : SV_Target {
     float edge = min(dist.x, dist.y) * cell;  // в физических пикселях
     float aa = smoothstep(0.0, 1.0, edge);    // антиалиасинг границы
     float parity = fmod(cellidx.x + cellidx.y, 2.0);
-    float3 my = parity < 0.5 ? white : black;
-    float3 nbr = parity < 0.5 ? black : white;
+    float3 my = parity < 0.5 ? magenta : black;
+    float3 nbr = parity < 0.5 ? black : magenta;
     float3 color = lerp(my, nbr, 1.0 - aa);
     return float4(color * misc.y, misc.y);    // premultiplied opacity
 }
@@ -565,23 +573,32 @@ mod tests {
             let i = ((y * 4 + x) * 4) as usize;
             [tile[i], tile[i + 1], tile[i + 2], tile[i + 3]]
         };
-        assert_eq!(px(0, 0), [255, 255, 255, 255]); // белый
-        assert_eq!(px(1, 0), [255, 255, 255, 255]);
+        // Цвет клетки — не белый: шахматка «здесь ничего нет» узнаётся
+        // именно по фуксии (репорт пользователя 2026-09-01), и тест держит
+        // это как контракт, а не как деталь оформления.
+        let magenta = [
+            CHECKER_MAGENTA[0],
+            CHECKER_MAGENTA[1],
+            CHECKER_MAGENTA[2],
+            255,
+        ];
+        assert_eq!(magenta, [255, 0, 255, 255]);
+        assert_eq!(px(0, 0), magenta);
+        assert_eq!(px(1, 0), magenta);
         assert_eq!(px(2, 0), [0, 0, 0, 255]); // чёрный
-        assert_eq!(px(0, 1), [255, 255, 255, 255]);
+        assert_eq!(px(0, 1), magenta);
         assert_eq!(px(3, 1), [0, 0, 0, 255]);
         assert_eq!(px(0, 2), [0, 0, 0, 255]);
-        assert_eq!(px(3, 3), [255, 255, 255, 255]);
+        assert_eq!(px(3, 3), magenta);
     }
 
     #[test]
     fn checkerboard_tile_single_pixel_cells() {
         let tile = checkerboard_tile(1, 2, 2);
+        let [r, g, b] = CHECKER_MAGENTA;
         assert_eq!(
             tile,
-            vec![
-                255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255
-            ]
+            vec![r, g, b, 255, 0, 0, 0, 255, 0, 0, 0, 255, r, g, b, 255]
         );
     }
 
@@ -595,9 +612,10 @@ mod tests {
             let i = ((y * 3 + x) * 4) as usize;
             [tile[i], tile[i + 1], tile[i + 2], tile[i + 3]]
         };
-        assert_eq!(px(0, 0), [255, 255, 255, 255]);
+        let [r, g, b] = CHECKER_MAGENTA;
+        assert_eq!(px(0, 0), [r, g, b, 255]);
         assert_eq!(px(1, 0), [0, 0, 0, 255]);
-        assert_eq!(px(2, 0), [255, 255, 255, 255]);
+        assert_eq!(px(2, 0), [r, g, b, 255]);
         assert_eq!(px(0, 1), [0, 0, 0, 255]);
         assert_eq!(px(2, 1), [0, 0, 0, 255]);
     }
@@ -612,7 +630,10 @@ mod tests {
     fn checkerboard_hlsl_has_both_entry_points() {
         assert!(CHECKERBOARD_HLSL.contains("mainVS"));
         assert!(CHECKERBOARD_HLSL.contains("mainPS"));
-        assert!(CHECKERBOARD_HLSL.contains("white"));
+        // Шейдер обязан называть тот же цвет, что и растровый путь: две
+        // шахматки разного цвета — это баг, который увидит только
+        // пользователь и только на живой машине.
+        assert!(CHECKERBOARD_HLSL.contains("magenta"));
         assert!(CHECKERBOARD_HLSL.contains("black"));
     }
 }

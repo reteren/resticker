@@ -349,6 +349,12 @@ pub enum CursorShape {
     /// выделения в пространстве (с учётом её собственного поворота), а не
     /// фиксированная константа на 4 угла.
     Rotate(i32),
+    /// Перекрестье режима резки окон — «митоз»
+    /// (docs/M9_WINDOW_MITOSIS_DESIGN.md, запрос пользователя 2026-09-01).
+    /// Системный `IDC_CROSS`: пользователь уже знает эту форму как «сейчас
+    /// я укажу точку», и своя рисованная не добавила бы ничего, кроме
+    /// расхождения с остальной системой.
+    Cross,
 }
 
 impl CursorZone {
@@ -614,6 +620,7 @@ fn create_rotate_cursor(base_angle_deg: f64) -> Option<HCURSOR> {
 /// `Drop`.
 struct CursorSet {
     arrow: HCURSOR,
+    cross: HCURSOR,
     size_all: HCURSOR,
     size_ns: HCURSOR,
     size_we: HCURSOR,
@@ -631,6 +638,7 @@ impl CursorSet {
         let or_arrow = |idc: PCWSTR| load_system_cursor(idc).or(arrow).unwrap_or_default();
         Self {
             arrow: arrow.unwrap_or_default(),
+            cross: or_arrow(IDC_CROSS),
             size_all: or_arrow(IDC_SIZEALL),
             size_ns: or_arrow(IDC_SIZENS),
             size_we: or_arrow(IDC_SIZEWE),
@@ -667,6 +675,7 @@ impl CursorSet {
             CursorShape::SizeNESW => self.size_nesw,
             CursorShape::SizeNWSE => self.size_nwse,
             CursorShape::Rotate(angle_deg) => self.rotate_cursor(angle_deg),
+            CursorShape::Cross => self.cross,
         }
     }
 }
