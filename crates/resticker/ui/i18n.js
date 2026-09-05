@@ -86,6 +86,7 @@ const STRINGS = {
   'denylist.loading': 'Loading…',
   'denylist.empty': 'The denylist is empty. Add a process above to prevent it from being pinned.',
   'denylist.noTitlePattern': 'no title filter',
+  'denylist.anyProcess': 'any process, title match only',
   'denylist.removeTitle': 'Remove',
   'denylist.added': 'Added to denylist: {process}',
   'denylist.removed': 'Rule removed from the denylist',
@@ -112,13 +113,13 @@ const STRINGS = {
   'general.outlinePinnedHint':
     'Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.',
   'control.notSet': 'Not set',
+  'control.clear': 'Clear',
   'control.groupsSection': 'Groups',
   'control.soundSection': 'Sound',
-  'control.hotkeyEditHint': 'Click, then press a combination. Esc cancels.',
   'control.recording': 'Press a combination…',
   'control.modifierRequired': 'At least one modifier is required (Ctrl, Alt, Shift, or Win).',
   'control.unsupportedKey': 'Key "{key}" is not supported. Use A-Z, 0-9, or F1-F24.',
-  'control.hintClick': 'Click a field, then press a key combination.',
+  'control.hintClick': 'Click a field, then press a combination. Esc cancels.',
   'control.hintRestart': 'Hotkey changes apply immediately after saving.',
   'control.hintRequired':
     '"Edit mode" is required (cannot be cleared). The others are optional.',

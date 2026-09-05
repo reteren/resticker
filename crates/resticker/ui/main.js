@@ -23,6 +23,74 @@ const stickerStatusEl = document.getElementById('sticker-status');
 const presetStatusEl = document.getElementById('preset-status');
 const denylistStatusEl = document.getElementById('denylist-status');
 
+/** Иконка из спрайта в index.html. Своей разметки на месте вызова нет:
+ *  иначе один и тот же путь пришлось бы держать в трёх шаблонах строк. */
+function icon(name) {
+  return `<svg aria-hidden="true"><use href="#i-${name}" /></svg>`;
+}
+
+// ==== Хоткей как клавиши ====
+//
+// Сочетание рисуется отдельными клавишами, а не строкой в поле ввода.
+// Строкой оно ломалось об ширину поля: «Ctrl+Alt+(number of group)»
+// обрезалось на «Ctrl+Alt+(number of grou» и хвост, который как раз и
+// объясняет смысл бинда, до пользователя не доходил. Клавиши переносятся
+// по строкам сами, а глаз находит нужный бинд, не читая.
+
+/** Одна клавиша. `ghost` — не клавиша, а пояснение (подставной хвост
+ *  «(number of group)», многоточие во время записи): у него нет рельефа,
+ *  чтобы его не искали на клавиатуре. */
+function keycap(label, ghost) {
+  const span = document.createElement('span');
+  span.className = ghost ? 'keycap ghost' : 'keycap';
+  span.textContent = label;
+  return span;
+}
+
+function appendCaps(el, parts, ghostLast) {
+  parts.forEach((part, i) => {
+    if (i > 0) {
+      const plus = document.createElement('span');
+      plus.className = 'keycapPlus';
+      plus.textContent = '+';
+      el.appendChild(plus);
+    }
+    el.appendChild(keycap(part, ghostLast && i === parts.length - 1));
+  });
+}
+
+/** Показать сохранённое значение поля. Пустая строка — плейсхолдер. */
+function setHotkeyDisplay(el, combo) {
+  if (!el) return;
+  el.replaceChildren();
+  if (!combo) {
+    const empty = document.createElement('span');
+    empty.className = 'hotkeyEmpty';
+    empty.textContent = t('control.notSet');
+    el.appendChild(empty);
+    return;
+  }
+  const parts = combo.split('+');
+  // Хвост поля открытия группы — не клавиша: цифру пользователь не
+  // выбирает, её присваивает сама группа (см. spreadDigits).
+  const ghostLast = parts[parts.length - 1] === t('control.openGroupNumber');
+  appendCaps(el, parts, ghostLast);
+}
+
+/** Показать состояние записи: уже зажатые модификаторы + ожидание. */
+function setHotkeyRecording(el, mods) {
+  if (!el) return;
+  el.replaceChildren();
+  if (!mods || mods.length === 0) {
+    const empty = document.createElement('span');
+    empty.className = 'hotkeyEmpty';
+    empty.textContent = t('control.recording');
+    el.appendChild(empty);
+    return;
+  }
+  appendCaps(el, [...mods, '…'], true);
+}
+
 function setStatus(text) {
   statusEl.textContent = text;
   if (text) {
@@ -34,7 +102,26 @@ function setStatus(text) {
 
 // ==== Вкладки ====
 
-document.getElementById('tabs').addEventListener('click', (e) => {
+// Подложка активной вкладки — одна на всю ленту, и она переезжает.
+// Положение и ширину CSS взять неоткуда (ширина вкладки зависит от текста
+// перевода), поэтому их подаёт сюда JS в переменных --nav-x/--nav-w, а
+// едет уже CSS-переход — на композиторе, не в главном потоке.
+const tabsEl = document.getElementById('tabs');
+
+function moveTabLight(animate = true) {
+  const active = tabsEl.querySelector('.tab.active');
+  if (!active) return;
+  if (!animate) tabsEl.style.transition = 'none';
+  tabsEl.style.setProperty('--nav-x', `${active.offsetLeft}px`);
+  tabsEl.style.setProperty('--nav-w', `${active.offsetWidth}px`);
+  if (!animate) {
+    // Первая установка не должна выглядеть как переезд из левого угла.
+    tabsEl.getBoundingClientRect();
+    tabsEl.style.transition = '';
+  }
+}
+
+tabsEl.addEventListener('click', (e) => {
   const tabEl = e.target.closest('.tab');
   const tab = tabEl?.dataset.tab;
   if (!tab) return;
@@ -44,10 +131,32 @@ document.getElementById('tabs').addEventListener('click', (e) => {
   for (const s of document.querySelectorAll('.panel')) {
     s.classList.toggle('active', s.dataset.panel === tab);
   }
+  moveTabLight();
+  updateScrollEdges();
   // Свежий снимок открытых окон при каждом заходе на вкладку — окна
   // открываются/закрываются, пока настройки открыты, список не должен
   // залипать на состоянии момента запуска (запрос пользователя 2026-08-19).
   if (tab === 'denylist') refreshDenylistProcessPicker();
+});
+
+// ==== Края прокрутки ====
+//
+// Вкладка «Общие» длиннее окна, и раньше об этом ничего не сообщало:
+// последняя строка просто упиралась в подвал и обрывалась на полуслове,
+// как будто вёрстка сломана. Теперь содержимое растворяется у того края,
+// за которым оно продолжается, — и только у него.
+const contentEl = document.querySelector('.content');
+
+function updateScrollEdges() {
+  const scrollable = contentEl.scrollHeight - contentEl.clientHeight;
+  contentEl.classList.toggle('scroll-top', contentEl.scrollTop > 4);
+  contentEl.classList.toggle('scroll-bottom', scrollable > 4 && contentEl.scrollTop < scrollable - 4);
+}
+
+contentEl.addEventListener('scroll', updateScrollEdges, { passive: true });
+addEventListener('resize', () => {
+  moveTabLight(false);
+  updateScrollEdges();
 });
 
 // ==== Загрузка конфига ====
@@ -210,7 +319,7 @@ function spreadDigits(combo) {
 
 function renderControl() {
   for (const [elId, key] of HOTKEY_FIELDS) {
-    document.getElementById(elId).value = hotkeyFieldValue(key, draftHotkeys[key]);
+    setHotkeyDisplay(document.getElementById(elId), hotkeyFieldValue(key, draftHotkeys[key]));
   }
   const volume = draftSettings.pin_sound_volume ?? 100;
   document.getElementById('pin-sound-volume').value = volume;
@@ -238,7 +347,7 @@ function cancelRecording() {
   const [, key] = HOTKEY_FIELDS.find(([id]) => id === recordingField);
   const input = document.getElementById(recordingField);
   if (input) {
-    input.value = hotkeyFieldValue(key, draftHotkeys[key]);
+    setHotkeyDisplay(input, hotkeyFieldValue(key, draftHotkeys[key]));
     input.classList.remove('recording');
   }
   recordingField = null;
@@ -246,11 +355,22 @@ function cancelRecording() {
 
 for (const [elId] of HOTKEY_FIELDS) {
   const input = document.getElementById(elId);
-  input.addEventListener('click', () => {
+  const startRecording = () => {
     cancelRecording();
     recordingField = elId;
     input.classList.add('recording');
-    input.value = t('control.recording');
+    setHotkeyRecording(input, []);
+  };
+  input.addEventListener('click', startRecording);
+  // Поле перестало быть <input>, поэтому клавиатурный вход в запись нужно
+  // задать самому: без этого до хоткеев нельзя было добраться с клавиатуры
+  // вообще — что для окна, целиком посвящённого клавиатуре, странно.
+  input.addEventListener('keydown', (e) => {
+    if (recordingField) return; // запись уже идёт, комбинацию ловит общий обработчик
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      startRecording();
+    }
   });
 }
 
@@ -273,8 +393,7 @@ window.addEventListener(
     // ("Alt + Shift + …"), подтверждая, что клавиши распознаны и поле ждёт букву.
     if (isModifierKey(e.code, e.key)) {
       const mods = getModifiersFromEvent(e);
-      const input = document.getElementById(recordingField);
-      if (input) input.value = formatHoldingModifiers(mods, t('control.recording'));
+      setHotkeyRecording(document.getElementById(recordingField), mods);
       return;
     }
 
@@ -312,7 +431,7 @@ window.addEventListener(
       // Для поля открытия группы это не набранная комбинация (в ней цифра
       // случайная — в значение она и так не попадает, см. spreadDigits), а
       // та же форма, что в renderControl: модификаторы + подставной хвост.
-      input.value = hotkeyFieldValue(key, draftHotkeys[key]);
+      setHotkeyDisplay(input, hotkeyFieldValue(key, draftHotkeys[key]));
       input.classList.remove('recording');
     }
     recordingField = null;
@@ -328,17 +447,14 @@ window.addEventListener(
     e.preventDefault();
     e.stopPropagation();
     const mods = getModifiersFromEvent(e);
-    const input = document.getElementById(recordingField);
-    if (input) {
-      input.value = formatHoldingModifiers(mods, t('control.recording'));
-    }
+    setHotkeyRecording(document.getElementById(recordingField), mods);
   },
   true
 );
 
 // Отмена записи при клике мимо полей хоткеев или потере фокуса окном
 document.addEventListener('click', (e) => {
-  if (recordingField && !e.target.closest('.hotkeyInput')) {
+  if (recordingField && !e.target.closest('.hotkeyField')) {
     cancelRecording();
   }
 });
@@ -364,7 +480,7 @@ for (const [elId, key] of HOTKEY_FIELDS) {
     // массив, а не null, иначе Rust прочитал бы отсутствие поля как «взять
     // значение по умолчанию» и хоткей вернулся бы сам собой.
     draftHotkeys[key] = key === 'open_group_by_number' ? [] : null;
-    document.getElementById(elId).value = '';
+    setHotkeyDisplay(document.getElementById(elId), '');
   });
 }
 
@@ -387,6 +503,18 @@ function mediaTypeLabel(source) {
   return t('media.image');
 }
 
+/** Подпись монитора для строки списка. Сырой monitor_id — device interface
+ *  path на девяносто знаков (ADR-010), одинаковый у всех строк: он занимал
+ *  всю мета-строку и не сообщал ничего. Берём дружественное имя из
+ *  config.monitors, а если записи нет — модель из самого пути. */
+function monitorLabel(monitorId) {
+  const rec = (config.monitors ?? []).find((m) => m.id === monitorId);
+  const name = rec?.friendly_name?.trim();
+  if (name) return name;
+  const m = /DISPLAY#([^#]+)#/.exec(monitorId ?? '');
+  return m ? m[1] : monitorId || '?';
+}
+
 function stickerFilePath(sticker) {
   const source = sticker.source;
   if (source?.kind === 'file' || source?.kind === 'pasted') return source.path;
@@ -401,6 +529,12 @@ function renderStickers() {
     list.innerHTML = `<p class="emptyHint">${t('stickers.empty')}</p>`;
     return;
   }
+  // На одном мониторе подпись монитора одинакова у всех строк — это не
+  // сведения, а шум во всю ширину. Показываем её, только когда есть из чего
+  // выбирать.
+  const monitorsUsed = new Set(stickers.map((s) => s.placement?.monitor_id));
+  const showMonitor = monitorsUsed.size > 1 || (config.monitors ?? []).length > 1;
+
   for (const sticker of stickers) {
     const row = document.createElement('div');
     row.className = 'stickerRow' + (sticker.visible ? '' : ' disabled');
@@ -415,14 +549,18 @@ function renderStickers() {
       </label>
       <div class="stickerInfo">
         <span class="stickerName">${escapeHtml(name)}</span>
-        <span class="stickerMeta">${mediaTypeLabel(sticker.source)} · ${t('sticker.monitorLabel', { id: escapeHtml(sticker.placement?.monitor_id ?? '?') })}</span>
+        <span class="stickerMeta">${mediaTypeLabel(sticker.source)}${
+          showMonitor
+            ? ` · ${t('sticker.monitorLabel', { id: escapeHtml(monitorLabel(sticker.placement?.monitor_id)) })}`
+            : ''
+        }</span>
       </div>
       <div class="stickerActions">
-        <button class="button compact" data-action="reset-pos" data-id="${sticker.id}" title="${t('sticker.resetPosTitle')}">⤾</button>
-        <button class="button compact" data-action="reset-transform" data-id="${sticker.id}" title="${t('sticker.resetTransformTitle')}">⟲</button>
-        <button class="button compact" data-action="reveal" data-id="${sticker.id}" title="${t('sticker.revealTitle')}" ${path ? '' : 'disabled'}>📁</button>
-        <button class="button compact" data-action="relink" data-id="${sticker.id}" title="${t('sticker.relinkTitle')}" ${path ? '' : 'disabled'}>↻</button>
-        <button class="button compact danger" data-action="delete" data-id="${sticker.id}" title="${t('sticker.deleteTitle')}">✕</button>
+        <button class="iconBtn" data-action="reset-pos" data-id="${sticker.id}" title="${t('sticker.resetPosTitle')}" aria-label="${t('sticker.resetPosTitle')}">${icon('recenter')}</button>
+        <button class="iconBtn" data-action="reset-transform" data-id="${sticker.id}" title="${t('sticker.resetTransformTitle')}" aria-label="${t('sticker.resetTransformTitle')}">${icon('restore')}</button>
+        <button class="iconBtn" data-action="reveal" data-id="${sticker.id}" title="${t('sticker.revealTitle')}" aria-label="${t('sticker.revealTitle')}" ${path ? '' : 'disabled'}>${icon('folder')}</button>
+        <button class="iconBtn" data-action="relink" data-id="${sticker.id}" title="${t('sticker.relinkTitle')}" aria-label="${t('sticker.relinkTitle')}" ${path ? '' : 'disabled'}>${icon('link')}</button>
+        <button class="iconBtn danger" data-action="delete" data-id="${sticker.id}" title="${t('sticker.deleteTitle')}" aria-label="${t('sticker.deleteTitle')}">${icon('trash')}</button>
       </div>
     `;
     list.appendChild(row);
@@ -526,7 +664,7 @@ document.getElementById('delete-all-stickers').addEventListener('click', async (
 // «Стикеры»).
 function presetMeta(preset) {
   if (preset.created_at) {
-    return new Date(preset.created_at).toLocaleDateString(currentLang === 'ru' ? 'ru-RU' : 'en-US');
+    return new Date(preset.created_at).toLocaleDateString('en-US');
   }
   const n = (preset.stickers ?? []).length;
   return t('preset.stickersCount', { n, word: pluralStickerWord(n) });
@@ -550,9 +688,9 @@ function renderPresets() {
       </div>
       <div class="stickerActions">
         <button class="button compact" data-action="apply" data-id="${preset.id}" title="${t('preset.applyTitle')}">${t('preset.applyAction')}</button>
-        <button class="button compact" data-action="rename" data-id="${preset.id}" title="${t('preset.renameTitle')}">${t('presets.rename')}</button>
-        <button class="button compact" data-action="export" data-id="${preset.id}" title="${t('preset.exportTitle')}">${t('preset.exportAction')}</button>
-        <button class="button compact danger" data-action="delete" data-id="${preset.id}" title="${t('preset.deleteTitle')}">✕</button>
+        <button class="iconBtn" data-action="rename" data-id="${preset.id}" title="${t('preset.renameTitle')}" aria-label="${t('preset.renameTitle')}">${icon('pencil')}</button>
+        <button class="iconBtn" data-action="export" data-id="${preset.id}" title="${t('preset.exportTitle')}" aria-label="${t('preset.exportAction')}">${icon('export')}</button>
+        <button class="iconBtn danger" data-action="delete" data-id="${preset.id}" title="${t('preset.deleteTitle')}" aria-label="${t('preset.deleteTitle')}">${icon('trash')}</button>
       </div>
     `;
     list.appendChild(row);
@@ -706,11 +844,15 @@ function renderDenylist() {
     row.className = 'stickerRow';
     row.innerHTML = `
       <div class="stickerInfo">
-        <span class="stickerName">${escapeHtml(rule.process_name ?? '')}</span>
-        <span class="stickerMeta">${escapeHtml(rule.title_pattern ?? t('denylist.noTitlePattern'))}</span>
+        <span class="stickerName">${escapeHtml(rule.process_name ?? rule.title_pattern ?? '')}</span>
+        <span class="stickerMeta">${escapeHtml(
+          rule.process_name
+            ? (rule.title_pattern ?? t('denylist.noTitlePattern'))
+            : t('denylist.anyProcess')
+        )}</span>
       </div>
       <div class="stickerActions">
-        <button class="button compact danger" data-action="remove" data-index="${i}" title="${t('denylist.removeTitle')}">✕</button>
+        <button class="iconBtn danger" data-action="remove" data-index="${i}" title="${t('denylist.removeTitle')}" aria-label="${t('denylist.removeTitle')}">${icon('trash')}</button>
       </div>
     `;
     list.appendChild(row);
@@ -844,4 +986,9 @@ document.getElementById('close').addEventListener('click', async () => {
   await getCurrentWindow().close();
 });
 
-loadConfig();
+loadConfig().then(() => {
+  // Свет ленты ставится без анимации: при открытии окна он должен уже
+  // лежать под активной вкладкой, а не приезжать под неё из угла.
+  moveTabLight(false);
+  updateScrollEdges();
+});

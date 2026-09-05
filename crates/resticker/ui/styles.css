@@ -780,6 +780,15 @@ hr {
   text-wrap: pretty;
 }
 
+.settingControl.noClear::after {
+  content: "";
+  flex: 0 0 26px; /* ширина .iconBtn — крестика тут нет, но колонка есть */
+}
+
+.card > .hint {
+  max-width: 78ch;
+}
+
 .mono {
   font-variant-numeric: tabular-nums;
   min-width: 48px;
@@ -1483,6 +1492,8 @@ input[type="range"]:active::-webkit-slider-thumb,
   line-height: 1.5;
   text-wrap: balance;
 }
+
+.emptyHint.loading::before { display: none; }
 
 .emptyHint::before {
   content: "";

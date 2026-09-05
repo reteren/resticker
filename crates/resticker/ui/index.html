@@ -171,7 +171,7 @@
 
                 <div class="setting">
                   <span class="settingLabel" data-i18n="control.editMode">Edit mode</span>
-                  <div class="settingControl">
+                  <div class="settingControl noClear">
                     <div class="hotkeyField hotkeyInput" id="hotkey-edit" tabindex="0" role="button"></div>
                   </div>
                 </div>
@@ -180,7 +180,7 @@
                   <span class="settingLabel" data-i18n="control.toggleAll">Show/hide all stickers</span>
                   <div class="settingControl">
                     <div class="hotkeyField hotkeyInput" id="hotkey-toggle-all" tabindex="0" role="button"></div>
-                    <button class="iconBtn" id="clear-hotkey-toggle-all" type="button" title="Clear" data-i18n-title="control.clear">
+                    <button class="iconBtn" id="clear-hotkey-toggle-all" type="button" title="Clear" data-i18n-title="control.clear" aria-label="Clear">
                       <svg aria-hidden="true"><use href="#i-x" /></svg>
                     </button>
                   </div>
@@ -190,7 +190,7 @@
                   <span class="settingLabel" data-i18n="control.muteAll">Mute all</span>
                   <div class="settingControl">
                     <div class="hotkeyField hotkeyInput" id="hotkey-mute-all" tabindex="0" role="button"></div>
-                    <button class="iconBtn" id="clear-hotkey-mute-all" type="button" title="Clear" data-i18n-title="control.clear">
+                    <button class="iconBtn" id="clear-hotkey-mute-all" type="button" title="Clear" data-i18n-title="control.clear" aria-label="Clear">
                       <svg aria-hidden="true"><use href="#i-x" /></svg>
                     </button>
                   </div>
@@ -200,7 +200,7 @@
                   <span class="settingLabel" data-i18n="control.pinFocusedWindow">Pin focused window</span>
                   <div class="settingControl">
                     <div class="hotkeyField hotkeyInput" id="hotkey-pin" tabindex="0" role="button"></div>
-                    <button class="iconBtn" id="clear-hotkey-pin" type="button" title="Clear" data-i18n-title="control.clear">
+                    <button class="iconBtn" id="clear-hotkey-pin" type="button" title="Clear" data-i18n-title="control.clear" aria-label="Clear">
                       <svg aria-hidden="true"><use href="#i-x" /></svg>
                     </button>
                   </div>
@@ -210,7 +210,7 @@
                   <span class="settingLabel" data-i18n="control.mitosis">Split a window in two (mitosis)</span>
                   <div class="settingControl">
                     <div class="hotkeyField hotkeyInput" id="hotkey-mitosis" tabindex="0" role="button"></div>
-                    <button class="iconBtn" id="clear-hotkey-mitosis" type="button" title="Clear" data-i18n-title="control.clear">
+                    <button class="iconBtn" id="clear-hotkey-mitosis" type="button" title="Clear" data-i18n-title="control.clear" aria-label="Clear">
                       <svg aria-hidden="true"><use href="#i-x" /></svg>
                     </button>
                   </div>
@@ -220,7 +220,7 @@
                   <span class="settingLabel" data-i18n="control.unpinAll">Unpin all windows</span>
                   <div class="settingControl">
                     <div class="hotkeyField hotkeyInput" id="hotkey-unpin-all" tabindex="0" role="button"></div>
-                    <button class="iconBtn" id="clear-hotkey-unpin-all" type="button" title="Clear" data-i18n-title="control.clear">
+                    <button class="iconBtn" id="clear-hotkey-unpin-all" type="button" title="Clear" data-i18n-title="control.clear" aria-label="Clear">
                       <svg aria-hidden="true"><use href="#i-x" /></svg>
                     </button>
                   </div>
@@ -228,7 +228,7 @@
 
                 <hr />
 
-                <p class="hint" data-i18n="control.hintClick">Click a field, then press a key combination.</p>
+                <p class="hint" data-i18n="control.hintClick">Click a field, then press a combination. Esc cancels.</p>
                 <p class="hint" data-i18n="control.hintRequired">
                   "Edit mode" is required (cannot be cleared). The others are optional.
                 </p>
@@ -242,7 +242,7 @@
                   <span class="settingLabel" data-i18n="control.groupsMenu">Window groups menu</span>
                   <div class="settingControl">
                     <div class="hotkeyField hotkeyInput" id="hotkey-groups-menu" tabindex="0" role="button"></div>
-                    <button class="iconBtn" id="clear-hotkey-groups-menu" type="button" title="Clear" data-i18n-title="control.clear">
+                    <button class="iconBtn" id="clear-hotkey-groups-menu" type="button" title="Clear" data-i18n-title="control.clear" aria-label="Clear">
                       <svg aria-hidden="true"><use href="#i-x" /></svg>
                     </button>
                   </div>
@@ -252,7 +252,7 @@
                   <span class="settingLabel" data-i18n="control.openGroup">Open group</span>
                   <div class="settingControl">
                     <div class="hotkeyField hotkeyInput" id="hotkey-open-group" tabindex="0" role="button"></div>
-                    <button class="iconBtn" id="clear-hotkey-open-group" type="button" title="Clear" data-i18n-title="control.clear">
+                    <button class="iconBtn" id="clear-hotkey-open-group" type="button" title="Clear" data-i18n-title="control.clear" aria-label="Clear">
                       <svg aria-hidden="true"><use href="#i-x" /></svg>
                     </button>
                   </div>
@@ -265,7 +265,7 @@
                   <span class="settingLabel" data-i18n="control.deleteGroup">Delete open group</span>
                   <div class="settingControl">
                     <div class="hotkeyField hotkeyInput" id="hotkey-delete-group" tabindex="0" role="button"></div>
-                    <button class="iconBtn" id="clear-hotkey-delete-group" type="button" title="Clear" data-i18n-title="control.clear">
+                    <button class="iconBtn" id="clear-hotkey-delete-group" type="button" title="Clear" data-i18n-title="control.clear" aria-label="Clear">
                       <svg aria-hidden="true"><use href="#i-x" /></svg>
                     </button>
                   </div>
@@ -275,7 +275,7 @@
                   <span class="settingLabel" data-i18n="control.pinGroup">Keep open group on top</span>
                   <div class="settingControl">
                     <div class="hotkeyField hotkeyInput" id="hotkey-pin-group" tabindex="0" role="button"></div>
-                    <button class="iconBtn" id="clear-hotkey-pin-group" type="button" title="Clear" data-i18n-title="control.clear">
+                    <button class="iconBtn" id="clear-hotkey-pin-group" type="button" title="Clear" data-i18n-title="control.clear" aria-label="Clear">
                       <svg aria-hidden="true"><use href="#i-x" /></svg>
                     </button>
                   </div>
@@ -440,7 +440,7 @@
                 </button>
               </div>
               <div class="stickerList" id="denylist-list">
-                <p class="emptyHint" data-i18n="denylist.loading">Loading…</p>
+                <p class="emptyHint loading" data-i18n="denylist.loading">Loading…</p>
               </div>
               <div class="cardFooter">
                 <span class="status" id="denylist-status"></span>
