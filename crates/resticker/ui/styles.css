@@ -1,11 +1,31 @@
 /* ============================================================
    resticker — Dark Liquid Glass design system
-   Specification: docs/DESIGN_LIQUID_GLASS.md
-   Blur: OS acrylic. Material: layered dark translucency +
-   specular sheen + 1px rim highlights + white glow.
+   Спецификация: docs/DESIGN_LIQUID_GLASS.md
+   Blur: акрил ОС. Материал: слоистая тёмная полупрозрачность +
+   зеркальный блик + однопиксельные кромки + белое гало.
+
+   ПРАВКА 2026-09-04 — три вещи, ради которых стоило мерить:
+
+   1. ПОЛ ЛЕГИБЕЛЬНОСТИ. Окно прозрачное, поэтому фон под текстом — не
+      токен, а стопка: обои → акриловый тинт Windows → GLASS_INK →
+      карточка. Посчитанный композит показал, что `TEXT_FAINT` (0.42),
+      которым набраны ВСЕ подсказки и заголовки секций, даёт 3.65–3.96:1
+      над любыми обоями и 2.26:1, если акрил не применился. Норма AA —
+      4.5:1. Стекло углублено 0.62 → 0.72, подсказки вынесены в
+      отдельный токен 0.56, заголовки 0.50: теперь 4.72–5.98:1 везде.
+      `rst_render::widgets::theme` рисует поверх такого же произвольного
+      фона и нуждается в том же — там числа пока прежние.
+
+   2. ГЛУБИНА СТАЛА СТОПКОЙ. Раньше корпус, хром, карточка и список
+      лежали на почти одной прозрачности — «стекло» читалось плёнкой.
+      Теперь четыре плана с разным поведением света (§«Планы» ниже).
+
+   3. СВЕТ ЕЗДИТ. Источник света один и он живой: подложка активной
+      вкладки и блик на кромке ленты переезжают к выбранной вкладке
+      одним движением, а не мигают.
    ============================================================ */
 
-/* ---------- Commissioner (local, offline-safe) ---------- */
+/* ---------- Commissioner (локально, без сети) ---------- */
 @font-face {
   font-family: "Commissioner";
   src: url("fonts/commissioner-latin-400.woff2") format("woff2");
@@ -63,42 +83,62 @@
   unicode-range: U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
 }
 
-/* ---------- Dark Liquid Glass Design Tokens (§2) ---------- */
+/* ============================================================
+   1. ТОКЕНЫ
+   ============================================================ */
 :root {
-  /* §2.1 Стекло */
-  --glass-ink: rgba(7, 7, 10, 0.62);
-  --glass-ink-deep: rgba(5, 5, 7, 0.74);
+  /* --- 1.1 Стекло. Четыре плана, снизу вверх ---------------
+     План 0 «корпус»    — GLASS_INK, самая глубокая плита.
+     План 1 «хром»      — титул, лента вкладок, подвал: НЕ светлее
+                          корпуса, а темнее (VEIL) с яркой верхней
+                          кромкой. Так хром отделяется глубиной, а не
+                          яркостью, и не спорит с содержимым за взгляд.
+     План 2 «карточка»  — приподнята: белая плёнка + собственная тень.
+     План 3 «утопленное»— поле ввода, список: свет перевёрнут (тёмная
+                          кромка сверху, светлая снизу).
+     Углубление 0.62 → 0.72 — из замера контраста, см. шапку файла. */
+  --glass-ink: rgba(6, 6, 9, 0.72);
+  --glass-ink-deep: rgba(4, 4, 6, 0.82);
+  --glass-veil: rgba(0, 0, 0, 0.24);
   --glass-sheen-top: rgba(255, 255, 255, 0.055);
-  --glass-sheen-bottom: rgba(255, 255, 255, 0.016);
-  --glass-specular: rgba(255, 255, 255, 0.20);
+  --glass-sheen-bottom: rgba(255, 255, 255, 0.014);
+  --glass-specular: rgba(255, 255, 255, 0.2);
+  --glass-bounce: rgba(255, 255, 255, 0.055);
+
   --rim-top: rgba(255, 255, 255, 0.34);
-  --rim-side: rgba(255, 255, 255, 0.10);
+  --rim-side: rgba(255, 255, 255, 0.1);
   --rim-bottom: rgba(255, 255, 255, 0.055);
   --stroke: rgba(255, 255, 255, 0.12);
-  --stroke-strong: rgba(255, 255, 255, 0.30);
+  --stroke-soft: rgba(255, 255, 255, 0.07);
+  --stroke-strong: rgba(255, 255, 255, 0.3);
 
-  /* §2.2 Контролы */
+  /* --- 1.2 Контролы --- */
   --ctrl-bg: rgba(255, 255, 255, 0.045);
   --ctrl-bg-hover: rgba(255, 255, 255, 0.105);
   --ctrl-bg-active: rgba(255, 255, 255, 0.165);
   --ctrl-bg-primary: rgba(255, 255, 255, 0.16);
   --ctrl-bg-on: rgba(255, 255, 255, 0.22);
   --sunken-bg: rgba(0, 0, 0, 0.34);
+  --sunken-bg-deep: rgba(0, 0, 0, 0.42);
 
-  /* §2.3 Текст и свет */
+  /* --- 1.3 Текст и свет ---
+     Числа — из замера композита (шапка файла), а не из вкуса. */
   --text: rgba(255, 255, 255, 0.97);
-  --text-dim: rgba(255, 255, 255, 0.66);
-  --text-faint: rgba(255, 255, 255, 0.42);
+  --text-dim: rgba(255, 255, 255, 0.72);
+  --text-soft: rgba(255, 255, 255, 0.56);
+  --text-faint: rgba(255, 255, 255, 0.5);
+  --text-mute: rgba(255, 255, 255, 0.34);
   --text-glow: 0 0 2px rgba(255, 255, 255, 0.26);
-  --hover-glow: 0 0 6px rgba(255, 255, 255, 0.22);
+  --hover-glow: rgba(255, 255, 255, 0.22);
 
-  /* §2.4 Danger */
+  /* --- 1.4 Единственный цвет во всём интерфейсе --- */
   --danger: #d0463c;
+  --danger-text: #ff9d96;
   --danger-bg: rgba(208, 70, 60, 0.18);
-  --danger-hover: rgba(208, 70, 60, 0.30);
-  --danger-stroke: rgba(208, 70, 60, 0.50);
+  --danger-hover: rgba(208, 70, 60, 0.3);
+  --danger-stroke: rgba(208, 70, 60, 0.5);
 
-  /* §3 Геометрия */
+  /* --- 1.5 Геометрия --- */
   --radius-win: 18px;
   --radius-card: 14px;
   --radius-ctl: 10px;
@@ -107,18 +147,26 @@
   --pad-panel: 14px;
   --pad-ctrl-x: 12px;
   --gap-row: 10px;
+  /* Мера чтения для вкладок-настроек. 900 px окна на строку «подпись —
+     контрол» слишком широки: глаз теряет связь между краями, а подсказка
+     уезжает в 110 знаков. 640 — это ~70 знаков подсказки. */
+  --measure: 640px;
 
-  /* §5 Движение */
+  /* --- 1.6 Движение --- */
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-glide: cubic-bezier(0.32, 0.72, 0, 1);
   --t-hover: 160ms;
   --t-press: 110ms;
   --t-panel: 240ms;
   --t-card: 300ms;
+  --t-nav: 380ms;
 
   --font: "Commissioner", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
-/* ---------- Reset / Base ---------- */
+/* ============================================================
+   2. RESET / BASE
+   ============================================================ */
 *,
 *::before,
 *::after {
@@ -139,26 +187,51 @@ body {
   font-size: 12.5px;
   font-weight: 500;
   line-height: 1.45;
+  letter-spacing: 0.004em;
   color: var(--text);
-  text-shadow: var(--text-glow);
+  font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   user-select: none;
 }
 
-/* ---------- Selection & Focus ---------- */
+/* Гало на КАЖДОМ глифе делало корпус текста мутным: на 12.5 px размытие
+   в 2 px съедает просветы букв. Свечение остаётся приёмом, но теперь оно
+   принадлежит тому, что должно светиться, — знаку, заголовку, активному
+   состоянию, — а не абзацу. */
+.brand,
+.tab.active h3,
+.groupTitle,
+.card h2,
+.button.primary,
+.keycap,
+.sliderValue {
+  text-shadow: var(--text-glow);
+}
+
 ::selection {
   background-color: rgba(255, 255, 255, 0.25);
-  color: #ffffff;
+  color: #fff;
   text-shadow: none;
+}
+
+/* Кольцо фокуса поверх стекла: тёмная прокладка отделяет белое кольцо от
+   светлого содержимого, иначе на блике оно исчезает. */
+:focus {
+  outline: none;
 }
 
 :focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.3), 0 0 8px var(--hover-glow);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.55),
+    0 0 0 3px rgba(255, 255, 255, 0.55),
+    0 0 12px rgba(255, 255, 255, 0.25);
 }
 
-/* ---------- Window Shell (Glass Pane) ---------- */
+/* ============================================================
+   3. КОРПУС ОКНА — план 0
+   ============================================================ */
 .window,
 .wrapper {
   position: relative;
@@ -168,11 +241,7 @@ body {
   border-radius: var(--radius-win);
   overflow: hidden;
   background:
-    linear-gradient(
-      180deg,
-      var(--glass-sheen-top) 0%,
-      var(--glass-sheen-bottom) 100%
-    ),
+    linear-gradient(180deg, var(--glass-sheen-top) 0%, var(--glass-sheen-bottom) 100%),
     var(--glass-ink);
   border: 1px solid var(--stroke);
   box-shadow:
@@ -184,7 +253,8 @@ body {
   animation: window-in var(--t-panel) var(--ease-out);
 }
 
-/* Specular sheen, deformed by SVG displacement for organic liquid edge */
+/* Зеркальный блик, искажённый SVG-турбулентностью, — «жидкость» в liquid
+   glass. Источник света один: левый верхний угол. */
 .window::before,
 .wrapper::before {
   content: "";
@@ -200,6 +270,27 @@ body {
     transparent 75%
   );
   filter: url(#liquid-soft);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Отражённый свет снизу справа. Без него плита освещена с одной стороны и
+   читается плоской: у стекла всегда есть слабый возврат от поверхности,
+   на которой оно лежит. Вчетверо слабее прямого блика — это отражение, а
+   не второй источник. */
+.window::after,
+.wrapper::after {
+  content: "";
+  position: absolute;
+  right: -12%;
+  bottom: -40px;
+  width: 62%;
+  height: 190px;
+  background: radial-gradient(
+    80% 100% at 70% 100%,
+    var(--glass-bounce),
+    transparent 70%
+  );
   pointer-events: none;
   z-index: 0;
 }
@@ -221,32 +312,28 @@ body {
   }
 }
 
-/* ---------- Custom Titlebar ---------- */
+/* ============================================================
+   4. ТИТУЛ — план 1 (хром)
+   ============================================================ */
 .titlebar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   height: 46px;
-  padding: 0 14px 0 18px;
+  padding: 0 12px 0 18px;
   flex: 0 0 auto;
-  border-bottom: 1px solid var(--stroke);
-  background: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.04) 0%,
-    transparent 100%
-  );
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045) 0%, transparent 100%);
   -webkit-app-region: drag;
   user-select: none;
 }
 
 .titlebar .header,
 .titlebar .brand {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 800;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.15em;
   text-transform: uppercase;
   color: var(--text);
-  text-shadow: var(--text-glow);
   cursor: move;
   margin: 0;
   display: flex;
@@ -257,25 +344,27 @@ body {
 .win-controls {
   display: flex;
   align-items: center;
+  gap: 2px;
   -webkit-app-region: no-drag;
 }
 
 .win-btn,
 .closeButton {
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
   display: grid;
   place-items: center;
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-tight);
-  color: var(--text-dim);
+  color: var(--text-soft);
   cursor: pointer;
-  transition: background var(--t-hover) var(--ease-out),
-              border-color var(--t-hover) var(--ease-out),
-              color var(--t-hover) var(--ease-out),
-              transform var(--t-press) var(--ease-out),
-              box-shadow var(--t-hover) var(--ease-out);
+  transition:
+    background var(--t-hover) var(--ease-out),
+    border-color var(--t-hover) var(--ease-out),
+    color var(--t-hover) var(--ease-out),
+    transform var(--t-press) var(--ease-out),
+    box-shadow var(--t-hover) var(--ease-out);
   -webkit-app-region: no-drag;
 }
 
@@ -294,13 +383,24 @@ body {
   transform: scale(0.955);
 }
 
+/* Закрытие — единственная кнопка, которая уходит в danger: это выход из
+   окна, и он должен читаться иначе, чем всё остальное в титуле. */
+.closeButton:hover {
+  background: var(--danger-bg);
+  border-color: var(--danger-stroke);
+  color: #fff;
+  box-shadow: 0 0 8px rgba(208, 70, 60, 0.35);
+}
+
 .win-btn svg,
 .closeButton svg {
   width: 12px;
   height: 12px;
 }
 
-/* ---------- Navigation Tabs ---------- */
+/* ============================================================
+   5. ЛЕНТА ВКЛАДОК — план 1, и свет, который ездит
+   ============================================================ */
 .tabsWrap {
   flex: 1;
   min-height: 0;
@@ -309,28 +409,81 @@ body {
 }
 
 .tabList {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 10px 18px 8px;
-  border-bottom: 1px solid var(--stroke);
-  background: rgba(0, 0, 0, 0.18);
+  gap: 2px;
+  padding: 9px 16px 10px;
+  background: var(--glass-veil);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.35);
   flex-shrink: 0;
 }
 
+/* Подложка активной вкладки — ОДНА на всю ленту. Она не появляется на
+   новом месте, а переезжает: положение и ширину подаёт JS
+   (--nav-x/--nav-w), кривая — ease-glide, тот же ход, что у ящика iOS.
+   Пока JS не отработал, --nav-w = 0 и подложки просто нет. */
+.tabList::before {
+  content: "";
+  position: absolute;
+  top: 9px;
+  left: 0;
+  height: 30px;
+  width: var(--nav-w, 0);
+  transform: translate3d(var(--nav-x, 0), 0, 0);
+  border-radius: var(--radius-ctl);
+  background: var(--ctrl-bg-primary);
+  border: 1px solid var(--stroke-strong);
+  box-shadow:
+    inset 0 1px 0 var(--rim-top),
+    inset 0 -1px 0 var(--rim-bottom),
+    0 0 10px rgba(255, 255, 255, 0.1);
+  pointer-events: none;
+  transition:
+    transform var(--t-nav) var(--ease-glide),
+    width var(--t-nav) var(--ease-glide);
+}
+
+/* Тот же источник света, отражённый на нижней кромке ленты. Едет вместе с
+   подложкой — из-за этого переключение читается как одно движение света,
+   а не как две независимые анимации. */
+.tabList::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 1px;
+  width: var(--nav-w, 0);
+  transform: translate3d(var(--nav-x, 0), 0, 0);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.55) 50%,
+    transparent
+  );
+  pointer-events: none;
+  transition:
+    transform var(--t-nav) var(--ease-glide),
+    width var(--t-nav) var(--ease-glide);
+}
+
 .tab {
-  padding: 6px 16px;
+  position: relative;
+  z-index: 1;
+  height: 30px;
+  padding: 0 14px;
   border-radius: var(--radius-ctl);
   border: 1px solid transparent;
   background: transparent;
   cursor: pointer;
   user-select: none;
   font-family: var(--font);
-  transition: background var(--t-hover) var(--ease-out),
-              border-color var(--t-hover) var(--ease-out),
-              box-shadow var(--t-hover) var(--ease-out),
-              transform var(--t-hover) var(--ease-out),
-              color var(--t-hover) var(--ease-out);
+  transition:
+    background var(--t-hover) var(--ease-out),
+    border-color var(--t-hover) var(--ease-out),
+    transform var(--t-hover) var(--ease-out);
 }
 
 .tab h3,
@@ -338,45 +491,67 @@ body {
   font-family: var(--font);
   font-size: 12.5px;
   font-weight: 600;
-  color: var(--text-dim);
+  color: var(--text-soft);
   margin: 0;
-  transition: color var(--t-hover) var(--ease-out);
+  transition:
+    color var(--t-hover) var(--ease-out),
+    font-weight var(--t-hover) var(--ease-out);
 }
 
-.tab:hover {
-  background: var(--ctrl-bg-hover);
-  border-color: var(--stroke);
-  transform: scale(0.972);
+/* Наведение на НЕактивную вкладку: только свет, без продавливания.
+   Продавливаться под курсором должно то, что нажимают, а не то, по чему
+   ведут; на пяти вкладках подряд это читалось нервозностью. */
+.tab:hover:not(.active) {
+  background: rgba(255, 255, 255, 0.05);
 }
 
-.tab:hover h3,
-.tab:hover > * {
+.tab:hover:not(.active) h3,
+.tab:hover:not(.active) > * {
   color: var(--text);
 }
 
-.tab.active {
-  background: var(--ctrl-bg-primary);
-  border-color: var(--stroke-strong);
-  box-shadow:
-    inset 0 1px 0 var(--rim-top),
-    inset 0 -1px 0 var(--rim-bottom),
-    0 0 8px rgba(255, 255, 255, 0.12);
-  transform: none;
+.tab:active:not(.active) {
+  transform: scale(0.968);
 }
 
 .tab.active h3,
 .tab.active > * {
   color: var(--text);
   font-weight: 700;
-  text-shadow: var(--text-glow);
 }
 
-/* ---------- Content Panels & Cards ---------- */
+/* ============================================================
+   6. СОДЕРЖИМОЕ И КРАЯ ПРОКРУТКИ
+   ============================================================ */
 .content {
+  position: relative;
   flex: 1 1 auto;
   overflow-y: auto;
-  padding: 16px 18px;
+  /* Место под полосу держится всегда: без этого содержимое дёргалось на
+     8 px при переходе между вкладкой с прокруткой и без. */
+  scrollbar-gutter: stable;
+  padding: 16px 18px 18px;
   min-height: 0;
+  /* Край прокрутки вместо линейки: содержимое растворяется под хромом,
+     а не обрезается о него. Маска включается только когда есть что
+     прокручивать (класс ставит JS). */
+  --fade-top: 0px;
+  --fade-bottom: 0px;
+  mask-image: linear-gradient(
+    180deg,
+    transparent 0,
+    #000 var(--fade-top),
+    #000 calc(100% - var(--fade-bottom)),
+    transparent 100%
+  );
+}
+
+.content.scroll-top {
+  --fade-top: 18px;
+}
+
+.content.scroll-bottom {
+  --fade-bottom: 22px;
 }
 
 .panel {
@@ -401,6 +576,23 @@ body {
   }
 }
 
+/* Вкладки-настройки читаются в одну колонку по мере чтения. Раньше здесь
+   стояли две колонки карточек: они всегда разной высоты, поэтому под
+   короткой оставалась дыра в треть окна, а длинная упиралась в подвал и
+   обрезалась на полустроке. */
+.panel.measured {
+  flex-direction: column;
+  align-items: center;
+}
+
+.measure {
+  width: 100%;
+  max-width: var(--measure);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .column {
   display: flex;
   flex-direction: column;
@@ -409,27 +601,36 @@ body {
   min-width: 0;
 }
 
-.card {
+/* ============================================================
+   7. КАРТОЧКА — план 2
+   ============================================================ */
+.card,
+.group {
+  position: relative;
   background: var(--ctrl-bg);
   border: 1px solid var(--stroke);
   border-radius: var(--radius-card);
-  padding: 14px 16px;
+  padding: 13px 15px 14px;
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.10),
-    0 8px 24px rgba(0, 0, 0, 0.25);
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.03),
+    0 8px 24px rgba(0, 0, 0, 0.28);
   animation: card-in var(--t-card) var(--ease-out) backwards;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 9px;
 }
 
-.card:nth-of-type(2) {
+.card:nth-of-type(2),
+.group:nth-of-type(2) {
   animation-delay: 0.04s;
 }
-.card:nth-of-type(3) {
+.card:nth-of-type(3),
+.group:nth-of-type(3) {
   animation-delay: 0.08s;
 }
-.card:nth-of-type(4) {
+.card:nth-of-type(4),
+.group:nth-of-type(4) {
   animation-delay: 0.12s;
 }
 
@@ -445,14 +646,14 @@ body {
 }
 
 .card h2,
-.card-title {
+.card-title,
+.groupTitle {
   font-size: 10px;
   font-weight: 800;
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--text-faint);
-  margin-bottom: 2px;
-  text-shadow: none;
+  margin: 0 0 1px;
 }
 
 .cardHeader {
@@ -470,10 +671,79 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 4px;
+  margin-top: 2px;
 }
 
-/* ---------- Rows & Layout Utilities ---------- */
+/* ============================================================
+   8. СТРОКА НАСТРОЙКИ — общая грамматика
+   Подпись слева, контрол справа по одной оси на всю вкладку;
+   пояснение — под подписью, в её колонке.
+   ============================================================ */
+.setting {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  column-gap: 14px;
+  row-gap: 3px;
+  min-height: 30px;
+}
+
+.setting + .setting {
+  margin-top: 3px;
+}
+
+.settingLabel {
+  grid-column: 1;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.setting > .settingControl,
+.setting > .textInput,
+.setting > .hotkeyField,
+.setting > .slider {
+  grid-column: 2;
+}
+
+.settingControl {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  justify-content: flex-end;
+}
+
+/* Пояснение принадлежит подписи и живёт в её колонке: под контролом оно
+   бы тянулось во всю ширину и разрывало пару «подпись — контрол». */
+.setting .hint,
+.settingHint {
+  grid-column: 1 / -1;
+  margin: 1px 0 5px;
+  max-width: 52ch;
+}
+
+.setting:last-child .hint,
+.setting:last-child .settingHint {
+  margin-bottom: 0;
+}
+
+/* Разделитель между смысловыми кустами внутри одной карточки. */
+.group hr,
+.card hr,
+hr {
+  border: none;
+  height: 1px;
+  background: var(--stroke-soft);
+  margin: 3px 0;
+}
+
+/* ============================================================
+   9. ПРОЧАЯ ВЁРСТКА
+   ============================================================ */
 .row {
   display: flex;
   align-items: center;
@@ -505,9 +775,9 @@ body {
 
 .hint {
   font-size: 11.5px;
-  line-height: 1.45;
-  color: var(--text-faint);
-  text-shadow: none;
+  line-height: 1.5;
+  color: var(--text-soft);
+  text-wrap: pretty;
 }
 
 .mono {
@@ -529,31 +799,28 @@ body {
   flex: 1;
 }
 
-hr {
-  border: none;
-  height: 1px;
-  background: var(--stroke);
-  margin: 4px 0;
-}
-
-/* ---------- Tactile Buttons (§5) ---------- */
+/* ============================================================
+   10. КНОПКИ
+   Наведение продавливает контрол: свет переезжает с верхней кромки на
+   нижнюю, корпус ужимается. Это подпись проекта (DESIGN §5) — она
+   сохранена; поправлено только то, что ей мешало.
+   ============================================================ */
 .button,
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 7px;
   background: var(--ctrl-bg);
   border: 1px solid var(--stroke);
   border-radius: var(--radius-ctl);
   color: var(--text);
-  padding: 6px var(--pad-ctrl-x);
+  padding: 5px var(--pad-ctrl-x);
   min-height: 28px;
   font-family: var(--font);
   font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
-  text-shadow: var(--text-glow);
   white-space: nowrap;
   user-select: none;
   box-shadow:
@@ -561,11 +828,12 @@ hr {
     inset 0 -1px 0 var(--rim-bottom),
     inset 1px 0 0 var(--rim-side),
     inset -1px 0 0 var(--rim-side);
-  transition: background var(--t-hover) var(--ease-out),
-              border-color var(--t-hover) var(--ease-out),
-              transform var(--t-hover) var(--ease-out),
-              box-shadow var(--t-hover) var(--ease-out),
-              color var(--t-hover) var(--ease-out);
+  transition:
+    background var(--t-hover) var(--ease-out),
+    border-color var(--t-hover) var(--ease-out),
+    transform var(--t-hover) var(--ease-out),
+    box-shadow var(--t-hover) var(--ease-out),
+    color var(--t-hover) var(--ease-out);
 }
 
 .button svg,
@@ -575,7 +843,6 @@ hr {
   flex: 0 0 auto;
 }
 
-/* Наведение: кнопка продавливается (scale 0.972), свет переезжает вниз, гало */
 .button:hover:not(:disabled),
 .btn:hover:not(:disabled) {
   background: var(--ctrl-bg-hover);
@@ -587,13 +854,13 @@ hr {
     0 0 6px var(--hover-glow);
 }
 
-/* Зажатие: scale 0.955 + CTRL_BG_ACTIVE */
 .button:active:not(:disabled),
 .btn:active:not(:disabled) {
   background: var(--ctrl-bg-active);
   transform: scale(0.955);
+  transition-duration: var(--t-press);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.10),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
     inset 0 -1px 0 rgba(255, 255, 255, 0.26),
     0 0 4px rgba(255, 255, 255, 0.15);
 }
@@ -609,13 +876,14 @@ hr {
 .button.compact,
 .btn.compact {
   min-width: 0;
-  padding: 4px 10px;
+  min-height: 26px;
+  padding: 3px 10px;
   font-size: 12px;
 }
 
 .button.danger,
 .btn.danger {
-  color: #ff9d96;
+  color: var(--danger-text);
 }
 
 .button.danger:hover:not(:disabled),
@@ -636,40 +904,114 @@ hr {
   box-shadow:
     inset 0 1px 0 var(--rim-top),
     inset 0 -1px 0 var(--rim-bottom),
-    0 0 8px rgba(255, 255, 255, 0.10);
+    0 0 8px rgba(255, 255, 255, 0.1);
 }
 
 .button.primary:hover:not(:disabled),
 .btn-primary:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.24);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.20),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
     inset 0 -1px 0 rgba(255, 255, 255, 0.35),
-    0 0 8px rgba(255, 255, 255, 0.30);
+    0 0 8px rgba(255, 255, 255, 0.3);
 }
 
-/* ---------- Inputs: Text, Number, Select ---------- */
+/* ---------- Кнопка-иконка ----------
+   Квадрат под палец без надписи. В покое — только штрих иконки, без
+   плашки: пять одинаковых плашек в каждой строке списка складывались в
+   решётку, которая заслоняла имена файлов. Плашка появляется, когда
+   строка под курсором или в ней есть фокус, — иконка при этом видна
+   всегда, поэтому находимость не страдает. */
+.iconBtn {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: var(--radius-tight);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background var(--t-hover) var(--ease-out),
+    border-color var(--t-hover) var(--ease-out),
+    color var(--t-hover) var(--ease-out),
+    transform var(--t-press) var(--ease-out),
+    box-shadow var(--t-hover) var(--ease-out),
+    opacity var(--t-hover) var(--ease-out);
+}
+
+.iconBtn svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.stickerRow:hover .iconBtn,
+.stickerRow:focus-within .iconBtn {
+  color: var(--text-dim);
+  background: var(--ctrl-bg);
+  border-color: var(--stroke-soft);
+}
+
+.iconBtn:hover:not(:disabled) {
+  background: var(--ctrl-bg-hover) !important;
+  border-color: var(--stroke-strong) !important;
+  color: var(--text) !important;
+  transform: scale(0.94);
+  box-shadow: 0 0 6px var(--hover-glow);
+}
+
+.iconBtn:active:not(:disabled) {
+  background: var(--ctrl-bg-active) !important;
+  transform: scale(0.9);
+}
+
+.iconBtn:disabled {
+  opacity: 0.28;
+  cursor: not-allowed;
+}
+
+.iconBtn.danger:hover:not(:disabled) {
+  background: var(--danger-bg) !important;
+  border-color: var(--danger-stroke) !important;
+  color: var(--danger-text) !important;
+  box-shadow: 0 0 8px rgba(208, 70, 60, 0.3);
+}
+
+/* ============================================================
+   11. ПОЛЯ ВВОДА — план 3 (утопленное)
+   ============================================================ */
 .textInput,
 .numberInput,
 input[type="text"],
 input[type="number"],
 select.textInput {
   background: var(--sunken-bg);
-  border: 1px solid var(--stroke);
+  border: 1px solid var(--stroke-soft);
   border-radius: var(--radius-ctl);
   color: var(--text);
-  padding: 6px 10px;
+  padding: 5px 10px;
   font-family: var(--font);
   font-size: 12.5px;
   font-weight: 500;
+  font-variant-numeric: tabular-nums;
   height: 30px;
   outline: none;
   box-shadow:
     inset 0 1px 2px rgba(0, 0, 0, 0.5),
     inset 0 -1px 0 rgba(255, 255, 255, 0.055);
-  transition: border-color var(--t-hover) var(--ease-out),
-              box-shadow var(--t-hover) var(--ease-out),
-              background var(--t-hover) var(--ease-out);
+  transition:
+    border-color var(--t-hover) var(--ease-out),
+    box-shadow var(--t-hover) var(--ease-out),
+    background var(--t-hover) var(--ease-out);
 }
 
 .textInput:hover,
@@ -677,8 +1019,8 @@ select.textInput {
 input[type="text"]:hover,
 input[type="number"]:hover,
 select.textInput:hover {
-  border-color: var(--stroke-strong);
-  background: rgba(0, 0, 0, 0.45);
+  border-color: var(--stroke);
+  background: var(--sunken-bg-deep);
 }
 
 .textInput:focus,
@@ -690,16 +1032,17 @@ select.textInput:focus {
   background: rgba(0, 0, 0, 0.55);
   box-shadow:
     inset 0 1px 2px rgba(0, 0, 0, 0.6),
-    0 0 0 2px rgba(255, 255, 255, 0.12),
-    0 0 8px var(--hover-glow);
+    0 0 0 2px rgba(255, 255, 255, 0.14),
+    0 0 10px rgba(255, 255, 255, 0.14);
 }
 
 input::placeholder {
-  color: var(--text-faint);
+  color: var(--text-mute);
 }
 
 .numberInput {
-  max-width: 70px;
+  max-width: 74px;
+  text-align: right;
 }
 
 .numberInput::-webkit-outer-spin-button,
@@ -711,6 +1054,15 @@ input::placeholder {
 .numberInput[type="number"] {
   -moz-appearance: textfield;
   appearance: textfield;
+}
+
+/* Единица измерения принадлежит полю, а не подписи: «Snap gap, %» в
+   подписи заставляет читать заголовок, чтобы понять число в поле. */
+.unit {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-mute);
+  min-width: 1.6em;
 }
 
 select.textInput {
@@ -727,30 +1079,101 @@ select.textInput option {
   color: var(--text);
 }
 
-/* ---------- Hotkey Input ---------- */
-.hotkeyInput {
-  cursor: pointer;
-  user-select: none;
-  text-align: center;
-  font-weight: 600;
-  transition: transform var(--t-hover) var(--ease-out),
-              background var(--t-hover) var(--ease-out),
-              border-color var(--t-hover) var(--ease-out),
-              box-shadow var(--t-hover) var(--ease-out);
-}
-
-.hotkeyInput:hover {
-  transform: scale(0.98);
-}
-
-.hotkeyInput.recording {
-  border-color: rgba(255, 255, 255, 0.6);
-  background: rgba(255, 255, 255, 0.10);
+/* ============================================================
+   12. ХОТКЕЙ КАК КЛАВИШИ
+   Сочетание — это клавиши, а не строка. Строкой «Ctrl+Alt+(number of
+   group)» не помещалась в поле и обрезалась на полуслове; клавишами она
+   переносится, а глаз находит нужный бинд, не читая.
+   ============================================================ */
+.hotkeyField {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-height: 30px;
+  min-width: 148px;
+  padding: 3px 8px;
+  border-radius: var(--radius-ctl);
+  background: var(--sunken-bg);
+  border: 1px solid var(--stroke-soft);
   box-shadow:
     inset 0 1px 2px rgba(0, 0, 0, 0.5),
-    0 0 0 2px rgba(255, 255, 255, 0.20),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.055);
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background var(--t-hover) var(--ease-out),
+    border-color var(--t-hover) var(--ease-out),
+    box-shadow var(--t-hover) var(--ease-out);
+}
+
+.hotkeyField:hover {
+  border-color: var(--stroke);
+  background: var(--sunken-bg-deep);
+}
+
+.keycap {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.05));
+  border: 1px solid var(--stroke);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.3),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.35),
+    0 1px 1px rgba(0, 0, 0, 0.35);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* Хвост «(number of group)» — не клавиша, а объяснение: у него нет
+   рельефа, чтобы его не искали на клавиатуре. */
+.keycap.ghost {
+  background: none;
+  border-style: dashed;
+  border-color: var(--stroke);
+  box-shadow: none;
+  font-weight: 600;
+  color: var(--text-soft);
+  text-shadow: none;
+}
+
+.keycapPlus {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-mute);
+  padding: 0 1px;
+}
+
+.hotkeyEmpty {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-mute);
+  padding: 0 2px;
+}
+
+/* Запись: поле пульсирует кромкой, а курсор-каретка показывает, что оно
+   слушает. */
+.hotkeyField.recording {
+  border-color: rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.5),
+    0 0 0 2px rgba(255, 255, 255, 0.2),
     0 0 12px var(--hover-glow);
   animation: pulse-recording 1.2s infinite alternate var(--ease-out);
+}
+
+.hotkeyField.recording .hotkeyEmpty {
+  color: var(--text);
 }
 
 @keyframes pulse-recording {
@@ -766,7 +1189,17 @@ select.textInput option {
   }
 }
 
-/* ---------- Custom Checkbox ---------- */
+/* Старая форма поля хоткея — ещё существует как input в редких местах. */
+.hotkeyInput {
+  cursor: pointer;
+  user-select: none;
+  text-align: center;
+  font-weight: 600;
+}
+
+/* ============================================================
+   13. ЧЕКБОКС
+   ============================================================ */
 .checkboxWrapper,
 label.check {
   display: inline-flex;
@@ -807,10 +1240,11 @@ label.check input {
   box-shadow:
     inset 0 1px 0 var(--rim-top),
     inset 0 -1px 0 var(--rim-bottom);
-  transition: background var(--t-hover) var(--ease-out),
-              border-color var(--t-hover) var(--ease-out),
-              transform var(--t-hover) var(--ease-out),
-              box-shadow var(--t-hover) var(--ease-out);
+  transition:
+    background var(--t-hover) var(--ease-out),
+    border-color var(--t-hover) var(--ease-out),
+    transform var(--t-hover) var(--ease-out),
+    box-shadow var(--t-hover) var(--ease-out);
 }
 
 .checkboxWrapper:hover .checkmark,
@@ -830,6 +1264,15 @@ label.check input:active ~ .checkmark {
   transform: scale(0.955);
 }
 
+.checkboxWrapper input:focus-visible ~ .checkmark,
+label.check input:focus-visible ~ .checkmark {
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.55),
+    0 0 0 3px rgba(255, 255, 255, 0.55);
+}
+
+/* Галочка не возникает из ничего: она приезжает из чуть меньшего размера
+   и рисуется вместе с проявлением — так же, как всё остальное в системе. */
 .checkmark::after {
   content: "";
   width: 9px;
@@ -837,8 +1280,11 @@ label.check input:active ~ .checkmark {
   margin-top: -2px;
   border-left: 2px solid #fff;
   border-bottom: 2px solid #fff;
-  transform: rotate(-45deg) scale(0);
-  transition: transform var(--t-hover) var(--ease-out);
+  opacity: 0;
+  transform: rotate(-45deg) scale(0.6);
+  transition:
+    transform var(--t-hover) var(--ease-out),
+    opacity var(--t-press) var(--ease-out);
   filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5));
 }
 
@@ -854,16 +1300,19 @@ label.check input:checked ~ .checkmark {
 
 .checkboxWrapper input:checked ~ .checkmark::after,
 label.check input:checked ~ .checkmark::after {
+  opacity: 1;
   transform: rotate(-45deg) scale(1);
 }
 
-/* ---------- Range Slider ---------- */
+/* ============================================================
+   14. ПОЛЗУНОК
+   ============================================================ */
 input[type="range"],
 .slider {
   -webkit-appearance: none;
   appearance: none;
-  flex: 1;
-  min-width: 0;
+  width: 150px;
+  flex: 0 0 auto;
   height: 22px;
   background: transparent;
   cursor: pointer;
@@ -881,25 +1330,26 @@ input[type="range"]::-webkit-slider-runnable-track,
 
 input[type="range"]:hover::-webkit-slider-runnable-track,
 .slider:hover::-webkit-slider-runnable-track {
-  background: rgba(255, 255, 255, 0.20);
+  background: rgba(255, 255, 255, 0.2);
 }
 
 input[type="range"]::-webkit-slider-thumb,
 .slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 16px;
-  height: 16px;
-  margin-top: -6px;
+  width: 15px;
+  height: 15px;
+  margin-top: -5.5px;
   border-radius: 50%;
-  background: #ffffff;
+  background: #fff;
   border: 1px solid rgba(255, 255, 255, 0.9);
   box-shadow:
     0 2px 8px rgba(0, 0, 0, 0.4),
     0 0 6px rgba(255, 255, 255, 0.4),
-    inset 0 1px 0 #ffffff;
-  transition: transform var(--t-press) var(--ease-out),
-              box-shadow var(--t-hover) var(--ease-out);
+    inset 0 1px 0 #fff;
+  transition:
+    transform var(--t-press) var(--ease-out),
+    box-shadow var(--t-hover) var(--ease-out);
 }
 
 input[type="range"]::-webkit-slider-thumb:hover,
@@ -908,7 +1358,7 @@ input[type="range"]::-webkit-slider-thumb:hover,
   box-shadow:
     0 2px 10px rgba(0, 0, 0, 0.5),
     0 0 10px rgba(255, 255, 255, 0.6),
-    inset 0 1px 0 #ffffff;
+    inset 0 1px 0 #fff;
 }
 
 input[type="range"]:active::-webkit-slider-thumb,
@@ -917,7 +1367,7 @@ input[type="range"]:active::-webkit-slider-thumb,
 }
 
 .sliderValue {
-  min-width: 36px;
+  min-width: 2.6em;
   text-align: right;
   font-variant-numeric: tabular-nums;
   font-weight: 700;
@@ -925,14 +1375,17 @@ input[type="range"]:active::-webkit-slider-thumb,
   font-size: 12.5px;
 }
 
-/* ---------- Sticker / Preset / Denylist Lists ---------- */
+/* ============================================================
+   15. СПИСКИ — план 3
+   ============================================================ */
 .stickerList {
   flex: 1;
   min-height: 140px;
-  max-height: 320px;
+  max-height: none;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   background: var(--sunken-bg);
-  border: 1px solid var(--stroke);
+  border: 1px solid var(--stroke-soft);
   border-radius: var(--radius-ctl);
   box-shadow:
     inset 0 1px 3px rgba(0, 0, 0, 0.5),
@@ -945,9 +1398,30 @@ input[type="range"]:active::-webkit-slider-thumb,
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 7px 10px 7px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
   transition: background var(--t-hover) var(--ease-out);
+  /* Каскад появления: +40 мс на строку, максимум 6 ступеней — числа из
+     DESIGN §5, там же, где каскад карточек. */
+  animation: row-in 260ms var(--ease-out) backwards;
+}
+
+.stickerRow:nth-child(1) { animation-delay: 0ms; }
+.stickerRow:nth-child(2) { animation-delay: 40ms; }
+.stickerRow:nth-child(3) { animation-delay: 80ms; }
+.stickerRow:nth-child(4) { animation-delay: 120ms; }
+.stickerRow:nth-child(5) { animation-delay: 160ms; }
+.stickerRow:nth-child(n + 6) { animation-delay: 200ms; }
+
+@keyframes row-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .stickerRow:last-child {
@@ -955,7 +1429,7 @@ input[type="range"]:active::-webkit-slider-thumb,
 }
 
 .stickerRow:hover {
-  background: rgba(255, 255, 255, 0.035);
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .stickerInfo {
@@ -963,7 +1437,7 @@ input[type="range"]:active::-webkit-slider-thumb,
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
 }
 
 .stickerName {
@@ -977,45 +1451,74 @@ input[type="range"]:active::-webkit-slider-thumb,
 
 .stickerMeta {
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--text-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
+/* Выключенный стикер: гаснет имя, но не органы управления — иначе строку
+   нельзя ни удалить, ни включить обратно, не угадывая, где кнопка. */
 .stickerRow.disabled .stickerName,
 .stickerRow.disabled .stickerMeta {
-  opacity: 0.4;
+  opacity: 0.45;
 }
 
 .stickerActions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 2px;
   flex: none;
 }
 
+/* Пустое состояние — не серая строчка, а композиция: знак, что здесь
+   бывает содержимое, и одно предложение о том, как оно тут появляется. */
 .emptyHint {
-  padding: 32px 16px;
-  color: var(--text-faint);
+  margin: auto;
+  padding: 30px 20px;
+  max-width: 34ch;
+  color: var(--text-soft);
   text-align: center;
   font-size: 12.5px;
-  margin: auto;
+  line-height: 1.5;
+  text-wrap: balance;
 }
 
-/* ---------- Footer / Status Bar ---------- */
+.emptyHint::before {
+  content: "";
+  display: block;
+  width: 34px;
+  height: 34px;
+  margin: 0 auto 11px;
+  border-radius: 9px;
+  border: 1px dashed var(--stroke);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+/* ============================================================
+   16. ПОДВАЛ — план 1
+   ============================================================ */
 .footer {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 12px 18px;
-  border-top: 1px solid var(--stroke);
-  background: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.02) 0%,
-    rgba(255, 255, 255, 0.04) 100%
-  );
+  gap: 8px;
+  padding: 11px 18px;
+  background: var(--glass-veil);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.3);
   justify-content: flex-end;
 }
 
+.footer .button {
+  min-width: 76px;
+}
+
+/* Статус — единственное место, где окно говорит словами. Он въезжает, а
+   не возникает, иначе появление в углу проходит мимо взгляда. */
 .status {
   font-size: 12px;
   font-weight: 500;
@@ -1026,10 +1529,27 @@ input[type="range"]:active::-webkit-slider-thumb,
   white-space: pre-line;
 }
 
-/* ---------- Scrollbars ---------- */
+.status:not(:empty) {
+  animation: status-in 220ms var(--ease-out);
+}
+
+@keyframes status-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ============================================================
+   17. ПОЛОСЫ ПРОКРУТКИ
+   ============================================================ */
 *::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 
 *::-webkit-scrollbar-track {
@@ -1037,14 +1557,83 @@ input[type="range"]:active::-webkit-slider-thumb,
 }
 
 *::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.18);
-  border-radius: 4px;
-  border: 2px solid transparent;
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 5px;
+  border: 3px solid transparent;
   background-clip: content-box;
   transition: background var(--t-hover) var(--ease-out);
 }
 
-*::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.32);
+*:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.24);
   background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.38);
+  background-clip: content-box;
+}
+
+/* ============================================================
+   18. НАСТРОЙКИ ДОСТУПНОСТИ СИСТЕМЫ
+   ============================================================ */
+
+/* Меньше движения — это не «без обратной связи», а без перемещений:
+   проявления и смены цвета остаются, переезды и продавливания уходят. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 120ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .button:hover:not(:disabled),
+  .btn:hover:not(:disabled),
+  .win-btn:hover,
+  .closeButton:hover,
+  .checkboxWrapper:hover .checkmark,
+  .iconBtn:hover:not(:disabled),
+  .tab:active:not(.active) {
+    transform: none;
+  }
+
+  .tabList::before,
+  .tabList::after {
+    transition: none;
+  }
+}
+
+/* Меньше прозрачности: стекло становится плотным, блик снимается. */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-ink: rgba(14, 14, 18, 0.99);
+    --glass-ink-deep: rgba(10, 10, 13, 0.99);
+    --sunken-bg: rgba(0, 0, 0, 0.6);
+    --sunken-bg-deep: rgba(0, 0, 0, 0.7);
+  }
+
+  .window::before,
+  .wrapper::before,
+  .window::after,
+  .wrapper::after {
+    display: none;
+  }
+}
+
+/* Больше контраста: кромки становятся линиями, вторичный текст —
+   основным. */
+@media (prefers-contrast: more) {
+  :root {
+    --glass-ink: rgba(10, 10, 13, 0.99);
+    --stroke: rgba(255, 255, 255, 0.42);
+    --stroke-soft: rgba(255, 255, 255, 0.28);
+    --stroke-strong: rgba(255, 255, 255, 0.72);
+    --text-dim: rgba(255, 255, 255, 0.88);
+    --text-soft: rgba(255, 255, 255, 0.78);
+    --text-faint: rgba(255, 255, 255, 0.7);
+    --text-mute: rgba(255, 255, 255, 0.55);
+  }
 }

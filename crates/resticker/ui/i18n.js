@@ -27,7 +27,7 @@ const STRINGS = {
   'stickers.loading': 'Loading…',
   'stickers.resetAll': 'Reset all',
   'stickers.deleteAll': 'Delete all',
-  'stickers.empty': 'No stickers yet.',
+  'stickers.empty': 'No stickers yet. Add an image or a video and it will appear on your desktop.',
   'stickers.resetAllDone': 'All stickers reset',
   'stickers.deleteAllConfirm': 'Delete all stickers? This cannot be undone.',
   'stickers.deleteAllDone': 'All stickers deleted',
@@ -90,7 +90,7 @@ const STRINGS = {
   'denylist.added': 'Added to denylist: {process}',
   'denylist.removed': 'Rule removed from the denylist',
 
-  'control.hotkeysLabel': 'Global hotkeys:',
+  'control.hotkeysLabel': 'Global hotkeys',
   'control.editMode': 'Edit mode',
   'control.toggleAll': 'Show/hide all stickers',
   'control.muteAll': 'Mute all',
@@ -112,6 +112,9 @@ const STRINGS = {
   'general.outlinePinnedHint':
     'Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.',
   'control.notSet': 'Not set',
+  'control.groupsSection': 'Groups',
+  'control.soundSection': 'Sound',
+  'control.hotkeyEditHint': 'Click, then press a combination. Esc cancels.',
   'control.recording': 'Press a combination…',
   'control.modifierRequired': 'At least one modifier is required (Ctrl, Alt, Shift, or Win).',
   'control.unsupportedKey': 'Key "{key}" is not supported. Use A-Z, 0-9, or F1-F24.',
@@ -120,18 +123,18 @@ const STRINGS = {
   'control.hintRequired':
     '"Edit mode" is required (cannot be cleared). The others are optional.',
 
-  'general.startupLabel': 'Startup:',
+  'general.startupLabel': 'Startup',
   'general.autostart': 'Launch with Windows',
   'general.silentStart': 'Silent start (don’t open settings)',
   'general.trayIcon': 'Tray icon',
-  'general.dialogsLabel': 'Dialogs:',
+  'general.dialogsLabel': 'Dialogs',
   'general.skipDeleteConfirm': 'Skip delete confirmation',
-  'general.screenLabel': 'Screen:',
+  'general.screenLabel': 'Screen',
   'general.hideFromCapture': 'Hide stickers from screen capture',
   'general.hideFromCaptureHint':
     'Unstable on some Windows 11 builds — the result is verified after applying; a warning is logged on failure.',
   'general.neverOverlapTaskbar': "Don't overlap the taskbar",
-  'general.performanceLabel': 'Performance:',
+  'general.performanceLabel': 'Performance',
   'general.fpsLimit': 'Overlay FPS limit',
   'general.mitosisMemoryLimit': 'Mitosis memory limit, MB',
   'general.mitosisMemoryLimitHint':

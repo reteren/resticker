@@ -27,6 +27,58 @@
       </filter>
     </svg>
 
+    <!--
+      Иконки строк списка. Раньше здесь стояли эмодзи (📁 ↻ ⤾ ⟲ ✕): в
+      монохромном интерфейсе цветная папка была единственным цветным
+      пятном на всё окно, а рисунок и вес глифа зависели от шрифта
+      системы. Теперь это штрих 1.5 в currentColor — он наследует цвет
+      состояния кнопки и совпадает по весу с текстом.
+    -->
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+      <defs>
+        <symbol id="i-recenter" viewBox="0 0 24 24">
+          <rect x="3.75" y="3.75" width="16.5" height="16.5" rx="3.25" />
+          <circle cx="12" cy="12" r="2.15" />
+          <path d="M12 3.75v2.6M12 17.65v2.6M3.75 12h2.6M17.65 12h2.6" />
+        </symbol>
+        <symbol id="i-restore" viewBox="0 0 24 24">
+          <path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1L3.5 8.4" />
+          <path d="M3.5 3.9v4.6h4.6" />
+        </symbol>
+        <symbol id="i-folder" viewBox="0 0 24 24">
+          <path
+            d="M3.75 7.4a2 2 0 0 1 2-2h3.1a2 2 0 0 1 1.6.8l1 1.35h6.8a2 2 0 0 1 2 2v6.9a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2z"
+          />
+        </symbol>
+        <symbol id="i-link" viewBox="0 0 24 24">
+          <path d="M9.6 16.9H7.9a4.9 4.9 0 0 1 0-9.8h1.7" />
+          <path d="M14.4 7.1h1.7a4.9 4.9 0 0 1 0 9.8h-1.7" />
+          <path d="M8.3 12h7.4" />
+        </symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24">
+          <path d="M4.2 6.9h15.6" />
+          <path d="M9.7 10.6v6.6M14.3 10.6v6.6" />
+          <path d="M6.2 6.9l.9 11.4a2 2 0 0 0 2 1.85h5.8a2 2 0 0 0 2-1.85l.9-11.4" />
+          <path d="M9.4 6.9V5.4a1.6 1.6 0 0 1 1.6-1.6h2a1.6 1.6 0 0 1 1.6 1.6v1.5" />
+        </symbol>
+        <symbol id="i-x" viewBox="0 0 24 24">
+          <path d="M6.6 6.6l10.8 10.8M17.4 6.6L6.6 17.4" />
+        </symbol>
+        <symbol id="i-pencil" viewBox="0 0 24 24">
+          <path d="M4.2 19.8h4l10-10a2.12 2.12 0 0 0-3-3l-10 10z" />
+          <path d="M14.6 6.4l3 3" />
+        </symbol>
+        <symbol id="i-export" viewBox="0 0 24 24">
+          <path d="M12 3.9v10.6" />
+          <path d="M8.1 10.6L12 14.5l3.9-3.9" />
+          <path d="M4.6 16.4v1.9a2 2 0 0 0 2 2h10.8a2 2 0 0 0 2-2v-1.9" />
+        </symbol>
+        <symbol id="i-plus" viewBox="0 0 24 24">
+          <path d="M12 5.4v13.2M5.4 12h13.2" />
+        </symbol>
+      </defs>
+    </svg>
+
     <div class="window wrapper">
       <!-- Titlebar (draggable, dark liquid glass) -->
       <header class="titlebar" data-tauri-drag-region>
@@ -57,7 +109,10 @@
             <section class="card" style="flex: 1">
               <div class="cardHeader">
                 <h2 data-i18n="stickers.listLabel">Sticker list</h2>
-                <button class="button compact primary" id="add-sticker" type="button" data-i18n="stickers.add">Add…</button>
+                <button class="button compact primary" id="add-sticker" type="button">
+                  <svg class="btnIcon" aria-hidden="true"><use href="#i-plus" /></svg>
+                  <span data-i18n="stickers.add">Add…</span>
+                </button>
               </div>
               <div class="stickerList" id="sticker-list">
                 <p class="emptyHint" data-i18n="stickers.loading">Loading…</p>
@@ -105,299 +160,255 @@
             </section>
           </div>
 
-          <!-- ==== Управление ==== -->
-          <div class="panel" data-panel="control">
-            <div class="column">
-              <section class="card">
-                <h2 data-i18n="control.hotkeysLabel">Global hotkeys:</h2>
+          <!-- ==== Управление ====
+               Одна колонка по мере чтения вместо двух карточек разной
+               высоты: правая упиралась в подвал и обрезалась на
+               полустроке, под левой оставалась дыра в треть окна. -->
+          <div class="panel measured" data-panel="control">
+            <div class="measure">
+              <section class="group">
+                <h2 class="groupTitle" data-i18n="control.hotkeysLabel">Global hotkeys</h2>
 
-                <label class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.editMode">Edit mode</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-edit"
-                    readonly
-                    style="max-width: 170px"
-                  />
-                </label>
-
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.toggleAll">Show/hide all stickers</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-toggle-all"
-                    readonly
-                    placeholder="Not set"
-                    data-i18n-placeholder="control.notSet"
-                    style="max-width: 170px"
-                  />
-                  <button class="button compact" id="clear-hotkey-toggle-all" type="button">×</button>
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.editMode">Edit mode</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-edit" tabindex="0" role="button"></div>
+                  </div>
                 </div>
 
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.muteAll">Mute all</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-mute-all"
-                    readonly
-                    placeholder="Not set"
-                    data-i18n-placeholder="control.notSet"
-                    style="max-width: 170px"
-                  />
-                  <button class="button compact" id="clear-hotkey-mute-all" type="button">×</button>
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.toggleAll">Show/hide all stickers</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-toggle-all" tabindex="0" role="button"></div>
+                    <button class="iconBtn" id="clear-hotkey-toggle-all" type="button" title="Clear" data-i18n-title="control.clear">
+                      <svg aria-hidden="true"><use href="#i-x" /></svg>
+                    </button>
+                  </div>
                 </div>
 
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.pinFocusedWindow">Pin focused window</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-pin"
-                    readonly
-                    placeholder="Not set"
-                    data-i18n-placeholder="control.notSet"
-                    style="max-width: 170px"
-                  />
-                  <button class="button compact" id="clear-hotkey-pin" type="button">×</button>
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.muteAll">Mute all</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-mute-all" tabindex="0" role="button"></div>
+                    <button class="iconBtn" id="clear-hotkey-mute-all" type="button" title="Clear" data-i18n-title="control.clear">
+                      <svg aria-hidden="true"><use href="#i-x" /></svg>
+                    </button>
+                  </div>
                 </div>
 
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.mitosis">Split a window in two (mitosis)</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-mitosis"
-                    readonly
-                    placeholder="Not set"
-                    data-i18n-placeholder="control.notSet"
-                    style="max-width: 170px"
-                  />
-                  <button class="button compact" id="clear-hotkey-mitosis" type="button">×</button>
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.pinFocusedWindow">Pin focused window</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-pin" tabindex="0" role="button"></div>
+                    <button class="iconBtn" id="clear-hotkey-pin" type="button" title="Clear" data-i18n-title="control.clear">
+                      <svg aria-hidden="true"><use href="#i-x" /></svg>
+                    </button>
+                  </div>
                 </div>
 
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.unpinAll">Unpin all windows</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-unpin-all"
-                    readonly
-                    placeholder="Not set"
-                    data-i18n-placeholder="control.notSet"
-                    style="max-width: 170px"
-                  />
-                  <button class="button compact" id="clear-hotkey-unpin-all" type="button">×</button>
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.mitosis">Split a window in two (mitosis)</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-mitosis" tabindex="0" role="button"></div>
+                    <button class="iconBtn" id="clear-hotkey-mitosis" type="button" title="Clear" data-i18n-title="control.clear">
+                      <svg aria-hidden="true"><use href="#i-x" /></svg>
+                    </button>
+                  </div>
                 </div>
 
-                <hr />
-
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.pinSoundVolume">Pin sound volume</span>
-                  <input
-                    type="range"
-                    class="slider"
-                    id="pin-sound-volume"
-                    min="0"
-                    max="100"
-                    step="1"
-                  />
-                  <span class="sliderValue" id="pin-sound-volume-value">100</span>
-                </div>
-              </section>
-            </div>
-
-            <div class="column">
-              <section class="card">
-                <h2 data-i18n="control.groupsMenu">Window groups menu</h2>
-
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.groupsMenu">Window groups menu</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-groups-menu"
-                    readonly
-                    placeholder="Not set"
-                    data-i18n-placeholder="control.notSet"
-                    style="max-width: 170px"
-                  />
-                  <button class="button compact" id="clear-hotkey-groups-menu" type="button">×</button>
-                </div>
-
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.openGroup">Open group</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-open-group"
-                    readonly
-                    placeholder="Not set"
-                    data-i18n-placeholder="control.notSet"
-                    style="max-width: 170px"
-                  />
-                  <button class="button compact" id="clear-hotkey-open-group" type="button">×</button>
-                </div>
-                <p class="hint" data-i18n="control.openGroupHint">
-                  Only the modifiers are set here — the digit is the group number (1–9), fixed for each group and not editable. Press the combination with any digit.
-                </p>
-
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.deleteGroup">Delete open group</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-delete-group"
-                    readonly
-                    placeholder="Not set"
-                    data-i18n-placeholder="control.notSet"
-                    style="max-width: 170px"
-                  />
-                  <button class="button compact" id="clear-hotkey-delete-group" type="button">×</button>
-                </div>
-
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="control.pinGroup">Keep open group on top</span>
-                  <input
-                    type="text"
-                    class="textInput hotkeyInput"
-                    id="hotkey-pin-group"
-                    readonly
-                    placeholder="Not set"
-                    data-i18n-placeholder="control.notSet"
-                    style="max-width: 170px"
-                  />
-                  <button class="button compact" id="clear-hotkey-pin-group" type="button">×</button>
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.unpinAll">Unpin all windows</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-unpin-all" tabindex="0" role="button"></div>
+                    <button class="iconBtn" id="clear-hotkey-unpin-all" type="button" title="Clear" data-i18n-title="control.clear">
+                      <svg aria-hidden="true"><use href="#i-x" /></svg>
+                    </button>
+                  </div>
                 </div>
 
                 <hr />
 
                 <p class="hint" data-i18n="control.hintClick">Click a field, then press a key combination.</p>
-                <p class="hint" data-i18n="control.hintRestart">Hotkey changes apply after restarting resticker.</p>
                 <p class="hint" data-i18n="control.hintRequired">
                   "Edit mode" is required (cannot be cleared). The others are optional.
                 </p>
+                <p class="hint" data-i18n="control.hintRestart">Hotkey changes apply after restarting resticker.</p>
+              </section>
+
+              <section class="group">
+                <h2 class="groupTitle" data-i18n="control.groupsSection">Groups</h2>
+
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.groupsMenu">Window groups menu</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-groups-menu" tabindex="0" role="button"></div>
+                    <button class="iconBtn" id="clear-hotkey-groups-menu" type="button" title="Clear" data-i18n-title="control.clear">
+                      <svg aria-hidden="true"><use href="#i-x" /></svg>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.openGroup">Open group</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-open-group" tabindex="0" role="button"></div>
+                    <button class="iconBtn" id="clear-hotkey-open-group" type="button" title="Clear" data-i18n-title="control.clear">
+                      <svg aria-hidden="true"><use href="#i-x" /></svg>
+                    </button>
+                  </div>
+                  <p class="hint" data-i18n="control.openGroupHint">
+                    Only the modifiers are set here — the digit is the group number (1–9), fixed for each group and not editable. Press the combination with any digit.
+                  </p>
+                </div>
+
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.deleteGroup">Delete open group</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-delete-group" tabindex="0" role="button"></div>
+                    <button class="iconBtn" id="clear-hotkey-delete-group" type="button" title="Clear" data-i18n-title="control.clear">
+                      <svg aria-hidden="true"><use href="#i-x" /></svg>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.pinGroup">Keep open group on top</span>
+                  <div class="settingControl">
+                    <div class="hotkeyField hotkeyInput" id="hotkey-pin-group" tabindex="0" role="button"></div>
+                    <button class="iconBtn" id="clear-hotkey-pin-group" type="button" title="Clear" data-i18n-title="control.clear">
+                      <svg aria-hidden="true"><use href="#i-x" /></svg>
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              <section class="group">
+                <h2 class="groupTitle" data-i18n="control.soundSection">Sound</h2>
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="control.pinSoundVolume">Pin sound volume</span>
+                  <div class="settingControl">
+                    <input type="range" class="slider" id="pin-sound-volume" min="0" max="100" step="1" />
+                    <span class="sliderValue" id="pin-sound-volume-value">100</span>
+                  </div>
+                </div>
               </section>
             </div>
           </div>
 
           <!-- ==== Общие ==== -->
-          <div class="panel" data-panel="general">
-            <div class="column">
-              <section class="card">
-                <h2 data-i18n="general.startupLabel">Startup:</h2>
+          <div class="panel measured" data-panel="general">
+            <div class="measure">
+              <section class="group">
+                <h2 class="groupTitle" data-i18n="general.startupLabel">Startup</h2>
 
-                <label class="checkboxWrapper">
-                  <input type="checkbox" id="autostart" />
-                  <span class="checkmark"></span>
-                  <span data-i18n="general.autostart">Launch with Windows</span>
-                </label>
-
-                <label class="checkboxWrapper">
-                  <input type="checkbox" id="silent-start" />
-                  <span class="checkmark"></span>
-                  <span data-i18n="general.silentStart">Silent start (don’t open settings)</span>
-                </label>
-
-                <label class="checkboxWrapper">
-                  <input type="checkbox" id="tray-icon" />
-                  <span class="checkmark"></span>
-                  <span data-i18n="general.trayIcon">Tray icon</span>
-                </label>
-              </section>
-
-              <section class="card">
-                <h2 data-i18n="general.dialogsLabel">Dialogs:</h2>
-
-                <label class="checkboxWrapper">
-                  <input type="checkbox" id="skip-delete-confirmation" />
-                  <span class="checkmark"></span>
-                  <span data-i18n="general.skipDeleteConfirm">Skip delete confirmation</span>
-                </label>
-              </section>
-            </div>
-
-            <div class="column">
-              <section class="card">
-                <h2 data-i18n="general.screenLabel">Screen:</h2>
-
-                <label class="checkboxWrapper">
-                  <input type="checkbox" id="outline-pinned-windows" />
-                  <span class="checkmark"></span>
-                  <span data-i18n="general.outlinePinned">Outline on pinned window</span>
-                </label>
-                <p class="hint" data-i18n="general.outlinePinnedHint">
-                  Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.
-                </p>
-
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="general.snapGap">Snap gap, %</span>
-                  <input
-                    type="number"
-                    class="textInput numberInput"
-                    id="snap-shrink-pct"
-                    min="0"
-                    max="35"
-                    step="1"
-                  />
-                </div>
-                <p class="hint" data-i18n="general.snapGapHint">
-                  Shrinks a window snapped by Windows to a half, quarter or third of the screen by this much on every side, leaving an even gap around it. 0 turns it off. Also available in the tray menu, where you can extend it to unpinned windows.
-                </p>
-
-                <label class="checkboxWrapper">
-                  <input type="checkbox" id="hide-from-capture" />
-                  <span class="checkmark"></span>
-                  <span data-i18n="general.hideFromCapture">Hide stickers from screen capture</span>
-                </label>
-                <p class="hint" data-i18n="general.hideFromCaptureHint">
-                  Unstable on some Windows 11 builds — the result is verified after applying; a warning is logged on failure.
-                </p>
-
-                <label class="checkboxWrapper">
-                  <input type="checkbox" id="never-overlap-taskbar" />
-                  <span class="checkmark"></span>
-                  <span data-i18n="general.neverOverlapTaskbar">Don't overlap the taskbar</span>
-                </label>
-              </section>
-
-              <section class="card">
-                <h2 data-i18n="general.performanceLabel">Performance:</h2>
-
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="general.fpsLimit">Overlay FPS limit</span>
-                  <input
-                    type="range"
-                    class="slider"
-                    id="battery-fps-limit"
-                    min="5"
-                    max="60"
-                    step="1"
-                  />
-                  <span class="sliderValue" id="battery-fps-limit-value">30</span>
+                <div class="setting">
+                  <label class="checkboxWrapper settingLabel">
+                    <input type="checkbox" id="autostart" />
+                    <span class="checkmark"></span>
+                    <span data-i18n="general.autostart">Launch with Windows</span>
+                  </label>
                 </div>
 
-                <div class="inputGroup">
-                  <span class="inputLabel" data-i18n="general.mitosisMemoryLimit">Mitosis memory limit, MB</span>
-                  <input
-                    type="number"
-                    class="textInput numberInput"
-                    id="mitosis-max-memory-mb"
-                    min="512"
-                    max="65536"
-                    step="512"
-                  />
+                <div class="setting">
+                  <label class="checkboxWrapper settingLabel">
+                    <input type="checkbox" id="silent-start" />
+                    <span class="checkmark"></span>
+                    <span data-i18n="general.silentStart">Silent start (don’t open settings)</span>
+                  </label>
                 </div>
-                <p class="hint" data-i18n="general.mitosisMemoryLimitHint">
-                  A heavier app is refused: mitosis launches a second copy of it.
-                </p>
+
+                <div class="setting">
+                  <label class="checkboxWrapper settingLabel">
+                    <input type="checkbox" id="tray-icon" />
+                    <span class="checkmark"></span>
+                    <span data-i18n="general.trayIcon">Tray icon</span>
+                  </label>
+                </div>
+              </section>
+
+              <section class="group">
+                <h2 class="groupTitle" data-i18n="general.screenLabel">Screen</h2>
+
+                <div class="setting">
+                  <label class="checkboxWrapper settingLabel">
+                    <input type="checkbox" id="outline-pinned-windows" />
+                    <span class="checkmark"></span>
+                    <span data-i18n="general.outlinePinned">Outline on pinned window</span>
+                  </label>
+                  <p class="hint" data-i18n="general.outlinePinnedHint">
+                    Keeps an outline around a window while it stays pinned. Without it, the only permanent sign is the pin badge in the corner.
+                  </p>
+                </div>
+
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="general.snapGap">Snap gap, %</span>
+                  <div class="settingControl">
+                    <input type="number" class="textInput numberInput" id="snap-shrink-pct" min="0" max="35" step="1" />
+                    <span class="unit">%</span>
+                  </div>
+                  <p class="hint" data-i18n="general.snapGapHint">
+                    Shrinks a window snapped by Windows to a half, quarter or third of the screen by this much on every side, leaving an even gap around it. 0 turns it off. Also available in the tray menu, where you can extend it to unpinned windows.
+                  </p>
+                </div>
+
+                <div class="setting">
+                  <label class="checkboxWrapper settingLabel">
+                    <input type="checkbox" id="hide-from-capture" />
+                    <span class="checkmark"></span>
+                    <span data-i18n="general.hideFromCapture">Hide stickers from screen capture</span>
+                  </label>
+                  <p class="hint" data-i18n="general.hideFromCaptureHint">
+                    Unstable on some Windows 11 builds — the result is verified after applying; a warning is logged on failure.
+                  </p>
+                </div>
+
+                <div class="setting">
+                  <label class="checkboxWrapper settingLabel">
+                    <input type="checkbox" id="never-overlap-taskbar" />
+                    <span class="checkmark"></span>
+                    <span data-i18n="general.neverOverlapTaskbar">Don't overlap the taskbar</span>
+                  </label>
+                </div>
+              </section>
+
+              <section class="group">
+                <h2 class="groupTitle" data-i18n="general.performanceLabel">Performance</h2>
+
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="general.fpsLimit">Overlay FPS limit</span>
+                  <div class="settingControl">
+                    <input type="range" class="slider" id="battery-fps-limit" min="5" max="60" step="1" />
+                    <span class="sliderValue" id="battery-fps-limit-value">30</span>
+                  </div>
+                </div>
+
+                <div class="setting">
+                  <span class="settingLabel" data-i18n="general.mitosisMemoryLimit">Mitosis memory limit, MB</span>
+                  <div class="settingControl">
+                    <input type="number" class="textInput numberInput" id="mitosis-max-memory-mb" min="512" max="65536" step="512" />
+                    <span class="unit">MB</span>
+                  </div>
+                  <p class="hint" data-i18n="general.mitosisMemoryLimitHint">
+                    A heavier app is refused: mitosis launches a second copy of it.
+                  </p>
+                </div>
+              </section>
+
+              <section class="group">
+                <h2 class="groupTitle" data-i18n="general.dialogsLabel">Dialogs</h2>
+
+                <div class="setting">
+                  <label class="checkboxWrapper settingLabel">
+                    <input type="checkbox" id="skip-delete-confirmation" />
+                    <span class="checkmark"></span>
+                    <span data-i18n="general.skipDeleteConfirm">Skip delete confirmation</span>
+                  </label>
+                </div>
               </section>
             </div>
           </div>
 
-          <!-- ==== Денй-лист ==== -->
+          <!-- ==== Дени-лист ==== -->
           <div class="panel" data-panel="denylist">
             <section class="card" style="flex: 1">
               <div class="cardHeader">
@@ -406,12 +417,10 @@
               <p class="hint" data-i18n="denylist.hint">
                 Windows whose process or title matches a rule cannot be pinned via the hotkey and are hidden from the window pick list. The denylist has no other effect.
               </p>
-              <div class="inputGroup">
-                <select class="textInput" id="denylist-process-picker" style="max-width: 320px">
+              <div class="denylistAddRow">
+                <select class="textInput" id="denylist-process-picker" style="flex: 1.2">
                   <option value="" data-i18n="denylist.pickWindow">Pick an open window…</option>
                 </select>
-              </div>
-              <div class="denylistAddRow">
                 <input
                   type="text"
                   class="textInput"
