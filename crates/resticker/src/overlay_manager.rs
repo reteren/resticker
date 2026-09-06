@@ -41,10 +41,11 @@ use rst_core::group_visibility::{
 };
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::mitosis::{self, MitosisRefusal, PixRect, SplitAxis};
+use rst_core::multi_transform;
 use rst_core::model::{
-    Config, GroupPlace, Hotkeys, MediaType, MonitorId, OverlapRule, Placement, Rect, Settings,
-    Sticker, StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode, VisibilityRule,
-    WindowGroup,
+    Config, GroupPlace, Hotkeys, MediaType, MonitorId, OverlapRule, Placement,
+    PlaybackSettings, Rect, Settings, Sticker, StickerSource, Transform, VIDEO_EXTENSIONS,
+    VisibilityMode, VisibilityRule, WindowGroup,
 };
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
@@ -61,7 +62,8 @@ use rst_render::glass::Surface;
 use rst_render::{
     Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon, Key,
     NumericField, Panel, PinnedRowField, PointerEvent, PresentSync, Primitive, RenderError,
-    SelectionBox, Slider, Sprite, TextField, Texture, TextureAtlas, VideoTextures, Widget,
+    SelectionBox, Slider, Sprite, TextField, Texture, TextureAtlas, VideoTextures,
+    VolumeControl, Widget,
     WidgetId, WindowHighlight, WindowTarget, edit_overlay, lock_indicator, marquee_visuals,
     pin_indicator, pinned_row_id, rasterize, solid_sprite, theme,
 };
@@ -374,7 +376,7 @@ fn teardown_monitor_state(
 
     let cancel_gesture = match &edit.gesture {
         Some(Gesture::Marquee { .. }) => cursor_was_here,
-        Some(other) => other.start().is_some_and(|start| {
+        Some(other) => other.starts().iter().any(|start| {
             cfg.stickers
                 .iter()
                 .any(|s| s.id == start.id && s.placement.monitor_id == *id)
@@ -392,7 +394,7 @@ fn teardown_monitor_state(
                 edit.marquee_started = false;
             }
             Some(gesture) => {
-                if let Some(start) = gesture.start() {
+                for start in gesture.starts() {
                     apply_transform(
                         cfg,
                         sprites,
@@ -1648,13 +1650,24 @@ struct GestureStart {
 /// Активный жест редактирования. Захватывается в `MouseDown`, применяется в
 /// `MouseMove`, завершается в `MouseUp` (или отменяется в `CaptureLost`).
 enum Gesture {
+    /// Перетаскивание. `starts` — ВСЕ стикеры, которые едут: первый —
+    /// ведущий, тот, за который взялись, остальные повторяют его смещение
+    /// жёстко (запрос пользователя 2026-09-06: «у них становится один
+    /// квадрат выделения и ты можешь их скейлить и двигать одновременно»).
+    /// Магнит считается по ведущему: тянуть группу к направляющим сразу по
+    /// нескольким кромкам значило бы драться самому с собой.
     Drag {
-        start: GestureStart,
+        starts: Vec<GestureStart>,
         grab_dx: f64,
         grab_dy: f64,
     },
+    /// Изменение размера. При одном стикере `bounds` — его же aabb, и работа
+    /// идёт ровно по старому пути [`transform_ops::resize`]; при нескольких
+    /// `bounds` — ОБЩАЯ рамка на момент захвата, ручка тянет её, а стикеры
+    /// переносятся аффинно ([`multi_transform::resize_selection`]).
     Resize {
-        start: GestureStart,
+        starts: Vec<GestureStart>,
+        bounds: DipRect,
         handle: HandleKind,
         grab: (f64, f64),
     },
@@ -1676,14 +1689,27 @@ enum Gesture {
 }
 
 impl Gesture {
-    /// `None` для [`Gesture::Marquee`] — ей нечего откатывать в модели
-    /// (докс M2_WIRING_PLAN.md, раздел 8).
-    fn start(&self) -> Option<&GestureStart> {
+    /// Ресайз ОДНОГО стикера: общая рамка вырождается в его собственный
+    /// aabb, и дальше работает ровно старый одиночный путь.
+    fn resize_one(start: GestureStart, handle: HandleKind, grab: (f64, f64)) -> Self {
+        let bounds = hittest::aabb(&start.placement, start.transform.rotation);
+        Gesture::Resize {
+            starts: vec![start],
+            bounds,
+            handle,
+            grab,
+        }
+    }
+
+    /// Стартовое состояние всех стикеров жеста — по нему жест откатывается
+    /// (докс M2_WIRING_PLAN.md, раздел 8). Пусто у [`Gesture::Marquee`]:
+    /// ей нечего откатывать в модели.
+    fn starts(&self) -> &[GestureStart] {
         match self {
-            Gesture::Drag { start, .. } => Some(start),
-            Gesture::Resize { start, .. } => Some(start),
-            Gesture::Rotate { start, .. } => Some(start),
-            Gesture::Marquee { .. } => None,
+            Gesture::Drag { starts, .. } => starts,
+            Gesture::Resize { starts, .. } => starts,
+            Gesture::Rotate { start, .. } => std::slice::from_ref(start),
+            Gesture::Marquee { .. } => &[],
         }
     }
 }
@@ -1731,6 +1757,13 @@ enum Zone {
     Background,
     StickerBody(Uuid),
     ResizeHandle(Uuid, HandleKind),
+    /// Тело мультивыделения: точка попала в один из выделенных стикеров, и
+    /// жест поведёт ВСЮ группу (запрос пользователя 2026-09-06).
+    MultiBody,
+    /// Ручка ОБЩЕЙ рамки мультивыделения. Поворота у группы нет: повернуть
+    /// её значило бы развернуть каждый стикер вокруг чужого центра, а этого
+    /// пользователь не просил.
+    MultiResize(HandleKind),
     /// Угол в градусах (экранная конвенция) для курсора — направление от
     /// центра стикера к БЛИЖАЙШЕМУ углу его рамки в мировом пространстве, с
     /// учётом текущего поворота стикера (см. `nearest_corner_world_angle_deg`).
@@ -2178,6 +2211,18 @@ enum PickerTarget {
 
 struct WindowPickerState {
     target: PickerTarget,
+    /// Стикеры, которым достанется правка, в порядке выделения; последний —
+    /// тот же, что в `target`. Один элемент — обычный одиночный случай.
+    ///
+    /// Группа (2026-09-06) правится по правилу пользователя: «по умолчанию,
+    /// независимо, как они были настроены раньше; если начинаешь что-то
+    /// менять — выделяются сразу все окна, и тогда ты уже выбираешь, каких
+    /// окон у стикера не будет». То есть до первой правки чужие настройки не
+    /// трогаются вовсе, а первая же правка приводит всю группу к общему
+    /// знаменателю «видно везде» — и дальше группа живёт одним правилом.
+    applies_to: Vec<Uuid>,
+    /// Группа уже приведена к общему знаменателю (см. `applies_to`).
+    leveled: bool,
     panel: Panel,
     /// Сколько строк списка пропущено сверху (виртуализация, дизайн §7.4).
     scroll: usize,
@@ -5350,7 +5395,7 @@ fn run(
                 playback.source.pause();
             }
             if let Some(audio) = &playback.audio {
-                audio.set_volume(sticker.playback.volume as f32);
+                audio.set_volume(effective_volume(&sticker.playback));
             }
         }
         // Ближайший дедлайн среди анимаций, которым сейчас положено тикать —
@@ -5848,7 +5893,7 @@ fn toggle_edit_mode(
     // CaptureLost, а не коммитит середину перетаскивания (docs/M2_SLICE_REVIEW.md,
     // пункт 4: раньше это было асимметрично).
     if let Some(gesture) = edit.gesture.take() {
-        if let Some(start) = gesture.start() {
+        for start in gesture.starts() {
             apply_transform(
                 cfg,
                 sprites,
@@ -6254,8 +6299,11 @@ fn adjust_video_volume(cfg: &mut Config, ids: &[Uuid], delta: f64) -> bool {
             .find(|s| s.id == *id && sticker_is_video(s))
         {
             let next = (sticker.playback.volume + delta).clamp(0.0, 1.0);
-            if (next - sticker.playback.volume).abs() > f64::EPSILON {
+            // Крутить громкость — значит включать звук: иначе PgUp у
+            // выключённого стикера двигал бы невидимую шкалу и молчал.
+            if (next - sticker.playback.volume).abs() > f64::EPSILON || sticker.playback.muted {
                 sticker.playback.volume = next;
+                sticker.playback.muted = false;
                 changed = true;
             }
         }
@@ -6359,7 +6407,7 @@ fn load_sticker_video(
     };
     let audio = mixer.map(|m| {
         let a = m.add_source(sticker.id);
-        a.set_volume(sticker.playback.volume as f32);
+        a.set_volume(effective_volume(&sticker.playback));
         a
     });
     if sticker.playback.paused {
@@ -6743,9 +6791,12 @@ fn handle_key(
                 .and_then(|p| p.widget_mut::<NumericField>(toolbar::TB_FIELD))
                 .and_then(NumericField::take_submitted)
             {
-                if let Some(id) = single_selected_id(&edit.selection) {
+                let ids: Vec<Uuid> = edit.selection.ids().to_vec();
+                if !ids.is_empty() {
                     commit_undo_snapshot(edit, cfg.clone());
-                    apply_opacity(cfg, sprites, id, value);
+                    for id in &ids {
+                        apply_opacity(cfg, sprites, *id, value);
+                    }
                     if let Some(slider) = edit
                         .toolbar
                         .as_mut()
@@ -7155,8 +7206,14 @@ fn corner_of_handle(kind: HandleKind) -> Option<CoreCorner> {
 /// Всё остальное снаружи рамки — обычный фон: клик там снимает выделение,
 /// как и просил пользователь. До 2026-08-23 повороту был отдан ВЕСЬ внешний
 /// периметр без верхнего предела расстояния, и снять выделение кликом по
-/// пустому месту было невозможно вовсе. Ручки/поворот доступны только для
-/// одиночного выделения (мультивыделение — следующий срез).
+/// пустому месту было невозможно вовсе.
+///
+/// Мультивыделение (2026-09-06) считается ПО ОДНОМУ МОНИТОРУ: рамка группы
+/// и её ручки — это union стикеров, лежащих здесь. Выделение может
+/// захватывать стикеры соседнего монитора, но общая рамка через границу
+/// экранов не имеет смысла — координаты у мониторов свои (ADR-010), и
+/// «растянуть» группу через стык было бы растягиванием двух разных систем
+/// координат сразу. У группы есть ручки размера, но нет поворота.
 fn resolve_zone(
     cfg: &Config,
     selection: &SelectionSet,
@@ -7164,6 +7221,28 @@ fn resolve_zone(
     dip_x: f64,
     dip_y: f64,
 ) -> Zone {
+    let here = selected_on_monitor(selection, cfg, monitor_id);
+    if here.len() > 1 {
+        if let Some(bounds) = union_bounds(&here) {
+            let placement = bounds_placement(&bounds, monitor_id);
+            let sbox = SelectionBox::new(&placement, &Transform::default());
+            for (kind, rect) in sbox.handle_rects(rst_render::HANDLE_SIZE_DIP) {
+                if point_in_box2d(&rect, dip_x, dip_y) {
+                    return Zone::MultiResize(kind);
+                }
+            }
+        }
+        // Тело группы — сами стикеры, а не прямоугольник вокруг них: в
+        // разреженной группе между стикерами много пустого места, и тащить
+        // её оттуда означало бы «схватил воздух — поехало всё». Решает
+        // ВЕРХНИЙ стикер под точкой: если поверх выделенного лежит чужой,
+        // клик достаётся ему — тому, который человек и видит.
+        return match hit_sticker_at(cfg, monitor_id, dip_x, dip_y) {
+            Some(id) if selection.contains(id) => Zone::MultiBody,
+            Some(id) => Zone::StickerBody(id),
+            None => Zone::Background,
+        };
+    }
     if let [id] = selection.ids() {
         if let Some(sticker) = cfg
             .stickers
@@ -7214,6 +7293,58 @@ fn resolve_zone(
     match hit_sticker_at(cfg, monitor_id, dip_x, dip_y) {
         Some(id) => Zone::StickerBody(id),
         None => Zone::Background,
+    }
+}
+
+/// Выделенные стикеры, лежащие на мониторе `monitor_id`, в порядке
+/// выделения. Порядок важен: последний — ведущий, по нему тулбар
+/// показывает значения, а группа считает своё смещение.
+fn selected_on_monitor<'a>(
+    selection: &SelectionSet,
+    cfg: &'a Config,
+    monitor_id: &MonitorId,
+) -> Vec<&'a Sticker> {
+    selection
+        .ids()
+        .iter()
+        .filter_map(|id| cfg.stickers.iter().find(|s| s.id == *id))
+        .filter(|s| s.placement.monitor_id == *monitor_id)
+        .collect()
+}
+
+/// Общая ось-выровненная рамка набора стикеров (union их aabb) — то же
+/// правило, что у [`SelectionSet::bounds`], но по уже отобранному списку.
+fn union_bounds(stickers: &[&Sticker]) -> Option<DipRect> {
+    let mut union: Option<DipRect> = None;
+    for s in stickers {
+        if !(s.placement.w > 0.0 && s.placement.h > 0.0) {
+            continue;
+        }
+        let r = hittest::aabb(&s.placement, s.transform.rotation);
+        union = Some(match union {
+            None => r,
+            Some(u) => {
+                let x = u.x.min(r.x);
+                let y = u.y.min(r.y);
+                let right = (u.x + u.w).max(r.x + r.w);
+                let bottom = (u.y + u.h).max(r.y + r.h);
+                DipRect::new(x, y, right - x, bottom - y)
+            }
+        });
+    }
+    union
+}
+
+/// Общая рамка как `Placement` — чтобы переиспользовать на ней всю геометрию
+/// одиночного выделения ([`SelectionBox`], [`transform_ops::resize`]) вместо
+/// второй копии тех же правил.
+fn bounds_placement(bounds: &DipRect, monitor_id: &MonitorId) -> Placement {
+    Placement {
+        monitor_id: monitor_id.clone(),
+        cx: bounds.x + bounds.w / 2.0,
+        cy: bounds.y + bounds.h / 2.0,
+        w: bounds.w,
+        h: bounds.h,
     }
 }
 
@@ -7318,6 +7449,12 @@ fn cursor_shape_for_zone(zone: &Zone) -> CursorShape {
             CursorZone::ResizeHandle(to_win32_handle(*kind)).cursor_shape()
         }
         Zone::Rotate(_, angle_deg) => CursorZone::RotateZone(*angle_deg).cursor_shape(),
+        // Группа отвечает теми же курсорами, что одиночный стикер: рука над
+        // телом, двусторонняя стрелка над ручкой — жест-то тот же самый.
+        Zone::MultiBody => CursorZone::StickerBody.cursor_shape(),
+        Zone::MultiResize(kind) => {
+            CursorZone::ResizeHandle(to_win32_handle(*kind)).cursor_shape()
+        }
     }
 }
 
@@ -7335,6 +7472,10 @@ fn toolbar_tooltip_text(id: WidgetId) -> Option<&'static str> {
         toolbar::TB_DELETE => Some("Delete"),
         toolbar::TB_PLAY_PAUSE => Some("Play/pause"),
         toolbar::TB_TIMELINE => Some("Timeline outside edit mode"),
+        // Тултип у динамика нужен как раз потому, что кнопка ничего не
+        // говорит про второе своё действие: шкала выезжает сама, а вот про
+        // «клик выключает звук» догадаться неоткуда.
+        toolbar::TB_VOLUME => Some("Volume — click to mute"),
         _ => None,
     }
 }
@@ -7441,26 +7582,20 @@ fn apply_transform(
     }
 }
 
-/// Id единственного выделенного стикера — тулбар в этом срезе показывается
-/// только для одиночного выделения (docs/M2_WIRING_PLAN.md, раздел 4;
-/// мультивыделение — `docs/M2_MULTISELECT_TOOLBAR_NOTES.md`, следующий срез).
-fn single_selected_id(selection: &SelectionSet) -> Option<Uuid> {
-    match selection.ids() {
-        [id] => Some(*id),
-        _ => None,
-    }
-}
 
-/// Монитор, на котором «живёт» тулбар — монитор единственного выделенного
-/// стикера (тулбара нет, если выделение не одиночное). Общая точка для двух
+/// Монитор, на котором «живёт» тулбар — монитор ПОСЛЕДНЕГО выделенного
+/// стикера (тулбара нет, если не выделено ничего). Общая точка для двух
 /// решений, которые обязаны совпадать (M3, docs/M3_STEP4_REVIEW.md, пункт
 /// 2.1): рисовать ли тулбар в кадре этого монитора (`redraw`) и адресован ли
-/// клик тулбару (`handle_input`) — иначе клик с чужого монитора по локальным
-/// DIP-координатам, совпавшим с тулбаром, «поглощался» бы невидимой там
-/// панелью (вплоть до срабатывания её кнопок на чужом стикере).
+/// ему клик мышью (`handle_input`).
+///
+/// Последний, а не первый: тулбар строится вокруг union-рамки всего
+/// выделения, а его значения показываются по последнему выделенному — пусть
+/// и живёт он там же, где стикер, на который человек смотрел последним.
 fn toolbar_monitor<'a>(selection: &SelectionSet, cfg: &'a Config) -> Option<&'a MonitorId> {
-    single_selected_id(selection)
-        .and_then(|id| cfg.stickers.iter().find(|s| s.id == id))
+    selection
+        .selected_stickers(&cfg.stickers)
+        .last()
         .map(|s| &s.placement.monitor_id)
 }
 
@@ -7971,45 +8106,68 @@ fn clamp_fully_within_monitor(placement: &Placement, rotation: f64, screen: &Dip
 }
 
 /// Пересобрать тулбар по текущему выделению (docs/M2_WIRING_PLAN.md,
-/// раздел 4): есть, когда режим активен, выделен ровно один стикер и марка
-/// не тянется; иначе — `None`. Билдер дёшев, но пересборка сбрасывает
-/// hover-подсветку кнопок — приемлемо для этого среза (docs/M2_WIRING_PLAN.md
-/// отмечает то же самое про пересборку по смене выделения).
+/// раздел 4): есть, когда режим активен, что-то выделено и марка не тянется;
+/// иначе — `None`. Билдер дёшев, но пересборка сбрасывает hover-подсветку
+/// кнопок — приемлемо для этого среза (docs/M2_WIRING_PLAN.md отмечает то же
+/// самое про пересборку по смене выделения).
+///
+/// С 2026-09-06 тулбар показывается и над НЕСКОЛЬКИМИ стикерами. Значения
+/// агрегируются по-разному, и каждое правило — из просьбы пользователя:
+/// * прозрачность и громкость — по ПОСЛЕДНЕМУ выделенному (правка сделает их
+///   общими: «если я меняю стикерам прозрачность, у них обоих становится
+///   прозрачность одинаковая»);
+/// * глаз, пауза и полоса перемотки — «И у всех»: пока хоть один видим,
+///   играет или без полосы, кнопка предлагает привести всех к одному;
+/// * видео-виджеты есть, если видео есть ХОТЬ У ОДНОГО — смешанное выделение
+///   картинки и видео даёт и общие действия, и видео-специфичные.
 fn rebuild_toolbar(edit: &mut EditState, cfg: &Config, screen_h: f64) {
     if !edit.active || edit.marquee.is_some() {
         edit.toolbar = None;
         return;
     }
-    let Some(id) = single_selected_id(&edit.selection) else {
+    let selected = edit.selection.selected_stickers(&cfg.stickers);
+    let (Some(bounds), Some(lead)) = (edit.selection.bounds(&cfg.stickers), selected.last()) else {
         edit.toolbar = None;
         return;
     };
-    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) else {
-        edit.toolbar = None;
-        return;
-    };
-    let bounds = hittest::aabb(&sticker.placement, sticker.transform.rotation);
     // Видео-виджеты тулбара (M5b) — источник состояния тот же Config, что и
     // у остальных полей тулбара: play/pause и громкость крутятся в
     // `sticker.playback`, координатор синхронизирует реальный
     // `rst_video::VideoSource`/`rst_audio::AudioSource` С НИМ (не наоборот),
     // поэтому здесь не нужна карта `videos` — она runtime-кэш, а не
     // источник истины.
-    let is_video = matches!(
-        &sticker.source,
-        StickerSource::File {
-            media_type: MediaType::Video,
-            ..
-        }
-    );
-    let video = is_video.then(|| toolbar::VideoToolbarState {
-        paused: sticker.playback.paused,
-        volume_pct: (sticker.playback.volume.clamp(0.0, 1.0) * 100.0).round() as u32,
-        show_timeline: sticker.playback.show_timeline,
+    let videos: Vec<&Sticker> = selected
+        .iter()
+        .copied()
+        .filter(|s| sticker_is_video(s))
+        .collect();
+    let video = videos.last().map(|lead_video| toolbar::VideoToolbarState {
+        paused: videos.iter().all(|s| s.playback.paused),
+        show_timeline: videos.iter().all(|s| s.playback.show_timeline),
+        volume_pct: (lead_video.playback.volume.clamp(0.0, 1.0) * 100.0).round() as u32,
+        muted: videos.iter().all(|s| s.playback.muted),
     });
-    let opacity = Some(sticker.transform.opacity);
-    edit.toolbar = Some(toolbar::build_toolbar(&bounds, opacity, video, screen_h));
+    let state = toolbar::ToolbarState {
+        opacity: lead.transform.opacity,
+        visible: selected.iter().all(|s| s.visible),
+        video,
+    };
+    edit.toolbar = Some(toolbar::build_toolbar(&bounds, &state, screen_h));
 }
+
+/// Непрозрачность контура отдельного стикера внутри мультивыделения: он
+/// лишь отмечает «этот входит в группу», а главная линия — общая рамка.
+/// Полная яркость обеих спорила бы за внимание.
+const MULTI_MEMBER_OPACITY: f64 = 0.45;
+
+/// Единичное преобразование — общая рамка группы не повёрнута (поворота у
+/// группы нет, см. `Zone::MultiResize`).
+const IDENTITY: Transform = Transform {
+    rotation: 0.0,
+    opacity: 1.0,
+    flip_h: false,
+    flip_v: false,
+};
 
 /// Идентификатор панели полосы перемотки: собственная панель, ни с чьими
 /// идентификаторами не пересекается (тулбар и панель закреплённого окна
@@ -8114,11 +8272,19 @@ fn media_keys_target(
     cursor: Option<(i32, i32)>,
 ) -> Option<(Uuid, MonitorId)> {
     if edit.active {
-        let [id] = edit.selection.ids() else {
-            return None;
-        };
-        let sticker = cfg.stickers.iter().find(|s| s.id == *id)?;
-        return sticker_is_video(sticker).then(|| (*id, sticker.placement.monitor_id.clone()));
+        // Любое выделенное видео, а не только единственное: с 2026-09-06
+        // выделение может быть групповым, и клавиши обязаны работать так
+        // же, как кнопки тулбара, — по всей группе. Возвращается последнее
+        // выделенное; сами клавиши применяются ко всем (см. `handle_key`),
+        // а эта цель нужна вызывающему только чтобы понять «есть ли кому
+        // адресовать» и на каком мониторе.
+        let sticker = edit
+            .selection
+            .selected_stickers(&cfg.stickers)
+            .into_iter()
+            .rev()
+            .find(|s| sticker_is_video(s))?;
+        return Some((sticker.id, sticker.placement.monitor_id.clone()));
     }
     let (cx, cy) = cursor?;
     let (monitor_id, dip) = monitor_dip_at(cx, cy, monitor_bounds)?;
@@ -8135,6 +8301,18 @@ fn media_keys_target(
         // который человек и видит под курсором.
         .max_by_key(|s| s.order)
         .map(|s| (s.id, monitor_id.clone()))
+}
+
+/// Громкость, которую слышит микшер: выключённый звук (`muted`) — это ноль
+/// в микшере, но НЕ ноль в модели. Уровень хранится отдельно и возвращается
+/// одним кликом по динамику (запрос пользователя 2026-09-06); если бы
+/// выключение просто обнуляло `volume`, включать пришлось бы «наугад».
+fn effective_volume(playback: &PlaybackSettings) -> f32 {
+    if playback.muted {
+        0.0
+    } else {
+        playback.volume as f32
+    }
 }
 
 /// Стикер — видеофайл.
@@ -8608,14 +8786,17 @@ fn rebuild_ui_panels(
         }
         None => edit.cursor_panel = None,
     }
-    // Панель выбора окон редактирует ОДИН конкретный стикер (открыта его
-    // кнопкой тулбара) — если выделение сменилось на другой стикер (или
-    // снялось, или стало множественным), панель больше не отражает то, что
-    // выбрано, и должна закрыться (M4_WINDOW_PICKER_DESIGN.md §1). Снимок
+    // Панель выбора окон открыта кнопкой тулбара и правит ровно то
+    // выделение, которое было при открытии (M4_WINDOW_PICKER_DESIGN.md §1).
+    // Сменилось выделение — панель показывает уже не то, что выбрано, и
+    // закрывается. Сравниваем список целиком: для группы (2026-09-06)
+    // «то же выделение» — это тот же набор в том же порядке, иначе
+    // ведущий стикер `target` перестал бы соответствовать панели. Снимок
     // окон здесь не нужен — закрытие, а не пересборка содержимого.
     if let Some(state) = &edit.window_picker {
-        if !matches!(state.target, PickerTarget::Sticker(id) if single_selected_id(&edit.selection) == Some(id))
-        {
+        let same_selection = matches!(state.target, PickerTarget::Sticker(_))
+            && state.applies_to == edit.selection.ids();
+        if !same_selection {
             edit.window_picker = None;
         }
     }
@@ -8647,8 +8828,14 @@ fn open_window_picker(
     }) else {
         return;
     };
+    let applies_to = match target {
+        PickerTarget::Sticker(_) => edit.selection.ids().to_vec(),
+        PickerTarget::PinnedHost(_) => Vec::new(),
+    };
     edit.window_picker = Some(WindowPickerState {
         target,
+        applies_to,
+        leveled: false,
         // Плейсхолдер — `rebuild_window_picker` ниже строит настоящую
         // панель немедленно, до первой отрисовки.
         panel: Panel::new(
@@ -8665,6 +8852,56 @@ fn open_window_picker(
         monitor_id,
     });
     rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+}
+
+/// Первая правка слоёв у группы: привести ВСЕХ выделенных к «видно везде»
+/// (`VisibilityRule::default()`), чтобы дальше человек снимал галочки с
+/// окон, а не гадал, чьё правило сейчас показывает панель (запрос
+/// пользователя 2026-09-06). Возвращает `true`, если что-то выровняли —
+/// вызывающий обязан был перед этим положить снимок в undo.
+///
+/// Одиночное выделение через эту функцию не проходит: там правило стикера и
+/// есть то, что показано, выравнивать не с чем.
+fn level_picker_group(edit: &mut EditState, cfg: &mut Config) -> bool {
+    let Some(state) = &mut edit.window_picker else {
+        return false;
+    };
+    if state.leveled || state.applies_to.len() < 2 {
+        return false;
+    }
+    state.leveled = true;
+    let ids = state.applies_to.clone();
+    for sticker in cfg.stickers.iter_mut().filter(|s| ids.contains(&s.id)) {
+        sticker.visibility = VisibilityRule::default();
+    }
+    true
+}
+
+/// Раздать правило ведущего стикера остальным членам группы: после правки
+/// слои у выделенных общие — ровно как прозрачность (2026-09-06).
+fn spread_picker_visibility(edit: &EditState, cfg: &mut Config, lead: Uuid) {
+    let Some(state) = &edit.window_picker else {
+        return;
+    };
+    if state.applies_to.len() < 2 {
+        return;
+    }
+    let Some(rule) = cfg
+        .stickers
+        .iter()
+        .find(|s| s.id == lead)
+        .map(|s| s.visibility.clone())
+    else {
+        return;
+    };
+    let ids = state.applies_to.clone();
+    for sticker in cfg
+        .stickers
+        .iter_mut()
+        .filter(|s| s.id != lead && ids.contains(&s.id))
+    {
+        sticker.visibility = rule.clone();
+    }
 }
 
 /// Пересобрать панель выбора окон (мутация `cfg`, влияющая на правило
@@ -9391,12 +9628,14 @@ fn handle_window_picker_up(
             return true;
         }
         commit_undo_snapshot(edit, cfg.clone());
+        level_picker_group(edit, cfg);
         let sticker = cfg
             .stickers
             .iter_mut()
             .find(|s| s.id == sticker_id)
             .expect("наличие стикера проверено выше");
         sticker.visibility = window_picker::toggle_select_all(&sticker.visibility, window_snapshot);
+        spread_picker_visibility(edit, cfg, sticker_id);
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после «выбрать все» в панели выбора окон");
         }
@@ -9421,12 +9660,14 @@ fn handle_window_picker_up(
         .is_some_and(Button::take_click);
     if desktop_only_clicked && matches!(target, PickerTarget::Sticker(_)) {
         commit_undo_snapshot(edit, cfg.clone());
+        level_picker_group(edit, cfg);
         let sticker = cfg
             .stickers
             .iter_mut()
             .find(|s| s.id == sticker_id)
             .expect("наличие стикера проверено выше");
         sticker.visibility = window_picker::apply_desktop_only_preset(&sticker.visibility);
+        spread_picker_visibility(edit, cfg, sticker_id);
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после пресета «только рабочий стол»");
         }
@@ -9469,6 +9710,7 @@ fn handle_window_picker_up(
             return true;
         }
         commit_undo_snapshot(edit, cfg.clone());
+        level_picker_group(edit, cfg);
         let sticker = cfg
             .stickers
             .iter_mut()
@@ -9477,6 +9719,7 @@ fn handle_window_picker_up(
         if let Some(new_rule) = window_picker::toggle_process_group(&sticker.visibility, group) {
             sticker.visibility = new_rule;
         }
+        spread_picker_visibility(edit, cfg, sticker_id);
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения процесса в панели выбора окон");
         }
@@ -12882,7 +13125,18 @@ fn handle_toolbar_up(
     if let Some(panel) = &mut edit.toolbar {
         panel.pointer_event(PointerEvent::Up { pos });
     }
-    let Some(id) = single_selected_id(&edit.selection) else {
+    // Щелчок по дорожке ползунка (или по шкале громкости) БЕЗ движения мыши
+    // тоже меняет значение: виджет ставит его уже на `Down`, а живой опрос
+    // висел только на `MouseMove`. Опрашиваем и здесь — до коммита снимка
+    // ниже, чтобы правка попала в тот же шаг истории.
+    poll_toolbar_opacity_live(edit, cfg, sprites);
+    poll_toolbar_volume_live(edit, cfg);
+    // Все выделенные, в порядке выделения: действия тулбара применяются ко
+    // всей группе, а значения показываются по последнему (запрос
+    // пользователя 2026-09-06). Для одиночного выделения это тот же самый
+    // код с вектором из одного элемента.
+    let ids: Vec<Uuid> = edit.selection.ids().to_vec();
+    let Some(&id) = ids.last() else {
         return true;
     };
 
@@ -12904,7 +13158,9 @@ fn handle_toolbar_up(
         .and_then(NumericField::take_submitted)
     {
         commit_undo_snapshot(edit, cfg.clone());
-        apply_opacity(cfg, sprites, id, value);
+        for id in &ids {
+            apply_opacity(cfg, sprites, *id, value);
+        }
         if let Some(slider) = edit
             .toolbar
             .as_mut()
@@ -12939,7 +13195,14 @@ fn handle_toolbar_up(
     }
     if clicked(edit, toolbar::TB_EYE) {
         commit_undo_snapshot(edit, cfg.clone());
-        let _ = ops::toggle_visibility(cfg, id);
+        // Глаз приводит группу к ОДНОМУ состоянию, как кнопка «показать/
+        // скрыть всё» на панели у курсора: пока хоть один скрыт, клик
+        // показывает всех (2026-09-06).
+        let all_visible = ids
+            .iter()
+            .filter_map(|id| cfg.stickers.iter().find(|s| s.id == *id))
+            .all(|s| s.visible);
+        ops::set_visible_many(cfg, &ids, !all_visible);
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения видимости");
         }
@@ -12948,7 +13211,7 @@ fn handle_toolbar_up(
     }
     if clicked(edit, toolbar::TB_ORDER_UP) {
         commit_undo_snapshot(edit, cfg.clone());
-        let _ = ops::step_up(cfg, id);
+        reorder_selection(cfg, &ids, true);
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после изменения порядка");
         }
@@ -12956,7 +13219,7 @@ fn handle_toolbar_up(
     }
     if clicked(edit, toolbar::TB_ORDER_DOWN) {
         commit_undo_snapshot(edit, cfg.clone());
-        let _ = ops::step_down(cfg, id);
+        reorder_selection(cfg, &ids, false);
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после изменения порядка");
         }
@@ -12964,9 +13227,19 @@ fn handle_toolbar_up(
     }
     if clicked(edit, toolbar::TB_DUPLICATE) {
         commit_undo_snapshot(edit, cfg.clone());
-        if let Ok(new_id) = ops::duplicate(cfg, id) {
+        let copies: Vec<Uuid> = ids
+            .iter()
+            .filter_map(|id| ops::duplicate(cfg, *id).ok())
+            .collect();
+        if !copies.is_empty() {
             resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
-            edit.selection.click(Some(new_id));
+            // Выделение переезжает на копии — тем же порядком, что был у
+            // оригиналов: следующее действие тулбара продолжит работать «по
+            // последнему», как человек и ожидает.
+            edit.selection.clear();
+            for new_id in copies {
+                edit.selection.select(new_id);
+            }
         }
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
@@ -12981,14 +13254,20 @@ fn handle_toolbar_up(
         // трогаются. Молча ничего не делает, если натуральный размер
         // недоступен (стикер-окно без спрайта) — тот же контракт, что у
         // команды настроек.
-        if let Some((natural_w, natural_h)) = sticker_natural_size(sprites, id) {
+        let sizes: Vec<(Uuid, f64, f64)> = ids
+            .iter()
+            .filter_map(|id| sticker_natural_size(sprites, *id).map(|(w, h)| (*id, w, h)))
+            .collect();
+        if !sizes.is_empty() {
             commit_undo_snapshot(edit, cfg.clone());
-            let _ = ops::reset_transform_and_size(cfg, id, natural_w, natural_h);
-            if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
-                let (placement, transform) = (sticker.placement.clone(), sticker.transform);
-                if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| *sid == id) {
-                    sprite.placement = placement;
-                    sprite.transform = transform;
+            for (id, natural_w, natural_h) in sizes {
+                let _ = ops::reset_transform_and_size(cfg, id, natural_w, natural_h);
+                if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
+                    let (placement, transform) = (sticker.placement.clone(), sticker.transform);
+                    if let Some((_, sprite)) = sprites.iter_mut().find(|(sid, _)| *sid == id) {
+                        sprite.placement = placement;
+                        sprite.transform = transform;
+                    }
                 }
             }
             if let Err(e) = config::save(cfg, config_path) {
@@ -13025,8 +13304,11 @@ fn handle_toolbar_up(
     // реальное состояние расходились (независимое ревью сшивки).
     if clicked(edit, toolbar::TB_PLAY_PAUSE) {
         commit_undo_snapshot(edit, cfg.clone());
-        if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
-            sticker.playback.paused = !sticker.playback.paused;
+        // Пока играет хоть одно выделенное видео, кнопка ставит на паузу
+        // ВСЕ; если на паузе все — запускает все (2026-09-06).
+        let all_paused = selected_videos(cfg, &ids).all(|s| s.playback.paused);
+        for sticker in selected_videos_mut(cfg, &ids) {
+            sticker.playback.paused = !all_paused;
         }
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после паузы/воспроизведения видео");
@@ -13039,8 +13321,9 @@ fn handle_toolbar_up(
     // config.json и переживает перезапуск.
     if clicked(edit, toolbar::TB_TIMELINE) {
         commit_undo_snapshot(edit, cfg.clone());
-        if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
-            sticker.playback.show_timeline = !sticker.playback.show_timeline;
+        let all_on = selected_videos(cfg, &ids).all(|s| s.playback.show_timeline);
+        for sticker in selected_videos_mut(cfg, &ids) {
+            sticker.playback.show_timeline = !all_on;
         }
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения полосы перемотки");
@@ -13048,7 +13331,75 @@ fn handle_toolbar_up(
         rebuild_ui_panels(edit, cfg, monitor_geometry);
         return true;
     }
+    // Клик по самому динамику — «включить/выключить звук» (запрос
+    // пользователя 2026-09-06). Отдельный флаг `muted`, а не громкость в
+    // ноль: уровень обязан пережить выключение и вернуться одним кликом.
+    let mute_clicked = edit
+        .toolbar
+        .as_mut()
+        .and_then(|p| p.widget_mut::<VolumeControl>(toolbar::TB_VOLUME))
+        .is_some_and(VolumeControl::take_mute_click);
+    if mute_clicked {
+        commit_undo_snapshot(edit, cfg.clone());
+        let all_muted = selected_videos(cfg, &ids).all(|s| s.playback.muted);
+        for sticker in selected_videos_mut(cfg, &ids) {
+            sticker.playback.muted = !all_muted;
+        }
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после переключения звука");
+        }
+        rebuild_ui_panels(edit, cfg, monitor_geometry);
+        return true;
+    }
     true
+}
+
+/// Видео среди выделенных стикеров, в порядке выделения.
+fn selected_videos<'a>(cfg: &'a Config, ids: &'a [Uuid]) -> impl Iterator<Item = &'a Sticker> {
+    ids.iter()
+        .filter_map(|id| cfg.stickers.iter().find(|s| s.id == *id))
+        .filter(|s| sticker_is_video(s))
+}
+
+/// То же самое для правки. Отдельная функция, а не параметр — изменяемый
+/// итератор по `cfg.stickers` не построить фильтром по чужому списку без
+/// повторного заимствования.
+fn selected_videos_mut<'a>(
+    cfg: &'a mut Config,
+    ids: &'a [Uuid],
+) -> impl Iterator<Item = &'a mut Sticker> {
+    cfg.stickers
+        .iter_mut()
+        .filter(|s| ids.contains(&s.id))
+        .filter(|s| sticker_is_video(s))
+}
+
+/// Порядок группы по кнопкам «выше»/«ниже» (запрос пользователя 2026-09-06:
+/// «последний стикер, который ты выделил, летит выше всех или ниже всех, а
+/// остальные по очереди»).
+///
+/// Одиночное выделение сохраняет прежний шаг на один уровень: там «выше» —
+/// это про соседа, а не про весь стек, и менять привычное поведение
+/// пользователь не просил. У группы шаг не годится вовсе: сдвинуть каждого
+/// на уровень значило бы протащить их сквозь друг друга.
+fn reorder_selection(cfg: &mut Config, ids: &[Uuid], up: bool) {
+    if let [id] = ids {
+        let _ = if up {
+            ops::step_up(cfg, *id)
+        } else {
+            ops::step_down(cfg, *id)
+        };
+        return;
+    }
+    // Порядок обхода — порядок выделения: каждый следующий встаёт над (под)
+    // предыдущим, и последний оказывается на самом верху (внизу).
+    for id in ids {
+        let _ = if up {
+            ops::bring_to_front(cfg, *id)
+        } else {
+            ops::send_to_back(cfg, *id)
+        };
+    }
 }
 
 /// Опросить действия панели у курсора после `Up` (docs/M2_WIRING_PLAN.md,
@@ -13207,6 +13558,48 @@ fn handle_cursor_panel_up(
     true
 }
 
+/// Прокрутка колесом над тулбаром выделения: отдать событие панели и
+/// довести изменение до `cfg`. `true` — колесо съедено тулбаром, дальше его
+/// не роутить.
+///
+/// До 2026-09-06 колесо до тулбара не доходило вовсе (находка независимого
+/// аудита): ветка `MouseWheel` знала только про списки окон и панель пина.
+/// Виджет под курсором послушно менял своё значение, `cfg` о нём не узнавал,
+/// и ближайшая пересборка панели молча возвращала старое — регулятор
+/// выглядел сломанным.
+///
+/// Шаг колеса — дискретное действие, поэтому снимок истории кладётся сразу,
+/// а не откладывается до `MouseUp`: клика по тулбару после прокрутки может и
+/// не быть, и отложенный снимок прилип бы к постороннему действию.
+fn toolbar_wheel(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    sprites: &mut [(Uuid, Sprite)],
+    notches: i32,
+    monitor_id: &MonitorId,
+) -> bool {
+    if edit.cursor_monitor != *monitor_id || toolbar_monitor(&edit.selection, cfg) != Some(monitor_id)
+    {
+        return false;
+    }
+    let pos = edit.cursor_pos;
+    let consumed = edit
+        .toolbar
+        .as_mut()
+        .is_some_and(|p| p.mouse_wheel(pos, notches).consumed);
+    if !consumed {
+        return false;
+    }
+    poll_toolbar_opacity_live(edit, cfg, sprites);
+    poll_toolbar_volume_live(edit, cfg);
+    if let Some(before) = edit.ui_pending_snapshot.take() {
+        if before != *cfg {
+            commit_undo_snapshot(edit, before);
+        }
+    }
+    true
+}
+
 /// Опросить ползунок прозрачности тулбара на каждом `MouseMove`, пока
 /// перетаскивание держит его (`pointer_owner == Toolbar`): применяет живо,
 /// первый снимок откладывается до `MouseUp` (docs/M2_WIRING_PLAN.md,
@@ -13216,9 +13609,10 @@ fn poll_toolbar_opacity_live(
     cfg: &mut Config,
     sprites: &mut [(Uuid, Sprite)],
 ) {
-    let Some(id) = single_selected_id(&edit.selection) else {
+    let ids: Vec<Uuid> = edit.selection.ids().to_vec();
+    if ids.is_empty() {
         return;
-    };
+    }
     let value = {
         let Some(panel) = &mut edit.toolbar else {
             return;
@@ -13234,7 +13628,12 @@ fn poll_toolbar_opacity_live(
     if edit.ui_pending_snapshot.is_none() {
         edit.ui_pending_snapshot = Some(cfg.clone());
     }
-    apply_opacity(cfg, sprites, id, value);
+    // Одно значение на всю группу: «если я меняю стикерам прозрачность, у
+    // них обоих становится прозрачность одинаковая, даже если до редакции
+    // она была разной» (2026-09-06).
+    for id in &ids {
+        apply_opacity(cfg, sprites, *id, value);
+    }
     if let Some(panel) = &mut edit.toolbar {
         if let Some(field) = panel.widget_mut::<NumericField>(toolbar::TB_FIELD) {
             field.set_value(value);
@@ -13254,17 +13653,18 @@ fn poll_toolbar_opacity_live(
 /// помнить о живом источнике (независимое ревью сшивки, находка про откат
 /// драга громкости через `Esc`, который применял cfg, но не звук).
 fn poll_toolbar_volume_live(edit: &mut EditState, cfg: &mut Config) {
-    let Some(id) = single_selected_id(&edit.selection) else {
+    let ids: Vec<Uuid> = edit.selection.ids().to_vec();
+    if ids.is_empty() {
         return;
-    };
+    }
     let value = {
         let Some(panel) = &mut edit.toolbar else {
             return;
         };
-        let Some(slider) = panel.widget_mut::<Slider>(toolbar::TB_VOLUME) else {
+        let Some(volume) = panel.widget_mut::<VolumeControl>(toolbar::TB_VOLUME) else {
             return;
         };
-        let Some(v) = slider.take_changed() else {
+        let Some(v) = volume.take_changed() else {
             return;
         };
         v
@@ -13273,8 +13673,12 @@ fn poll_toolbar_volume_live(edit: &mut EditState, cfg: &mut Config) {
         edit.ui_pending_snapshot = Some(cfg.clone());
     }
     let volume = f64::from(value.min(100)) / 100.0;
-    if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) {
+    // Тянуть шкалу — значит включать звук: выключённый регулятор, который
+    // молчит под рукой, читался бы как сломанный (та же логика, что в самом
+    // виджете `VolumeControl`).
+    for sticker in selected_videos_mut(cfg, &ids) {
         sticker.playback.volume = volume;
+        sticker.playback.muted = false;
     }
 }
 
@@ -13549,9 +13953,9 @@ fn handle_input(
                     let before = edit.selection.ids().to_vec();
                     if modifiers.shift {
                         // Shift+клик строит мультивыделение по одному
-                        // (SPEC 3.2) — жест перетаскивания здесь не
-                        // начинаем: мульти-драг ещё не реализован
-                        // (docs/M2_MULTISELECT_TOOLBAR_NOTES.md, раздел 4).
+                        // (SPEC 3.2). Жеста здесь нет намеренно: человек
+                        // набирает группу, а не тащит её — тащить будет
+                        // следующим нажатием, уже через `Zone::MultiBody`.
                         edit.selection.shift_click(id);
                         let changed = before != edit.selection.ids();
                         if changed {
@@ -13574,12 +13978,81 @@ fn handle_input(
                         let grab_dy = dip_y - sticker.placement.cy;
                         edit.pending_snapshot = Some(cfg.clone());
                         edit.gesture = Some(Gesture::Drag {
-                            start,
+                            starts: vec![start],
                             grab_dx,
                             grab_dy,
                         });
                     }
                     changed
+                }
+                Zone::MultiBody => {
+                    if edit.pinned_selection.take().is_some() {
+                        edit.pinned_panel = None;
+                    }
+                    let hit = hit_sticker_at(cfg, monitor_id, dip_x, dip_y);
+                    if modifiers.shift {
+                        // Shift по уже выделенному — выкинуть его из группы
+                        // (SPEC 3.2), а не начать тащить её.
+                        let Some(id) = hit else {
+                            return false;
+                        };
+                        let before = edit.selection.ids().to_vec();
+                        edit.selection.shift_click(id);
+                        let changed = before != edit.selection.ids();
+                        if changed {
+                            rebuild_ui_panels(edit, cfg, monitor_geometry);
+                        }
+                        return changed;
+                    }
+                    let here = selected_on_monitor(&edit.selection, cfg, monitor_id);
+                    let mut starts: Vec<GestureStart> = here
+                        .iter()
+                        .map(|s| GestureStart {
+                            id: s.id,
+                            placement: s.placement.clone(),
+                            transform: s.transform,
+                        })
+                        .collect();
+                    // Ведущий — стикер под курсором: магнит группы считается
+                    // по нему, и человек ждёт, что липнет именно тот, за
+                    // который он взялся.
+                    if let Some(pos) = hit.and_then(|id| starts.iter().position(|st| st.id == id)) {
+                        starts.swap(0, pos);
+                    }
+                    let Some(lead) = starts.first() else {
+                        return false;
+                    };
+                    let grab_dx = dip_x - lead.placement.cx;
+                    let grab_dy = dip_y - lead.placement.cy;
+                    edit.pending_snapshot = Some(cfg.clone());
+                    edit.gesture = Some(Gesture::Drag {
+                        starts,
+                        grab_dx,
+                        grab_dy,
+                    });
+                    false
+                }
+                Zone::MultiResize(handle) => {
+                    let here = selected_on_monitor(&edit.selection, cfg, monitor_id);
+                    let Some(bounds) = union_bounds(&here) else {
+                        return false;
+                    };
+                    let starts: Vec<GestureStart> = here
+                        .iter()
+                        .map(|s| GestureStart {
+                            id: s.id,
+                            placement: s.placement.clone(),
+                            transform: s.transform,
+                        })
+                        .collect();
+                    edit.pending_snapshot = Some(cfg.clone());
+                    edit.gesture = Some(Gesture::Resize {
+                        starts,
+                        bounds,
+                        handle,
+                        grab: (dip_x, dip_y),
+                    });
+                    false
                 }
                 Zone::ResizeHandle(id, handle) => {
                     if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
@@ -13589,11 +14062,7 @@ fn handle_input(
                             transform: sticker.transform,
                         };
                         edit.pending_snapshot = Some(cfg.clone());
-                        edit.gesture = Some(Gesture::Resize {
-                            start,
-                            handle,
-                            grab: (dip_x, dip_y),
-                        });
+                        edit.gesture = Some(Gesture::resize_one(start, handle, (dip_x, dip_y)));
                     }
                     false
                 }
@@ -14114,9 +14583,20 @@ fn handle_input(
             // его пропускает — как и клик без единого движения, который
             // иначе мог бы молча перепривязать стикер и сжечь шаг истории,
             // если центр уже был за краем до этого клика (пункт 2.3).
-            if let Some(start) = edit.gesture.as_ref().and_then(Gesture::start) {
-                let id = start.id;
-                let start_placement = start.placement.clone();
+            // Группа переезжает между мониторами так же, как одиночный
+            // стикер, — по каждому её участнику отдельно: центр у них разный,
+            // и границу пересекают не все сразу.
+            let gesture_starts: Vec<(Uuid, Placement)> = edit
+                .gesture
+                .as_ref()
+                .map(|g| {
+                    g.starts()
+                        .iter()
+                        .map(|st| (st.id, st.placement.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (id, start_placement) in gesture_starts {
                 let current = cfg
                     .stickers
                     .iter()
@@ -14173,7 +14653,11 @@ fn handle_input(
                     }
                 }
             }
-            let gesture_sticker_id = edit.gesture.as_ref().and_then(Gesture::start).map(|s| s.id);
+            let gesture_sticker_ids: Vec<Uuid> = edit
+                .gesture
+                .as_ref()
+                .map(|g| g.starts().iter().map(|st| st.id).collect())
+                .unwrap_or_default();
             if edit.gesture.take().is_some() {
                 // Снимок кладём в историю только сейчас, и только если жест
                 // реально что-то изменил — клик без движения не тратит шаг
@@ -14198,12 +14682,13 @@ fn handle_input(
                         // считать стикер уже отредактированным пользователем и
                         // не запустит автовозврат — стикер не теряется, но
                         // останется на месте миграции с «мёртвым» origin.
-                        if let Some(id) = gesture_sticker_id {
-                            if let Some(sticker) = cfg.stickers.iter().find(|s| s.id == id) {
-                                let actions = loss_tracker.on_user_edit(sticker);
-                                if !actions.is_empty() {
-                                    apply_loss_actions(cfg, sprites, actions);
-                                }
+                        for id in &gesture_sticker_ids {
+                            let Some(sticker) = cfg.stickers.iter().find(|s| s.id == *id) else {
+                                continue;
+                            };
+                            let actions = loss_tracker.on_user_edit(sticker);
+                            if !actions.is_empty() {
+                                apply_loss_actions(cfg, sprites, actions);
                             }
                         }
                         commit_undo_snapshot(edit, before);
@@ -14226,6 +14711,23 @@ fn handle_input(
             // `rebuild_window_picker`/`rebuild_window_pick_list`, здесь
             // нужен только пол в 0 — `saturating_add_signed` даёт его
             // бесплатно.
+            // Колесо над ТУЛБАРОМ — первым: под курсором там регулятор
+            // громкости и числовое поле прозрачности, оба умеют крутиться, но
+            // до 2026-09-06 колесо до тулбара не доходило вовсе (находка
+            // независимого аудита) — виджет менял своё значение, а `cfg` о нём
+            // не узнавал, и ближайшая пересборка панели его молча возвращала.
+            //
+            // Шаг колеса — дискретное действие, поэтому снимок истории
+            // кладётся сразу, а не откладывается до `MouseUp`: клика по
+            // тулбару после прокрутки может и не быть, и отложенный снимок
+            // прилип бы к постороннему действию.
+            if toolbar_wheel(edit, cfg, sprites, notches, monitor_id) {
+                if let Err(e) = config::save(cfg, config_path) {
+                    tracing::warn!(error = %e, "не удалось сохранить config.json после прокрутки колесом над тулбаром");
+                }
+                rebuild_ui_panels(edit, cfg, monitor_geometry);
+                return true;
+            }
             const ROWS_PER_NOTCH: isize = 3;
             let rows = (notches as isize).saturating_mul(-ROWS_PER_NOTCH);
             if let Some(state) = &mut edit.window_picker {
@@ -14339,7 +14841,7 @@ fn handle_input(
                     true
                 }
                 Some(gesture) => {
-                    if let Some(start) = gesture.start() {
+                    for start in gesture.starts() {
                         apply_transform(
                             cfg,
                             sprites,
@@ -14552,13 +15054,15 @@ fn apply_gesture(
     };
     match gesture {
         Gesture::Drag {
-            start,
+            starts,
             grab_dx,
             grab_dy,
         } => {
-            let id = start.id;
-            let rotation = start.transform.rotation;
-            let mut placement = start.placement.clone();
+            let Some(lead) = starts.first() else {
+                return false;
+            };
+            let rotation = lead.transform.rotation;
+            let mut placement = lead.placement.clone();
             placement.cx = dip_x - grab_dx;
             placement.cy = dip_y - grab_dy;
             // Магнит не только к монитору, но и к СОСЕДНИМ стикерам
@@ -14576,15 +15080,26 @@ fn apply_gesture(
             placement.cx += snap_result.dx;
             placement.cy += snap_result.dy;
             let placement = snap::clamp_min_visible(&placement, rotation, monitor);
-            apply_transform(cfg, sprites, id, placement, start.transform);
+            // Группа едет ЖЁСТКО: смещение считается по ведущему (вместе с
+            // магнитом и зажимом в экран) и повторяется всеми остальными.
+            // Зажимать каждого по отдельности значило бы разорвать группу —
+            // стикер у края застревал бы, а его спутники уезжали дальше.
+            let dx = placement.cx - lead.placement.cx;
+            let dy = placement.cy - lead.placement.cy;
+            for start in starts {
+                let mut p = start.placement.clone();
+                p.cx += dx;
+                p.cy += dy;
+                apply_transform(cfg, sprites, start.id, p, start.transform);
+            }
             true
         }
         Gesture::Resize {
-            start,
+            starts,
+            bounds,
             handle,
             grab,
         } => {
-            let id = start.id;
             let delta = (dip_x - grab.0, dip_y - grab.1);
             // Ctrl инвертирует блокировку пропорций в зависимости от типа
             // ручки (фидбэк пользователя 2026-08-09): угловые ручки по
@@ -14596,6 +15111,23 @@ fn apply_gesture(
                 shift: handle.is_corner() != modifiers.ctrl,
                 alt: modifiers.alt,
             };
+            let [start] = starts.as_slice() else {
+                return resize_many(
+                    cfg,
+                    sprites,
+                    starts,
+                    *bounds,
+                    *handle,
+                    delta,
+                    dm,
+                    monitor,
+                    monitor_id,
+                    &snap_peers(cfg, edit, monitor_id),
+                    &edit.snap,
+                    modifiers.alt,
+                );
+            };
+            let id = start.id;
             // Зеркалирование при протаскивании ручки через якорь не касается
             // видео (тот же фидбэк) — для видео размер просто не уходит
             // ниже минимума.
@@ -14674,6 +15206,69 @@ fn apply_gesture(
         }
         Gesture::Marquee { .. } => unreachable!("обработано в раннем возврате выше"),
     }
+}
+
+/// Групповой ресайз: ручка тянет ОБЩУЮ рамку, стикеры переносятся аффинно
+/// (запрос пользователя 2026-09-06 «один квадрат выделения — скейлить и
+/// двигать одновременно»).
+///
+/// Рамка считается ровно теми же правилами, что одиночный стикер: она
+/// подставляется в [`transform_ops::resize`] как обычный `Placement` без
+/// поворота, поэтому блокировка пропорций, минимальный размер и магнит
+/// кромок достаются группе бесплатно и не расходятся с одиночным случаем.
+/// Зеркалирование группе запрещено (`allow_mirror = false`): протащить
+/// ручку через противоположный край значило бы отразить каждый стикер
+/// вокруг чужого центра.
+#[allow(clippy::too_many_arguments)]
+fn resize_many(
+    cfg: &mut Config,
+    sprites: &mut [(Uuid, Sprite)],
+    starts: &[GestureStart],
+    bounds: DipRect,
+    handle: HandleKind,
+    delta: (f64, f64),
+    dm: DragModifiers,
+    monitor: DipRect,
+    monitor_id: &MonitorId,
+    peers: &[DipRect],
+    snap_cfg: &SnapConfig,
+    magnet_off: bool,
+) -> bool {
+    let frame = bounds_placement(&bounds, monitor_id);
+    let identity = Transform::default();
+    let free = transform_ops::resize(&frame, &identity, handle, delta, dm, false);
+    let snapped = snap_resize(
+        free,
+        &frame,
+        &identity,
+        handle,
+        delta,
+        dm,
+        false,
+        monitor,
+        peers,
+        snap_cfg,
+        magnet_off,
+    );
+    let after = DipRect::from_center(
+        snapped.placement.cx,
+        snapped.placement.cy,
+        snapped.placement.w,
+        snapped.placement.h,
+    );
+    let items: Vec<(Uuid, Placement)> = starts
+        .iter()
+        .map(|st| (st.id, st.placement.clone()))
+        .collect();
+    let rotations: Vec<f64> = starts.iter().map(|st| st.transform.rotation).collect();
+    for (id, placement) in multi_transform::resize_selection(&items, bounds, after, &rotations) {
+        let transform = starts
+            .iter()
+            .find(|st| st.id == id)
+            .map_or(identity, |st| st.transform);
+        apply_transform(cfg, sprites, id, placement, transform);
+    }
+    true
 }
 
 /// Применить активный `edit.pinned_gesture` к текущей мировой точке курсора
@@ -14941,7 +15536,35 @@ fn redraw(
     }
 
     if edit.active {
+        // Мультивыделение (2026-09-06): у группы ОДНА рамка с ручками — по
+        // union стикеров этого монитора, — а каждый её участник обведён
+        // тонким контуром без ручек. Восемь ручек на каждом стикере
+        // сообщали бы, что тянуть можно каждого по отдельности, а тянется
+        // вся группа разом.
+        let here = selected_on_monitor(&edit.selection, cfg, monitor_id);
+        let group_frame = (here.len() > 1).then(|| union_bounds(&here)).flatten();
+        if let Some(bounds) = group_frame {
+            if let Some(tex) = ui_cache.fill_texture(renderer, rst_render::SELECTION_COLOR) {
+                for sticker in &here {
+                    let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
+                    for rect in sbox.visuals().outline {
+                        frame.push(solid_sprite(&tex, monitor_id, &rect, MULTI_MEMBER_OPACITY));
+                    }
+                }
+                let sbox = SelectionBox::new(&bounds_placement(&bounds, monitor_id), &IDENTITY);
+                let visuals = sbox.visuals();
+                for rect in visuals.outline {
+                    frame.push(solid_sprite(&tex, monitor_id, &rect, 1.0));
+                }
+                for (_, rect) in visuals.handles {
+                    frame.push(solid_sprite(white_tex, monitor_id, &rect, 1.0));
+                }
+            }
+        }
         for id in edit.selection.ids() {
+            if group_frame.is_some() {
+                break;
+            }
             let Some(sticker) = cfg
                 .stickers
                 .iter()
@@ -16714,6 +17337,8 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         edit.window_picker = Some(WindowPickerState {
             target: PickerTarget::Sticker(Uuid::new_v4()),
+            applies_to: Vec::new(),
+            leveled: false,
             panel: Panel::new(
                 window_picker::PICKER_PANEL_ID,
                 Box2D {
@@ -16794,6 +17419,303 @@ mod tests {
         assert_eq!(group_to_close_before_opening(&groups, second), None);
     }
 
+    // --- Мультивыделение: общая рамка, общий тулбар, общие действия
+    // (запрос пользователя 2026-09-06) ---
+
+    /// Два стикера 100×100 на «main»: левый с центром (200,200), правый —
+    /// (500,200). Общая рамка: x ∈ [150, 550], y ∈ [150, 250].
+    fn group_harness() -> (Config, EditState, Uuid, Uuid) {
+        let mut cfg = Config::default();
+        let left = zone_test_sticker(0.0);
+        let mut right = zone_test_sticker(0.0);
+        right.placement.cx = 500.0;
+        let (a, b) = (left.id, right.id);
+        cfg.stickers.push(left);
+        cfg.stickers.push(right);
+
+        let mut edit = mask_gate_edit_state();
+        edit.active = true;
+        edit.selection.select(a);
+        edit.selection.select(b);
+        (cfg, edit, a, b)
+    }
+
+    fn placement_of(cfg: &Config, id: Uuid) -> Placement {
+        cfg.stickers
+            .iter()
+            .find(|s| s.id == id)
+            .expect("стикер на месте")
+            .placement
+            .clone()
+    }
+
+    fn start_of(cfg: &Config, id: Uuid) -> GestureStart {
+        let s = cfg.stickers.iter().find(|s| s.id == id).unwrap();
+        GestureStart {
+            id,
+            placement: s.placement.clone(),
+            transform: s.transform,
+        }
+    }
+
+    /// Клик по любому из выделенных ведёт ВСЮ группу, а не только его:
+    /// смещение у всех одно и то же.
+    #[test]
+    fn a_group_drag_moves_every_selected_sticker_by_the_same_delta() {
+        let (mut cfg, mut edit, a, b) = group_harness();
+        // Взялись за левый в его центре и увели курсор на (+40, +25).
+        edit.gesture = Some(Gesture::Drag {
+            starts: vec![start_of(&cfg, a), start_of(&cfg, b)],
+            grab_dx: 0.0,
+            grab_dy: 0.0,
+        });
+        apply_gesture(
+            &mut cfg,
+            &mut [],
+            &mut edit,
+            (240.0, 225.0),
+            Modifiers {
+                alt: true, // магнит выключен: тест про жёсткость группы
+                ..Modifiers::default()
+            },
+            DipRect::new(0.0, 0.0, 1920.0, 1080.0),
+            &monitor_id("main"),
+        );
+        let moved_a = placement_of(&cfg, a);
+        let moved_b = placement_of(&cfg, b);
+        assert_eq!((moved_a.cx, moved_a.cy), (240.0, 225.0));
+        assert_eq!(
+            (moved_b.cx, moved_b.cy),
+            (540.0, 225.0),
+            "спутник едет ровно на то же смещение"
+        );
+        assert_eq!(
+            moved_b.cx - moved_a.cx,
+            300.0,
+            "расстояние внутри группы не меняется"
+        );
+    }
+
+    /// Ручка ОБЩЕЙ рамки тянет группу целиком: и размеры, и промежутки между
+    /// стикерами масштабируются, а противоположный край стоит на месте.
+    #[test]
+    fn a_group_resize_scales_sizes_and_gaps_together() {
+        let (mut cfg, mut edit, a, b) = group_harness();
+        let bounds = DipRect::new(150.0, 150.0, 400.0, 100.0);
+        edit.gesture = Some(Gesture::Resize {
+            starts: vec![start_of(&cfg, a), start_of(&cfg, b)],
+            bounds,
+            handle: HandleKind::East,
+            grab: (550.0, 200.0),
+        });
+        // Правую кромку общей рамки уводим с 550 на 750: ширина 400 -> 600,
+        // то есть в полтора раза. Точка выбрана подальше от направляющих
+        // монитора (края и центр 960) — тест про масштаб, не про магнит.
+        apply_gesture(
+            &mut cfg,
+            &mut [],
+            &mut edit,
+            (750.0, 200.0),
+            Modifiers::default(),
+            DipRect::new(0.0, 0.0, 1920.0, 1080.0),
+            &monitor_id("main"),
+        );
+        let new_a = placement_of(&cfg, a);
+        let new_b = placement_of(&cfg, b);
+        assert!(
+            (new_a.w - 150.0).abs() < 1e-6,
+            "ширина выросла в полтора раза: {}",
+            new_a.w
+        );
+        assert!(
+            (new_b.cx - new_a.cx - 450.0).abs() < 1e-6,
+            "промежуток вырос вместе с размерами: {}",
+            new_b.cx - new_a.cx
+        );
+        assert!(
+            (new_a.cx - new_a.w / 2.0 - 150.0).abs() < 1e-6,
+            "левый край рамки — якорь, он не двигается"
+        );
+    }
+
+    /// Ручки у группы одни на всех — на общей рамке; тело группы — сами
+    /// стикеры, между ними пусто.
+    #[test]
+    fn resolve_zone_over_a_group_uses_the_shared_frame() {
+        let (cfg, edit, _a, _b) = group_harness();
+        // Правая-нижняя ручка общей рамки — угол (550, 250).
+        assert!(matches!(
+            resolve_zone(&cfg, &edit.selection, &monitor_id("main"), 550.0, 250.0),
+            Zone::MultiResize(HandleKind::SouthEast)
+        ));
+        // Внутри левого стикера — тело группы.
+        assert!(matches!(
+            resolve_zone(&cfg, &edit.selection, &monitor_id("main"), 200.0, 200.0),
+            Zone::MultiBody
+        ));
+        // Между стикерами рамка есть, а стикера нет — это фон, а не группа.
+        assert!(matches!(
+            resolve_zone(&cfg, &edit.selection, &monitor_id("main"), 350.0, 200.0),
+            Zone::Background
+        ));
+    }
+
+    /// Тулбар над группой есть (раньше его не было вовсе), стоит под общей
+    /// рамкой и показывает прозрачность ПОСЛЕДНЕГО выделенного.
+    #[test]
+    fn the_toolbar_over_a_group_shows_the_last_selected() {
+        let (mut cfg, mut edit, a, b) = group_harness();
+        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().transform.opacity = 0.2;
+        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().transform.opacity = 0.9;
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let panel = edit.toolbar.as_ref().expect("тулбар над группой есть");
+        assert_eq!(
+            panel.widget::<Slider>(toolbar::TB_SLIDER).unwrap().value(),
+            90,
+            "показан последний выделенный"
+        );
+        // Центр тулбара — под центром ОБЩЕЙ рамки (x ∈ [150, 550]).
+        assert!((panel.frame().cx - 350.0).abs() < 1e-6);
+    }
+
+    /// Глаз показывает состояние группы, а клик приводит её к одному:
+    /// пока хоть один скрыт — «показать всех».
+    #[test]
+    fn the_eye_reflects_the_whole_group() {
+        let (mut cfg, mut edit, a, _b) = group_harness();
+        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().visible = false;
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let mut prims = Vec::new();
+        edit.toolbar
+            .as_ref()
+            .unwrap()
+            .widget::<Button>(toolbar::TB_EYE)
+            .unwrap()
+            .draw(&mut prims);
+        let icon = prims.iter().find_map(|p| match p {
+            Primitive::Icon { icon, .. } => Some(*icon),
+            _ => None,
+        });
+        assert_eq!(icon, Some(Icon::EyeOff), "один скрыт — глаз закрыт");
+
+        let ids: Vec<Uuid> = edit.selection.ids().to_vec();
+        let all_visible = ids
+            .iter()
+            .filter_map(|id| cfg.stickers.iter().find(|s| s.id == *id))
+            .all(|s| s.visible);
+        ops::set_visible_many(&mut cfg, &ids, !all_visible);
+        assert!(
+            cfg.stickers.iter().all(|s| s.visible),
+            "клик показывает всю группу"
+        );
+    }
+
+    /// «Выше» у группы кладёт последний выделенный на самый верх, остальных —
+    /// по очереди под ним (дословная формулировка пользователя).
+    #[test]
+    fn bringing_a_group_forward_puts_the_last_selected_on_top() {
+        let (mut cfg, _edit, a, b) = group_harness();
+        // Чужой стикер сверху — группе есть куда всплывать.
+        let mut other = zone_test_sticker(0.0);
+        other.placement.cx = 900.0;
+        other.order = 99;
+        let other_id = other.id;
+        cfg.stickers.push(other);
+
+        fn order(cfg: &Config, id: Uuid) -> i64 {
+            cfg.stickers.iter().find(|s| s.id == id).unwrap().order
+        }
+
+        reorder_selection(&mut cfg, &[a, b], true);
+        assert!(
+            order(&cfg, b) > order(&cfg, a),
+            "последний выделенный — выше всех"
+        );
+        assert!(
+            order(&cfg, a) > order(&cfg, other_id),
+            "остальные — сразу под ним"
+        );
+
+        // «Ниже» — зеркально: последний выделенный оказывается на самом дне.
+        reorder_selection(&mut cfg, &[a, b], false);
+        assert!(order(&cfg, b) < order(&cfg, a));
+        assert!(order(&cfg, a) < order(&cfg, other_id));
+    }
+
+    /// Одиночное выделение по-прежнему ходит по одному уровню, а не улетает
+    /// на самый верх: менять привычное поведение пользователь не просил.
+    #[test]
+    fn a_single_sticker_still_steps_one_level() {
+        let (mut cfg, _edit, a, _b) = group_harness();
+        let mut top = zone_test_sticker(0.0);
+        top.placement.cx = 900.0;
+        top.order = 5;
+        let top_id = top.id;
+        cfg.stickers.push(top);
+        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().order = 0;
+
+        reorder_selection(&mut cfg, &[a], true);
+        let order = |id: Uuid| cfg.stickers.iter().find(|s| s.id == id).unwrap().order;
+        assert!(
+            order(a) < order(top_id),
+            "шаг на один уровень, а не прыжок наверх"
+        );
+    }
+
+    /// Колесо над регулятором громкости доезжает до `cfg` и до истории —
+    /// регрессия, найденная независимым аудитом 2026-09-06: событие колеса
+    /// вообще не роутилось в тулбар, виджет менял значение «в себя», и
+    /// ближайшая пересборка панели возвращала старое.
+    #[test]
+    fn the_wheel_over_the_volume_reaches_the_config() {
+        let (mut cfg, mut edit, a, b) = group_harness();
+        for id in [a, b] {
+            let sticker = cfg.stickers.iter_mut().find(|s| s.id == id).unwrap();
+            sticker.source = StickerSource::File {
+                path: std::path::PathBuf::from("video.mp4"),
+                media_type: MediaType::Video,
+            };
+            sticker.playback.volume = 0.5;
+        }
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        // Курсор — на кнопке-динамике: колесо адресуется позиции, а не
+        // «активному» виджету.
+        let volume_cx = edit
+            .toolbar
+            .as_ref()
+            .unwrap()
+            .widget::<VolumeControl>(toolbar::TB_VOLUME)
+            .unwrap()
+            .bounds();
+        edit.cursor_pos = (volume_cx.cx, volume_cx.cy);
+        edit.cursor_monitor = monitor_id("main");
+
+        let consumed = toolbar_wheel(&mut edit, &mut cfg, &mut [], 2, &monitor_id("main"));
+        assert!(consumed, "колесо над тулбаром съедено им");
+        for id in [a, b] {
+            let v = cfg.stickers.iter().find(|s| s.id == id).unwrap().playback.volume;
+            assert!(
+                (v - 0.6).abs() < 1e-9,
+                "громкость доехала до конфига у всей группы: {v}"
+            );
+        }
+        assert_eq!(edit.undo_stack.len(), 1, "один шаг истории на щелчок колеса");
+    }
+
+    /// Колесо мимо тулбара тулбар не трогает — иначе прокрутка над списком
+    /// окон или над пустым местом молча меняла бы громкость.
+    #[test]
+    fn the_wheel_away_from_the_toolbar_is_not_consumed() {
+        let (mut cfg, mut edit, _a, _b) = group_harness();
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        edit.cursor_monitor = monitor_id("main");
+        edit.cursor_pos = (5.0, 5.0);
+        assert!(!toolbar_wheel(&mut edit, &mut cfg, &mut [], 2, &monitor_id("main")));
+        // И на чужом мониторе — тоже нет.
+        edit.cursor_monitor = monitor_id("other");
+        assert!(!toolbar_wheel(&mut edit, &mut cfg, &mut [], 2, &monitor_id("other")));
+    }
+
     // --- Магнит при изменении размера (запрос пользователя 2026-09-01) ---
 
     /// Стикер-мишень и сосед справа, чья левая кромка стоит на 300.
@@ -16811,15 +17733,15 @@ mod tests {
         let mut edit = mask_gate_edit_state();
         edit.active = true;
         edit.selection.select(id);
-        edit.gesture = Some(Gesture::Resize {
-            start: GestureStart {
+        edit.gesture = Some(Gesture::resize_one(
+            GestureStart {
                 id,
                 placement: start_placement.clone(),
                 transform: target.transform,
             },
-            handle: HandleKind::East,
-            grab: (250.0, 200.0),
-        });
+            HandleKind::East,
+            (250.0, 200.0),
+        ));
         (cfg, edit, id, start_placement)
     }
 
@@ -16953,11 +17875,11 @@ mod tests {
         edit.active = true;
         edit.selection.select(id);
         edit.gesture = Some(Gesture::Drag {
-            start: GestureStart {
+            starts: vec![GestureStart {
                 id,
                 placement: start_placement,
                 transform: target.transform,
-            },
+            }],
             grab_dx: 0.0,
             grab_dy: 0.0,
         });
@@ -16991,15 +17913,15 @@ mod tests {
     #[test]
     fn a_corner_handle_snaps_when_the_other_axis_drives_the_size() {
         let (mut cfg, mut edit, id, start_placement) = resize_snap_harness();
-        edit.gesture = Some(Gesture::Resize {
-            start: GestureStart {
+        edit.gesture = Some(Gesture::resize_one(
+            GestureStart {
                 id,
                 placement: start_placement,
                 transform: Transform::default(),
             },
-            handle: HandleKind::SouthEast,
-            grab: (250.0, 250.0),
-        });
+            HandleKind::SouthEast,
+            (250.0, 250.0),
+        ));
         // Вниз на 47, вправо на 3: масштаб ведёт вертикаль. Правая кромка при
         // этом оказывается на 297 — в трёх DIP от левого края соседа (300).
         apply_gesture(
@@ -17041,15 +17963,15 @@ mod tests {
         far.placement.cy = 349.0; // верхняя кромка 299
         cfg.stickers.push(far);
 
-        edit.gesture = Some(Gesture::Resize {
-            start: GestureStart {
+        edit.gesture = Some(Gesture::resize_one(
+            GestureStart {
                 id,
                 placement: start_placement,
                 transform: Transform::default(),
             },
-            handle: HandleKind::SouthEast,
-            grab: (250.0, 250.0),
-        });
+            HandleKind::SouthEast,
+            (250.0, 250.0),
+        ));
         apply_gesture(
             &mut cfg,
             &mut [],
@@ -19613,14 +20535,20 @@ mod tests {
             toolbar::TB_RESET_SCALE,
             toolbar::TB_DELETE,
             toolbar::TB_PLAY_PAUSE,
+            toolbar::TB_TIMELINE,
+            // Динамик (2026-09-06) — не кнопка, но тултип ему нужен: про
+            // «клик выключает звук» догадаться неоткуда, шкала об этом
+            // молчит.
+            toolbar::TB_VOLUME,
         ] {
             assert!(
                 toolbar_tooltip_text(id).is_some(),
-                "у кнопки {id} должен быть текст тултипа"
+                "у контрола {id} должен быть текст тултипа"
             );
         }
-        // Слайдер/поле/громкость — не кнопки, тултипа не имеют.
-        for id in [toolbar::TB_SLIDER, toolbar::TB_FIELD, toolbar::TB_VOLUME] {
+        // Слайдер и числовое поле подписи не получают: они показывают своё
+        // значение сами.
+        for id in [toolbar::TB_SLIDER, toolbar::TB_FIELD] {
             assert_eq!(toolbar_tooltip_text(id), None);
         }
     }
@@ -20981,11 +21909,11 @@ mod tests {
             .find(|s| s.id == id)
             .expect("стикер в конфиге");
         edit.gesture = Some(Gesture::Drag {
-            start: GestureStart {
+            starts: vec![GestureStart {
                 id,
                 placement: sticker.placement.clone(),
                 transform: sticker.transform,
-            },
+            }],
             grab_dx: dip_x - sticker.placement.cx,
             grab_dy: dip_y - sticker.placement.cy,
         });

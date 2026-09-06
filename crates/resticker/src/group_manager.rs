@@ -309,7 +309,9 @@ pub fn height(count: usize, expanded_members: usize) -> f64 {
 /// уже не помещаются на экран, а выбирать, какую обрезать, — решение, которое
 /// пользователю объяснить нечем.
 pub fn build(groups: &[WindowGroup], expanded: Option<usize>, frame: Box2D) -> Panel {
-    let mut panel = Panel::new(PANEL_ID, frame).with_corner_radius(theme::RADIUS_WINDOW);
+    let mut panel = Panel::new(PANEL_ID, frame)
+        .with_corner_radius(theme::RADIUS_WINDOW)
+        .with_surface(glass::Surface::Modal);
     let left = frame.cx - frame.w / 2.0 + theme::PAD_PANEL;
     let right = frame.cx + frame.w / 2.0 - theme::PAD_PANEL;
     let top = frame.cy - frame.h / 2.0 + theme::PAD_PANEL;
@@ -698,7 +700,7 @@ mod tests {
     #[test]
     fn panel_body_is_a_glass_panel() {
         // §4: корпус — одна плита стекла. Раньше фон был «рамка + заливка»
-        // (два Fill), теперь — один Primitive::Glass с Surface::Panel.
+        // (два Fill), теперь — одна Primitive::Glass с Surface::Modal.
         let f = frame(0, 0);
         let panel = build(&[], None, f);
         let mut prims = Vec::new();
@@ -707,7 +709,7 @@ mod tests {
             prims.iter().any(|p| matches!(
                 p,
                 Primitive::Glass {
-                    surface: Surface::Panel,
+                    surface: Surface::Modal,
                     ..
                 }
             )),

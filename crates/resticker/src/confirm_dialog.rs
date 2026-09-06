@@ -22,7 +22,7 @@
 
 use rst_render::{
     Box2D, Button, ButtonContent, Checkbox, LINE_HEIGHT, Label, Panel, Primitive, Widget, WidgetId,
-    text_size, theme,
+    glass, text_size, theme,
 };
 
 /// Идентификатор самой панели-модала.
@@ -115,7 +115,8 @@ pub fn build(count: u32, center: (f64, f64)) -> Panel {
         },
     )
     // Радиус окна (§3): модал — большая панель, а не мелкий контрол.
-    .with_corner_radius(theme::RADIUS_WINDOW);
+    .with_corner_radius(theme::RADIUS_WINDOW)
+    .with_surface(glass::Surface::Modal);
 
     // Сообщение — по центру модала, обычной надписью: это текст, а не
     // кнопка (раньше оно было Label-кнопкой и рисовалось с фоном кнопки,

@@ -19,6 +19,11 @@ pub const GLASS_INK_RGB: [u8; 3] = [0x07, 0x07, 0x0a];
 /// §2.1 GLASS_INK — непрозрачность тела панели (0.62).
 pub const GLASS_INK_ALPHA: f64 = 0.62;
 
+/// §2.1 GLASS_INK_DEEP — цвет тела меню трея и модальных диалогов (#050507).
+pub const GLASS_INK_DEEP_RGB: [u8; 3] = [0x05, 0x05, 0x07];
+/// §2.1 GLASS_INK_DEEP — непрозрачность тела модальных диалогов (0.74).
+pub const GLASS_INK_DEEP_ALPHA: f64 = 0.74;
+
 /// §2.1 GLASS_SHEEN_TOP — цвет верха вертикального градиента корпуса (#FFFFFF).
 pub const GLASS_SHEEN_TOP_RGB: [u8; 3] = [0xff, 0xff, 0xff];
 /// §2.1 GLASS_SHEEN_TOP — непрозрачность верха градиента (0.055).
@@ -146,6 +151,8 @@ pub enum Surface {
     Panel,
     /// Карточка внутри панели.
     Card,
+    /// Корпус меню трея и модального диалога (§2.1 `GLASS_INK_DEEP`).
+    Modal,
     /// Кнопка / переключатель в состоянии покоя.
     Control,
     /// Кнопка под курсором.
@@ -354,6 +361,7 @@ fn sample_glass(x: f64, y: f64, rect: &GlassRect, surface: Surface, glow: f64) -
     // ------------------------------------------------------------------------
     let (body_rgb, body_alpha) = match surface {
         Surface::Panel | Surface::Card => (GLASS_INK_RGB, GLASS_INK_ALPHA),
+        Surface::Modal => (GLASS_INK_DEEP_RGB, GLASS_INK_DEEP_ALPHA),
         Surface::Control => (CTRL_BG_RGB, CTRL_BG_ALPHA),
         Surface::ControlHover => (CTRL_BG_HOVER_RGB, CTRL_BG_HOVER_ALPHA),
         Surface::ControlActive => (CTRL_BG_ACTIVE_RGB, CTRL_BG_ACTIVE_ALPHA),
@@ -556,6 +564,29 @@ mod tests {
         assert!(
             center_lum < top_rim_lum,
             "центр панели (яркость {center_lum:.2}) обязан быть темнее верхней кромки (яркость {top_rim_lum:.2})"
+        );
+    }
+
+    #[test]
+    fn test_modal_body_is_deeper_than_panel_body() {
+        // Репорт пользователя 2026-09-06: текст терминала слишком явно
+        // читался сквозь две модалки; Surface::Modal обязан быть плотнее
+        // обычного Panel, сохраняя остальные слои материала.
+        let w = 200;
+        let h = 100;
+        let panel = glass_rgba(w, h, 18.0, Surface::Panel, 0.0);
+        let modal = glass_rgba(w, h, 18.0, Surface::Modal, 0.0);
+        let panel_px = get_pixel(&panel, w, w / 2, h / 2);
+        let modal_px = get_pixel(&modal, w, w / 2, h / 2);
+        assert!(
+            modal_px[3] > panel_px[3],
+            "альфа модального тела ({}) должна быть выше Panel ({})",
+            modal_px[3],
+            panel_px[3]
+        );
+        assert!(
+            pixel_effective_brightness(modal_px) < pixel_effective_brightness(panel_px),
+            "модальное тело обязано пропускать меньше света"
         );
     }
 

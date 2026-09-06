@@ -56,9 +56,18 @@ pub enum Icon {
     /// Сетка два на два: тот же образ, что у раскладок тайлинга в ленте
     /// меню редактирования групп.
     Groups,
-    /// «Глаз» — показать/скрыть стикер (SPEC 3.7).
+    /// «Видно» — открытый глаз. Пара `Eye`/`EyeOff` отражает СОСТОЯНИЕ, а
+    /// не предстоящее действие: так попросил пользователь (2026-08-31,
+    /// «закрытый глаз, когда окна скрыты, и открытый, когда всё видно»).
+    ///
+    /// ОДНА пара на обе кнопки видимости — и на «показать/скрыть стикер» в
+    /// тулбаре выделения, и на «показать/скрыть всё» на панели у курсора
+    /// (`cursor_panel::BTN_TOGGLE_ALL`). Раньше пар было две, нарисованных
+    /// по-разному, и пользователь попросил свести их к одной (2026-09-06):
+    /// две похожие, но разные пиктограммы одного смысла — худший вид
+    /// расхождения. Рисунок — присланный пользователем PNG (см. `eye_rgba`).
     Eye,
-    /// «Глаз закрытый» — стикер скрыт.
+    /// «Скрыто» — перечёркнутый глаз.
     EyeOff,
     /// Порядок «выше» (SPEC 3.6, п. 5).
     OrderUp,
@@ -70,15 +79,6 @@ pub enum Icon {
     Delete,
     /// «Загрузить файл» (SPEC 3.8).
     FileOpen,
-    /// «Все стикеры сейчас видны» — открытый глаз (SPEC 3.8, кнопка
-    /// `cursor_panel::BTN_TOGGLE_ALL`). Пара `AllVisible`/`AllHidden`
-    /// отражает СОСТОЯНИЕ, как `Eye`/`EyeOff`, а не предстоящее действие:
-    /// так попросил пользователь (2026-08-31, «закрытый глаз когда окна
-    /// скрыты и открытый когда всё видно»), и до этого кнопка показывала
-    /// действие — глаз с минусом на видимых стикерах.
-    AllVisible,
-    /// «Все стикеры сейчас скрыты» — перечёркнутый глаз.
-    AllHidden,
     /// «Сохранить пресет» (SPEC 3.8).
     PresetSave,
     /// «Загрузить пресет» (SPEC 3.8).
@@ -97,9 +97,17 @@ pub enum Icon {
     /// `Eye`/`EyeOff`, а не действие (в отличие от `Play`/`Pause`):
     /// переключатель, а не кнопка-действие.
     Timeline,
-    /// «Полоса перемотки вне режима редактирования выключена» — приглушённый
-    /// вариант той же пиктограммы.
+    /// «Полоса перемотки вне режима редактирования выключена» — та же
+    /// пиктограмма, перечёркнутая косой чертой. Форма, а не только тон:
+    /// на сером стекле приглушённый рисунок читался как «кнопка недоступна»,
+    /// а не «выключено» (репорт пользователя 2026-09-06).
     TimelineOff,
+    /// Динамик с двумя волнами — звук громче половины.
+    VolumeHigh,
+    /// Динамик с одной волной — звук тише половины.
+    VolumeLow,
+    /// Перечёркнутый динамик — звук выключен (нулевая громкость либо `muted`).
+    VolumeMute,
     /// «Поворот» — ручка на углу рамки выделения (запрос пользователя
     /// 2026-08-23): дуга с остриями на обоих концах. Не кнопка панели —
     /// рисуется прямо на сцене рядом с углом выделенного стикера.
@@ -126,7 +134,7 @@ impl Icon {
     /// Все варианты в порядке объявления — для предварительной генерации
     /// кэша иконок (текс-карта `HashMap<Icon, Texture>`, M2_WIRING_PLAN §3)
     /// и тестов генератора `icon_rgba`.
-    pub const ALL: [Icon; 25] = [
+    pub const ALL: [Icon; 26] = [
         Icon::Layers,
         Icon::Groups,
         Icon::Eye,
@@ -136,8 +144,6 @@ impl Icon {
         Icon::Duplicate,
         Icon::Delete,
         Icon::FileOpen,
-        Icon::AllVisible,
-        Icon::AllHidden,
         Icon::PresetSave,
         Icon::PresetLoad,
         Icon::Settings,
@@ -146,6 +152,9 @@ impl Icon {
         Icon::Pause,
         Icon::Timeline,
         Icon::TimelineOff,
+        Icon::VolumeHigh,
+        Icon::VolumeLow,
+        Icon::VolumeMute,
         Icon::Rotate,
         Icon::ResetScale,
         Icon::Lock,
@@ -666,6 +675,10 @@ pub struct Button {
     /// Первичная (подтверждающая) кнопка — заметно ярче остальных (§2.2
     /// `CTRL_BG_PRIMARY`). Одна на панель: если ярких две, ни одна не ведёт.
     primary: bool,
+    /// Кнопка-тумблер во ВКЛЮЧЁННОМ состоянии: поверх покоя доливается
+    /// свет (§2.2 `CTRL_BG_ON`), как у [`Checkbox`]. Клик остаётся обычным
+    /// (`take_click`) — виджет не хранит состояние, только рисует его.
+    on: bool,
     /// Фаза наведения 0..1 (§5): кнопка проминается плавно, а не ступенькой.
     hover_phase: Phase,
     /// Фаза нажатия 0..1 (§5).
@@ -686,6 +699,18 @@ impl Button {
         self
     }
 
+    /// Та же кнопка, нарисованная как включённый тумблер.
+    ///
+    /// Появилась из репорта 2026-09-06: переключатель полосы перемотки
+    /// отличал состояния ТОЛЬКО тоном иконки (`Timeline` светлая,
+    /// `TimelineOff` приглушённая), и на сером стекле выключенное читалось
+    /// как «кнопка недоступна». Тумблер обязан отличаться заливкой — тем
+    /// же светом, которым уже наливается включённый чекбокс.
+    pub fn toggled(mut self, on: bool) -> Self {
+        self.on = on;
+        self
+    }
+
     pub fn with_label_color(mut self, color: [u8; 3]) -> Self {
         self.label_color = Some(color);
         self
@@ -699,6 +724,7 @@ impl Button {
             content,
             label_color: None,
             primary: false,
+            on: false,
             hover_phase: Phase::new(theme::HOVER_MS),
             press_phase: Phase::new(theme::PRESS_MS),
             hovered: false,
@@ -760,6 +786,9 @@ impl Widget for Button {
             self.primary,
             1.0,
         );
+        if self.on {
+            glass_on(out, self.bounds, radius, 1.0);
+        }
         let pad = theme::BUTTON_PAD;
         let content_rect = Box2D {
             w: (self.bounds.w - 2.0 * pad).max(0.0),
@@ -1050,6 +1079,374 @@ impl Widget for Slider {
             PointerEvent::Move { pos } => self.dragging && self.set_from_x(pos.0),
             PointerEvent::Up { .. } => std::mem::replace(&mut self.dragging, false),
             PointerEvent::Wheel { .. } => false,
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Регулятор громкости видео-стикера: кнопка-динамик, из которой при
+/// наведении вырастает вертикальная шкала.
+///
+/// Заменил горизонтальный [`Slider`] по репорту 2026-09-06: «непонятно
+/// вообще что это за ползунок, он выглядит странно и интуитивно непонятно
+/// что этот ползунок означает». Ползунок и правда не сообщал о себе
+/// ничего — дорожка с ручкой в ряду кнопок читается как что угодно.
+/// Динамик называет себя формой, а шкала показывается только тогда, когда
+/// к ней потянулись, — и заодно возвращает тулбару 66 DIP ширины.
+///
+/// Кнопка — единственный якорь геометрии: шкала растёт ВВЕРХ от неё, а
+/// [`Widget::bounds`] отдаёт объединение кнопки со шкалой, пока та
+/// раскрыта. Иначе указатель, ушедший с кнопки на шкалу, считался бы
+/// ушедшим с виджета, и шкала схлопывалась бы под рукой.
+pub struct VolumeControl {
+    id: WidgetId,
+    /// Границы КНОПКИ-динамика (шкала считается от них).
+    button: Box2D,
+    /// Громкость в процентах, 0..=100.
+    value: u32,
+    /// Звук выключен: шкала помнит своё значение, динамик перечёркнут.
+    muted: bool,
+    /// Фаза раскрытия шкалы 0..1 (§5): шкала выезжает, а не появляется.
+    open_phase: Phase,
+    /// Фаза наведения на кнопку 0..1 (§5) — та же, что у [`Button`].
+    hover_phase: Phase,
+    /// Фаза нажатия кнопки 0..1 (§5).
+    press_phase: Phase,
+    hovered: bool,
+    /// Ручка шкалы под указателем (захват держит панель).
+    dragging: bool,
+    /// Указатель зажат на самой кнопке — клик ещё не свершился.
+    armed: bool,
+    changed: bool,
+    mute_clicked: bool,
+}
+
+impl VolumeControl {
+    /// Высота раскрытой шкалы, DIP.
+    pub const FLYOUT_H: f64 = 84.0;
+    /// Зазор между кнопкой и шкалой, DIP.
+    pub const FLYOUT_GAP: f64 = 4.0;
+    /// Внутренний отступ шкалы, DIP.
+    const FLYOUT_PAD: f64 = 7.0;
+    /// Шаг изменения громкости колесом мыши, процентные пункты.
+    const WHEEL_STEP: i64 = 5;
+
+    /// Регулятор с центром кнопки в `(cx, cy)`; `value` приводится к 0..=100.
+    pub fn new(id: WidgetId, cx: f64, cy: f64, value: u32, muted: bool) -> Self {
+        Self {
+            id,
+            button: Box2D {
+                cx,
+                cy,
+                w: theme::BUTTON_SIZE,
+                h: theme::BUTTON_SIZE,
+                rotation: 0.0,
+            },
+            value: value.min(100),
+            muted,
+            open_phase: Phase::new(theme::HOVER_MS),
+            hover_phase: Phase::new(theme::HOVER_MS),
+            press_phase: Phase::new(theme::PRESS_MS),
+            hovered: false,
+            dragging: false,
+            armed: false,
+            changed: false,
+            mute_clicked: false,
+        }
+    }
+
+    /// Текущая громкость, проценты.
+    pub fn value(&self) -> u32 {
+        self.value
+    }
+
+    /// Установить громкость извне (пересборка панели из `cfg`).
+    pub fn set_value(&mut self, value: u32) {
+        self.value = value.min(100);
+    }
+
+    /// Звук выключен.
+    pub fn muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Новое значение с прошлого опроса (флаг сбрасывается).
+    pub fn take_changed(&mut self) -> Option<u32> {
+        if self.changed {
+            self.changed = false;
+            Some(self.value)
+        } else {
+            None
+        }
+    }
+
+    /// Был ли клик по самому динамику — «включить/выключить звук»
+    /// (флаг сбрасывается).
+    pub fn take_mute_click(&mut self) -> bool {
+        std::mem::take(&mut self.mute_clicked)
+    }
+
+    /// Иконка по состоянию: перечёркнутый динамик при выключенном звуке и
+    /// на нуле, одна волна до половины, две — выше. Уровень читается
+    /// формой, а не только положением ручки, которой в покое не видно.
+    pub fn icon(&self) -> Icon {
+        if self.muted || self.value == 0 {
+            Icon::VolumeMute
+        } else if self.value < 50 {
+            Icon::VolumeLow
+        } else {
+            Icon::VolumeHigh
+        }
+    }
+
+    /// Шкала раскрыта: указатель на виджете либо тянет ручку. Второе
+    /// условие обязательно — во время перетаскивания палец легко уводит
+    /// курсор за край шкалы, и без него она захлопнулась бы посреди жеста.
+    fn expanded(&self) -> bool {
+        self.hovered || self.dragging
+    }
+
+    /// Прямоугольник шкалы в раскрытом виде (геометрия хит-теста; в
+    /// отрисовке высота домножается на фазу).
+    fn flyout(&self) -> Box2D {
+        Box2D {
+            cx: self.button.cx,
+            cy: self.button.cy - self.button.h / 2.0 - Self::FLYOUT_GAP - Self::FLYOUT_H / 2.0,
+            w: theme::BUTTON_SIZE,
+            h: Self::FLYOUT_H,
+            rotation: 0.0,
+        }
+    }
+
+    /// Диапазон Y, доступный ЦЕНТРУ ручки: снизу — ноль, сверху — сто.
+    fn track_range(&self) -> (f64, f64) {
+        let f = self.flyout();
+        let half = theme::SLIDER_KNOB / 2.0;
+        let top = f.cy - f.h / 2.0 + Self::FLYOUT_PAD + half;
+        let bottom = f.cy + f.h / 2.0 - Self::FLYOUT_PAD - half;
+        (top, bottom)
+    }
+
+    /// Центр ручки для текущего значения.
+    fn value_to_y(&self, value: u32) -> f64 {
+        let (top, bottom) = self.track_range();
+        bottom - f64::from(value.min(100)) / 100.0 * (bottom - top)
+    }
+
+    /// Значение по Y указателя: снизу вверх, с отсечением к диапазону
+    /// (увод указателя за край не ломает перетаскивание).
+    fn y_to_value(&self, y: f64) -> u32 {
+        let (top, bottom) = self.track_range();
+        if bottom <= top {
+            return 0;
+        }
+        let t = ((bottom - y) / (bottom - top)).clamp(0.0, 1.0);
+        (t * 100.0).round() as u32
+    }
+
+    /// Установить значение по Y; флаг изменения — только при реальной смене.
+    /// Тянуть шкалу — значит включать звук: молчащий регулятор под рукой
+    /// сообщал бы, что сломан.
+    fn set_from_y(&mut self, y: f64) -> bool {
+        let v = self.y_to_value(y);
+        if v == self.value && !self.muted {
+            return false;
+        }
+        self.value = v;
+        self.muted = false;
+        self.changed = true;
+        true
+    }
+
+    /// Сдвинуть громкость колесом.
+    fn nudge(&mut self, notches: i32) -> bool {
+        let step = i64::from(notches) * Self::WHEEL_STEP;
+        let v = (i64::from(self.value) + step).clamp(0, 100) as u32;
+        if v == self.value && !self.muted {
+            return false;
+        }
+        self.value = v;
+        self.muted = false;
+        self.changed = true;
+        true
+    }
+}
+
+impl Widget for VolumeControl {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    /// Объединение кнопки со шкалой, пока та раскрыта, — иначе только
+    /// кнопка (см. заметку в шапке типа).
+    fn bounds(&self) -> Box2D {
+        if !self.expanded() {
+            return self.button;
+        }
+        let f = self.flyout();
+        let top = f.cy - f.h / 2.0;
+        let bottom = self.button.cy + self.button.h / 2.0;
+        Box2D {
+            cx: self.button.cx,
+            cy: (top + bottom) / 2.0,
+            w: self.button.w,
+            h: bottom - top,
+            rotation: 0.0,
+        }
+    }
+
+    /// Панель двигает виджет целиком (`Panel::translate`), а якорь у нас
+    /// кнопка: берём из новых границ их НИЖНИЙ край — там кнопка и стоит
+    /// в обоих состояниях.
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.button.cx = bounds.cx;
+        self.button.cy = bounds.cy + bounds.h / 2.0 - self.button.h / 2.0;
+    }
+
+    fn draw(&self, out: &mut Vec<Primitive>) {
+        let open = self.open_phase.eased();
+        if open > 0.0 {
+            // Шкала выезжает из-под кнопки: растёт высота, низ приколот к
+            // зазору над кнопкой — движение читается как выдвижение, а не
+            // как проявление из ниоткуда.
+            let full = self.flyout();
+            let h = (full.h * open).max(1.0);
+            let bottom = full.cy + full.h / 2.0;
+            let panel = Box2D {
+                cx: full.cx,
+                cy: bottom - h / 2.0,
+                w: full.w,
+                h,
+                rotation: 0.0,
+            };
+            glass_card(out, panel, theme::RADIUS_TIGHT, open);
+
+            let (top, bottom_y) = self.track_range();
+            let knob_cy = self.value_to_y(self.value);
+            let groove = Box2D {
+                cx: full.cx,
+                cy: (top + bottom_y) / 2.0,
+                w: theme::SETTINGS_GROOVE_H,
+                h: (bottom_y - top) + theme::SLIDER_KNOB,
+                rotation: 0.0,
+            };
+            out.push(Primitive::Glass {
+                rect: groove,
+                radius: theme::SETTINGS_GROOVE_H / 2.0,
+                surface: Surface::Sunken,
+                glow: 0.0,
+                opacity: open,
+            });
+            // Заполненная часть — от ручки вниз: «сколько налито».
+            let fill_h = (groove.cy + groove.h / 2.0) - knob_cy;
+            if fill_h > 0.0 {
+                out.push(Primitive::Fill {
+                    rect: Box2D {
+                        cx: full.cx,
+                        cy: knob_cy + fill_h / 2.0,
+                        w: theme::SETTINGS_GROOVE_H,
+                        h: fill_h,
+                        rotation: 0.0,
+                    },
+                    color: theme::SLIDER_FILL,
+                    opacity: open * if self.muted { 0.30 } else { 0.85 },
+                });
+            }
+            let knob = Box2D {
+                cx: full.cx,
+                cy: knob_cy,
+                w: theme::SLIDER_KNOB,
+                h: theme::SLIDER_KNOB,
+                rotation: 0.0,
+            };
+            glass_control(out, knob, theme::SLIDER_KNOB / 2.0, 1.0, 0.0, false, open);
+        }
+
+        glass_control(
+            out,
+            self.button,
+            theme::RADIUS_TIGHT,
+            self.hover_phase.eased(),
+            self.press_phase.eased(),
+            false,
+            1.0,
+        );
+        let pad = theme::BUTTON_PAD;
+        out.push(Primitive::Icon {
+            rect: Box2D {
+                w: (self.button.w - 2.0 * pad).max(0.0),
+                h: (self.button.h - 2.0 * pad).max(0.0),
+                ..self.button
+            },
+            icon: self.icon(),
+            opacity: 1.0,
+        });
+    }
+
+    fn set_hovered(&mut self, hovered: bool) -> bool {
+        let changed = std::mem::replace(&mut self.hovered, hovered) != hovered;
+        if changed {
+            self.open_phase.set_target(self.expanded());
+            // Кнопка светлеет только под самим указателем; уход со шкалы
+            // на кнопку и обратно панель различить не может (виджет один),
+            // поэтому подсветку кнопки ведём той же фазой наведения.
+            self.hover_phase.set_target(hovered);
+        }
+        changed
+    }
+
+    fn animate(&mut self, dt_ms: f64) -> bool {
+        let open = self.open_phase.advance(dt_ms);
+        let hover = self.hover_phase.advance(dt_ms);
+        let press = self.press_phase.advance(dt_ms);
+        open || hover || press
+    }
+
+    fn pointer_event(&mut self, ev: PointerEvent) -> bool {
+        match ev {
+            PointerEvent::Down { pos } => {
+                if box_contains(&self.button, pos) {
+                    self.armed = true;
+                    self.press_phase.set_target(true);
+                    return true;
+                }
+                if self.expanded() && box_contains(&self.flyout(), pos) {
+                    self.dragging = true;
+                    self.set_from_y(pos.1);
+                    return true;
+                }
+                false
+            }
+            PointerEvent::Move { pos } => {
+                if self.dragging {
+                    return self.set_from_y(pos.1);
+                }
+                false
+            }
+            PointerEvent::Up { pos } => {
+                let was_dragging = std::mem::take(&mut self.dragging);
+                if was_dragging {
+                    self.open_phase.set_target(self.expanded());
+                    return true;
+                }
+                if !self.armed {
+                    return false;
+                }
+                self.armed = false;
+                self.press_phase.set_target(false);
+                if box_contains(&self.button, pos) {
+                    self.mute_clicked = true;
+                }
+                true
+            }
+            PointerEvent::Wheel { notches, .. } => self.nudge(notches),
         }
     }
 
@@ -2283,6 +2680,10 @@ pub struct Panel {
     /// умолчанию» ([`theme::RADIUS_TIGHT`]): острых углов в Dark Liquid
     /// Glass нет — стекло всегда скруглено (§3).
     corner_radius: f64,
+    /// Материал корпуса. По умолчанию [`Surface::Panel`]; модальные диалоги
+    /// берут более плотное тело, чтобы сквозь них не читался чужой текст
+    /// (репорт пользователя 2026-09-06 про менеджер групп поверх терминала).
+    surface: Surface,
     /// Виджеты в порядке отрисовки: первый — нижний.
     widgets: Vec<Box<dyn Widget>>,
     focus: Option<usize>,
@@ -2297,6 +2698,7 @@ impl Panel {
             id,
             frame,
             corner_radius: 0.0,
+            surface: Surface::Panel,
             widgets: Vec::new(),
             focus: None,
             capture: None,
@@ -2308,6 +2710,14 @@ impl Panel {
     /// половиной меньшей стороны — иначе «скругление» съело бы всю панель.
     pub fn with_corner_radius(mut self, radius: f64) -> Self {
         self.corner_radius = radius.max(0.0);
+        self
+    }
+
+    /// Та же панель с другим материалом корпуса (модальный диалог —
+    /// [`Surface::Modal`]). Виджеты внутри не меняются: плотнее становится
+    /// только тело, освещение и кромки остаются общими для всего стекла.
+    pub fn with_surface(mut self, surface: Surface) -> Self {
+        self.surface = surface;
         self
     }
 
@@ -2385,7 +2795,13 @@ impl Panel {
         } else {
             theme::RADIUS_TIGHT
         };
-        glass_panel(out, self.frame, radius, 1.0);
+        out.push(Primitive::Glass {
+            rect: self.frame,
+            radius,
+            surface: self.surface,
+            glow: 0.0,
+            opacity: 1.0,
+        });
         for w in &self.widgets {
             w.draw(out);
         }
@@ -4494,6 +4910,137 @@ mod tests {
             b.cy > frame.cy,
             "«Открепить» в нижней части урезанной панели"
         );
+    }
+
+
+    // --- Регулятор громкости: динамик с выпадающей шкалой (репорт
+    // пользователя 2026-09-06 «непонятно, что этот ползунок означает») ---
+
+    const ID_VOLUME: WidgetId = 9;
+
+    fn volume(value: u32) -> VolumeControl {
+        VolumeControl::new(ID_VOLUME, 100.0, 300.0, value, false)
+    }
+
+    /// В покое регулятор занимает ровно квадрат кнопки — ради этого он и
+    /// затевался: горизонтальный ползунок съедал 96 DIP тулбара.
+    #[test]
+    fn volume_is_a_button_until_hovered() {
+        let mut v = volume(50);
+        assert_eq!(v.bounds().w, theme::BUTTON_SIZE);
+        assert_eq!(v.bounds().h, theme::BUTTON_SIZE);
+        v.set_hovered(true);
+        assert!(
+            v.bounds().h > theme::BUTTON_SIZE + VolumeControl::FLYOUT_H - 1.0,
+            "под курсором виджет накрывает и шкалу: {}",
+            v.bounds().h
+        );
+        // Верх шкалы попадает в границы — иначе указатель, ушедший с кнопки
+        // на шкалу, считался бы ушедшим с виджета.
+        let top = v.bounds().cy - v.bounds().h / 2.0;
+        assert!(box_contains(&v.bounds(), (100.0, top + 1.0)));
+    }
+
+    /// Шкала растёт ВВЕРХ от кнопки: тулбар обычно стоит под стикером, и
+    /// вниз шкале некуда.
+    #[test]
+    fn volume_flyout_grows_upwards() {
+        let mut v = volume(50);
+        v.set_hovered(true);
+        let b = v.bounds();
+        assert!(b.cy < 300.0, "центр виджета уехал вверх от кнопки");
+        assert_eq!(
+            b.cy + b.h / 2.0,
+            300.0 + theme::BUTTON_SIZE / 2.0,
+            "низ остаётся низом кнопки"
+        );
+    }
+
+    /// Ноль внизу, сотня наверху — как у любого регулятора громкости.
+    #[test]
+    fn volume_drag_reads_bottom_up() {
+        let mut v = volume(0);
+        v.set_hovered(true);
+        let flyout_top = v.bounds().cy - v.bounds().h / 2.0;
+        v.pointer_event(PointerEvent::Down {
+            pos: (100.0, flyout_top + 1.0),
+        });
+        assert_eq!(v.take_changed(), Some(100), "верх шкалы — полная громкость");
+        v.pointer_event(PointerEvent::Move {
+            pos: (100.0, 300.0 - theme::BUTTON_SIZE),
+        });
+        assert_eq!(v.value(), 0, "низ шкалы — тишина");
+    }
+
+    /// Клик по самому динамику — это «выключить звук», а не установка
+    /// громкости в ноль: уровень обязан пережить выключение.
+    #[test]
+    fn volume_button_click_is_a_mute_toggle() {
+        let mut v = volume(70);
+        v.pointer_event(PointerEvent::Down { pos: (100.0, 300.0) });
+        v.pointer_event(PointerEvent::Up { pos: (100.0, 300.0) });
+        assert!(v.take_mute_click(), "клик по динамику зафиксирован");
+        assert!(!v.take_mute_click(), "флаг снимается опросом");
+        assert_eq!(v.value(), 70, "уровень не тронут");
+        assert_eq!(v.take_changed(), None, "громкость не менялась");
+    }
+
+    /// Тянуть шкалу у выключённого звука — значит включить его: иначе
+    /// регулятор молчал бы под рукой и читался как сломанный.
+    #[test]
+    fn dragging_the_scale_unmutes() {
+        let mut v = VolumeControl::new(ID_VOLUME, 100.0, 300.0, 40.0 as u32, true);
+        assert_eq!(v.icon(), Icon::VolumeMute);
+        v.set_hovered(true);
+        let flyout_top = v.bounds().cy - v.bounds().h / 2.0;
+        v.pointer_event(PointerEvent::Down {
+            pos: (100.0, flyout_top + 1.0),
+        });
+        assert!(!v.muted(), "звук включился сам");
+        assert_eq!(v.icon(), Icon::VolumeHigh);
+    }
+
+    /// Колесо над регулятором меняет громкость шагами — не нужно попадать
+    /// в тонкую шкалу.
+    #[test]
+    fn wheel_over_volume_nudges_it() {
+        let mut v = volume(50);
+        assert!(v.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 300.0),
+            notches: 2,
+        }));
+        assert_eq!(v.value(), 60);
+        v.pointer_event(PointerEvent::Wheel {
+            pos: (100.0, 300.0),
+            notches: -20,
+        });
+        assert_eq!(v.value(), 0, "ниже нуля не уходит");
+    }
+
+    /// Кнопка-тумблер во включённом состоянии наливается светом
+    /// (`Surface::ControlOn`), в выключенном — обычное стекло. До 2026-09-06
+    /// состояния отличались только тоном иконки, и выключенное читалось как
+    /// «недоступно».
+    #[test]
+    fn a_toggled_button_is_lit() {
+        let count_on = |on: bool| {
+            let b = Button::icon(ID_BTN, 50.0, 50.0, Icon::Timeline).toggled(on);
+            let mut out = Vec::new();
+            b.draw(&mut out);
+            out.iter()
+                .filter(|p| {
+                    matches!(
+                        p,
+                        Primitive::Glass {
+                            surface: Surface::ControlOn,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(count_on(true), 1);
+        assert_eq!(count_on(false), 0);
     }
 
     /// Раздел правил соседства/z-order отсутствует в урезанной панели —

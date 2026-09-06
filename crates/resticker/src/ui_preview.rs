@@ -24,7 +24,7 @@ use rst_core::hittest::DipRect;
 use rst_render::{Box2D, Primitive, Widget, icon_rgba, rasterize, text_size};
 
 use crate::cursor_panel::build_cursor_panel;
-use crate::toolbar::{VideoToolbarState, build_toolbar};
+use crate::toolbar::{ToolbarState, VideoToolbarState, build_toolbar};
 
 /// Холст RGBA с прямым (straight) альфа-каналом.
 struct Canvas {
@@ -251,6 +251,166 @@ fn backdrop(canvas: &mut Canvas) {
     }
 }
 
+/// Контрастная «терминальная» подложка для замера плотности модала. Полосы
+/// вертикальные, чтобы можно было выбрать чистый участок между строками
+/// текста и не спутать просвет корпуса с яркостью глифов.
+fn modal_density_backdrop(canvas: &mut Canvas) {
+    let stripe_w = (16.0 * SCALE) as u32;
+    for y in 0..canvas.h {
+        for x in 0..canvas.w {
+            let stripe = (x / stripe_w.max(1)) % 2 == 0;
+            let mut color: [u8; 3] = if stripe {
+                [196, 62, 76]
+            } else {
+                [54, 151, 196]
+            };
+            // Тонкие горизонтальные строки добавляют подложке характер
+            // терминального текста, но не влияют на попарный замер вертикальных полос.
+            if y % (9 * SCALE as u32).max(1) == 0 {
+                color = [
+                    color[0].saturating_add(22),
+                    color[1].saturating_add(22),
+                    color[2],
+                ];
+            }
+            canvas.blend(x, y, color, 255);
+        }
+    }
+}
+
+/// Отрисовать менеджер групп, при необходимости убрав модальную накладку
+/// для контрольного кадра со старым телом `GLASS_INK @ 0.62`.
+fn draw_group_manager_density(canvas: &mut Canvas, frame: Box2D, old_body: bool) {
+    let panel = crate::group_manager::build(&[], None, frame);
+    let mut prims = Vec::new();
+    panel.draw(&mut prims);
+    if old_body {
+        // Контрольный кадр — ТОТ ЖЕ корпус, но со старым телом
+        // (`Surface::Panel`, `GLASS_INK` 0.62). Выбрасывать примитив совсем
+        // нельзя: получилось бы сравнение «без корпуса против 0.74», и
+        // просвет честно показывал бы 100 % — замер про плотность, а не
+        // про наличие панели.
+        for prim in &mut prims {
+            if let Primitive::Glass { surface, .. } = prim {
+                if *surface == rst_render::glass::Surface::Modal {
+                    *surface = rst_render::glass::Surface::Panel;
+                }
+            }
+        }
+    }
+    draw_primitives(canvas, &prims);
+}
+
+/// Средний перепад яркости между соседними вертикальными полосами в чистом
+/// участке корпуса, в процентах от перепада на голой подложке.
+fn modal_density_percent(canvas: &Canvas, bare: &Canvas, frame: Box2D) -> f64 {
+    let y = ((frame.cy - frame.h / 2.0 + 34.0) * SCALE).round() as u32;
+    let y0 = y.saturating_sub(3);
+    let y1 = (y + 3).min(canvas.h.saturating_sub(1));
+    let x0 = ((frame.cx - 150.0) * SCALE).round().max(0.0) as u32;
+    let x1 = ((frame.cx + 150.0) * SCALE).round().min(canvas.w as f64) as u32;
+    let stripe_w = (16.0 * SCALE) as u32;
+    let luminance = |source: &Canvas, x: u32, y: u32| {
+        let i = ((y * source.w + x) * 4) as usize;
+        0.2126 * f64::from(source.px[i])
+            + 0.7152 * f64::from(source.px[i + 1])
+            + 0.0722 * f64::from(source.px[i + 2])
+    };
+    let mean = |source: &Canvas, left: u32, right: u32| {
+        let mut total = 0.0;
+        let mut count = 0u32;
+        for yy in y0..=y1 {
+            for xx in left..right.min(source.w) {
+                total += luminance(source, xx, yy);
+                count += 1;
+            }
+        }
+        total / f64::from(count.max(1))
+    };
+    let mut covered = 0.0;
+    let mut bare_contrast = 0.0;
+    let mut left = x0;
+    while left + 2 * stripe_w <= x1 {
+        let middle = left + stripe_w;
+        let right = middle + stripe_w;
+        covered += (mean(canvas, left, middle) - mean(canvas, middle, right)).abs();
+        bare_contrast += (mean(bare, left, middle) - mean(bare, middle, right)).abs();
+        left = right;
+    }
+    if bare_contrast > 0.0 {
+        100.0 * covered / bare_contrast
+    } else {
+        0.0
+    }
+}
+
+#[test]
+#[ignore = "инструмент разработки: пишет PNG и замеряет просвет модального корпуса"]
+fn modal_density_preview_png() {
+    let (w, h) = (1120u32, 360u32);
+    let mut bare = Canvas::new((f64::from(w) * SCALE) as u32, (f64::from(h) * SCALE) as u32);
+    modal_density_backdrop(&mut bare);
+    let mut old_canvas = Canvas::new(bare.w, bare.h);
+    old_canvas.px.copy_from_slice(&bare.px);
+    let mut new_canvas = Canvas::new(bare.w, bare.h);
+    new_canvas.px.copy_from_slice(&bare.px);
+
+    let panel_h = crate::group_manager::height(0, 0);
+    let old_frame = Box2D {
+        cx: 280.0,
+        cy: 180.0,
+        w: crate::group_manager::WIDTH,
+        h: panel_h,
+        rotation: 0.0,
+    };
+    let new_frame = Box2D {
+        cx: 840.0,
+        cy: 180.0,
+        ..old_frame
+    };
+    draw_group_manager_density(&mut old_canvas, old_frame, true);
+    draw_group_manager_density(&mut new_canvas, new_frame, false);
+
+    let old_percent = modal_density_percent(&old_canvas, &bare, old_frame);
+    let new_percent = modal_density_percent(&new_canvas, &bare, new_frame);
+
+    let mut preview = Canvas::new(bare.w, bare.h);
+    preview.px.copy_from_slice(&bare.px);
+    draw_group_manager_density(&mut preview, old_frame, true);
+    draw_group_manager_density(&mut preview, new_frame, false);
+    for (cx, label) in [
+        (old_frame.cx, "old body 0.62"),
+        (new_frame.cx, "new body 0.74"),
+    ] {
+        let (tw, th) = text_size(label);
+        draw_primitives(
+            &mut preview,
+            &[Primitive::Text {
+                rect: Box2D {
+                    cx,
+                    cy: 38.0,
+                    w: tw,
+                    h: th,
+                    rotation: 0.0,
+                },
+                text: label.to_string(),
+                color: rst_render::theme::TEXT,
+                opacity: 1.0,
+            }],
+        );
+    }
+    let path = std::env::var("RESTICKER_MODAL_DENSITY_PREVIEW").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("resticker_modal_density_preview.png")
+            .to_string_lossy()
+            .into_owned()
+    });
+    std::fs::write(&path, encode_png(&preview)).expect("записать превью плотности модала");
+    println!(
+        "плотность модала: старое тело 0.62 — просвет {old_percent:.2}%; новое тело 0.74 — просвет {new_percent:.2}%; PNG: {path}"
+    );
+}
+
 #[test]
 #[ignore = "инструмент разработки: пишет PNG, не проверяет инвариантов"]
 fn ui_preview_png() {
@@ -260,30 +420,53 @@ fn ui_preview_png() {
 
     // Тулбар одиночного выделения видео-стикера: ползунок прозрачности,
     // поле, семь кнопок, play/pause, полоса перемотки, громкость.
+    // Ниже верхнего края намеренно: у громкости выпадающая шкала растёт
+    // ВВЕРХ, и у самой кромки холста её было бы не видно.
     let video_toolbar = build_toolbar(
-        &DipRect::from_center(560.0, 40.0, 400.0, 40.0),
-        Some(0.8),
-        Some(VideoToolbarState {
-            paused: false,
-            show_timeline: true,
-            volume_pct: 65,
-        }),
+        &DipRect::from_center(560.0, 190.0, 400.0, 40.0),
+        &ToolbarState {
+            opacity: 0.8,
+            visible: true,
+            video: Some(VideoToolbarState {
+                paused: false,
+                show_timeline: true,
+                volume_pct: 65,
+                muted: false,
+            }),
+        },
         f64::from(h),
     );
-    // Тот же тулбар без видео и с выключенной полосой — картинка-стикер.
+    // Тот же тулбар без видео — картинка-стикер.
     let image_toolbar = build_toolbar(
-        &DipRect::from_center(400.0, 130.0, 200.0, 40.0),
-        Some(0.35),
-        None,
+        &DipRect::from_center(300.0, 300.0, 200.0, 40.0),
+        &ToolbarState {
+            opacity: 0.35,
+            visible: true,
+            video: None,
+        },
         f64::from(h),
     );
-    // Мультивыделение: только кнопки.
+    // Скрытый стикер: тот же тулбар с закрытым глазом (2026-09-06).
     let multi_toolbar = build_toolbar(
-        &DipRect::from_center(880.0, 130.0, 200.0, 40.0),
-        None,
-        None,
+        &DipRect::from_center(820.0, 300.0, 200.0, 40.0),
+        &ToolbarState {
+            opacity: 1.0,
+            visible: false,
+            video: None,
+        },
         f64::from(h),
     );
+    // Громкость показываем РАСКРЫТОЙ: в покое это просто кнопка-динамик,
+    // а проверять надо именно выпадающую шкалу (2026-09-06). Наведение и
+    // прогон анимации — то же, что делает живой указатель.
+    let mut video_toolbar = video_toolbar;
+    if let Some(volume) = video_toolbar.widget_mut::<rst_render::VolumeControl>(crate::toolbar::TB_VOLUME)
+    {
+        volume.set_hovered(true);
+    }
+    for _ in 0..40 {
+        video_toolbar.animate(16.0);
+    }
     let cursor = build_cursor_panel(
         &DipRect::new(0.0, 0.0, f64::from(w), f64::from(h)),
         true,
@@ -624,4 +807,312 @@ fn preset_strip_preview_png() {
     });
     std::fs::write(&path, encode_png(&canvas)).expect("записать превью");
     println!("превью раскладок: {path}");
+}
+
+/// Мультивыделение: общая рамка с ручками, тонкие контуры участников и общий
+/// тулбар под ними (запрос пользователя 2026-09-06 — «один квадрат выделения,
+/// скейлить и двигать одновременно»). Рисуется теми же строителями, что и
+/// живой оверлей: `SelectionBox` для рамок, `build_toolbar` для панели.
+#[test]
+#[ignore = "инструмент разработки: пишет PNG, не проверяет инвариантов"]
+fn group_selection_preview_png() {
+    use rst_core::model::{MonitorId, Placement, Transform};
+    use rst_render::{SELECTION_COLOR, SelectionBox};
+
+    let (w, h) = (900u32, 460u32);
+    let mut canvas = Canvas::new((f64::from(w) * SCALE) as u32, (f64::from(h) * SCALE) as u32);
+    backdrop(&mut canvas);
+
+    let place = |cx: f64, cy: f64, w: f64, h: f64| Placement {
+        monitor_id: MonitorId("preview".to_string()),
+        cx,
+        cy,
+        w,
+        h,
+    };
+    let members = [
+        place(240.0, 150.0, 200.0, 130.0),
+        place(560.0, 210.0, 260.0, 160.0),
+    ];
+
+    let mut prims = Vec::new();
+    // Сами стикеры — просто плашки: превью про рамки, а не про картинки.
+    for m in &members {
+        prims.push(Primitive::Fill {
+            rect: Box2D {
+                cx: m.cx,
+                cy: m.cy,
+                w: m.w,
+                h: m.h,
+                rotation: 0.0,
+            },
+            color: [0x20, 0x24, 0x30],
+            opacity: 0.92,
+        });
+    }
+    // Контур участника — приглушённый: он отмечает «этот входит в группу»,
+    // а главная линия — общая рамка.
+    for m in &members {
+        for rect in SelectionBox::new(m, &Transform::default()).visuals().outline {
+            prims.push(Primitive::Fill {
+                rect,
+                color: SELECTION_COLOR,
+                opacity: 0.45,
+            });
+        }
+    }
+    // Общая рамка: union по краям участников, ручки — белые.
+    let left = members
+        .iter()
+        .map(|m| m.cx - m.w / 2.0)
+        .fold(f64::INFINITY, f64::min);
+    let top = members
+        .iter()
+        .map(|m| m.cy - m.h / 2.0)
+        .fold(f64::INFINITY, f64::min);
+    let right = members
+        .iter()
+        .map(|m| m.cx + m.w / 2.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let bottom = members
+        .iter()
+        .map(|m| m.cy + m.h / 2.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let frame = place(
+        (left + right) / 2.0,
+        (top + bottom) / 2.0,
+        right - left,
+        bottom - top,
+    );
+    let group = SelectionBox::new(&frame, &Transform::default());
+    let visuals = group.visuals();
+    for rect in visuals.outline {
+        prims.push(Primitive::Fill {
+            rect,
+            color: SELECTION_COLOR,
+            opacity: 1.0,
+        });
+    }
+    for (_, rect) in visuals.handles {
+        prims.push(Primitive::Fill {
+            rect,
+            color: [0xff, 0xff, 0xff],
+            opacity: 1.0,
+        });
+    }
+    draw_primitives(&mut canvas, &prims);
+
+    // Тулбар группы: ползунок прозрачности на месте (прежнее правило SPEC
+    // «в мульти только кнопки» отменено), видео-виджеты — потому что в
+    // выделении есть видео, глаз закрыт — потому что скрыт хотя бы один.
+    let mut toolbar = build_toolbar(
+        &DipRect::new(left, top, right - left, bottom - top),
+        &ToolbarState {
+            opacity: 0.6,
+            visible: false,
+            video: Some(VideoToolbarState {
+                paused: true,
+                show_timeline: false,
+                volume_pct: 65,
+                muted: false,
+            }),
+        },
+        f64::from(h),
+    );
+    if let Some(volume) =
+        toolbar.widget_mut::<rst_render::VolumeControl>(crate::toolbar::TB_VOLUME)
+    {
+        volume.set_hovered(true);
+    }
+    for _ in 0..40 {
+        toolbar.animate(16.0);
+    }
+    let mut panel_prims = Vec::new();
+    toolbar.draw(&mut panel_prims);
+    draw_primitives(&mut canvas, &panel_prims);
+
+    let path = std::env::var("RESTICKER_GROUP_PREVIEW").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("resticker_group_preview.png")
+            .to_string_lossy()
+            .into_owned()
+    });
+    std::fs::write(&path, encode_png(&canvas)).expect("записать превью мультивыделения");
+    println!("превью мультивыделения: {path}");
+}
+
+/// Численный замер читаемости состояний видео-кнопок: яркость плашки
+/// переключателя полосы и попарное отличие альфа-покрытия иконок динамика.
+#[test]
+#[ignore = "инструмент разработки: пишет PNG и печатает замеры различимости"]
+fn video_control_states_measurement_png() {
+    use rst_render::{Button, Icon};
+
+    let (w, h) = (1200u32, 190u32);
+    let mut off_canvas = Canvas::new((f64::from(w) * SCALE) as u32, (f64::from(h) * SCALE) as u32);
+    let mut on_canvas = Canvas::new(off_canvas.w, off_canvas.h);
+    backdrop(&mut off_canvas);
+    on_canvas.px.copy_from_slice(&off_canvas.px);
+
+    let toolbar_bounds = |cx| DipRect::from_center(cx, 80.0, 400.0, 40.0);
+    let state = |show_timeline| ToolbarState {
+        opacity: 0.8,
+        visible: true,
+        video: Some(VideoToolbarState {
+            paused: false,
+            show_timeline,
+            volume_pct: 65,
+            muted: false,
+        }),
+    };
+    // Рендерим оба состояния в одной и той же точке на одинаковой подложке:
+    // иначе горизонтальный градиент backdrop смешал бы яркость стекла с
+    // разницей фона.
+    let off_panel = build_toolbar(&toolbar_bounds(600.0), &state(false), f64::from(h));
+    let on_panel = build_toolbar(&toolbar_bounds(600.0), &state(true), f64::from(h));
+    let mut off_prims = Vec::new();
+    off_panel.draw(&mut off_prims);
+    draw_primitives(&mut off_canvas, &off_prims);
+    let mut on_prims = Vec::new();
+    on_panel.draw(&mut on_prims);
+    draw_primitives(&mut on_canvas, &on_prims);
+
+    let mean_brightness = |canvas: &Canvas, bounds: Box2D| {
+        let inset = 2.0 * SCALE;
+        let x0 = ((bounds.cx - bounds.w / 2.0) * SCALE + inset)
+            .floor()
+            .max(0.0) as u32;
+        let x1 = ((bounds.cx + bounds.w / 2.0) * SCALE - inset)
+            .ceil()
+            .min(f64::from(canvas.w)) as u32;
+        let y0 = ((bounds.cy - bounds.h / 2.0) * SCALE + inset)
+            .floor()
+            .max(0.0) as u32;
+        let y1 = ((bounds.cy + bounds.h / 2.0) * SCALE - inset)
+            .ceil()
+            .min(f64::from(canvas.h)) as u32;
+        let mut sum = 0.0;
+        let mut count = 0u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = ((y * canvas.w + x) * 4) as usize;
+                // Relative luminance makes the number independent of the
+                // equal RGB channels used by the button glass.
+                sum += 0.2126 * f64::from(canvas.px[i])
+                    + 0.7152 * f64::from(canvas.px[i + 1])
+                    + 0.0722 * f64::from(canvas.px[i + 2]);
+                count += 1;
+            }
+        }
+        sum / f64::from(count.max(1))
+    };
+    let percent_delta = |a: f64, b: f64| 100.0 * (a - b).abs() / b.abs().max(f64::EPSILON);
+
+    let button_bounds = |panel: &rst_render::Panel, id| {
+        panel
+            .widget::<rst_render::Button>(id)
+            .expect("кнопка тулбара на месте")
+            .bounds()
+    };
+    let off_timeline = mean_brightness(
+        &off_canvas,
+        button_bounds(&off_panel, crate::toolbar::TB_TIMELINE),
+    );
+    let on_timeline = mean_brightness(
+        &on_canvas,
+        button_bounds(&on_panel, crate::toolbar::TB_TIMELINE),
+    );
+    let off_play = mean_brightness(
+        &off_canvas,
+        button_bounds(&off_panel, crate::toolbar::TB_PLAY_PAUSE),
+    );
+    let on_play = mean_brightness(
+        &on_canvas,
+        button_bounds(&on_panel, crate::toolbar::TB_PLAY_PAUSE),
+    );
+    let timeline_delta = (on_timeline - off_timeline).abs();
+    println!(
+        "яркость плашки (luminance, inset 2 DIP): timeline off {off_timeline:.3}, on {on_timeline:.3}, "
+    );
+    println!(
+        "  timeline delta: {timeline_delta:.3} ({:.2}% от off); play/pause: off {off_play:.3}, on {on_play:.3}; on timeline vs обычная кнопка: {:.3} ({:.2}%), off timeline vs обычная: {:.3} ({:.2}%)",
+        percent_delta(on_timeline, off_timeline),
+        (on_timeline - on_play).abs(),
+        percent_delta(on_timeline, on_play),
+        (off_timeline - off_play).abs(),
+        percent_delta(off_timeline, off_play),
+    );
+
+    let icon_difference = |a: Icon, b: Icon, size: u32| {
+        let lhs = icon_rgba(a, size);
+        let rhs = icon_rgba(b, size);
+        let mut different = 0u32;
+        let mut nontransparent = 0u32;
+        for (la, rb) in lhs.chunks_exact(4).zip(rhs.chunks_exact(4)) {
+            if la[3] > 0 || rb[3] > 0 {
+                nontransparent += 1;
+                if la[3] != rb[3] {
+                    different += 1;
+                }
+            }
+        }
+        (different, nontransparent, 100.0 * f64::from(different) / f64::from(nontransparent.max(1)))
+    };
+    let icon_side_dip = rst_render::theme::BUTTON_SIZE - 2.0 * rst_render::theme::BUTTON_PAD;
+    for scale in [1.0, 2.0] {
+        let side = (icon_side_dip * scale).round() as u32;
+        println!("иконки динамика: N={side} px (сторона {icon_side_dip:.1} DIP × scale {scale:.1})");
+        for (name, a, b) in [
+            ("high vs low", Icon::VolumeHigh, Icon::VolumeLow),
+            ("high vs mute", Icon::VolumeHigh, Icon::VolumeMute),
+            ("low vs mute", Icon::VolumeLow, Icon::VolumeMute),
+        ] {
+            let (different, nontransparent, percent) = icon_difference(a, b, side);
+            println!("  {name}: {different}/{nontransparent} пикселей альфы отличаются ({percent:.2}%)");
+        }
+    }
+
+    // Отдельный кадр держит ровно те же реальные 30-DIP кнопки и 22-DIP
+    // области иконок, чтобы метрики можно было сопоставить с картинкой.
+    let mut preview = Canvas::new((520.0 * SCALE) as u32, (150.0 * SCALE) as u32);
+    backdrop(&mut preview);
+    let icons = [
+        ("timeline off", Icon::TimelineOff, false),
+        ("timeline on", Icon::Timeline, true),
+        ("volume high", Icon::VolumeHigh, false),
+        ("volume low", Icon::VolumeLow, false),
+        ("volume mute", Icon::VolumeMute, false),
+    ];
+    for (i, (label, icon, toggled)) in icons.into_iter().enumerate() {
+        let cx = 52.0 + i as f64 * 104.0;
+        let button = Button::icon(i as u32, cx, 65.0, icon).toggled(toggled);
+        let mut prims = Vec::new();
+        button.draw(&mut prims);
+        draw_primitives(&mut preview, &prims);
+        let (tw, th) = text_size(label);
+        draw_primitives(
+            &mut preview,
+            &[Primitive::Text {
+                rect: Box2D {
+                    cx,
+                    cy: 112.0,
+                    w: tw,
+                    h: th,
+                    rotation: 0.0,
+                },
+                text: label.to_string(),
+                color: rst_render::theme::TEXT,
+                opacity: 1.0,
+            }],
+        );
+    }
+
+    let path = std::env::var("RESTICKER_VIDEO_STATES_PREVIEW").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("resticker_video_control_states.png")
+            .to_string_lossy()
+            .into_owned()
+    });
+    std::fs::write(&path, encode_png(&preview)).expect("записать превью состояний видео-кнопок");
+    println!("PNG состояний видео-кнопок: {path}");
 }

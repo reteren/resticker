@@ -21,6 +21,7 @@ pub mod mitosis;
 pub mod model;
 pub mod monitor_loss;
 pub mod monitor_rebind;
+pub mod multi_transform;
 pub mod occluders;
 pub mod ops;
 pub mod pinned_window;

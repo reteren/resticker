@@ -134,9 +134,9 @@ pub fn build_cursor_panel(screen: &DipRect, all_visible: bool, progress: f64) ->
     // перечёркнутый. Прежняя пара была наоборот, «что произойдёт по
     // клику», и на видимых стикерах висел глаз с минусом.
     let toggle_icon = if all_visible {
-        Icon::AllVisible
+        Icon::Eye
     } else {
-        Icon::AllHidden
+        Icon::EyeOff
     };
     let buttons = [
         (BTN_LOAD_FILE, Icon::FileOpen),
@@ -319,7 +319,7 @@ mod tests {
                 Icon::Layers,
                 Icon::PresetLoad,
                 Icon::Groups,
-                Icon::AllVisible,
+                Icon::Eye,
                 Icon::Settings,
                 Icon::Exit
             ]
@@ -333,7 +333,7 @@ mod tests {
                 Icon::Layers,
                 Icon::PresetLoad,
                 Icon::Groups,
-                Icon::AllHidden,
+                Icon::EyeOff,
                 Icon::Settings,
                 Icon::Exit
             ]

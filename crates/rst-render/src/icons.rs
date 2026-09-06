@@ -24,23 +24,28 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
     match icon {
         Icon::Layers => draw_layers(&mut canvas, s),
         Icon::Groups => draw_groups(&mut canvas, s),
-        Icon::Eye => draw_eye(&mut canvas, s),
-        Icon::EyeOff => draw_eye_off(&mut canvas, s),
+        // Глаз стикера — ТОТ ЖЕ рисунок, что у «показать/скрыть всё» на
+        // панели у курсора: пользователь просил сделать кнопку тулбара
+        // «такой же, как на основном тулбаре» (2026-09-06), а две похожие,
+        // но разные пиктограммы одного смысла — худший вид расхождения.
+        Icon::Eye => return eye_rgba(EYE_OPEN_PNG, size_px, color_of(icon)),
+        Icon::EyeOff => return eye_rgba(EYE_CLOSED_PNG, size_px, color_of(icon)),
         Icon::OrderUp => draw_order_up(&mut canvas, s),
         Icon::OrderDown => draw_order_down(&mut canvas, s),
         Icon::Duplicate => draw_duplicate(&mut canvas, s),
         Icon::Delete => draw_delete(&mut canvas, s),
         Icon::FileOpen => draw_file_open(&mut canvas, s),
-        // Пара «состояние видимости» — рисунки пользователя, см. `eye_rgba`.
-        Icon::AllVisible => return eye_rgba(EYE_OPEN_PNG, size_px, color_of(icon)),
-        Icon::AllHidden => return eye_rgba(EYE_CLOSED_PNG, size_px, color_of(icon)),
         Icon::PresetSave => draw_preset_save(&mut canvas, s),
         Icon::PresetLoad => draw_preset_load(&mut canvas, s),
         Icon::Settings => draw_settings(&mut canvas, s),
         Icon::Exit => draw_exit(&mut canvas, s),
         Icon::Play => draw_play(&mut canvas, s),
         Icon::Pause => draw_pause(&mut canvas, s),
-        Icon::Timeline | Icon::TimelineOff => draw_timeline(&mut canvas, s),
+        Icon::Timeline => draw_timeline(&mut canvas, s),
+        Icon::TimelineOff => draw_timeline_off(&mut canvas, s),
+        Icon::VolumeHigh => draw_volume(&mut canvas, s, 2),
+        Icon::VolumeLow => draw_volume(&mut canvas, s, 1),
+        Icon::VolumeMute => draw_volume_mute(&mut canvas, s),
         Icon::ResetScale => draw_reset_scale(&mut canvas, s),
         // Двухцветная (белая с обводкой) — рисуется целиком своим
         // генератором, как и растровая булавка ниже.
@@ -177,7 +182,15 @@ fn color_of(icon: Icon) -> [u8; 3] {
     match icon {
         // Растровая иконка красится в `pinned_badge_rgba`, сюда не попадает.
         Icon::Pinned => PINNED_BADGE_COLOR,
-        Icon::EyeOff | Icon::TimelineOff | Icon::LockOpen => DIM,
+        Icon::LockOpen => DIM,
+        // Закрытый глаз — СОСТОЯНИЕ «скрыт», а не «недоступно»: тот же
+        // светлый тон, что у открытого (как у пары AllVisible/AllHidden).
+        Icon::EyeOff => LIGHT,
+        // Выключенный переключатель полосы больше НЕ красится в DIM: тон
+        // на тон с фоном кнопки — ровно та жалоба, из-за которой у него
+        // появилась косая черта (2026-09-06). Состояние сообщает форма
+        // и заливка кнопки, а не яркость рисунка.
+        Icon::TimelineOff => LIGHT,
         // Двухцветные иконки красятся своими генераторами.
         Icon::Rotate => PINNED_BADGE_COLOR,
         // Единственный цветной акцент: удаление необратимо, и форма урны
@@ -186,9 +199,7 @@ fn color_of(icon: Icon) -> [u8; 3] {
         // Обе иконки видимости — светлые: состояние читается формой
         // (перечёркнут или нет), а приглушать её на тёмном стекле значило
         // бы прятать саму кнопку.
-        Icon::AllVisible
-        | Icon::AllHidden
-        | Icon::Layers
+        Icon::Layers
         | Icon::Groups
         | Icon::Eye
         | Icon::OrderUp
@@ -202,6 +213,9 @@ fn color_of(icon: Icon) -> [u8; 3] {
         | Icon::Play
         | Icon::Pause
         | Icon::Timeline
+        | Icon::VolumeHigh
+        | Icon::VolumeLow
+        | Icon::VolumeMute
         | Icon::ResetScale
         | Icon::Lock
         | Icon::Plus => LIGHT,
@@ -362,19 +376,6 @@ fn draw_groups(cv: &mut Canvas, s: f64) {
     }
 }
 
-/// «Глаз»: эллипс с точкой-зрачком.
-fn draw_eye(cv: &mut Canvas, s: f64) {
-    stroke_ellipse(cv, 0.5 * s, 0.5 * s, 0.33 * s, 0.21 * s, 0.10 * s);
-    fill_circle(cv, 0.5 * s, 0.5 * s, 0.08 * s);
-}
-
-/// «Глаз закрытый»: эллипс с диагональной чертой.
-fn draw_eye_off(cv: &mut Canvas, s: f64) {
-    stroke_ellipse(cv, 0.5 * s, 0.5 * s, 0.33 * s, 0.21 * s, 0.09 * s);
-    fill_circle(cv, 0.5 * s, 0.5 * s, 0.07 * s);
-    line(cv, 0.34 * s, 0.38 * s, 0.66 * s, 0.62 * s, 0.09 * s);
-}
-
 /// «Выше по порядку»: стрелка вверх.
 fn draw_order_up(cv: &mut Canvas, s: f64) {
     fill_triangle(
@@ -494,6 +495,58 @@ fn draw_timeline(cv: &mut Canvas, s: f64) {
     // поперёк дорожки — «плюс».
     fill_rect(cv, 0.10 * s, 0.47 * s, 0.90 * s, 0.53 * s);
     fill_circle(cv, 0.50 * s, 0.50 * s, 0.17 * s);
+}
+
+/// «Полоса перемотки выключена»: та же дорожка с ручкой, перечёркнутая
+/// косой чертой — как `Eye`/`EyeOff`. Раньше отличие было только в тоне
+/// (`DIM`), и на сером стекле кнопка читалась не «выключено», а
+/// «недоступно» (репорт пользователя 2026-09-06).
+fn draw_timeline_off(cv: &mut Canvas, s: f64) {
+    draw_timeline(cv, s);
+    line(cv, 0.18 * s, 0.80 * s, 0.82 * s, 0.20 * s, 0.10 * s);
+}
+
+/// «Динамик» с `waves` волнами справа: корпус + раструб, затем шевроны.
+/// Одна волна — тихо, две — громко; сама форма динамика одинаковая, чтобы
+/// уровень читался приростом, а не другим знаком.
+fn draw_volume(cv: &mut Canvas, s: f64, waves: u8) {
+    speaker_body(cv, s);
+    if waves >= 1 {
+        chevron(cv, s, 0.58, 0.14);
+    }
+    if waves >= 2 {
+        chevron(cv, s, 0.74, 0.26);
+    }
+}
+
+/// «Звук выключен»: тот же динамик, крест вместо волн. Крест, а не одна
+/// косая черта: черта поверх раструба сливается с ним в размере кнопки.
+fn draw_volume_mute(cv: &mut Canvas, s: f64) {
+    speaker_body(cv, s);
+    let t = 0.09 * s;
+    line(cv, 0.60 * s, 0.34 * s, 0.88 * s, 0.66 * s, t);
+    line(cv, 0.88 * s, 0.34 * s, 0.60 * s, 0.66 * s, t);
+}
+
+/// Корпус динамика: прямоугольник мембраны и трапеция раструба.
+fn speaker_body(cv: &mut Canvas, s: f64) {
+    fill_rect(cv, 0.08 * s, 0.38 * s, 0.26 * s, 0.62 * s);
+    fill_quad(
+        cv,
+        (0.26 * s, 0.38 * s),
+        (0.48 * s, 0.18 * s),
+        (0.48 * s, 0.82 * s),
+        (0.26 * s, 0.62 * s),
+    );
+}
+
+/// Волна звука: шеврон «>» с вершиной на `x` и полураствором `half`
+/// (в долях стороны).
+fn chevron(cv: &mut Canvas, s: f64, x: f64, half: f64) {
+    let t = 0.085 * s;
+    let tip_x = (x + half * 0.55) * s;
+    line(cv, x * s, (0.5 - half) * s, tip_x, 0.5 * s, t);
+    line(cv, tip_x, 0.5 * s, x * s, (0.5 + half) * s, t);
 }
 
 /// «Поворот» — ручка на углу рамки выделения (запрос пользователя
