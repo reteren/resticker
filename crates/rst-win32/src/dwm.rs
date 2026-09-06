@@ -25,3 +25,41 @@ pub fn wait_for_composition() {
     // SAFETY: DwmFlush не принимает аргументов и безопасен с любого потока.
     let _ = unsafe { DwmFlush() };
 }
+
+/// Скруглить углы окна средствами DWM (Windows 11, build 22000+).
+///
+/// Зачем отдельно: у окна настроек нет системной рамки (`decorations: false`)
+/// и включён акрил, а безрамочное окно Windows не скругляет сама — акриловая
+/// подложка остаётся прямоугольной и торчит квадратными углами из-под
+/// скруглённого CSS-корпуса (жалоба пользователя 2026-09-05, скриншот с
+/// углом). CSS тут бессилен: подложку рисует не вебвью, а композитор.
+///
+/// Радиус задаёт система (`DWMWCP_ROUND` — те же 8 DIP, что у остальных окон
+/// Windows 11), поэтому радиус в CSS должен совпадать с ним, иначе между
+/// двумя скруглениями останется акриловый серп.
+///
+/// На Windows 10 атрибута нет — вызов вернёт ошибку, и это нормально: там
+/// окна и так не скруглены, приложение просто выглядит как остальные окна
+/// системы. Ошибку поэтому глотаем.
+pub fn round_window_corners(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    };
+
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    if hwnd.0.is_null() {
+        return;
+    }
+    let preference = DWMWCP_ROUND;
+    // SAFETY: hwnd — живое окно вызывающего; атрибут и его размер
+    // соответствуют контракту DwmSetWindowAttribute.
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const _ as *const core::ffi::c_void,
+            size_of_val(&preference) as u32,
+        )
+    };
+}

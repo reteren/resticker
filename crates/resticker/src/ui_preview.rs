@@ -472,3 +472,156 @@ fn ui_preview_png() {
     std::fs::write(&path, encode_png(&canvas)).expect("записать превью");
     println!("превью UI: {path}");
 }
+
+/// Превью ленты набора группы: иконка приложения поверх снимка окна.
+///
+/// Снимки взяты нарочно белый, тёмный и серый: иконка обязана читаться на
+/// любом — ради этого под ней и стоит плашка.
+#[test]
+#[ignore = "инструмент разработки: пишет PNG, не проверяет инвариантов"]
+fn strip_preview_png() {
+    use crate::group_strip::{self, StripCard, StripImage};
+
+    let (w, h) = (1200u32, 460u32);
+    let mut canvas = Canvas::new((f64::from(w) * SCALE) as u32, (f64::from(h) * SCALE) as u32);
+    backdrop(&mut canvas);
+
+    // Снимки широкие (16:9) — настоящие окна такие и есть, и именно на
+    // широком снимке видно, не свисает ли значок с угла карточки.
+    let solid = |key: u64, w: u32, h: u32, rgba: [u8; 4]| StripImage {
+        key,
+        width: w,
+        height: h,
+        rgba: rgba.repeat((w * h) as usize),
+    };
+    // Иконка с прозрачным полем по краям — как настоящая.
+    let icon = |key: u64, rgba: [u8; 4]| {
+        let side = 32u32;
+        let mut px = vec![0u8; (side * side * 4) as usize];
+        for y in 4..side - 4 {
+            for x in 4..side - 4 {
+                let i = ((y * side + x) * 4) as usize;
+                px[i..i + 4].copy_from_slice(&rgba);
+            }
+        }
+        StripImage {
+            key,
+            width: side,
+            height: side,
+            rgba: px,
+        }
+    };
+
+    let mut cards = vec![
+        StripCard {
+            hwnd: 1,
+            title: "Пустая вкладка".to_string(),
+            icon: Some(icon(1, [240, 240, 245, 255])),
+            thumb: Some(solid(11, 320, 180, [255, 255, 255, 255])),
+            slot: Some(1),
+        },
+        StripCard {
+            hwnd: 2,
+            title: "DaVinci Resolve S…".to_string(),
+            icon: Some(icon(2, [90, 150, 245, 255])),
+            thumb: Some(solid(12, 320, 180, [18, 18, 22, 255])),
+            slot: None,
+        },
+        StripCard {
+            hwnd: 3,
+            title: "Steam".to_string(),
+            icon: Some(icon(3, [70, 200, 160, 255])),
+            thumb: Some(solid(13, 240, 240, [120, 120, 128, 255])),
+            slot: Some(2),
+        },
+        StripCard {
+            hwnd: 4,
+            title: "Без снимка".to_string(),
+            icon: Some(icon(4, [230, 120, 90, 255])),
+            thumb: None,
+            slot: None,
+        },
+    ];
+
+    // Догоняем число карточек до четырнадцати — столько окон было на
+    // скриншоте пользователя: ровно тот случай, ради которого появились ряды.
+    for k in 5..=14u64 {
+        cards.push(StripCard {
+            hwnd: k as usize,
+            title: format!("Окно {k}"),
+            icon: Some(icon(k, [140, 140, 150, 255])),
+            thumb: Some(solid(100 + k, 320, 180, [40, 40, 46, 255])),
+            slot: None,
+        });
+    }
+
+    let strip = group_strip::build(
+        &cards,
+        Box2D {
+            cx: f64::from(w) / 2.0,
+            cy: f64::from(h) / 2.0,
+            w: f64::from(w),
+            h: f64::from(h),
+            rotation: 0.0,
+        },
+    );
+    // Карточки въезжают с задержкой-каскадом (`Phase` + `stagger_delay_ms`),
+    // и на нулевом кадре их содержимое ещё прозрачно. Прокручиваем анимацию
+    // до конца — превью показывает установившийся вид, а не первый кадр.
+    let mut strip = strip;
+    for _ in 0..60 {
+        strip.panel.animate(50.0);
+    }
+    let mut prims = Vec::new();
+    strip.panel.draw(&mut prims);
+    draw_primitives(&mut canvas, &prims);
+
+    let path = std::env::var("RESTICKER_STRIP_PREVIEW").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("resticker_strip_preview.png")
+            .to_string_lossy()
+            .into_owned()
+    });
+    std::fs::write(&path, encode_png(&canvas)).expect("записать превью");
+    println!("превью ленты: {path}");
+}
+
+/// Превью ленты раскладок для двух окон — чтобы опознать карточку, на
+/// которую показал пользователь, а не гадать по описанию таблицы.
+#[test]
+#[ignore = "инструмент разработки: пишет PNG, не проверяет инвариантов"]
+fn preset_strip_preview_png() {
+    use crate::preset_strip;
+
+    let (w, h) = (900u32, 200u32);
+    let mut canvas = Canvas::new((f64::from(w) * SCALE) as u32, (f64::from(h) * SCALE) as u32);
+    backdrop(&mut canvas);
+
+    let presets = rst_core::group_layout::presets_for(2).to_vec();
+    println!("раскладок для двух окон: {}", presets.len());
+    for (i, p) in presets.iter().enumerate() {
+        let slots: Vec<String> = p
+            .slots
+            .iter()
+            .map(|r| format!("({:.2},{:.2} {:.2}x{:.2})", r.x, r.y, r.w, r.h))
+            .collect();
+        println!("  #{i}: {}", slots.join(" "));
+    }
+    let screen = DipRect::new(0.0, 0.0, f64::from(w), f64::from(h));
+    let mut strip = preset_strip::build(&presets, false, Some(0), &screen, 4, &[]);
+    for _ in 0..60 {
+        strip.panel.animate(50.0);
+    }
+    let mut prims = Vec::new();
+    strip.panel.draw(&mut prims);
+    draw_primitives(&mut canvas, &prims);
+
+    let path = std::env::var("RESTICKER_PRESET_PREVIEW").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("resticker_preset_preview.png")
+            .to_string_lossy()
+            .into_owned()
+    });
+    std::fs::write(&path, encode_png(&canvas)).expect("записать превью");
+    println!("превью раскладок: {path}");
+}

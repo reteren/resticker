@@ -655,6 +655,12 @@ fn main() -> anyhow::Result<()> {
             #[cfg(windows)]
             if let Some(w) = app.get_webview_window("settings") {
                 disable_browser_accelerators(&w);
+                // Безрамочное окно Windows не скругляет сама — акриловая
+                // подложка торчала квадратными углами из-под скруглённого
+                // корпуса (жалоба 2026-09-05).
+                if let Ok(hwnd) = w.hwnd() {
+                    rst_win32::dwm::round_window_corners(hwnd.0 as isize);
+                }
             }
 
             if !silent_start {

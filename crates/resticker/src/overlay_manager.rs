@@ -5688,7 +5688,6 @@ fn run(
                 &monitor_bounds,
                 &mut group_thumbs,
                 now_ms,
-                0,
                 number,
             );
             if edit.group_editor.is_none() {
@@ -9926,16 +9925,10 @@ fn handle_group_editor_input(
                         dirty = true;
                     }
                 }
-            } else {
-                // Одна карточка на щелчок: шаг в три строки, как у списков,
-                // здесь означал бы прыжок через полленты.
-                let step = if notches > 0 { 1 } else { -1 };
-                let next = panels.scroll.saturating_add_signed(-step as isize);
-                if next != panels.scroll {
-                    panels.scroll = next;
-                    rebuild = true;
-                }
             }
+            // Над лентой окон колесо больше ничего не делает: карточки
+            // стоят рядами и видны все сразу (`group_strip::MAX_PER_ROW`),
+            // крутить нечего.
         }
         InputEvent::CaptureLost => {
             // Захват отобрали посреди жеста: перетаскивание ОТМЕНЯЕТСЯ, а не
@@ -9957,10 +9950,10 @@ fn handle_group_editor_input(
         edit.pending_open_group_manager = true;
     }
     if rebuild {
-        let (scroll, windows, number) = edit
+        let (windows, number) = edit
             .group_editor
             .as_ref()
-            .map(|p| (p.scroll, p.windows.clone(), p.group_number))
+            .map(|p| (p.windows.clone(), p.group_number))
             .unwrap_or_default();
         let now_ms = editor_clock_ms();
         if let Some(rebuilt) = build_group_editor(
@@ -9970,7 +9963,6 @@ fn handle_group_editor_input(
             monitor_bounds,
             thumbs,
             now_ms,
-            scroll,
             number,
         ) {
             edit.group_editor = Some(rebuilt);
@@ -10380,7 +10372,6 @@ fn open_group_editor(
         monitor_bounds,
         thumbs,
         now_ms,
-        0,
         number,
     );
     if edit.group_editor.is_none() {
@@ -11445,8 +11436,6 @@ struct GroupEditorPanels {
     strip: group_strip::StripPanel,
     /// Лента раскладок сверху вместе с полем зазора.
     presets: preset_strip::StripBuild,
-    /// Прокрутка ленты окон.
-    scroll: usize,
     /// Окна карточек в порядке ленты: id карточки кодирует индекс в этом
     /// списке, и без него клик не разобрать обратно в `HWND`.
     card_hwnds: Vec<usize>,
@@ -11487,7 +11476,6 @@ fn build_group_editor(
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     thumbs: &mut rst_win32::thumb_cache::ThumbCache,
     now_ms: u64,
-    scroll: usize,
     group_number: u32,
 ) -> Option<GroupEditorPanels> {
     let editor = groups.editor()?;
@@ -11569,7 +11557,7 @@ fn build_group_editor(
         // параметрах экрана Windows — крупная цифра в углу, — но отвечает
         // она на другой вопрос: какую группу ты сейчас делаешь.
         badge: monitor_badge::build(&screen, group_number),
-        strip: group_strip::build(&cards, scroll, screen_box),
+        strip: group_strip::build(&cards, screen_box),
         presets: preset_strip::build(
             &presets,
             adaptive_first,
@@ -11579,7 +11567,6 @@ fn build_group_editor(
             &layout_fit_verdicts(editor, &presets, monitor_bounds),
         ),
         monitor_id,
-        scroll,
         last_pos: (screen.x + screen.w / 2.0, screen.y + screen.h / 2.0),
     })
 }
@@ -14374,8 +14361,15 @@ fn handle_input(
     }
 }
 
-/// Соседи для магнита: ось-выровненные габариты остальных видимых стикеров
-/// ЭТОГО монитора.
+/// Соседи для магнита: ось-выровненные габариты остальных стикеров ЭТОГО
+/// монитора.
+///
+/// Скрытые (`visible == false`) входят наравне с видимыми: в режиме
+/// редактирования они нарисованы шахматкой и полностью интерактивны — их
+/// можно взять, двигать и удалить (`hit_sticker_at`, отрисовка по
+/// `s.visible || edit.active`). Раз это такой же объект на экране, то и
+/// магнититься к нему надо: без этого стикер проезжал сквозь соседа, которого
+/// пользователь видит перед собой (жалоба 2026-09-05).
 ///
 /// Выделенные исключены намеренно: при мультивыделении они едут вместе с
 /// перетаскиваемым, и магнитить его к ним значило бы магнитить его к самому
@@ -14383,11 +14377,117 @@ fn handle_input(
 fn snap_peers(cfg: &Config, edit: &EditState, monitor_id: &MonitorId) -> Vec<DipRect> {
     cfg.stickers
         .iter()
-        .filter(|s| {
-            s.visible && s.placement.monitor_id == *monitor_id && !edit.selection.contains(s.id)
-        })
+        .filter(|s| s.placement.monitor_id == *monitor_id && !edit.selection.contains(s.id))
         .map(|s| hittest::aabb(&s.placement, s.transform.rotation))
         .collect()
+}
+
+/// Магнит при изменении размера: вернуть результат, в котором тянутая кромка
+/// села на ближайшую направляющую (края и центры монитора и соседей).
+///
+/// Поправка идёт в СМЕЩЕНИЕ ПАЛЬЦА, а размер пересчитывается заново: только
+/// [`transform_ops::resize`] знает про блокировку пропорций, зеркалирование и
+/// минимальный размер, и править её результат снаружи значило бы
+/// продублировать всё это и рано или поздно разойтись.
+///
+/// Сложность в том, что при заблокированных пропорциях (по умолчанию у
+/// угловых ручек) у прямоугольника ОДНА степень свободы: `resize` ведёт
+/// размер по той оси, куда палец ушёл дальше, а смещение по второй просто
+/// выбрасывает. Поправка «подвинуть правую кромку на 3» уходила в ту ось,
+/// которую выбрасывают, и магнит на угловой ручке молчал (жалоба
+/// пользователя 2026-09-05).
+///
+/// Поэтому ось не угадывается, а ИЗМЕРЯЕТСЯ: пробный пересчёт с единичным
+/// смещением показывает, на сколько едет кромка за единицу пальца по каждой
+/// оси; дальше нужное смещение получается делением, а результат проверяется
+/// ещё одним пересчётом — сел или нет. Три вызова чистой арифметики на
+/// движение мыши; зато ни одной копии чужих правил.
+#[allow(clippy::too_many_arguments)]
+fn snap_resize(
+    free: transform_ops::TransformedState,
+    start_placement: &Placement,
+    start_transform: &Transform,
+    handle: HandleKind,
+    delta: (f64, f64),
+    dm: DragModifiers,
+    allow_mirror: bool,
+    monitor: DipRect,
+    peers: &[DipRect],
+    config: &snap::SnapConfig,
+    disabled: bool,
+) -> transform_ops::TransformedState {
+    let edges = snap::ResizeEdges::of(handle);
+    let free_rect = hittest::aabb(&free.placement, 0.0);
+    let (want_x, want_y) = snap::snap_resize_delta(free_rect, monitor, peers, edges, config, disabled);
+    if want_x == 0.0 && want_y == 0.0 {
+        return free;
+    }
+
+    let resize_with = |dx: f64, dy: f64| {
+        transform_ops::resize(
+            start_placement,
+            start_transform,
+            handle,
+            (delta.0 + dx, delta.1 + dy),
+            dm,
+            allow_mirror,
+        )
+    };
+    // Кромка по оси `axis` у результата: 0 — X, 1 — Y.
+    let edge_of = |state: &transform_ops::TransformedState, axis: usize| {
+        let (x, y) = snap::moving_edges(hittest::aabb(&state.placement, 0.0), edges);
+        if axis == 0 { x } else { y }
+    };
+
+    // Меньшая поправка идёт первой: кромка должна сесть на ближайшую линию,
+    // а не на дальнюю.
+    let mut wants = [(0usize, want_x), (1usize, want_y)];
+    if want_y.abs() < want_x.abs() {
+        wants.swap(0, 1);
+    }
+
+    const PROBE: f64 = 1.0;
+    const RESPONSE_EPS: f64 = 1e-6;
+    for (axis, want) in wants {
+        if want == 0.0 {
+            continue;
+        }
+        let Some(edge_now) = edge_of(&free, axis) else {
+            continue;
+        };
+        // Сначала пробуем ось самой кромки: при свободном ресайзе отклик
+        // ровно единичный и лишних пересчётов не будет. Если её выбросила
+        // блокировка пропорций — спрашиваем вторую ось.
+        for probe_axis in [axis, 1 - axis] {
+            let probe = if probe_axis == 0 {
+                resize_with(PROBE, 0.0)
+            } else {
+                resize_with(0.0, PROBE)
+            };
+            let Some(edge_probe) = edge_of(&probe, axis) else {
+                continue;
+            };
+            let response = (edge_probe - edge_now) / PROBE;
+            if response.abs() < RESPONSE_EPS {
+                continue;
+            }
+            let step = want / response;
+            let candidate = if probe_axis == 0 {
+                resize_with(step, 0.0)
+            } else {
+                resize_with(0.0, step)
+            };
+            if snap::resize_edge_on_guide(
+                hittest::aabb(&candidate.placement, 0.0),
+                monitor,
+                peers,
+                edges,
+            ) {
+                return candidate;
+            }
+        }
+    }
+    free
 }
 
 /// Выключен ли магнит на этот жест зажатым модификатором.
@@ -14535,28 +14635,21 @@ fn apply_gesture(
             let result = if rotated {
                 result
             } else {
-                let (sdx, sdy) = snap::snap_resize_delta(
-                    hittest::aabb(&result.placement, 0.0),
+                snap_resize(
+                    result,
+                    &start.placement,
+                    &start.transform,
+                    *handle,
+                    delta,
+                    dm,
+                    allow_mirror,
                     monitor,
                     &snap_peers(cfg, edit, monitor_id),
-                    snap::ResizeEdges::of(*handle),
                     &edit.snap,
                     // В ресайзе `Ctrl` занят пропорциями — магнит снимает
                     // только `Alt` (см. [`magnet_off`]).
                     modifiers.alt,
-                );
-                if sdx == 0.0 && sdy == 0.0 {
-                    result
-                } else {
-                    transform_ops::resize(
-                        &start.placement,
-                        &start.transform,
-                        *handle,
-                        (delta.0 + sdx, delta.1 + sdy),
-                        dm,
-                        allow_mirror,
-                    )
-                }
+                )
             };
             let placement =
                 snap::clamp_min_visible(&result.placement, result.transform.rotation, monitor);
@@ -16814,6 +16907,170 @@ mod tests {
         );
     }
 
+    /// Скрытый сосед притягивает так же, как видимый: в режиме
+    /// редактирования он нарисован шахматкой и никуда не делся (жалоба
+    /// 2026-09-05 — стикер проезжал сквозь выключенного соседа).
+    #[test]
+    fn resize_snaps_to_a_hidden_neighbour() {
+        let (mut cfg, mut edit, id, _) = resize_snap_harness();
+        for sticker in cfg.stickers.iter_mut() {
+            if sticker.id != id {
+                sticker.visible = false;
+            }
+        }
+        run_resize(
+            &mut cfg,
+            &mut edit,
+            297.0,
+            Modifiers {
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+        );
+        assert!(
+            (right_edge(&cfg, id) - 300.0).abs() < 0.001,
+            "выключенный сосед обязан магнитить: кромка на {}",
+            right_edge(&cfg, id)
+        );
+    }
+
+    /// Тот же магнит на перетаскивании: выключенный сосед — такая же цель.
+    #[test]
+    fn move_snaps_to_a_hidden_neighbour() {
+        let mut cfg = Config::default();
+        let target = zone_test_sticker(0.0); // 150..250 по X
+        let id = target.id;
+        let start_placement = target.placement.clone();
+        let mut peer = zone_test_sticker(0.0);
+        peer.placement.cx = 400.0;
+        peer.placement.w = 200.0; // левая кромка 300
+        peer.visible = false;
+        cfg.stickers.push(target.clone());
+        cfg.stickers.push(peer);
+
+        let mut edit = mask_gate_edit_state();
+        edit.active = true;
+        edit.selection.select(id);
+        edit.gesture = Some(Gesture::Drag {
+            start: GestureStart {
+                id,
+                placement: start_placement,
+                transform: target.transform,
+            },
+            grab_dx: 0.0,
+            grab_dy: 0.0,
+        });
+        // Ведём центр так, чтобы правая кромка встала на 297 — в пороге от
+        // левого края соседа (300).
+        apply_gesture(
+            &mut cfg,
+            &mut [],
+            &mut edit,
+            (247.0, 200.0),
+            Modifiers {
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            DipRect::new(0.0, 0.0, 1920.0, 1080.0),
+            &monitor_id("main"),
+        );
+        assert!(
+            (right_edge(&cfg, id) - 300.0).abs() < 0.001,
+            "кромка должна встать впритык к выключенному соседу, а не на {}",
+            right_edge(&cfg, id)
+        );
+    }
+
+    /// Угловая ручка с заблокированными пропорциями (поведение по
+    /// умолчанию): магнит обязан сработать даже тогда, когда размер ведёт
+    /// ДРУГАЯ ось. Палец ушёл вниз далеко, а вправо чуть-чуть: `resize`
+    /// берёт вертикаль, и поправка «подвинуть правую кромку на 3»,
+    /// поданная по горизонтали, раньше пропадала впустую — магнит молчал.
+    #[test]
+    fn a_corner_handle_snaps_when_the_other_axis_drives_the_size() {
+        let (mut cfg, mut edit, id, start_placement) = resize_snap_harness();
+        edit.gesture = Some(Gesture::Resize {
+            start: GestureStart {
+                id,
+                placement: start_placement,
+                transform: Transform::default(),
+            },
+            handle: HandleKind::SouthEast,
+            grab: (250.0, 250.0),
+        });
+        // Вниз на 47, вправо на 3: масштаб ведёт вертикаль. Правая кромка при
+        // этом оказывается на 297 — в трёх DIP от левого края соседа (300).
+        apply_gesture(
+            &mut cfg,
+            &mut [],
+            &mut edit,
+            (253.0, 297.0),
+            Modifiers {
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            DipRect::new(0.0, 0.0, 1920.0, 1080.0),
+            &monitor_id("main"),
+        );
+        assert!(
+            (right_edge(&cfg, id) - 300.0).abs() < 0.001,
+            "кромка обязана сесть на 300, получили {}",
+            right_edge(&cfg, id)
+        );
+        // Пропорции магнит не ломает — квадрат остаётся квадратом.
+        let p = &cfg.stickers.iter().find(|s| s.id == id).unwrap().placement;
+        assert!(
+            (p.w - p.h).abs() < 0.001,
+            "квадрат обязан остаться квадратом: {}x{}",
+            p.w,
+            p.h
+        );
+    }
+
+    /// Из двух направляющих побеждает ближняя, даже если она по другой оси.
+    #[test]
+    fn a_corner_handle_takes_the_nearest_guide_of_either_axis() {
+        let (mut cfg, mut edit, id, start_placement) = resize_snap_harness();
+        // Сосед далеко справа даёт ГОРИЗОНТАЛЬНУЮ линию на 299 — ближе, чем
+        // левый край первого соседа (300).
+        let mut far = zone_test_sticker(0.0);
+        far.placement.cx = 1050.0;
+        far.placement.cy = 349.0; // верхняя кромка 299
+        cfg.stickers.push(far);
+
+        edit.gesture = Some(Gesture::Resize {
+            start: GestureStart {
+                id,
+                placement: start_placement,
+                transform: Transform::default(),
+            },
+            handle: HandleKind::SouthEast,
+            grab: (250.0, 250.0),
+        });
+        apply_gesture(
+            &mut cfg,
+            &mut [],
+            &mut edit,
+            (297.0, 254.0),
+            Modifiers {
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            DipRect::new(0.0, 0.0, 1920.0, 1080.0),
+            &monitor_id("main"),
+        );
+        let p = &cfg.stickers.iter().find(|s| s.id == id).unwrap().placement;
+        let bottom = p.cy + p.h / 2.0;
+        assert!(
+            (bottom - 299.0).abs() < 0.001,
+            "нижняя кромка должна сесть на ближнюю линию 299, получили {bottom}"
+        );
+    }
+
     /// Далёкий сосед не притягивает: 8 DIP — это 8, а не «примерно рядом».
     #[test]
     fn resize_leaves_a_distant_edge_alone() {
@@ -17556,7 +17813,6 @@ mod tests {
             &geometry,
             &HashMap::new(),
             &mut thumbs,
-            0,
             0,
             1,
         );

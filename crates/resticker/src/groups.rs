@@ -18,7 +18,7 @@
 //! [`WindowGroup`] и списки того, что надо подвинуть. Двигает окна
 //! координатор.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use rst_core::group_fit;
@@ -174,6 +174,23 @@ pub struct GroupsState {
     /// подряд — анимация такой проверки не проходит, а рука пользователя,
     /// отпустившая окно, проходит сразу.
     seen_places: HashMap<usize, GroupPlace>,
+    /// Кому из членов какое ЖИВОЕ окно уже досталось — привязка, которая
+    /// переживает закрытие группы и не пересматривается, пока окно живо.
+    ///
+    /// Зачем: [`group_match::match_members`] опознаёт окна по приметам
+    /// (exe + заголовок + класс), и это правильно на холодном старте, когда
+    /// `HWND` из прошлого запуска уже ничего не значит. Но пересматривать
+    /// опознание при КАЖДОМ нажатии хоткея нельзя: у двух окон одного
+    /// браузера совпадают и exe, и класс, а различает их только заголовок —
+    /// который меняется от переключения вкладки. Стоило заголовкам
+    /// разъехаться, как члены менялись окнами местами, и группа принималась
+    /// расставлять по слотам НЕ ТО окно (жалоба пользователя 2026-09-05:
+    /// «закрепляю одно окно, а выкидывает другое»).
+    ///
+    /// Ключ — группа, значение — окно каждого её члена по индексу. Только
+    /// рантайм: после перезапуска карта пуста, и опознание по приметам
+    /// снова единственный способ найти окна.
+    bindings: HashMap<Uuid, Vec<Option<usize>>>,
 }
 
 impl GroupEditor {
@@ -470,10 +487,13 @@ impl GroupsState {
             return None;
         }
         let by_hwnd: HashMap<usize, &WindowInfo> = windows.iter().map(|w| (w.hwnd, w)).collect();
-        let members: Vec<GroupMember> = editor
+        let picked: Vec<&WindowInfo> = editor
             .slot_assignment()
             .into_iter()
             .filter_map(|hwnd| by_hwnd.get(&hwnd).copied())
+            .collect();
+        let members: Vec<GroupMember> = picked
+            .iter()
             .map(|w| GroupMember {
                 exe_path: w.exe_path.clone(),
                 title: w.title.clone(),
@@ -484,6 +504,12 @@ impl GroupsState {
         if members.len() < MIN_GROUP_MEMBERS {
             return None;
         }
+        // Окна, которые пользователь только что отметил сам, — самая надёжная
+        // привязка из возможных: опознавать по приметам то, на что уже
+        // показали пальцем, незачем. Заодно это стирает привязку прошлого
+        // состава: после правки группы номера слотов сдвигаются, и старая
+        // карта повесила бы на слот чужое окно.
+        let picked_hwnds: Vec<Option<usize>> = picked.iter().map(|w| Some(w.hwnd)).collect();
 
         let group = match editor.target {
             EditorTarget::Existing(id) => {
@@ -507,6 +533,7 @@ impl GroupsState {
                 }
             }
         };
+        self.bindings.insert(group.id, picked_hwnds);
         self.editor = None;
         Some(group)
     }
@@ -616,6 +643,73 @@ pub struct GroupPlacement {
 }
 
 impl GroupsState {
+    /// Окно каждого члена группы: сначала прежняя привязка, если её окно
+    /// живо, потом опознание по приметам для всех остальных.
+    ///
+    /// Два правила, и оба нужны:
+    /// - привязка держится за `HWND`, пока окно существует и принадлежит
+    ///   тому же приложению. Проверка exe обязательна: Windows переиспользует
+    ///   значения `HWND`, и без неё член группы мог бы унаследовать окно
+    ///   чужой программы, занявшей освободившийся номер;
+    /// - опознание по приметам получает только СВОБОДНЫЕ окна и только
+    ///   непривязанных членов. Иначе оно отобрало бы окно у члена, который
+    ///   уже держит его в руках, — ровно та перестановка, из-за которой
+    ///   группа расставляла не те окна.
+    fn resolve_windows(&self, group: &WindowGroup, live: &[LiveWindow]) -> Vec<Option<usize>> {
+        let mut windows: Vec<Option<usize>> = vec![None; group.members.len()];
+        let mut taken: HashSet<usize> = HashSet::new();
+
+        if let Some(previous) = self.bindings.get(&group.id) {
+            for (member_index, member) in group.members.iter().enumerate() {
+                let Some(hwnd) = previous.get(member_index).copied().flatten() else {
+                    continue;
+                };
+                if taken.contains(&hwnd) {
+                    continue;
+                }
+                let alive = live
+                    .iter()
+                    .any(|w| w.hwnd == hwnd && w.exe_path == member.exe_path);
+                if alive {
+                    windows[member_index] = Some(hwnd);
+                    taken.insert(hwnd);
+                }
+            }
+        }
+
+        // Остаток: непривязанные члены против незанятых окон. Индексы обеих
+        // сторон сжимаются, поэтому результат раскладывается обратно по
+        // исходным номерам.
+        let free_members: Vec<usize> = (0..group.members.len())
+            .filter(|i| windows[*i].is_none())
+            .collect();
+        if free_members.is_empty() {
+            return windows;
+        }
+        let keys: Vec<MemberKey> = free_members
+            .iter()
+            .map(|i| MemberKey {
+                exe_path: group.members[*i].exe_path.clone(),
+                title: group.members[*i].title.clone(),
+                class: group.members[*i].class.clone(),
+            })
+            .collect();
+        let free_windows: Vec<LiveWindow> = live
+            .iter()
+            .filter(|w| !taken.contains(&w.hwnd))
+            .cloned()
+            .collect();
+        for (slot, matched) in group_match::match_members(&keys, &free_windows)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(w) = matched {
+                windows[free_members[slot]] = Some(free_windows[w].hwnd);
+            }
+        }
+        windows
+    }
+
     /// Открыть группу: опознать её окна среди живых и сказать, кого куда
     /// поставить.
     ///
@@ -628,20 +722,8 @@ impl GroupsState {
     /// запущено. Это штатная ситуация, а не ошибка: пользователь выбрал
     /// «ждать окно и ловить по приложению и заголовку».
     pub fn open_group(&mut self, group: &WindowGroup, live: &[LiveWindow]) -> Vec<GroupPlacement> {
-        let keys: Vec<MemberKey> = group
-            .members
-            .iter()
-            .map(|m| MemberKey {
-                exe_path: m.exe_path.clone(),
-                title: m.title.clone(),
-                class: m.class.clone(),
-            })
-            .collect();
-        let matched = group_match::match_members(&keys, live);
-        let windows: Vec<Option<usize>> = matched
-            .iter()
-            .map(|idx| idx.map(|i| live[i].hwnd))
-            .collect();
+        let windows = self.resolve_windows(group, live);
+        self.bindings.insert(group.id, windows.clone());
 
         let places = group
             .members
@@ -985,6 +1067,78 @@ mod tests {
         assert_eq!(placements[0].hwnd, 22);
         assert_eq!(placements[1].hwnd, 11);
         assert_eq!(st.active(), Some(g.id));
+    }
+
+    /// Два окна одного браузера различает только заголовок, а он меняется
+    /// от переключения вкладки. Опознание по приметам на втором нажатии
+    /// хоткея меняло членов окнами местами, и группа расставляла НЕ ТО окно
+    /// (жалоба 2026-09-05). Привязка обязана держаться за живое окно.
+    #[test]
+    fn a_live_window_stays_with_its_member_when_titles_swap() {
+        let g = saved_group(vec![
+            member("вкладка A", Some(place(0.0, 0.0))),
+            member("вкладка B", Some(place(900.0, 0.0))),
+        ]);
+        let mut st = GroupsState::new();
+        st.open_group(&g, &[live(11, "вкладка A"), live(22, "вкладка B")]);
+        assert_eq!(st.open().expect("группа открыта").window_of(0), Some(11));
+        assert_eq!(st.open().expect("группа открыта").window_of(1), Some(22));
+
+        // Пользователь переключил вкладки — заголовки разъехались ровно так,
+        // чтобы опознание по приметам поменяло окна местами.
+        st.close_group();
+        st.open_group(&g, &[live(11, "вкладка B"), live(22, "вкладка A")]);
+        assert_eq!(
+            st.open().expect("группа открыта").window_of(0),
+            Some(11),
+            "член 0 обязан остаться на своём окне"
+        );
+        assert_eq!(st.open().expect("группа открыта").window_of(1), Some(22));
+    }
+
+    /// Привязка не вечная: закрытое окно освобождает члена, и он опознаётся
+    /// заново — иначе группа навсегда потеряла бы перезапущенное приложение.
+    #[test]
+    fn a_member_is_re_matched_after_its_window_dies() {
+        let g = saved_group(vec![
+            member("вкладка A", Some(place(0.0, 0.0))),
+            member("вкладка B", Some(place(900.0, 0.0))),
+        ]);
+        let mut st = GroupsState::new();
+        st.open_group(&g, &[live(11, "вкладка A"), live(22, "вкладка B")]);
+        st.close_group();
+        // Окно 11 закрыли, вместо него открылось 33.
+        st.open_group(&g, &[live(33, "вкладка A"), live(22, "вкладка B")]);
+        assert_eq!(st.open().expect("группа открыта").window_of(0), Some(33));
+        assert_eq!(st.open().expect("группа открыта").window_of(1), Some(22));
+    }
+
+    /// Значения `HWND` система переиспользует. Номер, доставшийся чужой
+    /// программе, наследовать нельзя — привязка проверяется по exe.
+    #[test]
+    fn a_recycled_handle_of_another_app_is_not_inherited() {
+        let g = saved_group(vec![
+            member("вкладка A", Some(place(0.0, 0.0))),
+            member("вкладка B", Some(place(900.0, 0.0))),
+        ]);
+        let mut st = GroupsState::new();
+        st.open_group(&g, &[live(11, "вкладка A"), live(22, "вкладка B")]);
+        st.close_group();
+
+        // Окно 11 умерло, а его номер занял калькулятор.
+        let stranger = LiveWindow {
+            hwnd: 11,
+            exe_path: PathBuf::from("calc.exe"),
+            title: "Калькулятор".to_string(),
+            class: "Other".to_string(),
+        };
+        st.open_group(&g, &[stranger, live(22, "вкладка B")]);
+        assert_eq!(
+            st.open().expect("группа открыта").window_of(0),
+            None,
+            "чужое окно с переиспользованным номером не должно достаться члену"
+        );
+        assert_eq!(st.open().expect("группа открыта").window_of(1), Some(22));
     }
 
     #[test]
@@ -1408,6 +1562,23 @@ mod tests {
         assert_eq!(group.members.len(), 2);
         assert_eq!(group.members[0].title, "окно 4", "порядок набора сохранён");
         assert!(st.editor().is_none(), "подтверждение закрывает меню");
+    }
+
+    /// Окна, отмеченные в меню, и есть привязка: по ним показали пальцем,
+    /// опознавать их по приметам не нужно ни на первом открытии, ни после.
+    #[test]
+    fn confirming_binds_the_windows_that_were_picked() {
+        let mut st = editor_with(&[6, 4]);
+        let group = st.confirm(&snapshot(), &[]).expect("две отметки — группа");
+        // Заголовки к этому моменту уже разъехались: если бы привязку решало
+        // опознание, слоты поменялись бы местами.
+        st.open_group(&group, &[live(4, "окно 6"), live(6, "окно 4")]);
+        assert_eq!(
+            st.open().expect("группа открыта").window_of(0),
+            Some(6),
+            "слот 1 — окно, отмеченное первым"
+        );
+        assert_eq!(st.open().expect("группа открыта").window_of(1), Some(4));
     }
 
     #[test]

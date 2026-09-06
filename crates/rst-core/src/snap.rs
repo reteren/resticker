@@ -256,6 +256,44 @@ pub fn snap_resize_delta(
     (dx, dy)
 }
 
+/// Координаты движущихся кромок `rect` — по одной на ось, `None` там, где
+/// ручка ничего не двигает.
+///
+/// Публично, потому что вызывающий слой меряет ими ОТКЛИК ресайза: узнать,
+/// какая ось на самом деле ведёт размер при заблокированных пропорциях,
+/// можно только пробным пересчётом (см. `overlay_manager::snap_resize`).
+pub fn moving_edges(rect: DipRect, edges: ResizeEdges) -> (Option<f64>, Option<f64>) {
+    (
+        moving_edge(rect.x, rect.x + rect.w, edges.left, edges.right),
+        moving_edge(rect.y, rect.y + rect.h, edges.top, edges.bottom),
+    )
+}
+
+/// Стоит ли хоть одна движущаяся кромка `rect` ровно на направляющей?
+///
+/// Проверка «сел или нет» после пробного пересчёта размера: точное сравнение
+/// с нулём тут не годится (по пути умножения на масштаб), поэтому допуск в
+/// сотую DIP — заметно меньше пикселя и заметно больше накопленной ошибки
+/// double.
+pub fn resize_edge_on_guide(
+    rect: DipRect,
+    monitor: DipRect,
+    peers: &[DipRect],
+    edges: ResizeEdges,
+) -> bool {
+    const EPS: f64 = 0.01;
+    let (x, y) = moving_edges(rect, edges);
+    on_guide(x, &collect_guides(monitor, peers, triple_x), EPS)
+        || on_guide(y, &collect_guides(monitor, peers, triple_y), EPS)
+}
+
+fn on_guide(edge: Option<f64>, guides: &[f64], eps: f64) -> bool {
+    let Some(edge) = edge else {
+        return false;
+    };
+    guides.iter().any(|g| (g - edge).abs() <= eps)
+}
+
 /// Координата движущейся кромки по оси; `None` — по этой оси ручка ничего
 /// не двигает (боковая ручка).
 fn moving_edge(low: f64, high: f64, low_moves: bool, high_moves: bool) -> Option<f64> {

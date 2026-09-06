@@ -20,16 +20,20 @@
 //! подтверждения» тоже выводится из входа: считается число карточек со
 //! слотом — ровно то, что значит `GroupEditor::can_confirm`.
 //!
-//! # Прокрутка, а не ужатие
+//! # Ряды, а не прокрутка
 //!
-//! Карточек может быть больше, чем влезает, — открытых окон на десктопе
-//! больше десятка почти всегда. Выбрана прокрутка, а не ужатие: снимок
-//! окна обязан оставаться узнаваемым, а пропорции — неискажёнными, ужатая
-//! до трети карточка неотличима от соседней. Это же поведение уже есть у
-//! списков окон (`window_pick_list`, `window_picker`): полоса прокрутки +
-//! колесо мыши, привычные мышцы. Карточки за пределами ленты не строятся
-//! вовсе — молча «за экраном» ничего не рисуется, а явная полоса
-//! прокрутки ([`HScrollBar`]) намекает, что лента длиннее.
+//! Карточек почти всегда больше десятка, и ужимать их нельзя: снимок окна
+//! обязан оставаться узнаваемым, а ужатая до трети карточка неотличима от
+//! соседней. Раньше лишние карточки уезжали в горизонтальную прокрутку —
+//! но прокрутка прячет: чтобы найти окно, приходилось листать, вместо того
+//! чтобы увидеть. Поэтому ряд ограничен [`MAX_PER_ROW`] карточками, а
+//! лишние переносятся в следующий ряд, и лента растёт вниз (запрос
+//! пользователя 2026-09-06). Прокрутки и полосы прокрутки нет вовсе.
+//!
+//! Предел сверху всё-таки есть — высота экрана: рядов строится столько,
+//! сколько помещается над нижним краем, остальные карточки не строятся.
+//! Это тот же молчаливый «за краем ленты ничего нет», что раньше был за
+//! правым краем.
 //!
 //! # Ключи текстур снимков приходят от вызывающего
 //!
@@ -99,7 +103,6 @@ pub const BTN_CONFIRM: WidgetId = 650;
 /// что уже собрано» и «закончить».
 pub const BTN_MANAGER: WidgetId = 652;
 /// Полоса горизонтальной прокрутки ленты (рисуется только при переполнении).
-const SCROLLBAR_ID: WidgetId = 651;
 /// Флаг для id содержимого карточки — не декодируется вызывающим кодом (тот
 /// же приём, что `window_pick_list::LABEL_FLAG`: интерактив карточки —
 /// `Button` под тем же индексом, содержимое поверх — неинтерактивный виджет).
@@ -115,6 +118,14 @@ const STRIP_PAD: f64 = theme::PAD_PANEL;
 pub const CARD_W: f64 = 132.0;
 /// Высота карточки, DIP. В §3 токена нет — см. [`CARD_W`].
 pub const CARD_H: f64 = 96.0;
+/// Сколько карточек стоит в одном ряду ленты.
+///
+/// Шесть — не вкус, а предел узнавания: карточка со снимком узнаётся
+/// боковым зрением, пока ряд можно окинуть одним взглядом, а лента на
+/// пол-экрана превращается в список, который надо ЧИТАТЬ. Лишние окна
+/// уходят в следующий ряд, и лента растёт вниз — прокрутка (запрос
+/// пользователя 2026-09-06) не нужна вовсе: видно сразу всё.
+pub const MAX_PER_ROW: usize = 6;
 /// Зазор между карточками, DIP — §3 GAP_ROW.
 const CARD_GAP: f64 = theme::GAP_ROW;
 /// Внутренний отступ карточки, DIP — §3 PAD_CTRL_X.
@@ -122,6 +133,11 @@ const CARD_PAD: f64 = theme::PAD_CTRL_X;
 /// Высота полосы снимка карточки (над подписью), DIP: карточка минус два
 /// отступа минус полоса подписи (`LINE_HEIGHT` + отступ под ней).
 const THUMB_H: f64 = CARD_H - 2.0 * CARD_PAD - LINE_HEIGHT - CARD_PAD;
+/// Сторона плашки под иконкой приложения поверх снимка, DIP. В §3 токена
+/// нет — мелкий бейдж, как номер слота.
+const ICON_PLATE: f64 = 22.0;
+/// Сторона самой иконки внутри плашки, DIP.
+const ICON_SIZE: f64 = 14.0;
 /// Сторона бейджа номера слота, DIP. В §3 токена нет — скругление бейджа
 /// при этом §3 RADIUS_TIGHT (мелкий бейдж).
 const BADGE_SIZE: f64 = 18.0;
@@ -165,24 +181,31 @@ pub struct StripPanel {
     pub panel: Panel,
     /// Всего карточек в срезе (не зависит от скролла).
     pub total_cards: usize,
-    /// Сколько карточек влезает в ленту (полоса прокрутки появляется, когда
-    /// `total_cards > visible_cards`).
+    /// Сколько карточек лента РЕАЛЬНО построила. Меньше `total_cards`
+    /// только на вырожденном экране, где не поместились все ряды.
     pub visible_cards: usize,
 }
 
-/// Высота ленты, DIP — панель не растёт от числа карточек, лишние
-/// прокручиваются.
-pub fn strip_height() -> f64 {
-    2.0 * STRIP_PAD + CARD_H
+/// Высота ленты в `rows` рядов, DIP.
+pub fn strip_height(rows: usize) -> f64 {
+    let rows = rows.max(1) as f64;
+    2.0 * STRIP_PAD + rows * CARD_H + (rows - 1.0) * CARD_GAP
+}
+
+/// Сколько рядов займут `count` карточек при `per_row` в ряду.
+fn rows_for(count: usize, per_row: usize) -> usize {
+    if per_row == 0 {
+        return 0;
+    }
+    count.div_ceil(per_row).max(1)
 }
 
 /// Собрать ленту карточек внизу экрана `screen` (DIP).
 ///
-/// `scroll` — сколько карточек пропущено слева (виртуализация: строятся
-/// только видимые, как у `window_pick_list`). Строитель сам скролл не
-/// клампит — вызывающий код правит его после `build` (та же схема, что у
-/// `rebuild_window_pick_list`).
-pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
+/// Карточки раскладываются рядами по [`MAX_PER_ROW`] штук; лишние уходят
+/// вниз, и лента растёт в высоту. Прокрутки нет — она и была нужна только
+/// потому, что ряд был один.
+pub fn build(cards: &[StripCard], screen: Box2D) -> StripPanel {
     // Лента прижата к нижнему краю экрана с отступом SCREEN_MARGIN. Если
     // экран ниже самой ленты, верхний край клампится к верху экрана с тем
     // же отступом: вырожденный экран не должен утащить ленту за нижний край
@@ -191,16 +214,33 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
     // трёх окон во весь экран выглядит сломанной, а из тридцати обязана
     // прокручиваться, а не вылезать за края (живой репорт 2026-08-25).
     let available = (screen.w - 2.0 * SCREEN_MARGIN).max(0.0);
-    let n = cards.len().max(1) as f64;
-    let needed = 2.0 * STRIP_PAD
-        + n * CARD_W
-        + (n - 1.0) * CARD_GAP
-        // Две квадратные кнопки по краям: список групп слева, галочка справа.
-        + 2.0 * (CARD_GAP + CONFIRM_SIZE);
-    let strip_w = needed.min(available);
-    let strip_h = strip_height();
+    // Ширина ленты — по самому длинному ряду, но не шире экрана. Ряд не
+    // длиннее MAX_PER_ROW карточек, и на узком экране — не длиннее того,
+    // что вообще влезает по ширине.
+    let chrome = 2.0 * STRIP_PAD + 2.0 * (CARD_GAP + CONFIRM_SIZE);
+    let for_cards = (available - chrome).max(0.0);
+    let fits_by_width = if for_cards <= 0.0 {
+        0
+    } else {
+        ((for_cards + CARD_GAP) / (CARD_W + CARD_GAP)).floor() as usize
+    };
+    let per_row = fits_by_width.min(MAX_PER_ROW);
+    let in_row = cards.len().min(per_row).max(1) as f64;
+    let strip_w =
+        (chrome + in_row * CARD_W + (in_row - 1.0) * CARD_GAP).min(available);
+
+    // Рядов — сколько нужно карточкам, но не больше, чем влезает по высоте:
+    // на вырожденном экране лента не должна вылезти за его край. Карточки,
+    // которым ряда не досталось, не строятся — то же молчаливое «за краем
+    // ленты ничего нет», что и раньше за правым краем.
     let screen_top = screen.cy - screen.h / 2.0;
     let screen_bottom = screen.cy + screen.h / 2.0;
+    let room = (screen.h - 2.0 * SCREEN_MARGIN).max(0.0);
+    let mut rows = rows_for(cards.len(), per_row);
+    while rows > 1 && strip_height(rows) > room {
+        rows -= 1;
+    }
+    let strip_h = strip_height(rows);
     let mut strip_top = screen_bottom - SCREEN_MARGIN - strip_h;
     if strip_top < screen_top + SCREEN_MARGIN {
         strip_top = screen_top + SCREEN_MARGIN;
@@ -219,28 +259,22 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
     // Галочка — крайний правый элемент ленты, карточки занимают остаток:
     // подтверждение всегда на виду, даже когда лента длинная и прокручена.
     let confirm_cx = right - CONFIRM_SIZE / 2.0;
-    let cards_right = confirm_cx - CONFIRM_SIZE / 2.0 - CARD_GAP;
     // Кнопка списка групп — крайняя левая, тем же поводом: она не должна
     // уезжать вместе с прокруткой карточек.
     let manager_cx = left + CONFIRM_SIZE / 2.0;
     let cards_left = manager_cx + CONFIRM_SIZE / 2.0 + CARD_GAP;
-    let visible_w = cards_right - cards_left;
-    // Сколько карточек влезает: первый центр — в `left + CARD_W/2`, дальше
-    // шаг `CARD_W + CARD_GAP`, последняя карточка обязана закончиться не
-    // правее `cards_right`. Неполная карточка у правого края не строится —
-    // за краем ленты ничего не рисуется молча.
-    let visible_cards = if visible_w <= 0.0 {
-        0
-    } else {
-        ((visible_w + CARD_GAP) / (CARD_W + CARD_GAP)).floor() as usize
-    };
+    let visible_cards = (rows * per_row).min(cards.len());
+    let rows_top = frame.cy - frame.h / 2.0 + STRIP_PAD;
 
     let picked = cards.iter().filter(|c| c.slot.is_some()).count();
-    for (i, card) in cards.iter().enumerate().skip(scroll).take(visible_cards) {
-        let x = cards_left + CARD_W / 2.0 + (i - scroll) as f64 * (CARD_W + CARD_GAP);
+    for (i, card) in cards.iter().enumerate().take(visible_cards) {
+        let (row, col) = (i / per_row.max(1), i % per_row.max(1));
+        // Последний ряд бывает неполным — его карточки центруются по той же
+        // левой кромке, что и полные ряды, а не по середине ленты: колонки
+        // должны стоять колоннами, иначе взгляд теряет сетку.
         let rect = Box2D {
-            cx: x,
-            cy: frame.cy,
+            cx: cards_left + CARD_W / 2.0 + col as f64 * (CARD_W + CARD_GAP),
+            cy: rows_top + CARD_H / 2.0 + row as f64 * (CARD_H + CARD_GAP),
             w: CARD_W,
             h: CARD_H,
             rotation: 0.0,
@@ -298,24 +332,6 @@ pub fn build(cards: &[StripCard], scroll: usize, screen: Box2D) -> StripPanel {
         },
         picked < MIN_GROUP_MEMBERS,
     ));
-
-    // Полоса прокрутки — только когда есть что листать; при нуле видимых
-    // карточек (вырожденный экран) листать бесполезно — лента пуста.
-    if cards.len() > visible_cards && visible_cards > 0 {
-        panel.add_widget(HScrollBar::new(
-            SCROLLBAR_ID,
-            Box2D {
-                cx: (cards_left + cards_right) / 2.0,
-                cy: frame.cy + frame.h / 2.0 - STRIP_PAD / 2.0,
-                w: visible_w,
-                h: theme::SCROLLBAR_WIDTH,
-                rotation: 0.0,
-            },
-            visible_cards,
-            cards.len(),
-            scroll,
-        ));
-    }
 
     StripPanel {
         panel,
@@ -416,6 +432,49 @@ impl Widget for CardContent {
                     rgba: img.rgba.clone(),
                     opacity: appear,
                 });
+                // Иконка приложения в углу снимка (запрос пользователя
+                // 2026-09-06). Снимок окна опознаётся плохо: полдесятка
+                // белых прямоугольников в ленте неотличимы друг от друга, а
+                // иконка узнаётся раньше, чем прочитан заголовок. Ставим её
+                // в НИЖНИЙ левый угол снимка, прямо над подписью, — читается
+                // как «иконка, под ней название».
+                //
+                // Только когда снимок есть: без снимка иконка уже занимает
+                // весь слот (ветка выше), и дублировать её бейджем незачем.
+                //
+                // Плашка под иконкой обязательна: снимок бывает и белым
+                // (пустая вкладка браузера), и светлая иконка на нём
+                // пропадала бы.
+                if self.thumb.is_some()
+                    && let Some(icon) = self.icon.as_ref()
+                {
+                    let plate = Box2D {
+                        cx: rect.cx - rect.w / 2.0 + BADGE_GAP + ICON_PLATE / 2.0,
+                        cy: rect.cy + rect.h / 2.0 - BADGE_GAP - ICON_PLATE / 2.0,
+                        w: ICON_PLATE,
+                        h: ICON_PLATE,
+                        rotation: 0.0,
+                    };
+                    glass_card(out, plate, theme::RADIUS_TIGHT, appear);
+                    out.push(Primitive::Rgba {
+                        rect: fit_rect(
+                            Box2D {
+                                cx: plate.cx,
+                                cy: plate.cy,
+                                w: ICON_SIZE,
+                                h: ICON_SIZE,
+                                rotation: 0.0,
+                            },
+                            icon.width,
+                            icon.height,
+                        ),
+                        key: icon.key,
+                        width: icon.width,
+                        height: icon.height,
+                        rgba: icon.rgba.clone(),
+                        opacity: appear,
+                    });
+                }
             }
             None => glass_sunken(out, thumb_area, theme::RADIUS_CTRL, appear),
         }
@@ -652,101 +711,18 @@ impl Widget for ConfirmButton {
     }
 }
 
-/// Горизонтальная полоса прокрутки ленты: только отрисовка, неинтерактивная
-/// (колесо мыши двигает `scroll` на вызывающем слое — тот же контракт, что у
-/// `rst_render::ScrollBar`). Вертикальный `ScrollBar` rst-render не годится:
-/// он рисует ручку вдоль СВОЕЙ длинной стороны, то есть всегда вертикально.
-struct HScrollBar {
-    id: WidgetId,
-    bounds: Box2D,
-    thumb_fraction: f64,
-    thumb_offset: f64,
-}
-
-impl HScrollBar {
-    /// `visible`/`total` — то же, что `StripPanel::visible_cards`/
-    /// `total_cards`; `scroll` — текущая позиция в карточках. `total <=
-    /// visible` даёт ручку во всю дорожку (не паникует — вызывающий слой
-    /// обычно вообще не добавляет виджет в этом случае).
-    fn new(id: WidgetId, bounds: Box2D, visible: usize, total: usize, scroll: usize) -> Self {
-        let total = total.max(1);
-        let thumb_fraction = (visible as f64 / total as f64).min(1.0);
-        let max_scroll = total.saturating_sub(1).max(1);
-        let thumb_offset = if total <= visible {
-            0.0
-        } else {
-            (scroll.min(max_scroll) as f64 / max_scroll as f64) * (1.0 - thumb_fraction)
-        };
-        Self {
-            id,
-            bounds,
-            thumb_fraction,
-            thumb_offset,
-        }
-    }
-}
-
-impl Widget for HScrollBar {
-    fn id(&self) -> WidgetId {
-        self.id
-    }
-
-    fn bounds(&self) -> Box2D {
-        self.bounds
-    }
-
-    fn set_bounds(&mut self, bounds: Box2D) {
-        self.bounds = bounds;
-    }
-
-    fn hit_test(&self, _pos: (f64, f64)) -> bool {
-        false
-    }
-
-    fn draw(&self, out: &mut Vec<Primitive>) {
-        let (w, h) = (self.bounds.w.max(0.0), self.bounds.h.max(0.0));
-        // Дорожка — утопленный жёлоб (§2.2 SUNKEN_BG, §4 «утопленная
-        // поверхность переворачивает свет»), ручка — белый свет (§2.4):
-        // у скроллбара нет своего токена в §3, но материал тот же.
-        glass_sunken(
-            out,
-            Box2D {
-                w,
-                h,
-                ..self.bounds
-            },
-            theme::RADIUS_TIGHT,
-            1.0,
-        );
-        let left = self.bounds.cx - self.bounds.w / 2.0;
-        let thumb_w = (self.bounds.w * self.thumb_fraction).max(theme::SCROLLBAR_MIN_THUMB_H);
-        let thumb_left = left + (self.bounds.w - thumb_w) * self.thumb_offset;
-        out.push(Primitive::Fill {
-            rect: Box2D {
-                cx: thumb_left + thumb_w / 2.0,
-                cy: self.bounds.cy,
-                w: thumb_w.max(0.0),
-                h,
-                rotation: 0.0,
-            },
-            color: theme::SLIDER_FILL,
-            opacity: 0.9,
-        });
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rst_render::glass::Surface;
+
+    fn card_bounds(built: &StripPanel, i: usize) -> Box2D {
+        built
+            .panel
+            .widget::<Button>(CARD_BASE + i as WidgetId)
+            .unwrap_or_else(|| panic!("нет карточки {i}"))
+            .bounds()
+    }
 
     fn screen(w: f64, h: f64) -> Box2D {
         Box2D {
@@ -781,8 +757,8 @@ mod tests {
         // Живой репорт: лента из нескольких окон растягивалась во весь экран
         // и выглядела пустой полосой. Ширина обязана считаться по карточкам.
         let scr = screen(1920.0, 1080.0);
-        let few = build(&cards(3), 0, scr);
-        let many = build(&cards(12), 0, scr);
+        let few = build(&cards(3), scr);
+        let many = build(&cards(12), scr);
         assert!(
             few.panel.frame().w < many.panel.frame().w,
             "лента из трёх карточек обязана быть уже ленты из двенадцати"
@@ -795,18 +771,20 @@ mod tests {
 
     #[test]
     fn a_long_window_list_stops_at_the_screen_edge() {
-        // Тридцать окон обязаны прокручиваться, а не вылезать за края.
+        // Тридцать окон обязаны разложиться рядами и не вылезти за края —
+        // ни вбок, ни вниз, ни вверх.
         let scr = screen(1920.0, 1080.0);
-        let built = build(&cards(30), 0, scr);
+        let built = build(&cards(30), scr);
         let f = built.panel.frame();
         assert!(
             f.cx - f.w / 2.0 >= scr.cx - scr.w / 2.0 - 0.5
                 && f.cx + f.w / 2.0 <= scr.cx + scr.w / 2.0 + 0.5,
-            "лента вылезла за экран: {f:?}"
+            "лента вылезла за экран по горизонтали: {f:?}"
         );
         assert!(
-            built.visible_cards < built.total_cards,
-            "лишние карточки обязаны уйти в прокрутку"
+            f.cy - f.h / 2.0 >= scr.cy - scr.h / 2.0 - 0.5
+                && f.cy + f.h / 2.0 <= scr.cy + scr.h / 2.0 + 0.5,
+            "лента вылезла за экран по вертикали: {f:?}"
         );
     }
 
@@ -814,7 +792,7 @@ mod tests {
     fn an_empty_window_list_still_builds_a_strip_with_the_confirm_button() {
         // Вырожденный случай: окон нет вовсе. Панель обязана собраться и не
         // паниковать.
-        let built = build(&[], 0, screen(1920.0, 1080.0));
+        let built = build(&[], screen(1920.0, 1080.0));
         assert_eq!(built.total_cards, 0);
         assert!(built.panel.frame().w > 0.0);
     }
@@ -825,8 +803,8 @@ mod tests {
         // карточку за край панели, и заметить это можно было бы только
         // глазами.
         let scr = screen(1920.0, 1080.0);
-        for n in [1usize, 3, 7, 12] {
-            let built = build(&cards(n), 0, scr);
+        for n in [1usize, 3, 7, 12, 25] {
+            let built = build(&cards(n), scr);
             let f = built.panel.frame();
             for i in 0..built.visible_cards {
                 let b = built
@@ -836,7 +814,9 @@ mod tests {
                     .unwrap_or_else(|| panic!("нет карточки {i} при {n} окнах"));
                 assert!(
                     b.cx - b.w / 2.0 >= f.cx - f.w / 2.0 - 0.5
-                        && b.cx + b.w / 2.0 <= f.cx + f.w / 2.0 + 0.5,
+                        && b.cx + b.w / 2.0 <= f.cx + f.w / 2.0 + 0.5
+                        && b.cy - b.h / 2.0 >= f.cy - f.h / 2.0 - 0.5
+                        && b.cy + b.h / 2.0 <= f.cy + f.h / 2.0 + 0.5,
                     "при {n} окнах карточка {i} вылезла за ленту: {b:?}"
                 );
             }
@@ -859,17 +839,16 @@ mod tests {
         out
     }
 
-    /// Карточки не выходят за экран ни при каком числе карточек и ни при
-    /// каком положении скролла: виртуализация строит только видимые, а
-    /// остальные уходят в прокрутку, а не за край.
+    /// Карточки не выходят за экран ни при каком их числе: лишние ряды
+    /// обрезаются по высоте экрана, а не вылезают за край.
     #[test]
-    fn cards_never_leave_the_screen_at_any_count_and_scroll() {
+    fn cards_never_leave_the_screen_at_any_count() {
         let scr = screen(1600.0, 900.0);
         let (l, r) = (scr.cx - scr.w / 2.0, scr.cx + scr.w / 2.0);
         let (t, b) = (scr.cy - scr.h / 2.0, scr.cy + scr.h / 2.0);
-        for count in [0usize, 1, 3, 10, 40] {
-            for scroll in [0usize, 5, 37] {
-                let result = build(&cards(count), scroll, scr);
+        for count in [0usize, 1, 3, 10, 40, 120] {
+            {
+                let result = build(&cards(count), scr);
                 for prim in prims(&result.panel) {
                     let rect = match &prim {
                         Primitive::Fill { rect, .. }
@@ -883,7 +862,7 @@ mod tests {
                             && rect.cx + rect.w / 2.0 <= r + 1e-9
                             && rect.cy - rect.h / 2.0 >= t - 1e-9
                             && rect.cy + rect.h / 2.0 <= b + 1e-9,
-                        "примитив {prim:?} вылез за экран (count={count}, scroll={scroll})"
+                        "примитив {prim:?} вылез за экран (count={count})"
                     );
                 }
             }
@@ -899,7 +878,7 @@ mod tests {
             card(20, "двадцать", Some(2)),
             card(30, "тридцать", None),
         ];
-        let result = build(&cards, 0, screen(1600.0, 900.0));
+        let result = build(&cards, screen(1600.0, 900.0));
         let labels = texts(&result.panel);
         assert!(
             labels.contains(&"1".to_string()),
@@ -942,7 +921,7 @@ mod tests {
     #[test]
     fn the_groups_list_button_sits_at_the_left_edge_clear_of_the_cards() {
         for count in [2usize, 6, 30] {
-            let result = build(&cards(count), 0, screen(1600.0, 900.0));
+            let result = build(&cards(count), screen(1600.0, 900.0));
             let button = result
                 .panel
                 .widget::<Button>(BTN_MANAGER)
@@ -986,7 +965,7 @@ mod tests {
                     c.slot = Some(i + 1);
                 }
             }
-            let result = build(&cards, 0, screen(1600.0, 900.0));
+            let result = build(&cards, screen(1600.0, 900.0));
             let btn = result
                 .panel
                 .widget::<ConfirmButton>(BTN_CONFIRM)
@@ -1009,7 +988,7 @@ mod tests {
 
         let mut list = cards(3);
         list[0].slot = Some(1);
-        let mut result = build(&list, 0, scr);
+        let mut result = build(&list, scr);
         let center = {
             let b = result
                 .panel
@@ -1034,7 +1013,7 @@ mod tests {
         let mut list = cards(3);
         list[0].slot = Some(1);
         list[1].slot = Some(2);
-        let mut result = build(&list, 0, scr);
+        let mut result = build(&list, scr);
         let center = {
             let b = result
                 .panel
@@ -1076,7 +1055,7 @@ mod tests {
     #[test]
     fn degenerate_screen_builds_without_panicking() {
         for scr in [screen(50.0, 40.0), screen(0.0, 0.0), screen(30.0, 300.0)] {
-            let mut result = build(&cards(12), 3, scr);
+            let mut result = build(&cards(12), scr);
             assert_eq!(result.visible_cards, 0, "экран {scr:?}");
             let _ = prims(&result.panel);
             result.panel.pointer_event(PointerEvent::Down {
@@ -1088,41 +1067,60 @@ mod tests {
         }
     }
 
-    /// Полоса прокрутки появляется только когда карточек больше, чем влезает
-    /// (тот же регрессионный сценарий, что у `window_pick_list`: длинный
-    /// список без намёка на листание выглядит обрезанным).
+    /// Ряд не длиннее [`MAX_PER_ROW`], лишние карточки уходят вниз, и лента
+    /// растёт ровно на нужное число рядов.
     #[test]
-    fn scrollbar_appears_only_when_cards_overflow_the_strip() {
-        let scr = screen(1600.0, 900.0);
-        let short = build(&cards(3), 0, scr);
-        assert!(
-            short.panel.widget::<HScrollBar>(SCROLLBAR_ID).is_none(),
-            "3 карточки влезают — полосы быть не должно"
-        );
-        let long = build(&cards(20), 0, scr);
-        assert!(
-            long.panel.widget::<HScrollBar>(SCROLLBAR_ID).is_some(),
-            "20 карточек не влезают — полоса обязана появиться"
-        );
-        assert!(long.visible_cards < long.total_cards);
+    fn cards_wrap_into_rows_of_six() {
+        let scr = screen(1920.0, 1080.0);
+        for (count, rows) in [(1usize, 1usize), (6, 1), (7, 2), (12, 2), (13, 3)] {
+            let result = build(&cards(count), scr);
+            let f = result.panel.frame();
+            assert!(
+                (f.h - strip_height(rows)).abs() < 0.5,
+                "{count} карточек — ждали {rows} ряд(а), высота {}",
+                f.h
+            );
+            // В первом ряду не больше шести, и ряды идут сверху вниз.
+            let y0 = card_bounds(&result, 0).cy;
+            let in_first_row = (0..count)
+                .filter(|i| (card_bounds(&result, *i).cy - y0).abs() < 0.5)
+                .count();
+            assert!(
+                in_first_row <= MAX_PER_ROW,
+                "{count} карточек: в первом ряду {in_first_row}"
+            );
+        }
     }
 
-    /// Число видимых карточек соответствует геометрии: слоты укладываются
-    /// шагом `CARD_W + CARD_GAP`, последняя заканчивается перед галочкой.
+    /// Карточки стоят колоннами: седьмая — ровно под первой.
     #[test]
-    fn visible_cards_match_the_strip_geometry() {
-        let scr = screen(1600.0, 900.0);
-        let result = build(&cards(40), 0, scr);
-        assert_eq!(result.visible_cards, 10);
-        let frame = result.panel.frame();
-        let last = result
-            .panel
-            .widget::<Button>(CARD_BASE + result.visible_cards as WidgetId - 1)
-            .unwrap()
-            .bounds();
+    fn the_seventh_card_starts_a_new_column_under_the_first() {
+        let result = build(&cards(7), screen(1920.0, 1080.0));
+        let first = card_bounds(&result, 0);
+        let seventh = card_bounds(&result, 6);
         assert!(
-            last.cx + last.w / 2.0 < frame.cx + frame.w / 2.0 - STRIP_PAD,
-            "последняя видимая карточка не лезет под галочку: {last:?}"
+            (seventh.cx - first.cx).abs() < 0.5,
+            "седьмая карточка обязана встать под первой: {} против {}",
+            seventh.cx,
+            first.cx
+        );
+        assert!(
+            seventh.cy > first.cy,
+            "второй ряд обязан быть ниже первого"
+        );
+    }
+
+    /// Ширина ленты считается по самому длинному ряду, а не по всем
+    /// карточкам разом: иначе двенадцать окон растянули бы её вдвое шире
+    /// экрана.
+    #[test]
+    fn the_strip_is_no_wider_than_one_full_row() {
+        let scr = screen(1920.0, 1080.0);
+        let six = build(&cards(6), scr).panel.frame().w;
+        let twelve = build(&cards(12), scr).panel.frame().w;
+        assert!(
+            (six - twelve).abs() < 0.5,
+            "шесть и двенадцать окон дают ряд одной длины: {six} против {twelve}"
         );
     }
 
@@ -1131,7 +1129,7 @@ mod tests {
     #[test]
     fn long_title_is_truncated_to_the_card_width() {
         let c = card(1, &"очень-длинный-заголовок-окна-".repeat(6), None);
-        let result = build(std::slice::from_ref(&c), 0, screen(1600.0, 900.0));
+        let result = build(std::slice::from_ref(&c), screen(1600.0, 900.0));
         // Усечение режет длинное слово — ищем по началу, а не по «заголовок».
         let label = texts(&result.panel)
             .into_iter()
@@ -1152,7 +1150,7 @@ mod tests {
             height: 100,
             rgba: vec![0; 200 * 100 * 4],
         });
-        let result = build(std::slice::from_ref(&c), 0, screen(1600.0, 900.0));
+        let result = build(std::slice::from_ref(&c), screen(1600.0, 900.0));
         // Среди растров есть и скруглённые углы панели (8×8) — снимок
         // опознаётся по исходным размерам растра.
         let (rect, key, width, height) = prims(&result.panel)
@@ -1186,7 +1184,7 @@ mod tests {
     /// `window_pick_list`).
     #[test]
     fn card_without_image_draws_a_placeholder_slot() {
-        let result = build(&[card(1, "окно", None)], 0, screen(1600.0, 900.0));
+        let result = build(&[card(1, "окно", None)], screen(1600.0, 900.0));
         let placeholder = prims(&result.panel)
             .into_iter()
             .find_map(|p| match p {
@@ -1209,7 +1207,7 @@ mod tests {
     fn picked_card_lights_up_with_glass_and_badge() {
         let mut c = card(1, "окно", None);
         c.slot = Some(1);
-        let result = build(std::slice::from_ref(&c), 0, screen(1600.0, 900.0));
+        let result = build(std::slice::from_ref(&c), screen(1600.0, 900.0));
         let card_bounds = result.panel.widget::<Button>(CARD_BASE).unwrap().bounds();
         let on = prims(&result.panel)
             .into_iter()
@@ -1235,7 +1233,7 @@ mod tests {
             texts(&result.panel).contains(&"1".to_string()),
             "цифра слота на бейдже"
         );
-        let plain = build(&[card(1, "окно", None)], 0, screen(1600.0, 900.0));
+        let plain = build(&[card(1, "окно", None)], screen(1600.0, 900.0));
         let on = prims(&plain.panel)
             .into_iter()
             .filter(|p| {
@@ -1280,7 +1278,7 @@ mod tests {
     /// Галочка стоит у правого края ленты, по вертикали по центру.
     #[test]
     fn confirm_button_sits_at_the_strip_right_edge() {
-        let result = build(&cards(2), 0, screen(1600.0, 900.0));
+        let result = build(&cards(2), screen(1600.0, 900.0));
         let btn = result
             .panel
             .widget::<ConfirmButton>(BTN_CONFIRM)
@@ -1302,7 +1300,7 @@ mod tests {
     #[test]
     fn strip_sits_at_the_bottom_of_the_screen() {
         let scr = screen(1600.0, 900.0);
-        let result = build(&cards(1), 0, scr);
+        let result = build(&cards(1), scr);
         let frame = result.panel.frame();
         assert!(
             (frame.cy + frame.h / 2.0 - (scr.cy + scr.h / 2.0 - SCREEN_MARGIN)).abs() < 1e-9,
@@ -1311,13 +1309,12 @@ mod tests {
     }
 
     /// Пустая лента — не панель-призрак: галочка (неактивная) на месте,
-    /// карточек нет, полосы прокрутки нет.
+    /// карточек нет.
     #[test]
     fn empty_strip_shows_only_a_disabled_confirm_button() {
-        let result = build(&[], 0, screen(1600.0, 900.0));
+        let result = build(&[], screen(1600.0, 900.0));
         assert_eq!(result.total_cards, 0);
         assert!(result.panel.widget::<Button>(CARD_BASE).is_none());
-        assert!(result.panel.widget::<HScrollBar>(SCROLLBAR_ID).is_none());
         assert!(
             result
                 .panel
