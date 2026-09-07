@@ -184,9 +184,10 @@
 | кнопки ×7 | toolbar.rs:182–188 | TB_LAYERS, TB_EYE, TB_ORDER_UP, TB_ORDER_DOWN, TB_DUPLICATE, TB_RESET_SCALE, TB_DELETE |
 | кнопка play/pause | toolbar.rs:199–203 | TB_PLAY_PAUSE |
 | кнопка timeline | toolbar.rs:213–217 | TB_TIMELINE |
+| кнопка-динамик громкости | toolbar.rs:239–243 | TB_VOLUME (`VolumeControl`: клик переключает mute, шкала выпадает при наведении) |
 | кнопки ×7 | cursor_panel.rs:151–167 | BTN_LOAD_FILE, BTN_ADD_WINDOW, BTN_PRESETS, BTN_GROUPS, BTN_TOGGLE_ALL, BTN_SETTINGS, BTN_EXIT |
 | кнопка Close | gap_panel.rs:79–92 | BTN_CLOSE |
-| ручка слайдера (drag) | toolbar.rs:158–162, 219–233 | TB_SLIDER, TB_VOLUME |
+| ручка слайдера (drag) | toolbar.rs:158–162 | TB_SLIDER |
 
 **Фокусные (не hover, а focus):**
 
@@ -221,7 +222,7 @@
 | `toolbar_centered_horizontally_on_bbox` | 267–274 | точки **775/773** и комментарий «x ∈ [774, 1146], TOOLBAR_WIDTH = 372»: при BUTTON_SIZE 30 тулбар x ∈ [766, 1154] (center 960, w 388), край = 766 |
 | `toolbar_above_when_no_space_below` | 277–285 | cy-точка **984**: cy = 1010−8−19 = **983** |
 | `toolbar_below_boundary_is_inclusive` | 288–301 | формула на константах — пройдёт автоматически; проверить после пересчёта TOOLBAR_HEIGHT |
-| `toolbar_multi_is_narrower_by_slider_and_field` | 366–375 | формула констант — самосогласована; числа в `assert_eq` пересчитаются сами |
+| `toolbar_multi_is_narrower_by_slider_and_field` | — | тест удалён 2026-09-06: тулбар мультивыделения больше не сужается, ширина и состав унифицированы |
 | `button_icon` (хелпер) | 377–391 | комментарий «в стилистике настроек между фоном и иконкой лежат ещё четыре грани объёмной рамки (settings_bevel)» — устареет; поиск `Primitive::Icon` по типу переживёт смену примитивов |
 | `toolbar_video_adds_play_pause_and_volume_after_buttons` | 478–508 | `p.frame().w == TOOLBAR_WIDTH + TOOLBAR_VIDEO_EXTRA_W` — формула, переживёт |
 | остальные (опacity-мироринг, порядок, отсутствие виджетов) | 314–363, 426–467, 470–571 | логика, не геометрия — не сломаются |
@@ -279,8 +280,9 @@
     (четыре грани bevel у кнопки). Обновить в рамках правки, иначе разойдутся с кодом.
 11. **Иконки не трогать** (§8): в трёх панелях 16 кнопок с иконками — толщина штриха/цвет
     иконок вне этого захода.
-12. **Volume-слайдер собирается с `h: theme::BUTTON_SIZE`** (toolbar.rs:225) — при 30 станет выше;
-    ни на что не влияет, но формула коробки останется константной.
+12. **Громкость TB_VOLUME — не слайдер, а кнопка-динамик `VolumeControl`** (toolbar.rs):
+    кнопка размера `theme::BUTTON_SIZE` с выпадающей вертикальной шкалой 0..=100 при наведении
+    и переключателем `muted` по клику (решение пользователя 2026-09-06).
 13. **cursor_panel уже анимирует выезд** (progress 0..1, panel_center:88–96) — это готовый прецедент
     покадровой анимации в координаторе; новые 160/110 мс переходы не конфликтуют, но тик 60 Гц
     должен планироваться и для неподвижной панели с «зависшим» курсором (§5).

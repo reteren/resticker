@@ -66,7 +66,7 @@ resticker: **база чёрная, а не белая**. Renarrator кладё�
 |---|---|---|
 | `TEXT` | `#FFFFFF` @ `0.97` | основной |
 | `TEXT_DIM` | `#FFFFFF` @ `0.66` | подписи, второстепенное |
-| `TEXT_FAINT` | `#FFFFFF` @ `0.42` | заголовки секций, выключенное |
+| `TEXT_FAINT` | `#FFFFFF` @ `0.42` | заголовки секций, неактивные подписи (выключенное состояние тогглов больше НЕ задаётся приглушением тона — оно выражается формой/перечёркиванием и заливкой контрола, решение 2026-09-06) |
 | `TEXT_GLOW` | `#FFFFFF` @ `0.26`, радиус `2.0` DIP | гало вокруг глифов |
 | `HOVER_GLOW` | `#FFFFFF` @ `0.22`, радиус `6.0` DIP | гало вокруг контрола под курсором |
 
@@ -205,8 +205,8 @@ resticker: **база чёрная, а не белая**. Renarrator кладё�
 
 ```rust
 // widgets.rs
-pub enum Surface { Panel, Card, Control, ControlHover, ControlActive,
-                   ControlPrimary, ControlOn, Sunken }
+pub enum Surface { Panel, Card, Modal, Control, ControlHover, ControlActive,
+                   ControlPrimary, ControlOn, Sunken, Danger }
 
 pub enum Primitive {
     /* … существующие … */
@@ -260,9 +260,11 @@ impl Panel { pub fn animate(&mut self, dt_ms: f64) -> bool; }
 | I | Выделение, марки, подсветка окна, полоса видео | `rst-render/src/selection.rs`, `marquee.rs`, `window_highlight.rs`, `video_timeline.rs` | OpenCode |
 | J | Сшивка: тик анимации UI, вызовы новых билдеров | `resticker/src/overlay_manager.rs` | координатор |
 
-Иконки (`rst-render/src/icons.rs`) в этот заход **не переделываются** — по
-решению пользователя это отдельный шаг позже. Разрешено только привести
-толщину штриха и цвет к `TEXT`/`TEXT_DIM`.
+Иконки (`rst-render/src/icons.rs`) переработаны 2026-09-06: добавлены парные
+иконки состояний с перечёркиванием (`EyeOff`, `TimelineOff`, `VolumeMute`),
+динамик с выпадающей шкалой громкости; геометрия штриха и цвет приведены к
+единому белому тону `LIGHT` (`#FFFFFF`), а состояние передаётся формой глифа
+и заливкой кнопки (`Surface::ControlOn`), а не приглушением тона.
 
 ---
 

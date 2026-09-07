@@ -200,9 +200,9 @@ match msg {
 `handle_input` (координаты уже в DIP):
 
 - `MouseDown { pos, modifiers }` → **разрешение зоны** (§7):
-  - `RotateZone(corner)` → `gesture = Rotate{..}`, курсор `Rotate`
-  - `ResizeHandle(h)` → `gesture = Resize{..}`, курсор по зоне
-  - `StickerBody` → выделение (§9.1), `gesture = Drag{..}`, курсор `Move`
+  - `Rotate(id, angle)` (только одиночное выделение) → `gesture = Rotate{..}`, курсор поворота
+  - `ResizeHandle(id, h)` / `MultiResize(h)` → `gesture = Resize{..}`, курсор по зоне
+  - `StickerBody(id)` / `MultiBody` → выделение (§9.1), `gesture = Drag{..}`, курсор `Move`
   - `Background` → `selection.click(None)`; при удержании мыши начать
     `gesture = Marquee{anchor}` (SPEC 3.2 протяжка); курсор `Arrow`
   - redraw (изменилось выделение)
@@ -219,33 +219,30 @@ match msg {
 ## 7. Разрешение зоны под курсором
 
 Порядок проверки — обратный порядку отрисовки (сверху вниз, ARCHITECTURE 5.3).
-Выполняется над `Placement`/`Transform` каждого стикера (все в DIP).
+Выполняется над `Placement`/`Transform` стикеров (все в DIP).
 
-1. **Поворот** (кольцо 6–24 px наружу от угловой ручки, SPEC 3.3;
-   `input.rs:205`): для каждой угловой ручки
-   `SelectionBox::handle_center(corner_handle)` (через
-   `rst_render::selection::SelectionBox::new(&placement, &transform)`), если
-   `!contains_inflated(pl, tr, px, py, 6.0)` и дистанция до угла `<= 24.0` →
-   `RotateZone(corner)`. Смаппить `selection::HandleKind` → `input::Corner`
-   (REVIEW §1: три типа ручек; пока — явный маппинг по именам).
-2. **Ручки ресайза:** `SelectionBox::handle_center(kind)` для 8 ручек, попадание
-   `|p − c| <= HANDLE_SIZE_DIP/2 + 1` → `ResizeHandle(handle)`
-   (`selection::HANDLE_SIZE_DIP` = 10).
-3. **Тело стикера:** `hittest::contains(&pl, &tr, px, py)` →
-   `StickerBody`.
+При **мультивыделении** (>1 выделенного стикера на данном мониторе, `overlay_manager.rs:resolve_zone`):
+1. **Ручки ресайза группы (`Zone::MultiResize(kind)`):** строятся по общей рамке
+   `union_bounds` выделенных стикеров на этом мониторе (`SelectionBox`). Попадание в одну из 8 ручек
+   даёт жест масштабирования всей группы.
+2. **Ручек поворота у группы нет** (решение пользователя 2026-09-06: поворот группы
+   вращал бы стикеры вокруг общего центра, разбрасывая их по экрану; для поворота
+   стикер выделяется индивидуально).
+3. **Тело группы (`Zone::MultiBody`):** проверяется верхний стикер под курсором
+   (`hit_sticker_at`). Если он входит в текущее выделение → `Zone::MultiBody` (перетаскивание
+   всей группы). Если поверх лежит невыделенный стикер → `Zone::StickerBody(id)` (клик
+   достаётся ему, а не скрытой под ним группе).
+4. Иначе — `Zone::Background`.
+
+При **одиночном выделении** (или клике вне группы):
+1. **Поворот** (кольцо наружу от рамки, SPEC 3.3; `Rotate(id, angle)`): только для
+   одиночного выделенного стикера.
+2. **Ручки ресайза:** 8 ручек рамки стикера → `ResizeHandle(id, handle)`.
+3. **Тело стикера:** верхний стикер под курсором → `StickerBody(id)`.
 4. Иначе — `Background`.
 
-Зона → курсор: `input::CursorZone` строится вручную
-(`Background`/`StickerBody`/`ResizeHandle(h)`/`RotateZone(c)`) и
-`zone.cursor_shape()` даёт `CursorShape` (`input.rs:247`). Отправка формы pump-у:
-`PostMessageW(hwnd, WM_APP_EDIT_CURSOR, WPARAM(shape as usize), 0)`; wndproc →
-`CursorManager::set_shape` (идемпотентна, `input.rs:331`). `CursorManager` живёт
-на pump, `pending_cursor` на координаторе — источник истины.
-
-При **мультивыделении** зоны тела/ручек/поворота считаются по
-`selection::SelectionBox::new` от общего bbox `SelectionSet::bounds(&stickers)`
-(для ручек и поворота) и по телу того стикера, который под курсором
-(первый в порядке отрисовки сверху).
+Зона → курсор: `Zone` транслируется в форму курсора (`zone.cursor_shape()`),
+включая `MultiResize` (двусторонняя стрелка по направлению ручки) и `MultiBody` (`Move`).
 
 ---
 

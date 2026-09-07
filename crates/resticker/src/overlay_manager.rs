@@ -1981,10 +1981,12 @@ struct EditState {
     /// Протяжка марки превысила порог (`MARQUEE_THRESHOLD_DIP`) — отличает
     /// «клик по фону» (снимает выделение на `MouseUp`) от настоящей марки.
     marquee_started: bool,
-    /// Тулбар выделенного стикера — есть, когда `active && selection.len() ==
-    /// 1 && marquee.is_none()` (docs/M2_WIRING_PLAN.md, раздел 4). Мультивыделение
-    /// (`docs/M2_MULTISELECT_TOOLBAR_NOTES.md`) — следующий срез: билдер уже
-    /// поддерживает `opacity: None`, но действия батчем сюда не подключены.
+    /// Тулбар выделения — есть, когда `active && !selection.is_empty() &&
+    /// marquee.is_none()` (docs/M2_WIRING_PLAN.md, раздел 4). Состав панели
+    /// одинаков для одного стикера и для группы: с 2026-09-06 ползунок
+    /// прозрачности и поле показываются всегда, значения берутся по
+    /// последнему выделенному, действия применяются ко всем
+    /// (docs/M2_MULTISELECT_TOOLBAR_NOTES.md, §9).
     /// Момент прошлого кадра анимации интерфейса (§5). `None` — сейчас
     /// ничего не движется, и следующий переход начнёт отсчёт с чистого
     /// кадрового шага, а не с паузы длиной в простой приложения.
@@ -4006,9 +4008,21 @@ fn run(
                         }
                         _ => None,
                     };
+                    // В режиме редактирования клавиши адресованы ВСЕМУ
+                    // выделению — так же, как кнопки тулбара и пробел из
+                    // `handle_key`. До 2026-09-06 аппаратные медиа-клавиши
+                    // правили ровно один стикер, и на группе расходились с
+                    // кнопкой (находка независимого аудита). Вне режима
+                    // редактирования цель по-прежнему одна — та, что под
+                    // курсором.
+                    let ids: Vec<Uuid> = if edit.active {
+                        edit.selection.ids().to_vec()
+                    } else {
+                        vec![id]
+                    };
                     let changed = match delta {
-                        Some(delta) => adjust_video_volume(&mut cfg, &[id], delta),
-                        None => toggle_video_playback(&mut cfg, &[id]),
+                        Some(delta) => adjust_video_volume(&mut cfg, &ids, delta),
+                        None => toggle_video_playback(&mut cfg, &ids),
                     };
                     if changed {
                         if let Err(e) = config::save(&cfg, &config_path) {
@@ -6275,6 +6289,16 @@ fn open_streaming_animation(
 /// `sticker.playback`, а синхронизацию с декодером делает общий проход в
 /// `run()` (тот же принцип, что у кнопки паузы в тулбаре).
 fn toggle_video_playback(cfg: &mut Config, ids: &[Uuid]) -> bool {
+    // Группа приводится к ОДНОМУ состоянию, а не инвертируется по одному:
+    // пока играет хоть одно выделенное видео, пробел ставит на паузу все.
+    // Это ровно то же правило, что у кнопки тулбара; до 2026-09-06 клавиша
+    // и кнопка расходились — на смешанной группе пробел оставлял её
+    // смешанной, а кнопка выравнивала (находка независимого аудита).
+    let all_paused = ids
+        .iter()
+        .filter_map(|id| cfg.stickers.iter().find(|s| s.id == *id))
+        .filter(|s| sticker_is_video(s))
+        .all(|s| s.playback.paused);
     let mut changed = false;
     for id in ids {
         if let Some(sticker) = cfg
@@ -6282,8 +6306,10 @@ fn toggle_video_playback(cfg: &mut Config, ids: &[Uuid]) -> bool {
             .iter_mut()
             .find(|s| s.id == *id && sticker_is_video(s))
         {
-            sticker.playback.paused = !sticker.playback.paused;
-            changed = true;
+            if sticker.playback.paused != !all_paused {
+                sticker.playback.paused = !all_paused;
+                changed = true;
+            }
         }
     }
     changed
@@ -7243,18 +7269,18 @@ fn resolve_zone(
             None => Zone::Background,
         };
     }
-    if let [id] = selection.ids() {
-        if let Some(sticker) = cfg
-            .stickers
-            .iter()
-            .find(|s| s.id == *id && s.placement.monitor_id == *monitor_id)
+    // Ровно один выделенный НА ЭТОМ мониторе — обычная одиночная геометрия
+    // (ручки, поворот). Считается по `here`, а не по всему выделению: группа
+    // может лежать на двух мониторах, и тогда здесь честно один стикер, хотя
+    // выделено больше (находка независимого аудита 2026-09-06).
+    if let [sticker] = here.as_slice() {
         {
             let sbox = SelectionBox::new(&sticker.placement, &sticker.transform);
             // Ручки ресайза — высший приоритет, безусловно (и внутри, и
             // снаружи рамки — квадрат ручки обычно на самой границе).
             for (kind, rect) in sbox.handle_rects(rst_render::HANDLE_SIZE_DIP) {
                 if point_in_box2d(&rect, dip_x, dip_y) {
-                    return Zone::ResizeHandle(*id, kind);
+                    return Zone::ResizeHandle(sticker.id, kind);
                 }
             }
             // Ручки поворота — за углами рамки, снаружи; проверяются после
@@ -7269,19 +7295,27 @@ fn resolve_zone(
                 if rst_render::box_contains(&rect, (dip_x, dip_y)) {
                     if let Some(corner) = corner_of_handle(kind) {
                         let angle = rotate_cursor_angle_deg(corner, sticker.transform.rotation);
-                        return Zone::Rotate(*id, angle);
+                        return Zone::Rotate(sticker.id, angle);
                     }
                 }
             }
             let inside = hittest::contains(&sticker.placement, &sticker.transform, dip_x, dip_y);
             if inside {
-                return Zone::StickerBody(*id);
+                // Если выделение шире этого монитора, клик по его члену НЕ
+                // сворачивает группу: он ведёт местную её часть. Иначе
+                // выделение на двух экранах разваливалось бы от первого же
+                // касания (находка независимого аудита 2026-09-06).
+                return if selection.len() > 1 {
+                    Zone::MultiBody
+                } else {
+                    Zone::StickerBody(sticker.id)
+                };
             }
             // Клик снаружи рамки может лежать на ДРУГОМ стикере —
             // переключение выделения (баг из репорта пользователя: «выбрал
             // стикер — не могу выбрать другой», 2026-08-10).
             if let Some(other_id) = hit_sticker_at(cfg, monitor_id, dip_x, dip_y) {
-                if other_id != *id {
+                if other_id != sticker.id {
                     return Zone::StickerBody(other_id);
                 }
             }
@@ -8126,7 +8160,17 @@ fn rebuild_toolbar(edit: &mut EditState, cfg: &Config, screen_h: f64) {
         return;
     }
     let selected = edit.selection.selected_stickers(&cfg.stickers);
-    let (Some(bounds), Some(lead)) = (edit.selection.bounds(&cfg.stickers), selected.last()) else {
+    let Some(lead) = selected.last() else {
+        edit.toolbar = None;
+        return;
+    };
+    // Рамка, под которой стоит тулбар, считается по стикерам ТОГО ЖЕ
+    // монитора, где он рисуется (`toolbar_monitor` — монитор последнего
+    // выделенного). Union по всем мониторам сразу — смесь координат из
+    // разных систем (ADR-010): тулбар уезжал бы в пустое место экрана
+    // (находка независимого аудита 2026-09-06).
+    let here = selected_on_monitor(&edit.selection, cfg, &lead.placement.monitor_id);
+    let Some(bounds) = union_bounds(&here) else {
         edit.toolbar = None;
         return;
     };
@@ -13102,10 +13146,12 @@ fn selection_center_or_screen(
         ))
 }
 
-/// Опросить действия тулбара после `Up` (одиночное выделение,
-/// docs/M2_WIRING_PLAN.md, раздел 6): опрос ползунка/поля/пяти кнопок,
-/// каждая — свой снимок undo. Мультивыделение — следующий срез (билдер уже
-/// поддерживает `opacity: None`, но действия батчем сюда не подключены).
+/// Опросить действия тулбара после `Up` (docs/M2_WIRING_PLAN.md, раздел 6):
+/// ползунок, поле, семь кнопок и видео-виджеты, каждое действие — свой
+/// снимок undo. Действия применяются ко ВСЕМУ выделению, а значения
+/// показываются по последнему выделенному (2026-09-06,
+/// docs/M2_MULTISELECT_TOOLBAR_NOTES.md §9): одна групповая операция — один
+/// шаг истории.
 #[allow(clippy::too_many_arguments)]
 fn handle_toolbar_up(
     edit: &mut EditState,
@@ -13341,10 +13387,7 @@ fn handle_toolbar_up(
         .is_some_and(VolumeControl::take_mute_click);
     if mute_clicked {
         commit_undo_snapshot(edit, cfg.clone());
-        let all_muted = selected_videos(cfg, &ids).all(|s| s.playback.muted);
-        for sticker in selected_videos_mut(cfg, &ids) {
-            sticker.playback.muted = !all_muted;
-        }
+        toggle_video_mute(cfg, &ids);
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения звука");
         }
@@ -13352,6 +13395,21 @@ fn handle_toolbar_up(
         return true;
     }
     true
+}
+
+/// «Включить/выключить звук» у выделенных видео: та же сходимость к одному
+/// состоянию, что у паузы и глаза — пока звучит хоть одно, клик выключает
+/// все. `true` — что-то изменилось.
+fn toggle_video_mute(cfg: &mut Config, ids: &[Uuid]) -> bool {
+    let all_muted = selected_videos(cfg, ids).all(|s| s.playback.muted);
+    let mut changed = false;
+    for sticker in selected_videos_mut(cfg, ids) {
+        if sticker.playback.muted != !all_muted {
+            sticker.playback.muted = !all_muted;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Видео среди выделенных стикеров, в порядке выделения.
@@ -17659,6 +17717,257 @@ mod tests {
         assert!(
             order(a) < order(top_id),
             "шаг на один уровень, а не прыжок наверх"
+        );
+    }
+
+    /// Прозрачность, поставленная ползунком, доезжает до КАЖДОГО выделенного
+    /// и делает их равными — дословный заказ пользователя («если я меняю
+    /// стикерам прозрачность, у них обоих становится прозрачность
+    /// одинаковая, даже если до редакции она была разной»). Пробел в
+    /// покрытии нашёл независимый аудит 2026-09-06.
+    #[test]
+    fn opacity_from_the_slider_makes_the_whole_group_equal() {
+        let (mut cfg, mut edit, a, b) = group_harness();
+        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().transform.opacity = 0.2;
+        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().transform.opacity = 0.9;
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+
+        // Тянем ручку ползунка в середину дорожки: значение виджета меняется
+        // ровно так же, как под настоящим пальцем.
+        let track = edit
+            .toolbar
+            .as_ref()
+            .unwrap()
+            .widget::<Slider>(toolbar::TB_SLIDER)
+            .unwrap()
+            .bounds();
+        edit.toolbar.as_mut().unwrap().pointer_event(PointerEvent::Down {
+            pos: (track.cx, track.cy),
+        });
+        poll_toolbar_opacity_live(&mut edit, &mut cfg, &mut []);
+
+        let opacities: Vec<f64> = [a, b]
+            .iter()
+            .map(|id| {
+                cfg.stickers
+                    .iter()
+                    .find(|s| s.id == *id)
+                    .unwrap()
+                    .transform
+                    .opacity
+            })
+            .collect();
+        assert!(
+            (opacities[0] - opacities[1]).abs() < 1e-9,
+            "после правки прозрачность общая: {opacities:?}"
+        );
+        assert!(
+            (opacities[0] - 0.5).abs() < 0.02,
+            "и равна тому, что показывает ползунок: {opacities:?}"
+        );
+        // Один живой жест — один отложенный снимок, а не по снимку на стикер.
+        assert!(
+            edit.ui_pending_snapshot.is_some(),
+            "снимок для истории отложен до отпускания кнопки"
+        );
+        assert!(edit.undo_stack.is_empty(), "и пока не закоммичен");
+    }
+
+    /// Слои видимости у группы: до первой правки чужие настройки не
+    /// трогаются, первая приводит всех к «видно везде», дальше правило
+    /// раздаётся всем. Дословная формулировка пользователя 2026-09-06;
+    /// пробел в покрытии нашёл независимый аудит.
+    #[test]
+    fn the_layers_panel_levels_the_group_only_on_the_first_edit() {
+        let (mut cfg, mut edit, a, b) = group_harness();
+        // У стикеров РАЗНЫЕ правила видимости до правки.
+        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().visibility = VisibilityRule {
+            mode: VisibilityMode::Desktop,
+            rules: Vec::new(),
+        };
+        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().visibility = VisibilityRule {
+            mode: VisibilityMode::NeverOverlap,
+            rules: Vec::new(),
+        };
+        let before = cfg.clone();
+
+        edit.window_picker = Some(WindowPickerState {
+            target: PickerTarget::Sticker(b),
+            applies_to: vec![a, b],
+            leveled: false,
+            panel: Panel::new(
+                window_picker::PICKER_PANEL_ID,
+                Box2D {
+                    cx: 0.0,
+                    cy: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                    rotation: 0.0,
+                },
+            ),
+            scroll: 0,
+            monitor_id: monitor_id("main"),
+        });
+
+        // Панель открыта, но человек ещё ничего не нажал — конфиг нетронут.
+        assert_eq!(cfg, before, "открытие панели ничего не меняет");
+
+        // Первая правка: выравнивание.
+        assert!(level_picker_group(&mut edit, &mut cfg));
+        for id in [a, b] {
+            assert_eq!(
+                cfg.stickers.iter().find(|s| s.id == id).unwrap().visibility,
+                VisibilityRule::default(),
+                "первая правка приводит группу к «видно везде»"
+            );
+        }
+        // Вторая правка уже не выравнивает — иначе она затирала бы то, что
+        // человек только что выбрал.
+        assert!(!level_picker_group(&mut edit, &mut cfg));
+
+        // Правку ведущего раздаём остальным.
+        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().visibility = VisibilityRule {
+            mode: VisibilityMode::OverlapDenylist,
+            rules: vec![OverlapRule {
+                process_name: Some("code.exe".to_string()),
+                title_pattern: None,
+            }],
+        };
+        spread_picker_visibility(&edit, &mut cfg, b);
+        assert_eq!(
+            cfg.stickers.iter().find(|s| s.id == a).unwrap().visibility,
+            cfg.stickers.iter().find(|s| s.id == b).unwrap().visibility,
+            "правило ведущего досталось всей группе"
+        );
+    }
+
+    /// Смешанное выделение картинки и видео: видео-виджеты появляются, если
+    /// видео есть ХОТЬ У ОДНОГО (заказ пользователя 2026-09-06). Проверяем
+    /// координатор, а не только вёрстку билдера.
+    #[test]
+    fn a_mixed_image_and_video_selection_still_gets_the_video_widgets() {
+        let (mut cfg, mut edit, _a, b) = group_harness();
+        {
+            let video = cfg.stickers.iter_mut().find(|s| s.id == b).unwrap();
+            video.source = StickerSource::File {
+                path: std::path::PathBuf::from("v.mp4"),
+                media_type: MediaType::Video,
+            };
+            video.playback.volume = 0.3;
+        }
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let panel = edit.toolbar.as_ref().unwrap();
+        assert!(
+            panel.widget::<Button>(toolbar::TB_PLAY_PAUSE).is_some(),
+            "пауза есть, хотя видео в выделении только одно"
+        );
+        let volume = panel.widget::<VolumeControl>(toolbar::TB_VOLUME).unwrap();
+        assert_eq!(volume.value(), 30, "громкость — по единственному видео");
+    }
+
+    /// «Включить/выключить звук» сходится к одному состоянию, как пауза и
+    /// глаз, и не трогает картинки в том же выделении.
+    #[test]
+    fn mute_converges_the_group_and_spares_images() {
+        let (mut cfg, _edit, a, b) = group_harness();
+        {
+            let video = cfg.stickers.iter_mut().find(|s| s.id == b).unwrap();
+            video.source = StickerSource::File {
+                path: std::path::PathBuf::from("v.mp4"),
+                media_type: MediaType::Video,
+            };
+            video.playback.volume = 0.7;
+        }
+        assert!(toggle_video_mute(&mut cfg, &[a, b]));
+        let video = cfg.stickers.iter().find(|s| s.id == b).unwrap();
+        assert!(video.playback.muted, "звук выключен");
+        assert!(
+            (video.playback.volume - 0.7).abs() < 1e-9,
+            "уровень пережил выключение — его возвращает один клик"
+        );
+        assert!(
+            !cfg.stickers.iter().find(|s| s.id == a).unwrap().playback.muted,
+            "картинка звука не имеет и её настройка не трогается"
+        );
+        assert!(toggle_video_mute(&mut cfg, &[a, b]));
+        assert!(!cfg.stickers.iter().find(|s| s.id == b).unwrap().playback.muted);
+    }
+
+    /// Выделение на ДВУХ мониторах: клик по местному члену группы не
+    /// сворачивает выделение (находка независимого аудита 2026-09-06 —
+    /// раньше второй монитор молча вылетал из группы от первого касания).
+    #[test]
+    fn a_click_on_a_member_of_a_cross_monitor_group_keeps_the_group() {
+        let (mut cfg, mut edit, a, b) = group_harness();
+        // Уводим второй стикер на соседний монитор.
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == b)
+            .unwrap()
+            .placement
+            .monitor_id = monitor_id("second");
+
+        // На «main» выделенным остался один стикер — но выделение шире.
+        let zone = resolve_zone(&cfg, &edit.selection, &monitor_id("main"), 200.0, 200.0);
+        assert!(
+            matches!(zone, Zone::MultiBody),
+            "клик по члену группы ведёт группу, а не сворачивает её: {zone:?}"
+        );
+        // Ручки у местного одиночки при этом остаются его собственными.
+        let handle = resolve_zone(&cfg, &edit.selection, &monitor_id("main"), 150.0, 150.0);
+        assert!(matches!(handle, Zone::ResizeHandle(id, HandleKind::NorthWest) if id == a));
+
+        // А когда выделен ровно один стикер, поведение прежнее.
+        edit.selection.click(Some(a));
+        assert!(matches!(
+            resolve_zone(&cfg, &edit.selection, &monitor_id("main"), 200.0, 200.0),
+            Zone::StickerBody(id) if id == a
+        ));
+    }
+
+    /// Тулбар при выделении на двух мониторах встаёт под МЕСТНОЙ рамкой, а не
+    /// под смесью координат разных экранов (та же находка аудита).
+    #[test]
+    fn the_toolbar_of_a_cross_monitor_group_uses_local_bounds() {
+        let (mut cfg, mut edit, _a, b) = group_harness();
+        {
+            let far = cfg.stickers.iter_mut().find(|s| s.id == b).unwrap();
+            far.placement.monitor_id = monitor_id("second");
+            far.placement.cx = 1500.0;
+        }
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let panel = edit.toolbar.as_ref().expect("тулбар есть");
+        // Последний выделенный — `b` на «second», его рамка x ∈ [1400, 1600].
+        assert!(
+            (panel.frame().cx - 1500.0).abs() < 1e-6,
+            "тулбар под своим стикером, а не под смесью мониторов: {}",
+            panel.frame().cx
+        );
+    }
+
+    /// Пробел приводит группу видео к одному состоянию — как и кнопка
+    /// тулбара. До 2026-09-06 клавиша инвертировала каждого по отдельности,
+    /// и смешанная группа оставалась смешанной (находка аудита).
+    #[test]
+    fn space_converges_a_mixed_group_like_the_toolbar_button() {
+        let (mut cfg, _edit, a, b) = group_harness();
+        for (id, paused) in [(a, true), (b, false)] {
+            let s = cfg.stickers.iter_mut().find(|s| s.id == id).unwrap();
+            s.source = StickerSource::File {
+                path: std::path::PathBuf::from("v.mp4"),
+                media_type: MediaType::Video,
+            };
+            s.playback.paused = paused;
+        }
+        assert!(toggle_video_playback(&mut cfg, &[a, b]));
+        assert!(
+            cfg.stickers.iter().all(|s| s.playback.paused),
+            "играло хоть одно — на паузу встали все"
+        );
+        assert!(toggle_video_playback(&mut cfg, &[a, b]));
+        assert!(
+            cfg.stickers.iter().all(|s| !s.playback.paused),
+            "на паузе были все — поехали все"
         );
     }
 
