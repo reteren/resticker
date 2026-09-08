@@ -44,7 +44,9 @@ mod ui_preview;
 mod window_pick_list;
 mod window_picker;
 
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::Context;
@@ -503,9 +505,165 @@ fn config_path() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(base).join("resticker").join("config.json"))
 }
 
+const PANIC_MARKER_HEADER: &str = "resticker-panic-marker-v1";
+const PANIC_MARKER_FILE: &str = "panic.marker";
+
+/// Данные, которые переживают `panic = "abort"`: после аварии процесс уже
+/// не может отправить тост и не оставляет консоли, поэтому следующий старт
+/// читает короткую метку рядом с журналом и объясняет пользователю исчезновение
+/// резидентной программы.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PanicMarker {
+    pub(crate) timestamp: String,
+    pub(crate) version: String,
+    pub(crate) thread: String,
+    pub(crate) location: String,
+    pub(crate) message: String,
+    pub(crate) log_path: String,
+}
+
+impl PanicMarker {
+    fn from_panic(
+        timestamp: String,
+        version: String,
+        thread: &str,
+        location: &str,
+        message: &str,
+        log_path: &Path,
+    ) -> Self {
+        Self {
+            timestamp,
+            version,
+            thread: thread.to_string(),
+            location: location.to_string(),
+            message: message.lines().next().unwrap_or("panic without a message").to_string(),
+            log_path: log_path.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != PANIC_MARKER_HEADER {
+            return None;
+        }
+        fn field<'a>(line: Option<&'a str>, name: &str) -> Option<&'a str> {
+            line?.strip_prefix(name)?.strip_prefix('=')
+        }
+        let timestamp = field(lines.next(), "timestamp")?;
+        let version = field(lines.next(), "version")?;
+        let thread = field(lines.next(), "thread")?;
+        let location = field(lines.next(), "location")?;
+        let message = field(lines.next(), "message")?;
+        let log_path = field(lines.next(), "log_path")?;
+        if lines.next().is_some()
+            || timestamp.is_empty()
+            || version.is_empty()
+            || thread.is_empty()
+            || location.is_empty()
+            || message.is_empty()
+            || log_path.is_empty()
+            || chrono::DateTime::parse_from_rfc3339(timestamp).is_err()
+        {
+            return None;
+        }
+        Some(Self {
+            timestamp: timestamp.to_string(),
+            version: version.to_string(),
+            thread: thread.to_string(),
+            location: location.to_string(),
+            message: message.to_string(),
+            log_path: log_path.to_string(),
+        })
+    }
+}
+
+/// Формат намеренно построчный: его можно прочитать даже после частичной
+/// записи в момент аварии, а разбор отбрасывает чужие/повреждённые файлы
+/// вместо показа мусора пользователю.
+fn panic_marker_text(marker: &PanicMarker) -> String {
+    format!(
+        "{PANIC_MARKER_HEADER}\ntimestamp={}\nversion={}\nthread={}\nlocation={}\nmessage={}\nlog_path={}\n",
+        marker.timestamp,
+        marker.version,
+        marker.thread,
+        marker.location,
+        marker.message,
+        marker.log_path,
+    )
+}
+
+fn panic_marker_path_for_log(log_path: &Path) -> PathBuf {
+    log_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(PANIC_MARKER_FILE)
+}
+
+/// Путь стабилен относительно `%LOCALAPPDATA%`, поэтому координатор может
+/// прочитать ту же метку до того, как главный поток покажет тост и удалит её.
+#[allow(dead_code)] // До подключения стартового баннера вызывается из overlay_manager.
+pub(crate) fn panic_marker_path_from_env() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|base| base.join("resticker").join(PANIC_MARKER_FILE))
+}
+
+/// Запись после `tracing::error!` не должна сама паниковать: двойная паника
+/// в аварийном хуке только скрыла бы исходную причину.
+fn write_panic_marker(path: &Path, marker: &PanicMarker) {
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = file.write_all(panic_marker_text(marker).as_bytes());
+    let _ = file.flush();
+}
+
+/// Прочитать метку и сразу собрать оба текста уведомления, но НЕ удалять
+/// файл: тост и оверлей должны увидеть одну и ту же причину, а удаление
+/// выполняется ровно один раз после успешного показа тоста.
+pub(crate) fn panic_notification_from_marker(
+    path: &Path,
+) -> Option<(PanicMarker, (String, String))> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return None;
+    };
+    let marker = PanicMarker::parse(&text)?;
+    let notification = i18n::panic_notification(
+        &marker.version,
+        &marker.thread,
+        &marker.location,
+        &marker.message,
+        &marker.log_path,
+    );
+    Some((marker, notification))
+}
+
+fn consume_panic_marker(path: &Path, notify: impl FnOnce(&PanicMarker, &(String, String)) -> bool) -> bool {
+    let Some((marker, notification)) = panic_notification_from_marker(path) else {
+        // Повреждённая метка не должна застрять и проверяться на каждом
+        // старте; главное — не показывать её содержимое как достоверное.
+        let _ = fs::remove_file(path);
+        return false;
+    };
+    if notify(&marker, &notification) {
+        fs::remove_file(path).is_ok()
+    } else {
+        false
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let log_path = logging::init()?;
     tracing::info!(path = %log_path.display(), "логирование инициализировано");
+    let panic_marker_file = panic_marker_path_for_log(&log_path);
+    let panic_marker_file_for_hook = panic_marker_file.clone();
 
     // `panic = "abort"` (Cargo.toml, release-профиль) — паника на ЛЮБОМ
     // потоке мгновенно валит весь процесс, а GUI-подсистема (windows_subsystem
@@ -516,7 +674,7 @@ fn main() -> anyhow::Result<()> {
     // порядке, причина осталась бы неизвестной без этого). Хук ставится ДО
     // спавна остальных потоков (окна оверлея на каждый монитор, трей,
     // хоткей-поток), чтобы покрыть панику где угодно, не только в main.
-    std::panic::set_hook(Box::new(|info| {
+    std::panic::set_hook(Box::new(move |info| {
         let location = info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
@@ -535,6 +693,15 @@ fn main() -> anyhow::Result<()> {
             backtrace = %backtrace,
             "ПАНИКА — процесс сейчас завершится (panic = \"abort\")"
         );
+        let marker = PanicMarker::from_panic(
+            chrono::Utc::now().to_rfc3339(),
+            env!("CARGO_PKG_VERSION").to_string(),
+            std::thread::current().name().unwrap_or("<unnamed>"),
+            &location,
+            &message,
+            &log_path,
+        );
+        write_panic_marker(&panic_marker_file_for_hook, &marker);
     }));
 
     // Второй экземпляр (автозапуск + ручной запуск, повторный клик по
@@ -622,6 +789,7 @@ fn main() -> anyhow::Result<()> {
     // из `setup` ниже.
     let (coordinator_tx, coordinator_rx) = mpsc::channel::<CoordinatorRequest>();
     let overlay_handle = overlay_manager::start(cfg_path, cfg, coordinator_tx);
+    let panic_marker_file_for_setup = panic_marker_file.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -652,6 +820,26 @@ fn main() -> anyhow::Result<()> {
             list_open_processes,
         ])
         .setup(move |app| {
+            // Прошлый запуск завершился паникой — сказать об этом человеку.
+            // Двумя каналами сразу: тост трея и баннер оверлея. Баллуны
+            // Windows 11 25H2 молча не рендерятся (замер 2026-08-18), а
+            // баннер рисует сам resticker своим конвейером — его видно
+            // гарантированно. Метка удаляется в любом случае: канал
+            // координатора жив всё время работы программы, и повторять
+            // сообщение при каждом запуске было бы хуже, чем пропустить его
+            // один раз.
+            let _ = consume_panic_marker(&panic_marker_file_for_setup, |_marker, notification| {
+                let (title, body) = notification;
+                if app.state::<TrayIcon>().show_balloon(title, body).is_err() {
+                    tracing::warn!(
+                        "баллун трея не показался — о падении сообщит только баннер оверлея"
+                    );
+                }
+                app.state::<OverlayHandle>()
+                    .send(OverlayCommand::ShowBanner(body.clone()));
+                true
+            });
+
             #[cfg(windows)]
             if let Some(w) = app.get_webview_window("settings") {
                 disable_browser_accelerators(&w);
@@ -883,5 +1071,104 @@ mod tests {
         );
         assert_eq!(trim_non_empty("".to_string()), None);
         assert_eq!(trim_non_empty("   ".to_string()), None);
+    }
+
+    fn sample_panic_marker() -> PanicMarker {
+        PanicMarker {
+            timestamp: "2026-09-08T15:00:00+00:00".to_string(),
+            version: "0.5.0".to_string(),
+            thread: "overlay-1".to_string(),
+            location: "crates/resticker/src/main.rs:42:7".to_string(),
+            message: "device lost".to_string(),
+            log_path: r"C:\Users\me\AppData\Local\resticker\logs\resticker.log".to_string(),
+        }
+    }
+
+    fn temp_marker_path() -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("resticker-panic-marker-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).expect("создать временный каталог для метки");
+        let path = dir.join(PANIC_MARKER_FILE);
+        (dir, path)
+    }
+
+    #[test]
+    fn panic_marker_text_round_trips_deterministically() {
+        let marker = sample_panic_marker();
+        let text = panic_marker_text(&marker);
+        assert!(text.starts_with("resticker-panic-marker-v1\ntimestamp=2026-09-08T15:00:00+00:00\n"));
+        assert_eq!(PanicMarker::parse(&text), Some(marker));
+
+        let panic = PanicMarker::from_panic(
+            "2026-09-08T15:00:00+00:00".to_string(),
+            "0.5.0".to_string(),
+            "overlay-1",
+            "main.rs:42:7",
+            "first line\nsecond line",
+            Path::new(r"C:\logs\resticker.log"),
+        );
+        assert_eq!(panic.message, "first line");
+    }
+
+    #[test]
+    fn panic_notification_from_marker_reads_ready_text_without_consuming() {
+        let (dir, path) = temp_marker_path();
+        let marker = sample_panic_marker();
+        std::fs::write(&path, panic_marker_text(&marker)).expect("записать метку");
+        let (found, (title, body)) =
+            panic_notification_from_marker(&path).expect("валидная метка читается");
+        assert_eq!(found, marker);
+        assert_eq!(title, "resticker closed unexpectedly");
+        assert!(body.contains("version 0.5.0"));
+        assert!(path.exists(), "чтение текста не должно удалять метку");
+        std::fs::remove_dir_all(dir).expect("убрать временный каталог");
+    }
+
+    #[test]
+    fn missing_panic_marker_does_not_notify() {
+        let (dir, path) = temp_marker_path();
+        let mut called = false;
+        assert!(!consume_panic_marker(&path, |_, _| {
+            called = true;
+            true
+        }));
+        assert!(!called);
+        std::fs::remove_dir_all(dir).expect("убрать временный каталог");
+    }
+
+    #[test]
+    fn malformed_or_foreign_panic_marker_is_ignored_without_garbage() {
+        let (dir, path) = temp_marker_path();
+        for text in [
+            "",
+            "foreign-app-marker\nmessage=not ours\n",
+            "resticker-panic-marker-v1\nversion=\nmessage=garbage\n",
+        ] {
+            std::fs::write(&path, text).expect("записать тестовую метку");
+            let mut called = false;
+            assert!(!consume_panic_marker(&path, |_, _| {
+                called = true;
+                true
+            }));
+            assert!(!called);
+            assert!(!path.exists(), "битая метка удаляется после проверки");
+        }
+        std::fs::remove_dir_all(dir).expect("убрать временный каталог");
+    }
+
+    #[test]
+    fn panic_marker_is_removed_after_notification() {
+        let (dir, path) = temp_marker_path();
+        let marker = sample_panic_marker();
+        std::fs::write(&path, panic_marker_text(&marker)).expect("записать метку");
+        let mut shown = false;
+        assert!(consume_panic_marker(&path, |_, (title, body)| {
+            shown = title == "resticker closed unexpectedly"
+                && body.contains("version 0.5.0")
+                && body.contains("resticker.log");
+            shown
+        }));
+        assert!(shown);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).expect("убрать временный каталог");
     }
 }

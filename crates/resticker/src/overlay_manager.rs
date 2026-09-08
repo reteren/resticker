@@ -374,6 +374,20 @@ fn teardown_monitor_state(
         edit.cursor_pos = (0.0, 0.0);
     }
 
+    // Панели живут на КОНКРЕТНОМ мониторе (у каждой своё поле `monitor_id`):
+    // окно этого монитора уже уничтожено, панель с экрана исчезла — но
+    // состояние осталось. Для модальных это не мелочь, а зависание: модал
+    // подтверждения удаления блокирует ввод НА ВСЕХ мониторах (`return true`
+    // в `MouseDown`/`MouseUp` независимо от монитора), и после отключения
+    // его экрана человек кликает по оставшемуся и не получает ничего —
+    // диалога уже не видно, а выйти можно только `Esc`, о котором он не
+    // знает. Найдено прицельным аудитом многомониторности 2026-09-07.
+    //
+    // Подтверждение удаления снимается как ОТМЕНА: снимок в `ConfirmState`
+    // просто отбрасывается, ничего не удаляется. Терять стикеры из-за
+    // выдернутого кабеля нельзя.
+    close_panels_of_monitor(edit, id);
+
     let cancel_gesture = match &edit.gesture {
         Some(Gesture::Marquee { .. }) => cursor_was_here,
         Some(other) => other.starts().iter().any(|start| {
@@ -1296,6 +1310,20 @@ pub enum OverlayCommand {
     /// пользователь остаётся заперт снаружи (живой репорт 2026-08-25).
     /// Пункт меню в трее от клавиатуры не зависит.
     ToggleEditMode,
+    /// Показать баннер поверх экрана — сообщение, которое человек ОБЯЗАН
+    /// увидеть, даже если тост трея не отрисовался.
+    ///
+    /// Появилась 2026-09-07 ради уведомления о прошлом падении. Профиль
+    /// релиза собран с `panic = "abort"` и без консоли: до этого паника
+    /// уходила только в лог, а для человека программа просто исчезала.
+    /// Баллуны Windows 11 25H2 молча не рендерятся (доказано живым стендом
+    /// 2026-08-18) — поэтому тот же текст дублируется баннером, который
+    /// рисует сам resticker своим конвейером.
+    ///
+    /// Кто владеет меткой падения: `main.rs` читает её, показывает тост,
+    /// шлёт эту команду и УДАЛЯЕТ метку. Координатор её не трогает вовсе —
+    /// иначе два потока удаляли бы один файл наперегонки.
+    ShowBanner(String),
     /// Открыть панель величины зазора (пункт трея «Set value…»).
     ///
     /// Меню трея не умеет полей ввода, поэтому число задаётся панелью
@@ -1770,6 +1798,54 @@ enum Zone {
     Rotate(Uuid, i32),
 }
 
+/// Закрыть все панели, привязанные к монитору `id` — его окно уничтожено,
+/// и держать их состояние не за что.
+///
+/// Перечислено вручную, а не «как-нибудь автоматически»: у каждой панели
+/// своё поле `monitor_id`, и единственный способ ничего не забыть — держать
+/// список в одном месте. Если появится новая панель со своим монитором, её
+/// надо добавить сюда же.
+fn close_panels_of_monitor(edit: &mut EditState, id: &MonitorId) {
+    if edit.confirm.as_ref().is_some_and(|s| s.monitor_id == *id) {
+        edit.confirm = None;
+    }
+    if edit.window_picker.as_ref().is_some_and(|s| s.monitor_id == *id) {
+        edit.window_picker = None;
+    }
+    if edit.preset_picker.as_ref().is_some_and(|s| s.monitor_id == *id) {
+        edit.preset_picker = None;
+    }
+    if edit.gap_panel.as_ref().is_some_and(|s| s.monitor_id == *id) {
+        edit.gap_panel = None;
+    }
+    if edit.group_manager.as_ref().is_some_and(|s| s.monitor_id == *id) {
+        edit.group_manager = None;
+    }
+    if edit
+        .window_pick_list
+        .as_ref()
+        .is_some_and(|s| s.monitor_id == *id)
+    {
+        edit.window_pick_list = None;
+    }
+    if edit.pinned_panel.as_ref().is_some_and(|s| s.monitor_id == *id) {
+        edit.pinned_panel = None;
+    }
+    if edit.banner.as_ref().is_some_and(|s| s.monitor_id == *id) {
+        edit.banner = None;
+    }
+    if edit.tooltip.as_ref().is_some_and(|s| s.monitor_id == *id) {
+        edit.tooltip = None;
+    }
+    // Панель у курсора собрана под геометрию экрана и своего поля с
+    // монитором не имеет: её «домашний» монитор — `cursor_monitor`, который
+    // вызывающий переводит на новый primary. Сбрасываем, чтобы следующий же
+    // кадр собрал её заново под новый экран.
+    if edit.cursor_monitor == *id {
+        edit.cursor_panel = None;
+    }
+}
+
 /// Состояние режима редактирования (docs/M2_INTEGRATION_PLAN.md, раздел 2).
 struct EditState {
     active: bool,
@@ -1994,6 +2070,11 @@ struct EditState {
     toolbar: Option<Panel>,
     /// Панель у курсора — есть, пока `active` (раздел 4).
     cursor_panel: Option<Panel>,
+    /// Монитор, под геометрию которого собрана `cursor_panel`. Сама панель
+    /// своего монитора не помнит, а рисуется там, где курсор: без этого
+    /// поля переход на экран другого размера оставлял панель за краем
+    /// (аудит многомониторности 2026-09-07).
+    cursor_panel_monitor: Option<MonitorId>,
     /// Тултип наведённой кнопки тулбара/панели у курсора (фидбэк
     /// пользователя 2026-08-10) — `None`, если курсор не над кнопкой с
     /// текстом подсказки.
@@ -3066,12 +3147,35 @@ fn run(
     // в общий канал», что и у пер-мониторных форвардеров выше (M3_HOTPLUG_
     // DESIGN.md §1); выходит сам, как только канал закрыт (координатор
     // завершился).
+    //
+    // Тикает НЕ ВСЕГДА. До 2026-09-07 этот поток будил координатор раз в
+    // секунду безусловно — и в полном покое тоже, хотя все три причины тика
+    // условны: меню снап-раскладок ищется только при живых закреплённых
+    // окнах, таймеры автомата — только когда монитор потерян, ретрай
+    // восстановления устройства — только после провалившейся попытки. Замер
+    // живого процесса 2026-09-07 показал эти пробуждения, а SPEC.md §13
+    // требует прямо обратного: «в полном покое программа не должна
+    // просыпаться вообще». Теперь координатор сам говорит, нужен ли ему
+    // тик (`tick_wanted_tx`), тем же приёмом, что уже используется для
+    // планировщика анимации ниже.
+    let (tick_wanted_tx, tick_wanted_rx) = mpsc::channel::<bool>();
     let tick_tx = tx.clone();
     thread::spawn(move || {
+        // Час — не ожидание события, а самопроверка на случай, если
+        // координатор завершился, не закрыв канал: тогда `send` ниже
+        // вернёт ошибку и поток выйдет.
+        const IDLE_POLL: Duration = Duration::from_secs(3600);
+        let mut wanted = false;
         loop {
-            thread::sleep(LOSS_TICK_PERIOD);
-            if tick_tx.send(OverlayMessage::Tick).is_err() {
-                break;
+            let timeout = if wanted { LOSS_TICK_PERIOD } else { IDLE_POLL };
+            match tick_wanted_rx.recv_timeout(timeout) {
+                Ok(next) => wanted = next,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if wanted && tick_tx.send(OverlayMessage::Tick).is_err() {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     });
@@ -3147,6 +3251,9 @@ fn run(
     // Последний дедлайн, отправленный планировщику — чтобы не слать
     // одинаковое значение на каждой итерации цикла впустую.
     let mut last_anim_deadline: Option<Instant> = None;
+    // Прошлое значение «нужен ли секундный тик» — шлём только при смене,
+    // чтобы не будить поток-будильник каждым сообщением координатора.
+    let mut last_tick_wanted = true;
     // Вырез под окном настроек, применённый к окнам оверлея (см.
     // `apply_settings_hole`) — чтобы не звать систему без изменений.
     let mut applied_settings_hole: Option<(i32, i32, i32, i32)> = None;
@@ -3234,6 +3341,7 @@ fn run(
         ui_anim_last: None,
         toolbar: None,
         cursor_panel: None,
+        cursor_panel_monitor: None,
         cursor_panel_hovered: false,
         cursor_panel_slide: PanelSlide::fixed(1.0),
         settings_rect: None,
@@ -3677,6 +3785,12 @@ fn run(
                     monitor_id,
                     OverlayEvent::ToggleEditMode,
                 ));
+            }
+            OverlayMessage::Command(OverlayCommand::ShowBanner(text)) => {
+                // На primary: там же показывается баннер конфликта хоткея,
+                // и по той же причине — глобальные события приходят туда.
+                show_banner(&mut edit, &primary_id, text);
+                need_redraw = true;
             }
             OverlayMessage::Command(OverlayCommand::OpenGapPanel) => {
                 // Повторный вызов из трея при уже открытой панели закрывает
@@ -5636,6 +5750,19 @@ fn run(
         if next_tick_deadline != last_anim_deadline {
             last_anim_deadline = next_tick_deadline;
             let _ = anim_deadline_tx.send(next_tick_deadline);
+        }
+        // Секундный будильник нужен ровно трём вещам, и все три условны:
+        // ловить меню снап-раскладок у закреплённых окон, крутить таймеры
+        // автомата потери монитора и повторять восстановление устройства
+        // после неудачи. Нет ни одной причины — тикер спит, и в покое
+        // программа не просыпается вовсе (SPEC.md §13).
+        let tick_wanted = !session_locked
+            && (!edit.pinned_windows.is_empty()
+                || loss_tracker.has_pending_losses()
+                || device_needs_recovery);
+        if tick_wanted != last_tick_wanted {
+            last_tick_wanted = tick_wanted;
+            let _ = tick_wanted_tx.send(tick_wanted);
         }
         // Открытие панели выбора окон отложено до этой точки — кликом по
         // `TB_LAYERS` в `handle_toolbar_up`, у которого нет `window_snapshot`
@@ -8459,7 +8586,12 @@ fn sync_video_timeline(
     // Полоса «в полный голос» ровно тогда, когда курсор на стикере: вне
     // режима редактирования она в этот момент и появляется, а в самом
     // режиме — подсвечивается, когда до неё дотянулись.
-    let hovered = hover_mode || cursor_over_rect(edit, &r);
+    let timeline_monitor = edit
+        .video_timeline
+        .as_ref()
+        .map(|t| t.monitor_id.clone())
+        .unwrap_or_else(|| sticker.placement.monitor_id.clone());
+    let hovered = hover_mode || cursor_over_rect(edit, &timeline_monitor, &r);
     let position = playback.position.as_secs_f64();
     let Some(state) = edit.video_timeline.as_mut() else {
         return false;
@@ -8478,7 +8610,15 @@ fn sync_video_timeline(
 
 /// Курсор внутри прямоугольника (DIP своего монитора) по данным режима
 /// редактирования — там `MouseMove` приходят и опрашивать курсор незачем.
-fn cursor_over_rect(edit: &EditState, r: &DipRect) -> bool {
+///
+/// Монитор обязателен: координаты у мониторов ЛОКАЛЬНЫЕ (ADR-010), и точка
+/// (600, 400) существует на каждом из них. Без сверки монитора курсор на
+/// соседнем экране «подсвечивал» полосу перемотки видео здесь — аудит
+/// многомониторности 2026-09-07.
+fn cursor_over_rect(edit: &EditState, monitor_id: &MonitorId, r: &DipRect) -> bool {
+    if edit.cursor_monitor != *monitor_id {
+        return false;
+    }
     let (x, y) = edit.cursor_pos;
     x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
 }
@@ -8786,10 +8926,21 @@ fn update_cursor_panel_hover(
     } else {
         rst_render::box_contains(&cursor_panel::peek_hot_zone(&screen), dip)
     };
-    if hovered == edit.cursor_panel_hovered {
+    // Панель собрана под геометрию КОНКРЕТНОГО экрана и своего монитора не
+    // помнит, а рисуется на том, где сейчас курсор (`redraw` сверяется с
+    // `cursor_monitor`). Пока сравнивали только hover, переход курсора на
+    // монитор другого размера оставлял старую геометрию: панель, собранная
+    // под 1440p (cy = 1394), на экране 1080p оказывалась на 314 px ниже
+    // нижнего края — то есть просто исчезала, а клики в её место не
+    // попадали ни во что. Найдено прицельным аудитом многомониторности
+    // 2026-09-07. Поэтому пересборка нужна и при смене монитора, а не
+    // только при смене hover.
+    let moved_to_other_monitor = edit.cursor_panel_monitor.as_ref() != Some(&edit.cursor_monitor);
+    if hovered == edit.cursor_panel_hovered && !moved_to_other_monitor {
         return false;
     }
     edit.cursor_panel_hovered = hovered;
+    edit.cursor_panel_monitor = Some(edit.cursor_monitor.clone());
     rebuild_cursor_panel(edit, cfg, &screen);
     true
 }
@@ -13146,28 +13297,40 @@ fn selection_center_or_screen(
         ))
 }
 
+/// Чего тулбар просит от вызывающего кода после разбора клика.
+///
+/// Существует ради тестируемости: всё, что можно сделать без рендерера и
+/// живых медиа, делает [`toolbar_actions`], а два действия, которым они
+/// нужны (дублирование пересобирает спрайты, удаление открывает модал и
+/// чистит анимации/видео/звук), возвращаются наружу как намерение. До
+/// 2026-09-07 весь разбор жил в одной функции с `&Renderer` в сигнатуре, и
+/// НИ ОДНО действие тулбара нельзя было проверить тестом: тест не поднимает
+/// D3D-устройство. Именно эта слепая зона пропустила колесо громкости,
+/// которое не доезжало до конфига.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolbarEffect {
+    /// Всё сделано внутри; вызывающему остаётся только перерисоваться.
+    Done,
+    /// Пересобрать спрайты по новому `cfg` (дублирование).
+    Resync,
+    /// Запустить удаление выделенного (модал подтверждения или сразу).
+    Delete,
+}
+
 /// Опросить действия тулбара после `Up` (docs/M2_WIRING_PLAN.md, раздел 6):
 /// ползунок, поле, семь кнопок и видео-виджеты, каждое действие — свой
 /// снимок undo. Действия применяются ко ВСЕМУ выделению, а значения
 /// показываются по последнему выделенному (2026-09-06,
 /// docs/M2_MULTISELECT_TOOLBAR_NOTES.md §9): одна групповая операция — один
 /// шаг истории.
-#[allow(clippy::too_many_arguments)]
-fn handle_toolbar_up(
+fn toolbar_actions(
     edit: &mut EditState,
-    renderer: &Renderer,
     cfg: &mut Config,
     config_path: &Path,
-    sprites: &mut Vec<(Uuid, Sprite)>,
-    animations: &mut HashMap<Uuid, StickerAnimation>,
-    videos: &mut HashMap<Uuid, VideoPlayback>,
-    audio_mixer: Option<&AudioMixer>,
+    sprites: &mut [(Uuid, Sprite)],
     pos: (f64, f64),
-    overlay_size: (u32, u32),
-    scale: f32,
-    monitor_id: &MonitorId,
     monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
-) -> bool {
+) -> ToolbarEffect {
     if let Some(panel) = &mut edit.toolbar {
         panel.pointer_event(PointerEvent::Up { pos });
     }
@@ -13183,7 +13346,7 @@ fn handle_toolbar_up(
     // код с вектором из одного элемента.
     let ids: Vec<Uuid> = edit.selection.ids().to_vec();
     let Some(&id) = ids.last() else {
-        return true;
+        return ToolbarEffect::Done;
     };
 
     // Коммит живого opacity-жеста ползунка, если он был (раздел 6: «на
@@ -13218,7 +13381,7 @@ fn handle_toolbar_up(
             tracing::warn!(error = %e, "не удалось сохранить config.json после изменения прозрачности");
         }
         rebuild_ui_panels(edit, cfg, monitor_geometry);
-        return true;
+        return ToolbarEffect::Done;
     }
 
     let clicked = |edit: &mut EditState, id_widget: WidgetId| -> bool {
@@ -13237,7 +13400,7 @@ fn handle_toolbar_up(
         if edit.window_picker.take().is_none() {
             edit.pending_open_picker = Some(PickerTarget::Sticker(id));
         }
-        return true;
+        return ToolbarEffect::Done;
     }
     if clicked(edit, toolbar::TB_EYE) {
         commit_undo_snapshot(edit, cfg.clone());
@@ -13253,7 +13416,7 @@ fn handle_toolbar_up(
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения видимости");
         }
         rebuild_ui_panels(edit, cfg, monitor_geometry);
-        return true;
+        return ToolbarEffect::Done;
     }
     if clicked(edit, toolbar::TB_ORDER_UP) {
         commit_undo_snapshot(edit, cfg.clone());
@@ -13261,7 +13424,7 @@ fn handle_toolbar_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после изменения порядка");
         }
-        return true;
+        return ToolbarEffect::Done;
     }
     if clicked(edit, toolbar::TB_ORDER_DOWN) {
         commit_undo_snapshot(edit, cfg.clone());
@@ -13269,7 +13432,7 @@ fn handle_toolbar_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после изменения порядка");
         }
-        return true;
+        return ToolbarEffect::Done;
     }
     if clicked(edit, toolbar::TB_DUPLICATE) {
         commit_undo_snapshot(edit, cfg.clone());
@@ -13277,8 +13440,8 @@ fn handle_toolbar_up(
             .iter()
             .filter_map(|id| ops::duplicate(cfg, *id).ok())
             .collect();
-        if !copies.is_empty() {
-            resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
+        let any = !copies.is_empty();
+        if any {
             // Выделение переезжает на копии — тем же порядком, что был у
             // оригиналов: следующее действие тулбара продолжит работать «по
             // последнему», как человек и ожидает.
@@ -13290,8 +13453,13 @@ fn handle_toolbar_up(
         if let Err(e) = config::save(cfg, config_path) {
             tracing::warn!(error = %e, "не удалось сохранить config.json после дублирования");
         }
-        rebuild_ui_panels(edit, cfg, monitor_geometry);
-        return true;
+        // Спрайты пересобирает вызывающий (нужен рендерер), он же и
+        // перестроит панели — после того, как спрайты появятся.
+        return if any {
+            ToolbarEffect::Resync
+        } else {
+            ToolbarEffect::Done
+        };
     }
     if clicked(edit, toolbar::TB_RESET_SCALE) {
         // То же действие, что `OverlayCommand::ResetStickerTransform` из
@@ -13321,23 +13489,10 @@ fn handle_toolbar_up(
             }
             rebuild_ui_panels(edit, cfg, monitor_geometry);
         }
-        return true;
+        return ToolbarEffect::Done;
     }
     if clicked(edit, toolbar::TB_DELETE) {
-        let center = selection_center_or_screen(edit, cfg, overlay_size, scale, monitor_id);
-        return begin_delete(
-            edit,
-            renderer,
-            cfg,
-            config_path,
-            sprites,
-            animations,
-            videos,
-            audio_mixer,
-            center,
-            monitor_geometry,
-            monitor_id,
-        );
+        return ToolbarEffect::Delete;
     }
     // Play/pause (M5b): иконка кнопки отражает действие (см. build_toolbar),
     // а состояние — `sticker.playback.paused`, единственный источник истины.
@@ -13360,7 +13515,7 @@ fn handle_toolbar_up(
             tracing::warn!(error = %e, "не удалось сохранить config.json после паузы/воспроизведения видео");
         }
         rebuild_ui_panels(edit, cfg, monitor_geometry);
-        return true;
+        return ToolbarEffect::Done;
     }
     // Полоса перемотки вне режима редактирования (запрос пользователя
     // 2026-08-22) — настройка стикера, как пауза и громкость: сохраняется в
@@ -13375,7 +13530,7 @@ fn handle_toolbar_up(
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения полосы перемотки");
         }
         rebuild_ui_panels(edit, cfg, monitor_geometry);
-        return true;
+        return ToolbarEffect::Done;
     }
     // Клик по самому динамику — «включить/выключить звук» (запрос
     // пользователя 2026-09-06). Отдельный флаг `muted`, а не громкость в
@@ -13392,9 +13547,55 @@ fn handle_toolbar_up(
             tracing::warn!(error = %e, "не удалось сохранить config.json после переключения звука");
         }
         rebuild_ui_panels(edit, cfg, monitor_geometry);
-        return true;
+        return ToolbarEffect::Done;
     }
-    true
+    ToolbarEffect::Done
+}
+
+/// Обвязка [`toolbar_actions`] тем, что требует рендерера и живых медиа.
+/// Здесь остаётся ровно два действия — пересборка спрайтов после
+/// дублирования и запуск удаления; всё остальное разобрано выше и покрыто
+/// тестами.
+#[allow(clippy::too_many_arguments)]
+fn handle_toolbar_up(
+    edit: &mut EditState,
+    renderer: &Renderer,
+    cfg: &mut Config,
+    config_path: &Path,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
+    pos: (f64, f64),
+    overlay_size: (u32, u32),
+    scale: f32,
+    monitor_id: &MonitorId,
+    monitor_geometry: &HashMap<MonitorId, (u32, u32, f32)>,
+) -> bool {
+    match toolbar_actions(edit, cfg, config_path, sprites, pos, monitor_geometry) {
+        ToolbarEffect::Done => true,
+        ToolbarEffect::Resync => {
+            resync_sprites(renderer, cfg, sprites, animations, videos, audio_mixer);
+            rebuild_ui_panels(edit, cfg, monitor_geometry);
+            true
+        }
+        ToolbarEffect::Delete => {
+            let center = selection_center_or_screen(edit, cfg, overlay_size, scale, monitor_id);
+            begin_delete(
+                edit,
+                renderer,
+                cfg,
+                config_path,
+                sprites,
+                animations,
+                videos,
+                audio_mixer,
+                center,
+                monitor_geometry,
+                monitor_id,
+            )
+        }
+    }
 }
 
 /// «Включить/выключить звук» у выделенных видео: та же сходимость к одному
@@ -14149,20 +14350,6 @@ fn handle_input(
             let (dip_x, dip_y) = to_dip(pos, scale);
             edit.cursor_pos = (dip_x, dip_y);
             edit.cursor_monitor = monitor_id.clone();
-            if dragging {
-                // ВРЕМЕННАЯ диагностика бага «стикер дрейфует сам по себе» —
-                // снять после того, как причина найдена по логу реального
-                // запуска пользователя.
-                tracing::info!(
-                    px = pos.x,
-                    py = pos.y,
-                    dip_x,
-                    dip_y,
-                    ?edit.pointer_owner,
-                    has_gesture = edit.gesture.is_some(),
-                    "diag: coordinator MouseMove dragging=true"
-                );
-            }
             if let Some(confirm) = &mut edit.confirm {
                 // Модал блокирует всю сцену на любом мониторе (см. MouseDown),
                 // но hover-состояние его виджетов трогаем только своим
@@ -17000,6 +17187,7 @@ mod tests {
             ui_anim_last: None,
             toolbar: None,
             cursor_panel: None,
+        cursor_panel_monitor: None,
             cursor_panel_hovered: false,
             cursor_panel_slide: PanelSlide::fixed(1.0),
             settings_rect: None,
@@ -17891,6 +18079,346 @@ mod tests {
         );
         assert!(toggle_video_mute(&mut cfg, &[a, b]));
         assert!(!cfg.stickers.iter().find(|s| s.id == b).unwrap().playback.muted);
+    }
+
+    // --- Многомониторность: находки прицельного аудита 2026-09-07 ---
+
+    /// Монитор с открытым модалом отключили — модал обязан уйти вместе с
+    /// ним. Иначе он продолжает блокировать ввод НА ВСЕХ мониторах
+    /// (`MouseDown`/`MouseUp` возвращают `true` независимо от монитора), а
+    /// на экране его уже нет: человек кликает и не получает ничего.
+    #[test]
+    fn a_dead_monitor_takes_its_modal_with_it() {
+        let (cfg, mut edit, _a, _b) = group_harness();
+        edit.confirm = Some(ConfirmState {
+            snapshot: cfg.clone(),
+            ids: vec![],
+            monitor_id: monitor_id("second"),
+            panel: confirm_dialog::build(1, (100.0, 100.0)),
+        });
+        edit.banner = Some(BannerState {
+            monitor_id: monitor_id("second"),
+            text: "x".to_string(),
+            shown_at: Instant::now(),
+        });
+
+        close_panels_of_monitor(&mut edit, &monitor_id("second"));
+
+        assert!(edit.confirm.is_none(), "модал ушёл вместе со своим экраном");
+        assert!(edit.banner.is_none(), "и баннер тоже");
+    }
+
+    /// Панель чужого монитора не трогаем: у человека два экрана, и снос
+    /// одного не должен закрывать диалог на другом.
+    #[test]
+    fn closing_a_monitor_spares_panels_of_other_monitors() {
+        let (cfg, mut edit, _a, _b) = group_harness();
+        edit.confirm = Some(ConfirmState {
+            snapshot: cfg.clone(),
+            ids: vec![],
+            monitor_id: monitor_id("main"),
+            panel: confirm_dialog::build(1, (100.0, 100.0)),
+        });
+
+        close_panels_of_monitor(&mut edit, &monitor_id("second"));
+
+        assert!(edit.confirm.is_some(), "модал на живом мониторе остался");
+    }
+
+    /// Панель у курсора собрана под геометрию экрана: при переходе на
+    /// монитор другого размера её обязано пересобрать, иначе она уезжает за
+    /// край (на 1080p панель, собранная под 1440p, оказывается на 314 px
+    /// ниже нижней кромки).
+    #[test]
+    fn the_cursor_panel_follows_the_cursor_to_another_monitor() {
+        let (cfg, mut edit, _a, _b) = group_harness();
+        edit.active = true;
+        edit.selection.clear();
+        let geometry: HashMap<MonitorId, (u32, u32, f32)> = HashMap::from([
+            (monitor_id("main"), (2560u32, 1440u32, 1.0f32)),
+            (monitor_id("second"), (1920u32, 1080u32, 1.0f32)),
+        ]);
+
+        edit.cursor_monitor = monitor_id("main");
+        assert!(
+            update_cursor_panel_hover(&mut edit, &cfg, &geometry, (1280.0, 700.0)),
+            "первая сборка панели под монитор курсора"
+        );
+        let on_main = edit.cursor_panel.as_ref().unwrap().frame().cy;
+
+        edit.cursor_monitor = monitor_id("second");
+        assert!(
+            update_cursor_panel_hover(&mut edit, &cfg, &geometry, (900.0, 500.0)),
+            "смена монитора обязана пересобрать панель"
+        );
+        let on_second = edit.cursor_panel.as_ref().unwrap().frame().cy;
+
+        assert!(
+            on_second < on_main,
+            "панель переехала под низ меньшего экрана: было {on_main}, стало {on_second}"
+        );
+        assert!(
+            on_second < 1080.0,
+            "и осталась внутри экрана 1080p: {on_second}"
+        );
+    }
+
+    /// Координаты у мониторов локальные, поэтому точка «600, 400» есть на
+    /// каждом: курсор на соседнем экране не должен подсвечивать полосу
+    /// перемотки здесь.
+    #[test]
+    fn a_cursor_on_another_monitor_is_not_over_this_rect() {
+        let (_cfg, mut edit, _a, _b) = group_harness();
+        let rect = DipRect::new(500.0, 300.0, 200.0, 200.0);
+        edit.cursor_pos = (600.0, 400.0);
+
+        edit.cursor_monitor = monitor_id("main");
+        assert!(cursor_over_rect(&edit, &monitor_id("main"), &rect));
+        assert!(
+            !cursor_over_rect(&edit, &monitor_id("second"), &rect),
+            "та же точка на другом мониторе — не попадание"
+        );
+    }
+
+    // --- Сквозные тесты действий тулбара (2026-09-07). Раньше весь разбор
+    // клика жил в функции с `&Renderer` в сигнатуре и не проверялся ничем:
+    // именно эта слепая зона пропустила колесо громкости, которое не
+    // доезжало до конфига. Теперь клик идёт через настоящую панель и
+    // настоящие виджеты, а тест смотрит на `cfg`, историю и файл. ---
+
+    /// Каталог для `config::save` в тестах: настоящий путь во временной
+    /// папке — проверяем в том числе, что действие ДОЕЗЖАЕТ ДО ДИСКА.
+    struct TempConfig(std::path::PathBuf);
+
+    impl TempConfig {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("resticker-test-{}.json", Uuid::new_v4()));
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn saved(&self) -> bool {
+            self.0.exists()
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn one_geometry() -> HashMap<MonitorId, (u32, u32, f32)> {
+        HashMap::from([(monitor_id("main"), (2560u32, 1440u32, 1.0f32))])
+    }
+
+    /// Нажать кнопку тулбара по-настоящему: `Down` в её центр, а `Up`
+    /// отправит уже сам разбор — ровно как в проде.
+    fn press_toolbar(edit: &mut EditState, widget: WidgetId) -> (f64, f64) {
+        let bounds = edit
+            .toolbar
+            .as_ref()
+            .expect("тулбар собран")
+            .widget::<Button>(widget)
+            .map(|b| b.bounds())
+            .or_else(|| {
+                edit.toolbar
+                    .as_ref()
+                    .unwrap()
+                    .widget::<VolumeControl>(widget)
+                    .map(|v| v.bounds())
+            })
+            .expect("виджет есть в тулбаре");
+        let pos = (bounds.cx, bounds.cy);
+        edit.toolbar
+            .as_mut()
+            .unwrap()
+            .pointer_event(PointerEvent::Down { pos });
+        pos
+    }
+
+    fn video_group() -> (Config, EditState, Uuid, Uuid) {
+        let (mut cfg, edit, a, b) = group_harness();
+        for id in [a, b] {
+            let s = cfg.stickers.iter_mut().find(|s| s.id == id).unwrap();
+            s.source = StickerSource::File {
+                path: std::path::PathBuf::from("v.mp4"),
+                media_type: MediaType::Video,
+            };
+        }
+        (cfg, edit, a, b)
+    }
+
+    /// Глаз: клик по настоящей кнопке скрывает всю группу, кладёт ОДИН шаг
+    /// истории и доезжает до файла.
+    #[test]
+    fn clicking_the_eye_hides_the_whole_group_and_saves() {
+        let (mut cfg, mut edit, _a, _b) = group_harness();
+        let tmp = TempConfig::new();
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let pos = press_toolbar(&mut edit, toolbar::TB_EYE);
+
+        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+
+        assert_eq!(effect, ToolbarEffect::Done);
+        assert!(
+            cfg.stickers.iter().all(|s| !s.visible),
+            "видимы были все — клик скрыл всех"
+        );
+        assert_eq!(edit.undo_stack.len(), 1, "одна операция — один шаг истории");
+        assert!(tmp.saved(), "изменение записано в config.json");
+    }
+
+    /// Удаление не делается на месте: у него свои зависимости (модал,
+    /// анимации, видео, звук), и разбор просит вызывающего их применить.
+    #[test]
+    fn clicking_delete_asks_the_caller_to_delete() {
+        let (mut cfg, mut edit, _a, _b) = group_harness();
+        let tmp = TempConfig::new();
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let pos = press_toolbar(&mut edit, toolbar::TB_DELETE);
+
+        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+
+        assert_eq!(effect, ToolbarEffect::Delete);
+        assert_eq!(cfg.stickers.len(), 2, "сам разбор ничего не удаляет");
+        assert!(edit.undo_stack.is_empty(), "и не тратит шаг истории");
+    }
+
+    /// Дублирование: копии созданы, выделение переехало на них, а спрайты
+    /// просит пересобрать вызывающий — ему для этого нужен рендерер.
+    #[test]
+    fn clicking_duplicate_moves_the_selection_to_the_copies() {
+        let (mut cfg, mut edit, a, b) = group_harness();
+        let tmp = TempConfig::new();
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let pos = press_toolbar(&mut edit, toolbar::TB_DUPLICATE);
+
+        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+
+        assert_eq!(effect, ToolbarEffect::Resync);
+        assert_eq!(cfg.stickers.len(), 4, "продублированы оба");
+        let selected = edit.selection.ids();
+        assert_eq!(selected.len(), 2, "выделены копии, а не оригиналы");
+        assert!(
+            !selected.contains(&a) && !selected.contains(&b),
+            "оригиналы из выделения ушли"
+        );
+        assert_eq!(edit.undo_stack.len(), 1);
+    }
+
+    /// Число, введённое в поле и подтверждённое, применяется ко ВСЕЙ группе.
+    #[test]
+    fn submitting_the_field_applies_opacity_to_the_whole_group() {
+        let (mut cfg, mut edit, a, b) = group_harness();
+        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().transform.opacity = 0.1;
+        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().transform.opacity = 0.9;
+        let tmp = TempConfig::new();
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+
+        // Печатаем в поле как человек: фокус кликом, цифры, Enter.
+        let field = edit
+            .toolbar
+            .as_ref()
+            .unwrap()
+            .widget::<NumericField>(toolbar::TB_FIELD)
+            .unwrap()
+            .bounds();
+        let pos = (field.cx, field.cy);
+        let panel = edit.toolbar.as_mut().unwrap();
+        panel.pointer_event(PointerEvent::Down { pos });
+        panel.pointer_event(PointerEvent::Up { pos });
+        for k in [Key::Backspace, Key::Backspace, Key::Backspace] {
+            panel.key_event(k);
+        }
+        panel.key_event(Key::Digit(4));
+        panel.key_event(Key::Digit(0));
+        panel.key_event(Key::Enter);
+
+        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+        assert_eq!(effect, ToolbarEffect::Done);
+        for id in [a, b] {
+            let o = cfg.stickers.iter().find(|s| s.id == id).unwrap().transform.opacity;
+            assert!((o - 0.4).abs() < 1e-9, "прозрачность общая и равна введённой: {o}");
+        }
+        assert!(tmp.saved());
+    }
+
+    /// Клик по динамику выключает звук всей группе — путь «панель → виджет →
+    /// cfg», который до 2026-09-07 не проверялся ничем.
+    #[test]
+    fn clicking_the_speaker_mutes_the_group() {
+        let (mut cfg, mut edit, a, b) = video_group();
+        let tmp = TempConfig::new();
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let pos = press_toolbar(&mut edit, toolbar::TB_VOLUME);
+
+        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+
+        assert_eq!(effect, ToolbarEffect::Done);
+        for id in [a, b] {
+            assert!(
+                cfg.stickers.iter().find(|s| s.id == id).unwrap().playback.muted,
+                "звук выключен у всей группы"
+            );
+        }
+        assert_eq!(edit.undo_stack.len(), 1);
+        assert!(tmp.saved());
+    }
+
+    /// Переключатель полосы перемотки приводит группу к одному состоянию.
+    #[test]
+    fn clicking_the_timeline_toggle_converges_the_group() {
+        let (mut cfg, mut edit, a, b) = video_group();
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == a)
+            .unwrap()
+            .playback
+            .show_timeline = true;
+        let tmp = TempConfig::new();
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let pos = press_toolbar(&mut edit, toolbar::TB_TIMELINE);
+
+        toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+
+        for id in [a, b] {
+            assert!(
+                cfg.stickers
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .playback
+                    .show_timeline,
+                "включена была у одного — включилась у всех"
+            );
+        }
+    }
+
+    /// Клик по пустому месту панели не тратит ни шага истории, ни записи на
+    /// диск: до 2026-09-07 такого теста не было, и «лишний снимок» никто бы
+    /// не заметил.
+    #[test]
+    fn a_click_on_empty_toolbar_space_changes_nothing() {
+        let (mut cfg, mut edit, _a, _b) = group_harness();
+        let before = cfg.clone();
+        let tmp = TempConfig::new();
+        rebuild_toolbar(&mut edit, &cfg, 1080.0);
+        let frame = edit.toolbar.as_ref().unwrap().frame();
+        // Левый нижний угол корпуса — там отступ панели, виджетов нет.
+        let pos = (frame.cx - frame.w / 2.0 + 1.0, frame.cy + frame.h / 2.0 - 1.0);
+        edit.toolbar
+            .as_mut()
+            .unwrap()
+            .pointer_event(PointerEvent::Down { pos });
+
+        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+
+        assert_eq!(effect, ToolbarEffect::Done);
+        assert_eq!(cfg, before, "конфиг не тронут");
+        assert!(edit.undo_stack.is_empty(), "шаг истории не потрачен");
+        assert!(!tmp.saved(), "и на диск ничего не писалось");
     }
 
     /// Выделение на ДВУХ мониторах: клик по местному члену группы не
@@ -22167,6 +22695,7 @@ mod tests {
             ui_anim_last: None,
             toolbar: None,
             cursor_panel: None,
+        cursor_panel_monitor: None,
             cursor_panel_hovered: false,
             cursor_panel_slide: PanelSlide::fixed(1.0),
             settings_rect: None,

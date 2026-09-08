@@ -160,6 +160,25 @@ pub fn hotkey_conflict_notification(
     )
 }
 
+/// Тост следующего запуска после аварийного завершения процесса. При
+/// `panic = "abort"` и GUI-подсистеме окно ошибки Windows не появляется, а
+/// резидентная программа просто исчезает — пользователю нужно явно назвать
+/// причину и путь к журналу.
+pub fn panic_notification(
+    version: &str,
+    thread: &str,
+    location: &str,
+    message: &str,
+    log_path: &str,
+) -> (String, String) {
+    (
+        "resticker closed unexpectedly".to_string(),
+        format!(
+            "The previous resticker session ended with an error (version {version}). Cause: {message} in {location} on thread {thread}. Details are in the log: {log_path}."
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +224,20 @@ mod tests {
         assert_ne!(edit, toggle);
         assert_ne!(edit, mute);
         assert_ne!(toggle, mute);
+    }
+
+    #[test]
+    fn panic_notification_names_version_cause_and_log() {
+        let (title, body) = panic_notification(
+            "0.5.0",
+            "overlay-1",
+            "crates/resticker/src/main.rs:42:7",
+            "device lost",
+            "C:\\Users\\me\\AppData\\Local\\resticker\\logs\\resticker.log",
+        );
+        assert_eq!(title, "resticker closed unexpectedly");
+        assert!(body.contains("version 0.5.0"));
+        assert!(body.contains("device lost"));
+        assert!(body.contains("resticker.log"));
     }
 }
