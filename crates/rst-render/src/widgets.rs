@@ -4912,7 +4912,6 @@ mod tests {
         );
     }
 
-
     // --- Регулятор громкости: динамик с выпадающей шкалой (репорт
     // пользователя 2026-09-06 «непонятно, что этот ползунок означает») ---
 
@@ -4977,8 +4976,12 @@ mod tests {
     #[test]
     fn volume_button_click_is_a_mute_toggle() {
         let mut v = volume(70);
-        v.pointer_event(PointerEvent::Down { pos: (100.0, 300.0) });
-        v.pointer_event(PointerEvent::Up { pos: (100.0, 300.0) });
+        v.pointer_event(PointerEvent::Down {
+            pos: (100.0, 300.0),
+        });
+        v.pointer_event(PointerEvent::Up {
+            pos: (100.0, 300.0),
+        });
         assert!(v.take_mute_click(), "клик по динамику зафиксирован");
         assert!(!v.take_mute_click(), "флаг снимается опросом");
         assert_eq!(v.value(), 70, "уровень не тронут");

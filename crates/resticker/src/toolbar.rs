@@ -16,7 +16,9 @@
 //! и состояние живут в [`crate::window_picker`] (docs/M4_WINDOW_PICKER_DESIGN.md).
 
 use rst_core::hittest::DipRect;
-use rst_render::{Box2D, Button, Icon, NumericField, Panel, Slider, VolumeControl, WidgetId, theme};
+use rst_render::{
+    Box2D, Button, Icon, NumericField, Panel, Slider, VolumeControl, WidgetId, theme,
+};
 
 /// Идентификаторы виджетов тулбара — для опроса состояния ядром через
 /// [`Panel::widget`]/[`Panel::widget_mut`].
@@ -301,7 +303,10 @@ mod tests {
     fn toolbar_centered_horizontally_on_bbox() {
         let bounds = aabb(960.0, 400.0, 200.0, 100.0);
         let p = build_toolbar(&bounds, &plain(1.0), SCREEN_H);
-        assert!((p.frame().cx - 960.0).abs() < 1e-9, "центр тулбара под центром рамки");
+        assert!(
+            (p.frame().cx - 960.0).abs() < 1e-9,
+            "центр тулбара под центром рамки"
+        );
         let left = 960.0 - TOOLBAR_WIDTH / 2.0;
         assert!(p.hit_test((left + 1.0, 476.0)), "левый край тулбара");
         assert!(!p.hit_test((left - 1.0, 476.0)));
@@ -325,7 +330,11 @@ mod tests {
         let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), &plain(1.0), screen_h);
         assert_eq!(toolbar_cy(&p), 450.0 + TOOLBAR_GAP_Y + TOOLBAR_HEIGHT / 2.0);
         // Один DIP меньше — уже сверху.
-        let p = build_toolbar(&aabb(960.0, 400.0, 200.0, 100.0), &plain(1.0), screen_h - 1.0);
+        let p = build_toolbar(
+            &aabb(960.0, 400.0, 200.0, 100.0),
+            &plain(1.0),
+            screen_h - 1.0,
+        );
         assert_eq!(toolbar_cy(&p), 350.0 - TOOLBAR_GAP_Y - TOOLBAR_HEIGHT / 2.0);
     }
 

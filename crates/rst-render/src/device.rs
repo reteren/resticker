@@ -23,6 +23,7 @@ use crate::atlas::{AtlasFrame, TextureAtlas};
 use crate::sprite::Sprite;
 use crate::texture::Texture;
 use crate::video::VideoTextures;
+use crate::window_crop_texture::{WindowCropTexture, WindowCropUpdate};
 use crate::window_target::{PresentSync, WindowTarget};
 use crate::{RenderError, shader};
 
@@ -606,6 +607,31 @@ impl Device {
         let nv12 = textures.nv12.as_ref().expect("same_texture => Some");
         nv12.set_index(array_index)?;
         Ok(())
+    }
+
+    /// Создать держатель SRV для живого BGRA-кадра Windows.Graphics.Capture.
+    ///
+    /// Текстура уже создана на общем D3D11-устройстве, поэтому здесь нет
+    /// readback или копирования. SRV создаётся один раз; дальнейшие кадры того
+    /// же внешнего ресурса принимает [`Self::update_window_crop_texture`].
+    pub fn create_window_crop_texture(
+        &self,
+        texture: &ID3D11Texture2D,
+    ) -> Result<WindowCropTexture, RenderError> {
+        WindowCropTexture::from_capture(&self.device, texture)
+    }
+
+    /// Принять следующий кадр захвата, переиспользовав SRV при той же текстуре.
+    ///
+    /// `Recreated` означает смену COM-ресурса (например, resize или новый
+    /// capture pool), а `Reused` — обычную смену содержимого уже существующей
+    /// текстуры. Никаких `CreateTexture2D`/`UpdateSubresource` на кадр здесь нет.
+    pub fn update_window_crop_texture(
+        &self,
+        crop: &mut WindowCropTexture,
+        texture: &ID3D11Texture2D,
+    ) -> Result<WindowCropUpdate, RenderError> {
+        crop.update(&self.device, texture)
     }
 
     /// Обновить содержимое существующих плоскостей видеокадра (M5b):

@@ -744,6 +744,74 @@ impl GroupsState {
         places
     }
 
+    /// Принять окно, родившееся от митоза члена открытой группы.
+    ///
+    /// Митоз сообщает о новом `HWND` уже после того, как группа открыта.
+    /// Принимаем его только в ту же живую группу и только рядом с известным
+    /// родителем: иначе позднее событие одного окна могло бы изменить другую
+    /// группу. Новый член добавляется в конец, потому что индекс — это слот,
+    /// а `GroupMember::place` хранит абсолютное место отдельно от слота.
+    // Пока координатор сшивает вызов в соседнем срезе, метод намеренно не
+    // вызывается из этого бинарного модуля; публичность нужна для этой сшивки.
+    #[allow(dead_code)]
+    pub fn adopt_window(
+        &mut self,
+        group: &mut WindowGroup,
+        parent: usize,
+        child: usize,
+        mut key: GroupMember,
+    ) -> bool {
+        let Some(open) = &mut self.active else {
+            // Без открытой группы нет согласованной пары «члены ↔ HWND», в
+            // которую можно безопасно добавить результат митоза.
+            return false;
+        };
+        if group.members.len() >= MAX_GROUP_MEMBERS {
+            // Потолок тот же, что при наборе группы руками, и по той же
+            // причине: таблица раскладок тайлинга заведена на 2..=8 окон, и
+            // девятый член остался бы без раскладки навсегда
+            // (`group_layout::presets_for` вернул бы пустой список). Митоз —
+            // не повод обойти ограничение молча (находка аудита 2026-09-09).
+            return false;
+        }
+        if open.id != group.id
+            || parent == child
+            || group.members.is_empty()
+            || open.windows.len() != group.members.len()
+        {
+            // Проверка id не даёт событию одной группы изменить другую, а
+            // саммитоз в себя, пустая группа и уже нарушенный параллельный
+            // список не образуют безопасного нового члена.
+            return false;
+        }
+        if !open.windows.contains(&Some(parent)) {
+            // Родитель должен быть именно найденным членом OpenGroup, а не
+            // просто окном с похожими приметами.
+            return false;
+        }
+        if open.windows.contains(&Some(child))
+            || self
+                .bindings
+                .get(&group.id)
+                .is_some_and(|windows| windows.iter().flatten().any(|hwnd| *hwnd == child))
+        {
+            // Митоз может доставить один успех дважды; второй раз не должен
+            // создавать вечный лишний слот в группе.
+            return false;
+        }
+
+        // Реальное место нового окна будет подтверждено двумя одинаковыми
+        // снимками в note_places; приметы не должны притворяться геометрией.
+        key.place = None;
+        group.members.push(key);
+        open.windows.push(Some(child));
+        // После принятия все три индексированных представления должны
+        // совпадать; это также восстанавливает карту после старого запуска,
+        // где у неё могло не быть записи для этой группы.
+        self.bindings.insert(group.id, open.windows.clone());
+        true
+    }
+
     /// Группа больше не открыта (её удалили или закрыли последнее окно).
     pub fn close_group(&mut self) {
         self.active = None;
@@ -1067,6 +1135,139 @@ mod tests {
         assert_eq!(placements[0].hwnd, 22);
         assert_eq!(placements[1].hwnd, 11);
         assert_eq!(st.active(), Some(g.id));
+    }
+
+    #[test]
+    fn a_mitosed_window_is_adopted_by_its_open_group() {
+        let mut g = saved_group(vec![
+            member("родитель", Some(place(0.0, 0.0))),
+            member("сосед", Some(place(900.0, 0.0))),
+        ]);
+        let mut st = GroupsState::new();
+        st.open_group(&g, &[live(11, "родитель"), live(22, "сосед")]);
+
+        let mut child_key = member("новое окно", Some(place(123.0, 456.0)));
+        child_key.class = "MitosisChild".to_string();
+        assert!(st.adopt_window(&mut g, 11, 33, child_key));
+
+        // Заказ пользователя 2026-09-09: второе окно митоза должно попасть
+        // в группу сразу, по HWND, без повторного открытия меню.
+        assert_eq!(g.members[2].title, "новое окно");
+        assert!(g.members[2].place.is_none(), "место запишет note_places");
+        assert_eq!(st.open().expect("группа открыта").window_of(2), Some(33));
+    }
+
+    /// Группа, уже набравшая потолок, от митоза не растёт: девятому окну
+    /// негде взять раскладку тайлинга — она заведена на 2..=8 окон.
+    #[test]
+    fn adoption_stops_at_the_group_size_cap() {
+        let members: Vec<GroupMember> = (0..MAX_GROUP_MEMBERS)
+            .map(|i| member(&format!("окно {i}"), Some(place(i as f64 * 100.0, 0.0))))
+            .collect();
+        let mut g = saved_group(members);
+        let windows: Vec<LiveWindow> = (0..MAX_GROUP_MEMBERS)
+            .map(|i| live(100 + i, &format!("окно {i}")))
+            .collect();
+        let mut st = GroupsState::new();
+        st.open_group(&g, &windows);
+
+        assert!(
+            !st.adopt_window(&mut g, 100, 999, member("девятое", None)),
+            "девятый член не принимается"
+        );
+        assert_eq!(g.members.len(), MAX_GROUP_MEMBERS, "состав не тронут");
+    }
+
+    #[test]
+    fn adoption_keeps_member_and_live_window_indices_aligned() {
+        let mut g = saved_group(vec![
+            member("родитель", Some(place(0.0, 0.0))),
+            member("сосед", Some(place(900.0, 0.0))),
+        ]);
+        let mut st = GroupsState::new();
+        st.open_group(&g, &[live(11, "родитель"), live(22, "сосед")]);
+
+        assert!(st.adopt_window(&mut g, 11, 33, member("новое окно", None)));
+        // Машина видимости и note_places обращаются к одному индексу в этих
+        // двух списках; расхождение означало бы обращение к чужому окну.
+        assert_eq!(g.members.len(), 3);
+        assert_eq!(st.open().expect("группа открыта").windows.len(), 3);
+        assert_eq!(
+            st.open().expect("группа открыта").windows(),
+            vec![11, 22, 33]
+        );
+    }
+
+    #[test]
+    fn adopting_the_same_child_twice_does_not_add_a_second_slot() {
+        let mut g = saved_group(vec![
+            member("родитель", Some(place(0.0, 0.0))),
+            member("сосед", Some(place(900.0, 0.0))),
+        ]);
+        let mut st = GroupsState::new();
+        st.open_group(&g, &[live(11, "родитель"), live(22, "сосед")]);
+        assert!(st.adopt_window(&mut g, 11, 33, member("новое окно", None)));
+
+        assert!(!st.adopt_window(&mut g, 11, 33, member("дубликат", None)));
+        assert_eq!(g.members.len(), 3);
+        assert_eq!(
+            st.open().expect("группа открыта").windows(),
+            vec![11, 22, 33]
+        );
+    }
+
+    #[test]
+    fn adoption_refuses_when_another_or_no_group_is_open() {
+        let mut open = saved_group(vec![
+            member("родитель", Some(place(0.0, 0.0))),
+            member("сосед", Some(place(900.0, 0.0))),
+        ]);
+        let mut other = saved_group(vec![
+            member("чужой 1", Some(place(0.0, 0.0))),
+            member("чужой 2", Some(place(900.0, 0.0))),
+        ]);
+        let mut st = GroupsState::new();
+        st.open_group(&open, &[live(11, "родитель"), live(22, "сосед")]);
+
+        assert!(!st.adopt_window(&mut other, 11, 33, member("новое окно", None)));
+        assert_eq!(other.members.len(), 2, "чужая группа не должна измениться");
+        st.close_group();
+        assert!(!st.adopt_window(&mut open, 11, 33, member("новое окно", None)));
+        assert_eq!(
+            open.members.len(),
+            2,
+            "закрытая группа не должна измениться"
+        );
+    }
+
+    #[test]
+    fn adoption_refuses_a_parent_that_is_not_in_the_open_group() {
+        let mut g = saved_group(vec![
+            member("родитель", Some(place(0.0, 0.0))),
+            member("сосед", Some(place(900.0, 0.0))),
+        ]);
+        let mut st = GroupsState::new();
+        st.open_group(&g, &[live(11, "родитель"), live(22, "сосед")]);
+
+        assert!(!st.adopt_window(&mut g, 99, 33, member("новое окно", None)));
+        assert_eq!(g.members.len(), 2);
+        assert_eq!(st.open().expect("группа открыта").windows(), vec![11, 22]);
+    }
+
+    #[test]
+    fn adoption_refuses_empty_group_and_self_mitosis() {
+        let mut empty = saved_group(Vec::new());
+        let mut st = GroupsState::new();
+        st.open_group(&empty, &[]);
+        assert!(!st.adopt_window(&mut empty, 11, 33, member("новое окно", None)));
+
+        let mut g = saved_group(vec![
+            member("родитель", Some(place(0.0, 0.0))),
+            member("сосед", Some(place(900.0, 0.0))),
+        ]);
+        st.open_group(&g, &[live(11, "родитель"), live(22, "сосед")]);
+        assert!(!st.adopt_window(&mut g, 11, 11, member("сам", None)));
+        assert_eq!(g.members.len(), 2);
     }
 
     /// Два окна одного браузера различает только заголовок, а он меняется

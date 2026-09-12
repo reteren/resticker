@@ -133,11 +133,7 @@ pub fn build_cursor_panel(screen: &DipRect, all_visible: bool, progress: f64) ->
     // пользователя 2026-08-31): всё видно — открытый глаз, всё скрыто —
     // перечёркнутый. Прежняя пара была наоборот, «что произойдёт по
     // клику», и на видимых стикерах висел глаз с минусом.
-    let toggle_icon = if all_visible {
-        Icon::Eye
-    } else {
-        Icon::EyeOff
-    };
+    let toggle_icon = if all_visible { Icon::Eye } else { Icon::EyeOff };
     let buttons = [
         (BTN_LOAD_FILE, Icon::FileOpen),
         (BTN_ADD_WINDOW, Icon::Layers),

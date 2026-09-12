@@ -460,7 +460,8 @@ fn ui_preview_png() {
     // а проверять надо именно выпадающую шкалу (2026-09-06). Наведение и
     // прогон анимации — то же, что делает живой указатель.
     let mut video_toolbar = video_toolbar;
-    if let Some(volume) = video_toolbar.widget_mut::<rst_render::VolumeControl>(crate::toolbar::TB_VOLUME)
+    if let Some(volume) =
+        video_toolbar.widget_mut::<rst_render::VolumeControl>(crate::toolbar::TB_VOLUME)
     {
         volume.set_hovered(true);
     }
@@ -853,7 +854,10 @@ fn group_selection_preview_png() {
     // Контур участника — приглушённый: он отмечает «этот входит в группу»,
     // а главная линия — общая рамка.
     for m in &members {
-        for rect in SelectionBox::new(m, &Transform::default()).visuals().outline {
+        for rect in SelectionBox::new(m, &Transform::default())
+            .visuals()
+            .outline
+        {
             prims.push(Primitive::Fill {
                 rect,
                 color: SELECTION_COLOR,
@@ -919,8 +923,7 @@ fn group_selection_preview_png() {
         },
         f64::from(h),
     );
-    if let Some(volume) =
-        toolbar.widget_mut::<rst_render::VolumeControl>(crate::toolbar::TB_VOLUME)
+    if let Some(volume) = toolbar.widget_mut::<rst_render::VolumeControl>(crate::toolbar::TB_VOLUME)
     {
         volume.set_hovered(true);
     }
@@ -1056,19 +1059,27 @@ fn video_control_states_measurement_png() {
                 }
             }
         }
-        (different, nontransparent, 100.0 * f64::from(different) / f64::from(nontransparent.max(1)))
+        (
+            different,
+            nontransparent,
+            100.0 * f64::from(different) / f64::from(nontransparent.max(1)),
+        )
     };
     let icon_side_dip = rst_render::theme::BUTTON_SIZE - 2.0 * rst_render::theme::BUTTON_PAD;
     for scale in [1.0, 2.0] {
         let side = (icon_side_dip * scale).round() as u32;
-        println!("иконки динамика: N={side} px (сторона {icon_side_dip:.1} DIP × scale {scale:.1})");
+        println!(
+            "иконки динамика: N={side} px (сторона {icon_side_dip:.1} DIP × scale {scale:.1})"
+        );
         for (name, a, b) in [
             ("high vs low", Icon::VolumeHigh, Icon::VolumeLow),
             ("high vs mute", Icon::VolumeHigh, Icon::VolumeMute),
             ("low vs mute", Icon::VolumeLow, Icon::VolumeMute),
         ] {
             let (different, nontransparent, percent) = icon_difference(a, b, side);
-            println!("  {name}: {different}/{nontransparent} пикселей альфы отличаются ({percent:.2}%)");
+            println!(
+                "  {name}: {different}/{nontransparent} пикселей альфы отличаются ({percent:.2}%)"
+            );
         }
     }
 

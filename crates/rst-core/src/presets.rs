@@ -101,7 +101,14 @@ pub fn apply_preset(cfg: &mut Config, id: Uuid) -> Result<ApplyPresetOutcome, Pr
             StickerSource::File { path, .. } if !path.exists() => {
                 missing.push((sticker.id, path.clone()));
             }
-            StickerSource::File { .. } | StickerSource::Pasted { .. } => applied.push(sticker),
+            // Кусок окна применяется всегда, даже если приложения сейчас нет:
+            // «пропал» здесь означает удалённый файл, а окно — вещь временно
+            // отсутствующая, и кусок обязан дождаться его возвращения
+            // (решение пользователя 2026-09-10). Пока окна нет, координатор
+            // держит кусок скрытым; список `missing` для этого не нужен.
+            StickerSource::File { .. }
+            | StickerSource::Pasted { .. }
+            | StickerSource::WindowCrop { .. } => applied.push(sticker),
         }
     }
     cfg.stickers = applied;

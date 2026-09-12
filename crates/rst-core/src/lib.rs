@@ -32,6 +32,7 @@ pub mod snap;
 pub mod transform_ops;
 pub mod ui_motion;
 pub mod undo;
+pub mod window_crop;
 
 pub use animation_clock::AnimationClock;
 pub use error::CoreError;

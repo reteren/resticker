@@ -41,6 +41,32 @@ impl Texture {
         self.height
     }
 
+    /// Обернуть ЧУЖУЮ текстуру и уже созданный на неё SRV.
+    ///
+    /// Нужно для живого куска окна: кадр приходит текстурой от
+    /// Windows.Graphics.Capture, её нельзя ни создать здесь, ни заполнить
+    /// через `UpdateSubresource` — она уже лежит на общем с рендером
+    /// устройстве. Обёртка берёт COM-ссылку (`Clone` = `AddRef`), поэтому
+    /// вызов на каждый кадр не создаёт ни ресурсов, ни SRV — именно это и
+    /// требуется, чтобы кусок не пересобирал GPU-объекты 60 раз в секунду.
+    ///
+    /// `rtv: None`: чужая текстура захвата в render target не рисуется —
+    /// мы из неё только читаем.
+    pub(crate) fn from_external(
+        srv: ID3D11ShaderResourceView,
+        texture: ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            srv,
+            _texture: texture,
+            width,
+            height,
+            rtv: None,
+        }
+    }
+
     /// SRV для биндинга в пиксельный шейдер (только внутри крейта).
     pub(crate) fn srv(&self) -> &ID3D11ShaderResourceView {
         &self.srv

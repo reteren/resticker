@@ -105,6 +105,7 @@ const STRINGS = {
   'control.pinGroup': 'Keep open group on top',
   'control.pinFocusedWindow': 'Pin focused window',
   'control.mitosis': 'Split a window in two (mitosis)',
+  'control.windowCrop': 'Tear off a piece of a window',
   'control.pinSoundVolume': 'Pin sound volume',
   'general.snapGap': 'Snap gap, %',
   'general.snapGapHint':

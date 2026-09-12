@@ -329,7 +329,11 @@ pub fn relink_file(
             *mt = media_type;
             Ok(())
         }
-        StickerSource::Pasted { .. } => Err(OpError::NotFileBacked(id)),
+        // Кусок чужого окна файлом не подпирается: «переуказать» его значит
+        // выделить заново над другим окном, а не подменить путь.
+        StickerSource::Pasted { .. } | StickerSource::WindowCrop { .. } => {
+            Err(OpError::NotFileBacked(id))
+        }
     }
 }
 

@@ -229,6 +229,17 @@ pub struct Hotkeys {
     /// (`Ctrl+Alt+S/H/M/T/G/U`) и мимо пары `Alt+Shift`, которую Windows
     /// отдаёт переключателю раскладки (см. `edit_groups_menu`).
     pub window_mitosis: Option<String>,
+    /// Отделить кусок чужого окна и положить его отдельным стикером
+    /// (запрос пользователя 2026-09-10; [`StickerSource::WindowCrop`]).
+    /// Нажатие включает выделение области: экран притухает, наведение
+    /// подсвечивает окно целиком, протяжка внутри него задаёт кусок.
+    /// Повторное нажатие или `Esc` выходит без выделения. `None` — не
+    /// назначен.
+    ///
+    /// Дефолт `Ctrl+Alt+C` («crop») — в один ряд с остальными хоткеями
+    /// программы (`Ctrl+Alt+S/H/M/T/G/U/F`) и мимо пары `Alt+Shift`, которую
+    /// Windows отдаёт переключателю раскладки (см. `edit_groups_menu`).
+    pub window_crop: Option<String>,
 }
 
 impl Hotkeys {
@@ -263,6 +274,7 @@ impl Default for Hotkeys {
             unpin_all: Some("Ctrl+Alt+U".to_string()),
             pin_open_group: Some("Ctrl+Alt+Shift+T".to_string()),
             window_mitosis: Some("Ctrl+Alt+F".to_string()),
+            window_crop: Some("Ctrl+Alt+C".to_string()),
         }
     }
 }
@@ -418,6 +430,44 @@ impl Sticker {
             ..Self::default()
         }
     }
+
+    /// Новый стикер — живой кусок чужого окна (запрос пользователя
+    /// 2026-09-10, [`StickerSource::WindowCrop`]).
+    ///
+    /// Отдельный конструктор по той же причине, что [`Sticker::new_pasted`]:
+    /// источник собирается из двух частей (приметы окна + доли), и давать
+    /// координатору собирать его вручную значило бы тащить туда `chrono` и
+    /// `Uuid` ради одного места.
+    pub fn new_window_crop(
+        window: CropWindowKey,
+        crop: CropRect,
+        monitor_id: MonitorId,
+        cx: f64,
+        cy: f64,
+        w: f64,
+        h: f64,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            source: StickerSource::WindowCrop {
+                window,
+                crop,
+                // Новый кусок всегда развёрнут: человек только что провёл
+                // рамку, и показать ему вместо содержимого иконку было бы
+                // ответом не на то действие.
+                minimized: false,
+            },
+            placement: Placement {
+                monitor_id,
+                cx,
+                cy,
+                w,
+                h,
+            },
+            ..Self::default()
+        }
+    }
 }
 /// Источник стикера (SPEC.md, раздел 2.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -430,6 +480,163 @@ pub enum StickerSource {
     },
     /// Вставка из буфера, материализованная в pasted/<uuid>.png (SPEC 2.1).
     Pasted { path: PathBuf },
+    /// Живой кусок чужого окна: прямоугольник внутри окна-источника,
+    /// обновляющийся по мере его перерисовки (задача «оторвать кусок окна»,
+    /// 2026-09-10). Не копия и не снимок — кадры приходит от
+    /// Windows.Graphics.Capture ТОЛЬКО когда источник реально перерисовался
+    /// (замер 2026-09-10: 3 с неподвижного окна — ноль кадров), поэтому
+    /// обещание SPEC §13 «в полном покое программа не должна просыпаться
+    /// вообще» не нарушается.
+    ///
+    /// Кликать по такому куску нельзя: это пиксели, а не окно. Пересылка
+    /// ввода в источник проверена и отвергнута — Chromium/Electron не
+    /// принимает `PostMessage`, а `SendInput` требует поднять окно и увести
+    /// фокус (замер 2026-09-10).
+    WindowCrop {
+        /// Приметы окна-источника — те же, что у члена группы, и по той же
+        /// причине: `HWND` не переживает перезапуск, а кусок обязан
+        /// (`crate::group_match` опознаёт окно по exe + заголовку + классу).
+        window: CropWindowKey,
+        /// Какую часть окна показывать.
+        crop: CropRect,
+        /// Кусок свёрнут в иконку у ближайшего края экрана (решение
+        /// пользователя 2026-09-11). Живёт в конфиге, а не в рантайме:
+        /// свёрнутое состояние — это решение человека убрать кусок с глаз, и
+        /// перезапуск программы не повод разворачивать всё обратно.
+        ///
+        /// Пока кусок свёрнут, захват его окна ОСТАНОВЛЕН: показывать нечего,
+        /// а держать сессию Windows.Graphics.Capture ради иконки — это
+        /// 2.4 МБ VRAM и пробуждения на каждую перерисовку чужого окна
+        /// (замеры 2026-09-10) ни за что.
+        ///
+        /// `#[serde(default)]` — старые `config.json` без поля читаются как
+        /// «развёрнут», миграция схемы не нужна.
+        #[serde(default)]
+        minimized: bool,
+    },
+}
+
+/// Приметы окна-источника живого куска. Повторяют [`GroupMember`] без
+/// `place`: место окна к опознанию отношения не имеет. Переводится в
+/// [`crate::group_match::MemberKey`] для сопоставления с живыми окнами —
+/// механизм общий с группами, отдельного заводить не нужно.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CropWindowKey {
+    /// Полный путь к exe процесса-владельца — главная примета окна.
+    pub exe_path: PathBuf,
+    /// Заголовок на момент выделения куска. Сравнивается нестрого:
+    /// заголовки меняются на лету, и опознание обязано это переживать.
+    pub title: String,
+    /// Класс окна: отличает главное окно приложения от вспомогательных,
+    /// меняется куда реже заголовка.
+    pub class: String,
+}
+
+/// Прямоугольник внутри окна-источника — в ДОЛЯХ его клиентской области,
+/// не в пикселях (решение пользователя 2026-09-10).
+///
+/// Доли, потому что окно меняют в размере. В пикселях кусок остался бы
+/// прежней полосой и при растянутом окне показывал бы не то место; в долях
+/// он продолжает показывать ту же по смыслу область — растянули окно вдвое,
+/// кусок показывает тот же список, просто крупнее.
+///
+/// `x`/`y` — левый верхний угол, `w`/`h` — размеры; все четыре в `0.0..=1.0`,
+/// причём `x + w <= 1.0` и `y + h <= 1.0`. Конструктор это обеспечивает —
+/// см. [`CropRect::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CropRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Default for CropRect {
+    /// Всё окно целиком — нейтральный кусок, который ничего не отрезает.
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        }
+    }
+}
+
+impl CropRect {
+    /// Наименьший кусок, который вообще имеет смысл показывать, в долях.
+    /// Ниже этого протяжка считается случайным щелчком, а не выделением.
+    pub const MIN_FRACTION: f64 = 0.005;
+
+    /// Собрать по двум углам протяжки в долях окна. Порядок углов любой
+    /// (протяжка влево-вверх нормализуется), выход всегда лежит в окне.
+    /// `None` — протяжка вырожденная: по одной из осей меньше
+    /// [`Self::MIN_FRACTION`], показывать нечего.
+    pub fn from_corners(ax: f64, ay: f64, bx: f64, by: f64) -> Option<Self> {
+        if ![ax, ay, bx, by].iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let x0 = ax.min(bx).clamp(0.0, 1.0);
+        let y0 = ay.min(by).clamp(0.0, 1.0);
+        let x1 = ax.max(bx).clamp(0.0, 1.0);
+        let y1 = ay.max(by).clamp(0.0, 1.0);
+        let (w, h) = (x1 - x0, y1 - y0);
+        if w < Self::MIN_FRACTION || h < Self::MIN_FRACTION {
+            return None;
+        }
+        Some(Self { x: x0, y: y0, w, h })
+    }
+
+    /// Втащить прямоугольник в границы окна, не меняя его размера, пока
+    /// это возможно. Нужно на загрузке конфига: файл мог быть отредактирован
+    /// руками, а кусок за краем окна означал бы пустую или битую текстуру.
+    pub fn sanitized(self) -> Self {
+        let d = Self::default();
+        if ![self.x, self.y, self.w, self.h]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            return d;
+        }
+        let w = self.w.clamp(Self::MIN_FRACTION, 1.0);
+        let h = self.h.clamp(Self::MIN_FRACTION, 1.0);
+        Self {
+            x: self.x.clamp(0.0, 1.0 - w),
+            y: self.y.clamp(0.0, 1.0 - h),
+            w,
+            h,
+        }
+    }
+
+    /// Соотношение сторон куска при данном размере окна-источника в
+    /// пикселях — исходная пропорция стикера в момент выделения.
+    /// `None` — окно вырожденное (нулевая сторона).
+    pub fn aspect(&self, window_w: u32, window_h: u32) -> Option<f64> {
+        let (pw, ph) = (self.w * f64::from(window_w), self.h * f64::from(window_h));
+        if pw <= 0.0 || ph <= 0.0 {
+            return None;
+        }
+        Some(pw / ph)
+    }
+
+    /// Перевести в пиксели окна-источника — то, что уходит в `D3D11_BOX`
+    /// при вырезании куска из кадра захвата. Результат всегда лежит внутри
+    /// `window_w × window_h` и не вырожден по осям (минимум 1 пиксель),
+    /// иначе `CopySubresourceRegion` получил бы пустой бокс.
+    /// `None` — окно вырожденное, вырезать не из чего.
+    pub fn to_pixels(&self, window_w: u32, window_h: u32) -> Option<(u32, u32, u32, u32)> {
+        if window_w == 0 || window_h == 0 {
+            return None;
+        }
+        let r = self.sanitized();
+        let fw = f64::from(window_w);
+        let fh = f64::from(window_h);
+        let x = (r.x * fw).round().clamp(0.0, fw - 1.0) as u32;
+        let y = (r.y * fh).round().clamp(0.0, fh - 1.0) as u32;
+        let w = ((r.w * fw).round() as u32).clamp(1, window_w - x);
+        let h = ((r.h * fh).round() as u32).clamp(1, window_h - y);
+        Some((x, y, w, h))
+    }
 }
 
 impl Default for StickerSource {
@@ -827,5 +1034,168 @@ mod tests {
             Some("Ctrl+Alt+Shift+T"),
             "отсутствующий хоткей достраивается дефолтом"
         );
+    }
+
+    // --- Живой кусок окна (StickerSource::WindowCrop, 2026-09-10) ---
+
+    #[test]
+    fn crop_from_corners_normalizes_any_drag_direction() {
+        let a = CropRect::from_corners(0.2, 0.3, 0.6, 0.8).unwrap();
+        let b = CropRect::from_corners(0.6, 0.8, 0.2, 0.3).unwrap();
+        assert_eq!(a, b, "протяжка влево-вверх даёт тот же прямоугольник");
+        assert_eq!((a.x, a.y), (0.2, 0.3));
+        assert!((a.w - 0.4).abs() < 1e-9 && (a.h - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn crop_from_corners_rejects_accidental_click() {
+        assert!(
+            CropRect::from_corners(0.5, 0.5, 0.5004, 0.9).is_none(),
+            "полоса тоньше MIN_FRACTION — это щелчок, а не выделение"
+        );
+        assert!(CropRect::from_corners(0.5, 0.5, 0.5, 0.5).is_none());
+        assert!(CropRect::from_corners(f64::NAN, 0.0, 1.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn crop_from_corners_clamps_drag_outside_window() {
+        let r = CropRect::from_corners(-0.4, -0.2, 1.7, 1.3).unwrap();
+        assert_eq!(
+            (r.x, r.y, r.w, r.h),
+            (0.0, 0.0, 1.0, 1.0),
+            "протяжка за край окна упирается в его границы"
+        );
+    }
+
+    #[test]
+    fn crop_sanitized_pulls_hand_edited_config_back_inside() {
+        let r = CropRect {
+            x: 0.9,
+            y: 0.95,
+            w: 0.5,
+            h: 0.4,
+        }
+        .sanitized();
+        assert!(r.x + r.w <= 1.0 + 1e-9 && r.y + r.h <= 1.0 + 1e-9);
+        assert!(
+            (r.w - 0.5).abs() < 1e-9,
+            "размер сохраняется, сдвигается угол"
+        );
+        assert_eq!(
+            CropRect {
+                x: f64::NAN,
+                y: 0.0,
+                w: 0.5,
+                h: 0.5
+            }
+            .sanitized(),
+            CropRect::default(),
+            "битые числа из конфига дают всё окно, а не панику"
+        );
+    }
+
+    #[test]
+    fn crop_to_pixels_matches_window_size() {
+        let r = CropRect {
+            x: 0.25,
+            y: 0.5,
+            w: 0.5,
+            h: 0.25,
+        };
+        assert_eq!(r.to_pixels(1000, 800), Some((250, 400, 500, 200)));
+        assert_eq!(
+            r.to_pixels(0, 800),
+            None,
+            "вырожденное окно — вырезать не из чего"
+        );
+    }
+
+    #[test]
+    fn crop_to_pixels_never_leaves_the_frame() {
+        // Правый нижний угол при мелком окне — самый опасный случай:
+        // D3D11_BOX за пределами текстуры уронил бы копирование кадра.
+        let r = CropRect {
+            x: 0.99,
+            y: 0.99,
+            w: 0.01,
+            h: 0.01,
+        };
+        let (x, y, w, h) = r.to_pixels(7, 5).unwrap();
+        assert!(
+            x + w <= 7 && y + h <= 5,
+            "бокс {x},{y} {w}x{h} вышел за кадр 7x5"
+        );
+        assert!(w >= 1 && h >= 1, "бокс не может быть пустым");
+    }
+
+    #[test]
+    fn crop_resize_keeps_the_same_part_of_the_window() {
+        // Решение пользователя 2026-09-10: окно растянули — кусок
+        // показывает ту же по смыслу область, просто крупнее.
+        let r = CropRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.3,
+            h: 1.0,
+        };
+        assert_eq!(r.to_pixels(1000, 800).unwrap().2, 300);
+        assert_eq!(r.to_pixels(1600, 800).unwrap().2, 480);
+    }
+
+    #[test]
+    fn crop_aspect_follows_window_shape() {
+        let r = CropRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+        };
+        assert_eq!(r.aspect(1000, 500), Some(2.0));
+        assert_eq!(r.aspect(0, 500), None);
+    }
+
+    #[test]
+    fn window_crop_source_survives_config_roundtrip() {
+        let src = StickerSource::WindowCrop {
+            window: CropWindowKey {
+                exe_path: std::path::PathBuf::from(r"C:\app\app.exe"),
+                title: "Чат".to_string(),
+                class: "Chrome_WidgetWin_1".to_string(),
+            },
+            crop: CropRect {
+                x: 0.1,
+                y: 0.2,
+                w: 0.3,
+                h: 0.4,
+            },
+            minimized: true,
+        };
+        let json = serde_json::to_string(&src).expect("сериализация");
+        assert!(
+            json.contains("window_crop"),
+            "тег вида источника в конфиге: {json}"
+        );
+        let back: StickerSource = serde_json::from_str(&json).expect("разбор");
+        assert_eq!(back, src, "кусок обязан пережить перезапуск");
+        assert!(
+            json.contains("minimized"),
+            "свёрнутость пишется в конфиг: перезапуск не повод разворачивать всё обратно"
+        );
+    }
+
+    #[test]
+    fn window_crop_reads_old_config_without_minimized() {
+        // Старые `config.json` писались до появления свёрнутости. Они обязаны
+        // читаться как «развёрнут», а не отказом чтения: миграция схемы ради
+        // одного булева поля — это риск потерять весь конфиг пользователя.
+        let legacy = r#"{"kind":"window_crop","window":{"exe_path":"C:\\app\\app.exe","title":"Чат","class":"Cls"},"crop":{"x":0.0,"y":0.0,"w":1.0,"h":1.0}}"#;
+        let src: StickerSource = serde_json::from_str(legacy).expect("старый конфиг читается");
+        assert!(matches!(
+            src,
+            StickerSource::WindowCrop {
+                minimized: false,
+                ..
+            }
+        ));
     }
 }

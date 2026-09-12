@@ -20,6 +20,7 @@ mod group_manager;
 mod group_strip;
 mod groups;
 mod i18n;
+mod input_policy;
 // Бейдж номера монитора (T7). `dead_code`: бейдж подключает координатор в
 // `overlay_manager.rs` отдельной задачей, и до этого момента модуль никто
 // не вызывает — а удалять его нельзя, это готовый API для координатора;
@@ -41,6 +42,8 @@ mod toolbar;
 /// Оффскрин-превью панелей в PNG — инструмент разработки оформления.
 #[cfg(test)]
 mod ui_preview;
+mod window_crop_chrome;
+mod window_crop_overlay;
 mod window_pick_list;
 mod window_picker;
 
@@ -536,7 +539,11 @@ impl PanicMarker {
             version,
             thread: thread.to_string(),
             location: location.to_string(),
-            message: message.lines().next().unwrap_or("panic without a message").to_string(),
+            message: message
+                .lines()
+                .next()
+                .unwrap_or("panic without a message")
+                .to_string(),
             log_path: log_path.to_string_lossy().into_owned(),
         }
     }
@@ -645,7 +652,10 @@ pub(crate) fn panic_notification_from_marker(
     Some((marker, notification))
 }
 
-fn consume_panic_marker(path: &Path, notify: impl FnOnce(&PanicMarker, &(String, String)) -> bool) -> bool {
+fn consume_panic_marker(
+    path: &Path,
+    notify: impl FnOnce(&PanicMarker, &(String, String)) -> bool,
+) -> bool {
     let Some((marker, notification)) = panic_notification_from_marker(path) else {
         // Повреждённая метка не должна застрять и проверяться на каждом
         // старте; главное — не показывать её содержимое как достоверное.
@@ -1095,7 +1105,9 @@ mod tests {
     fn panic_marker_text_round_trips_deterministically() {
         let marker = sample_panic_marker();
         let text = panic_marker_text(&marker);
-        assert!(text.starts_with("resticker-panic-marker-v1\ntimestamp=2026-09-08T15:00:00+00:00\n"));
+        assert!(
+            text.starts_with("resticker-panic-marker-v1\ntimestamp=2026-09-08T15:00:00+00:00\n")
+        );
         assert_eq!(PanicMarker::parse(&text), Some(marker));
 
         let panic = PanicMarker::from_panic(

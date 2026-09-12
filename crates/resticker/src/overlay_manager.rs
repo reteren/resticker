@@ -41,14 +41,14 @@ use rst_core::group_visibility::{
 };
 use rst_core::hittest::{self, Corner as CoreCorner, DipRect, HandleKind};
 use rst_core::mitosis::{self, MitosisRefusal, PixRect, SplitAxis};
-use rst_core::multi_transform;
 use rst_core::model::{
-    Config, GroupPlace, Hotkeys, MediaType, MonitorId, OverlapRule, Placement,
-    PlaybackSettings, Rect, Settings, Sticker, StickerSource, Transform, VIDEO_EXTENSIONS,
-    VisibilityMode, VisibilityRule, WindowGroup,
+    Config, GroupPlace, Hotkeys, MediaType, MonitorId, OverlapRule, Placement, PlaybackSettings,
+    Rect, Settings, Sticker, StickerSource, Transform, VIDEO_EXTENSIONS, VisibilityMode,
+    VisibilityRule, WindowGroup,
 };
 use rst_core::monitor_loss::{LossAction, MonitorLossTracker, MonitorSnapshot};
 use rst_core::monitor_rebind::{self, MonitorBounds};
+use rst_core::multi_transform;
 use rst_core::occluders::{self, OccluderCandidate, OccluderSet};
 use rst_core::ops;
 use rst_core::pinned_window::{self, HostFilter, PinnedWindow};
@@ -62,9 +62,8 @@ use rst_render::glass::Surface;
 use rst_render::{
     Box2D, Button, Checkbox, Device, HIGHLIGHT_THICKNESS_DIP, HighlightKind, Icon, Key,
     NumericField, Panel, PinnedRowField, PointerEvent, PresentSync, Primitive, RenderError,
-    SelectionBox, Slider, Sprite, TextField, Texture, TextureAtlas, VideoTextures,
-    VolumeControl, Widget,
-    WidgetId, WindowHighlight, WindowTarget, edit_overlay, lock_indicator, marquee_visuals,
+    SelectionBox, Slider, Sprite, TextField, Texture, TextureAtlas, VideoTextures, VolumeControl,
+    Widget, WidgetId, WindowHighlight, WindowTarget, edit_overlay, lock_indicator, marquee_visuals,
     pin_indicator, pinned_row_id, rasterize, solid_sprite, theme,
 };
 use rst_video::VideoSource;
@@ -83,8 +82,8 @@ use uuid::Uuid;
 use crate::{
     confirm_dialog, cursor_panel, gap_panel, group_manager, group_strip,
     groups::{self, GroupEditor, GroupsState},
-    mitosis_overlay, monitor_badge, preset_picker, preset_strip, toolbar, window_pick_list,
-    window_picker,
+    mitosis_overlay, monitor_badge, preset_picker, preset_strip, toolbar, window_crop_chrome,
+    window_crop_overlay, window_pick_list, window_picker,
 };
 
 /// Мост к `Device`/`WindowTarget` (M3 step 2 разделил `rst_render::Renderer`
@@ -225,9 +224,10 @@ fn create_monitor_state(
             return None;
         }
     };
-    if edit_active {
-        overlay.set_interactive(true);
-    }
+    // Интерактивность нового окна при уже активном редактировании задаёт
+    // `apply_input_policies` в конце итерации: окно новое, его `HWND` в кэше
+    // решений нет, и решение применится к нему само.
+    let _ = edit_active;
     apply_capture_affinity(&overlay, hide_from_capture, &info.id);
     let (width, height) = overlay.size();
     let mut target = match WindowTarget::new(device, overlay.hwnd(), width, height) {
@@ -890,12 +890,10 @@ fn enter_mitosis_mode(
     monitors_map: &HashMap<MonitorId, MonitorState>,
     monitor_id: &MonitorId,
 ) {
-    for (id, ms) in monitors_map.iter() {
-        if id == monitor_id {
-            ms.overlay.set_click_through(false);
-        } else {
-            ms.overlay.set_interactive(true);
-        }
+    for ms in monitors_map.values() {
+        // Интерактивность всех окон и фокус инициатора задаёт
+        // `apply_input_policies` — единый владелец флага прозрачности.
+        // Здесь только курсор и состояние режима.
         // Крест ставится на ВСЕ мониторы сразу, а не только на тот, где
         // курсор сейчас: форма курсора живёт в окне, и курсор, переехавший
         // на соседний монитор, иначе молча стал бы стрелкой посреди режима.
@@ -913,6 +911,1169 @@ fn enter_mitosis_mode(
     });
 }
 
+/// Области, в которых живые куски ловят мышь на одном мониторе, —
+/// КЛИЕНТСКИЕ координаты окна оверлея, физические пиксели.
+///
+/// Развёрнутый кусок — тело плюс полоса: у куска на самом верху экрана
+/// полоса прижимается к границе монитора и выходит за тело, без неё кнопки
+/// в такой полосе не нажимались бы. Свёрнутый — его иконка у края: там, где
+/// он был до сворачивания, его уже нет. Места иконок раздаются в том же
+/// порядке, что и при отрисовке, иначе клик попал бы не по той иконке,
+/// которую человек видит.
+fn crop_piece_rects(
+    cfg: &Config,
+    monitor_id: &MonitorId,
+    bounds: &MonitorBounds,
+) -> Vec<(i32, i32, i32, i32)> {
+    let scale = bounds.scale;
+    let screen = DipRect::new(
+        0.0,
+        0.0,
+        f64::from(bounds.bounds_px.w) / scale,
+        f64::from(bounds.bounds_px.h) / scale,
+    );
+    let mut rects = Vec::new();
+    let mut occupied: Vec<DipRect> = Vec::new();
+    for sticker in &cfg.stickers {
+        let StickerSource::WindowCrop { minimized, .. } = &sticker.source else {
+            continue;
+        };
+        if !sticker.visible || sticker.placement.monitor_id != *monitor_id {
+            continue;
+        }
+        let piece = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+        let area = if *minimized {
+            let Some(icon) = window_crop_chrome::collapsed_icon_rect(piece, screen, &occupied)
+            else {
+                continue;
+            };
+            occupied.push(icon);
+            icon
+        } else {
+            let layout = window_crop_chrome::chrome_layout(piece, 0.0, screen.h);
+            let top = piece.y.min(layout.bar.y);
+            let bottom = (piece.y + piece.h).max(layout.bar.y + layout.bar.h);
+            DipRect::new(piece.x, top, piece.w, bottom - top)
+        };
+        rects.push((
+            (area.x * scale).floor() as i32,
+            (area.y * scale).floor() as i32,
+            (area.w * scale).ceil() as i32,
+            (area.h * scale).ceil() as i32,
+        ));
+    }
+    rects
+}
+
+/// ЕДИНСТВЕННЫЙ владелец того, как окна оверлея ловят мышь.
+///
+/// Раз за итерацию собирает полное состояние, решает для каждого монитора
+/// через [`crate::input_policy::resolve_input_policies`] и применяет решение
+/// одним вызовом `OverlayWindow::apply_input_policy` — только если оно
+/// изменилось.
+///
+/// Раньше флаг `WS_EX_TRANSPARENT` писали четыре независимых механизма
+/// (`set_click_through`, `set_interactive`, `set_hover_click_target`,
+/// `set_hit_rects`), и они перезаписывали друг друга. 2026-09-11 это дважды
+/// намертво залочило мышь у пользователя на всём компьютере (аудит
+/// `scratchpad/y1_audit_report.md`). Теперь все эти места только меняют
+/// СОСТОЯНИЕ, а флаг пишет эта функция.
+///
+/// Решение применяется «только при изменении»: смена ex-стиля — это
+/// `SetWindowPos` с `SWP_FRAMECHANGED`, и дёргать его на каждое движение
+/// мыши незачем.
+fn apply_input_policies(
+    edit: &EditState,
+    cfg: &Config,
+    monitors_map: &HashMap<MonitorId, MonitorState>,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    primary_id: &MonitorId,
+    session_locked: bool,
+    applied: &mut HashMap<isize, rst_win32::overlay::OverlayInputPolicy>,
+) {
+    use crate::input_policy::{
+        InputPolicy, InputState, MonitorIndex, MonitorInput, TimelineInput, resolve_input_policies,
+    };
+    use rst_win32::overlay::OverlayInputPolicy;
+
+    // Номера мониторов — в устойчивом порядке: решение не должно зависеть от
+    // порядка обхода хэш-таблицы.
+    let mut ids: Vec<&MonitorId> = monitors_map.keys().collect();
+    ids.sort_by(|a, b| a.0.cmp(&b.0));
+    let index_of = |id: &MonitorId| -> Option<MonitorIndex> {
+        ids.iter().position(|m| *m == id).map(|i| i as MonitorIndex)
+    };
+
+    // Области кусков НЕ передаются: режим `HitRects` выключен (2026-09-11,
+    // третье залипание мыши — сразу при запуске программы).
+    //
+    // Причина: `WM_NCHITTEST` → `HTTRANSPARENT` передаёт сообщение дальше
+    // ТОЛЬКО окнам того же потока (MSDN, WM_NCHITTEST: «In a window currently
+    // covered by another window in the same thread»). Окнам других программ
+    // клик не уходит — он пропадает. Замер X3 этого не поймал: его
+    // окно-мишень создавалось в том же потоке, что и оверлей
+    // (`scratchpad/probe_x3/src/main.rs`), и проверял не тот случай.
+    //
+    // Пока механизм попиксельной кликопрозрачности для ЧУЖИХ окон не найден
+    // и не проверен на окне ДРУГОГО процесса, куски вне режима
+    // редактирования мышь не ловят.
+    let _ = (crop_piece_rects, cfg);
+    let monitors: Vec<MonitorInput> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| MonitorInput {
+            id: i as MonitorIndex,
+            piece_rects: Vec::new(),
+        })
+        .collect();
+
+    // Инициатор полноэкранного режима — тот, кто его включил. Для режима
+    // редактирования — основной монитор: хоткей зарегистрирован на нём, и
+    // прежний `set_click_through` отдавал фокус именно его окну.
+    let initiator = if let Some(m) = &edit.mitosis {
+        index_of(&m.initiator)
+    } else if let Some(c) = &edit.window_crop {
+        index_of(&c.initiator)
+    } else if edit.active {
+        index_of(primary_id)
+    } else {
+        None
+    };
+
+    let panel_monitor = edit
+        .group_editor
+        .as_ref()
+        .map(|g| &g.monitor_id)
+        .or_else(|| edit.group_manager.as_ref().map(|g| &g.monitor_id))
+        .or_else(|| edit.gap_panel.as_ref().map(|g| &g.monitor_id))
+        .and_then(|id| index_of(id));
+
+    // Полоса перемотки участвует только вне режима редактирования
+    // (`hover_mode`) — ровно как прежнее условие `timeline_click_target`: в
+    // режиме редактирования окно и так интерактивно целиком.
+    let timeline = edit.video_timeline.as_ref().and_then(|t| {
+        if !t.hover_mode {
+            return None;
+        }
+        let monitor = index_of(&t.monitor_id)?;
+        let scale = monitor_bounds.get(&t.monitor_id).map_or(1.0, |b| b.scale);
+        let f = t.panel.frame();
+        Some(TimelineInput {
+            monitor,
+            rect: (
+                ((f.cx - f.w / 2.0) * scale).floor() as i32,
+                ((f.cy - f.h / 2.0) * scale).floor() as i32,
+                (f.w * scale).ceil() as i32,
+                (f.h * scale).ceil() as i32,
+            ),
+            under_cursor: t.over_strip,
+        })
+    });
+
+    let state = InputState {
+        editing: edit.active,
+        fullscreen: edit.mitosis.is_some() || edit.window_crop.is_some(),
+        initiator,
+        panel_monitor,
+        timeline,
+        timeline_dragging: edit.timeline_dragging,
+        session_locked,
+        system_suspending: false,
+        settings_rect: None,
+    };
+
+    for decided in resolve_input_policies(&monitors, &state) {
+        let Some(id) = ids.get(decided.monitor as usize) else {
+            continue;
+        };
+        let Some(ms) = monitors_map.get(*id) else {
+            continue;
+        };
+        let want = match decided.policy {
+            InputPolicy::Transparent => OverlayInputPolicy::Transparent,
+            InputPolicy::Interactive { take_focus } => {
+                OverlayInputPolicy::Interactive { take_focus }
+            }
+            InputPolicy::HitRects(r) => OverlayInputPolicy::HitRects(r),
+            InputPolicy::HoverTarget => OverlayInputPolicy::HoverTarget,
+        };
+        let hwnd = ms.overlay.hwnd().0 as isize;
+        if applied.get(&hwnd) != Some(&want) {
+            tracing::debug!(monitor = %id.0, policy = ?want, "политика ввода окна");
+            ms.overlay.apply_input_policy(want.clone());
+            applied.insert(hwnd, want);
+        }
+    }
+    // Окна, которых больше нет (монитор отключили или пересоздали), из кэша
+    // убираются: иначе он рос бы с каждым переподключением.
+    let live: Vec<isize> = monitors_map
+        .values()
+        .map(|ms| ms.overlay.hwnd().0 as isize)
+        .collect();
+    applied.retain(|hwnd, _| live.contains(hwnd));
+}
+
+/// Одно отдельное окно живого куска и то, что ему уже отдано.
+///
+/// Последние отданные значения хранятся, чтобы не слать окну команду на
+/// каждой итерации цикла: окно живёт на своём потоке, и каждая команда —
+/// это `PostMessage`.
+struct CropWindowSlot {
+    window: rst_win32::crop_window::CropWindow,
+    bounds: rst_core::model::Rect,
+    minimized: bool,
+    opacity: u8,
+}
+
+/// Прямоугольник стикера в физических пикселях виртуального десктопа —
+/// там, где должно стоять окно куска. `None` — монитора стикера нет.
+fn crop_window_bounds(
+    sticker: &Sticker,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> Option<rst_core::model::Rect> {
+    let b = monitor_bounds.get(&sticker.placement.monitor_id)?;
+    let p = &sticker.placement;
+    let s = b.scale;
+    Some(rst_core::model::Rect {
+        x: b.bounds_px.x + ((p.cx - p.w / 2.0) * s).round() as i32,
+        y: b.bounds_px.y + ((p.cy - p.h / 2.0) * s).round() as i32,
+        w: (p.w * s).round().max(1.0) as u32,
+        h: (p.h * s).round().max(1.0) as u32,
+    })
+}
+
+/// Точка, где встанет иконка свёрнутого куска, — физические пиксели.
+///
+/// Места раздаются в порядке `cfg.stickers`, как и при отрисовке: иначе две
+/// свёрнутые иконки у одного края легли бы друг на друга.
+fn crop_window_icon_point(
+    cfg: &Config,
+    sticker_id: Uuid,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> Option<rst_win32::crop_window::Point> {
+    let target = cfg.stickers.iter().find(|s| s.id == sticker_id)?;
+    let b = monitor_bounds.get(&target.placement.monitor_id)?;
+    let screen = DipRect::new(
+        0.0,
+        0.0,
+        f64::from(b.bounds_px.w) / b.scale,
+        f64::from(b.bounds_px.h) / b.scale,
+    );
+    let mut occupied: Vec<DipRect> = Vec::new();
+    for s in &cfg.stickers {
+        let StickerSource::WindowCrop { minimized, .. } = &s.source else {
+            continue;
+        };
+        if !*minimized || !s.visible || s.placement.monitor_id != target.placement.monitor_id {
+            continue;
+        }
+        let piece = hittest::aabb(&s.placement, 0.0);
+        let icon = window_crop_chrome::collapsed_icon_rect(piece, screen, &occupied)?;
+        if s.id == sticker_id {
+            return Some(rst_win32::crop_window::Point {
+                x: b.bounds_px.x + (icon.x * b.scale).round() as i32,
+                y: b.bounds_px.y + (icon.y * b.scale).round() as i32,
+            });
+        }
+        occupied.push(icon);
+    }
+    None
+}
+
+/// Привести отдельные окна кусков в соответствие с состоянием программы.
+///
+/// Окно куска показывается только вне режима редактирования и вне
+/// полноэкранных режимов (резка окон, выделение куска): в режиме
+/// редактирования кусок рисует оверлей и правится как обычный стикер (с
+/// ручками и тулбаром), а в режиме выделения окно куска стояло бы поверх
+/// окон, из которых человек выбирает.
+///
+/// Вне режима редактирования окно куска — единственное, что показывает его
+/// содержимое (DWM-превью), поэтому оверлей такой кусок не рисует
+/// (`crop_windows_shown`).
+#[allow(clippy::too_many_arguments)]
+fn sync_crop_windows(
+    edit: &mut EditState,
+    cfg: &Config,
+    window_crops: &HashMap<Uuid, WindowCropRuntime>,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    tx: &mpsc::Sender<OverlayMessage>,
+    crop_windows: &mut HashMap<Uuid, CropWindowSlot>,
+) -> bool {
+    use rst_win32::crop_window::{CropWindow, CropWindowOptions, SourceRect};
+
+    let show = !edit.active && edit.window_crop.is_none() && edit.mitosis.is_none();
+    let mut changed = false;
+
+    // Окна, которые больше не нужны: режим редактирования, кусок удалён или
+    // скрыт, источник потерян.
+    let wanted: HashSet<Uuid> = if show {
+        cfg.stickers
+            .iter()
+            .filter(|s| s.visible && matches!(s.source, StickerSource::WindowCrop { .. }))
+            .filter(|s| window_crops.contains_key(&s.id))
+            .map(|s| s.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let before = crop_windows.len();
+    crop_windows.retain(|id, _| wanted.contains(id));
+    if crop_windows.len() != before {
+        changed = true;
+    }
+
+    for sticker in &cfg.stickers {
+        if !wanted.contains(&sticker.id) {
+            continue;
+        }
+        let StickerSource::WindowCrop {
+            window,
+            crop,
+            minimized,
+        } = &sticker.source
+        else {
+            continue;
+        };
+        let Some(bounds) = crop_window_bounds(sticker, monitor_bounds) else {
+            continue;
+        };
+        let opacity = (sticker.transform.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+
+        if let Some(slot) = crop_windows.get_mut(&sticker.id) {
+            if *minimized != slot.minimized {
+                if *minimized {
+                    if let Some(point) = crop_window_icon_point(cfg, sticker.id, monitor_bounds) {
+                        let _ = slot.window.minimize(point);
+                    }
+                } else {
+                    let _ = slot.window.restore(bounds);
+                    slot.bounds = bounds;
+                }
+                slot.minimized = *minimized;
+                changed = true;
+            }
+            if !slot.minimized && slot.bounds != bounds {
+                let _ = slot.window.set_bounds(bounds);
+                slot.bounds = bounds;
+                changed = true;
+            }
+            if slot.opacity != opacity {
+                let _ = slot.window.set_opacity(opacity);
+                slot.opacity = opacity;
+            }
+            continue;
+        }
+
+        // --- создать окно куска ---
+        let Some(rt) = window_crops.get(&sticker.id) else {
+            continue;
+        };
+        let Some(info) = window_snapshot.iter().find(|w| w.hwnd == rt.hwnd) else {
+            continue;
+        };
+        let (fw, fh) = (info.rect.w.max(0) as u32, info.rect.h.max(0) as u32);
+        let Some((cx, cy, cw, ch)) = crop.to_pixels(fw, fh) else {
+            continue;
+        };
+        // Прямоугольник DWM-превью задаётся в пространстве `GetWindowRect`,
+        // а доли куска считаются от DWM-рамки: у окон Win11 между ними ~7 px
+        // невидимых полей ресайза. Без поправки кусок в окне съехал бы.
+        let source_hwnd = HWND(rt.hwnd as *mut _);
+        let (dx, dy, _, _) = rst_win32::window_enum::dwm_frame_offset(source_hwnd);
+        let source_rect = SourceRect {
+            x: cx as i32 + dx,
+            y: cy as i32 + dy,
+            w: cw,
+            h: ch,
+        };
+        // Подпись — заголовок окна, а имя exe лишь запасной вариант. У
+        // приложений из Магазина (Калькулятор, Параметры) окно принадлежит
+        // служебному `ApplicationFrameHost.exe`, и полоса показывала бы
+        // «ApplicationFrameHost» вместо «Калькулятор» (живой скриншот
+        // 2026-09-11). Заголовок задаётся один раз при создании окна куска,
+        // поэтому смена вкладки в браузере полосу не дёргает.
+        let app = if window.title.trim().is_empty() {
+            window
+                .exe_path
+                .file_stem()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        } else {
+            window.title.clone()
+        };
+        let window_title = crate::i18n::crop_window_title(&app);
+        let mut options = CropWindowOptions::new(bounds, source_rect, app);
+        options.window_title = window_title;
+        if let Some(b) = monitor_bounds.get(&sticker.placement.monitor_id) {
+            options.screen_top = b.bounds_px.y;
+            options.dpi = (b.scale * 96.0).round() as u32;
+        }
+        options.opacity = opacity;
+        match CropWindow::create(source_hwnd, options) {
+            Ok((cw_window, events)) => {
+                // Переходник: события окна куска — в общую очередь
+                // координатора. Поток сам завершится, когда окно закроют
+                // (отправитель событий уничтожается вместе с ним).
+                let fwd = tx.clone();
+                let id = sticker.id;
+                std::thread::spawn(move || {
+                    for ev in events {
+                        if fwd.send(OverlayMessage::CropWindow(id, ev)).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let mut slot = CropWindowSlot {
+                    window: cw_window,
+                    bounds,
+                    minimized: false,
+                    opacity,
+                };
+                if *minimized {
+                    if let Some(point) = crop_window_icon_point(cfg, sticker.id, monitor_bounds) {
+                        let _ = slot.window.minimize(point);
+                    }
+                    slot.minimized = true;
+                }
+                tracing::info!(sticker = %sticker.id, "окно живого куска создано");
+                crop_windows.insert(sticker.id, slot);
+                changed = true;
+            }
+            Err(e) => {
+                tracing::warn!(sticker = %sticker.id, error = %e, "не удалось создать окно куска");
+            }
+        }
+    }
+
+    let shown: HashSet<Uuid> = crop_windows.keys().copied().collect();
+    if shown != edit.crop_windows_shown {
+        edit.crop_windows_shown = shown;
+        changed = true;
+    }
+    changed
+}
+
+/// Разобрать событие отдельного окна куска. `true` — нужна перерисовка.
+fn handle_crop_window_event(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    crop_windows: &mut HashMap<Uuid, CropWindowSlot>,
+    id: Uuid,
+    event: rst_win32::crop_window::CropWindowEvent,
+) -> bool {
+    use rst_win32::crop_window::CropWindowEvent as E;
+    match event {
+        E::Geometry { x, y, w, h } => {
+            // Окно куска сообщает свой прямоугольник: его перетащили за полосу
+            // или подвинул кто-то снаружи — раскладка группы, закрепление,
+            // привязка Windows. Стикер хранит центр в DIP своего монитора.
+            // Монитор — по ЦЕНТРУ окна, а не по углу: кусок, дотащенный к
+            // кромке, иначе уехал бы на соседний экран из-за одного пикселя.
+            let Some(slot) = crop_windows.get_mut(&id) else {
+                return false;
+            };
+            let (w_px, h_px) = (w.max(1) as i32, h.max(1) as i32);
+            let Some((monitor, (cx, cy))) =
+                monitor_dip_at(x + w_px / 2, y + h_px / 2, monitor_bounds)
+            else {
+                return false;
+            };
+            let monitor = monitor.clone();
+            let before = cfg.clone();
+            let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id) else {
+                return false;
+            };
+            let scale = monitor_bounds.get(&monitor).map_or(1.0, |b| b.scale);
+            sticker.placement.monitor_id = monitor;
+            sticker.placement.cx = cx;
+            sticker.placement.cy = cy;
+            sticker.placement.w = f64::from(w_px) / scale;
+            sticker.placement.h = f64::from(h_px) / scale;
+            // Окно уже стоит там, куда его подвинули: запоминаем его
+            // прямоугольник целиком, чтобы синхронизация не послала ему
+            // лишний `set_bounds` и не вернула его обратно.
+            slot.bounds = rst_core::model::Rect {
+                x,
+                y,
+                w: w.max(1),
+                h: h.max(1),
+            };
+            commit_undo_snapshot(edit, before);
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после перемещения куска");
+            }
+            false
+        }
+        E::CloseClicked => {
+            // Через общий путь удаления со снимком undo: крестик на куске —
+            // то же удаление стикера, и undo обязан его вернуть.
+            let before = cfg.clone();
+            cfg.stickers.retain(|s| s.id != id);
+            commit_undo_snapshot(edit, before);
+            crop_windows.remove(&id);
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после закрытия куска");
+            }
+            true
+        }
+        E::MinimizeClicked | E::RestoreClicked => {
+            let want = matches!(event, E::MinimizeClicked);
+            if let Some(s) = cfg.stickers.iter_mut().find(|s| s.id == id)
+                && let StickerSource::WindowCrop { minimized, .. } = &mut s.source
+            {
+                *minimized = want;
+            }
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после сворачивания куска");
+            }
+            true
+        }
+        E::SourceGone => {
+            // Источник исчез — окно куска снимаем; кусок остаётся в конфиге
+            // и оживёт, когда приложение откроют снова (решение пользователя
+            // 2026-09-10), — тем же путём привязки, что после перезапуска.
+            crop_windows.remove(&id);
+            true
+        }
+    }
+}
+
+/// Что сделал клик по обвязке живого куска.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropChromeAction {
+    /// Клик обвязки не касался — пусть его разбирает обычный путь сцены.
+    None,
+    /// Состояние изменилось, нужна перерисовка и сохранение конфига.
+    Changed,
+    /// Начато перетаскивание куска за полосу.
+    DragStarted,
+}
+
+/// Разобрать нажатие по обвязке куска: закрыть, свернуть, развернуть,
+/// начать перетаскивание.
+///
+/// Точка приходит в физических пикселях виртуального десктопа — в той же
+/// системе, что и `cursor_position`, а не в DIP: обвязка живёт на конкретном
+/// мониторе, и переводить координаты надо ОДИН раз, зная этот монитор.
+fn handle_crop_chrome_click(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    px: i32,
+    py: i32,
+) -> CropChromeAction {
+    let Some((monitor, (dx, dy))) = monitor_dip_at(px, py, monitor_bounds) else {
+        return CropChromeAction::None;
+    };
+    let monitor = monitor.clone();
+    let Some(bounds) = monitor_bounds.get(&monitor) else {
+        return CropChromeAction::None;
+    };
+    let screen_w = f64::from(bounds.bounds_px.w) / bounds.scale;
+    let screen_h = f64::from(bounds.bounds_px.h) / bounds.scale;
+
+    // --- свёрнутые: попадание по иконке разворачивает ---
+    // Места раздаются в том же порядке, что и при отрисовке, иначе клик
+    // попал бы не по той иконке, которую человек видит.
+    let mut occupied: Vec<DipRect> = Vec::new();
+    let mut restore: Option<Uuid> = None;
+    for sticker in &cfg.stickers {
+        let StickerSource::WindowCrop { minimized, .. } = &sticker.source else {
+            continue;
+        };
+        if !*minimized || !sticker.visible || sticker.placement.monitor_id != monitor {
+            continue;
+        }
+        let piece = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+        let Some(icon) = window_crop_chrome::collapsed_icon_rect(
+            piece,
+            DipRect::new(0.0, 0.0, screen_w, screen_h),
+            &occupied,
+        ) else {
+            continue;
+        };
+        if restore.is_none()
+            && window_crop_chrome::hit_test_collapsed(icon, (dx, dy))
+                == window_crop_chrome::CollapsedHit::Restore
+        {
+            restore = Some(sticker.id);
+        }
+        occupied.push(icon);
+    }
+    if let Some(id) = restore {
+        if let Some(s) = cfg.stickers.iter_mut().find(|s| s.id == id)
+            && let StickerSource::WindowCrop { minimized, .. } = &mut s.source
+        {
+            *minimized = false;
+        }
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после разворачивания куска");
+        }
+        return CropChromeAction::Changed;
+    }
+
+    // --- развёрнутый кусок под курсором ---
+    let Some(hover) = edit.window_crop_hover.clone() else {
+        return CropChromeAction::None;
+    };
+    if hover.monitor != monitor {
+        return CropChromeAction::None;
+    }
+    let Some(sticker) = cfg.stickers.iter().find(|s| s.id == hover.sticker) else {
+        return CropChromeAction::None;
+    };
+    if !matches!(
+        sticker.source,
+        StickerSource::WindowCrop {
+            minimized: false,
+            ..
+        }
+    ) {
+        return CropChromeAction::None;
+    }
+    let piece = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+    let layout = window_crop_chrome::chrome_layout(piece, 0.0, screen_h);
+    match window_crop_chrome::hit_test(&layout, (dx, dy)) {
+        window_crop_chrome::ChromeHit::Close => {
+            // Удаление куска — через ту же операцию, что и у любого стикера:
+            // undo обязан его вернуть, а отдельный путь удаления разошёлся бы
+            // с общим (файл куска на диске не лежит, поэтому чистить нечего).
+            let before = cfg.clone();
+            cfg.stickers.retain(|s| s.id != hover.sticker);
+            commit_undo_snapshot(edit, before);
+            edit.window_crop_hover = None;
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после закрытия куска");
+            }
+            CropChromeAction::Changed
+        }
+        window_crop_chrome::ChromeHit::Minimize => {
+            if let Some(s) = cfg.stickers.iter_mut().find(|s| s.id == hover.sticker)
+                && let StickerSource::WindowCrop { minimized, .. } = &mut s.source
+            {
+                *minimized = true;
+            }
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после сворачивания куска");
+            }
+            CropChromeAction::Changed
+        }
+        window_crop_chrome::ChromeHit::Drag => CropChromeAction::DragStarted,
+        window_crop_chrome::ChromeHit::Body | window_crop_chrome::ChromeHit::Outside => {
+            CropChromeAction::None
+        }
+    }
+}
+
+/// Пересчитать, над каким куском сейчас курсор. `true` — картинка изменилась.
+///
+/// Опросом позиции курсора, а не обработкой `WM_MOUSEMOVE`: вне режима
+/// редактирования оверлей кликопрозрачен и движений мыши не получает вовсе —
+/// тем же приёмом живёт полоса перемотки видео (`update_timeline_over_strip`).
+///
+/// Цена приёма честная и её надо знать: наведение обновляется только тогда,
+/// когда цикл и так проснулся по другому поводу. Для видео этого достаточно —
+/// кадры будят цикл непрерывно; для неподвижного куска окна кадров нет, и
+/// полоса появится с задержкой до ближайшего пробуждения. Ставить ради этого
+/// таймер опроса нельзя: он сломал бы обещание SPEC §13 «в полном покое
+/// программа не должна просыпаться вообще» — то самое, ради которого выбран
+/// событийный захват.
+fn sync_window_crop_hover(
+    edit: &mut EditState,
+    cfg: &Config,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> bool {
+    // В режиме выделения куска наведение на СУЩЕСТВУЮЩИЕ куски не считается:
+    // там курсор выбирает окно-источник, и обвязка чужого куска под ним была
+    // бы помехой.
+    if edit.window_crop.is_some() || !WINDOW_CROP_CHROME {
+        return edit.window_crop_hover.take().is_some();
+    }
+    let next = rst_win32::window_pick::cursor_position()
+        .ok()
+        .and_then(|c| window_crop_at(cfg, monitor_bounds, c.x, c.y));
+    if next == edit.window_crop_hover {
+        return false;
+    }
+    edit.window_crop_hover = next;
+    true
+}
+
+/// Обвязка живого куска — полоса с кнопками «свернуть»/«закрыть»,
+/// перетаскивание за неё и свёрнутые иконки у края — ВЫКЛЮЧЕНА.
+///
+/// Причина: нажать эти кнопки вне режима редактирования нечем. Попиксельная
+/// кликопрозрачность через `HTTRANSPARENT` не передаёт клики окнам других
+/// программ (2026-09-11, третье залипание мыши), и оверлей в покое обязан
+/// быть прозрачным целиком. Рисовать кнопки, которые нельзя нажать, — это
+/// врать интерфейсом: пользователь 2026-09-11 так и не смог ни сдвинуть
+/// кусок за полосу, ни закрыть его крестиком.
+///
+/// Вернётся вместе с отдельным окном на каждый кусок (замер V1,
+/// `scratchpad/probe_v1`): такое окно существует только в своём
+/// прямоугольнике, и клики вне его доходят до любых программ естественно.
+///
+/// Пока выключено: кусок — живой стикер без обвязки, в режиме
+/// редактирования двигается, тянется и удаляется обычными инструментами;
+/// флаг `minimized` не действует, чтобы ранее свёрнутый кусок не застрял
+/// без способа его вернуть.
+const WINDOW_CROP_CHROME: bool = false;
+
+/// Какой живой кусок сейчас под курсором и на каком мониторе.
+///
+/// Вне режима редактирования кусок ведёт себя как маленькое окно: при
+/// наведении у него появляется полоса с кнопками (решение пользователя
+/// 2026-09-11), за неё его двигают, в ней же закрывают и сворачивают.
+/// Наведение хранится отдельно от выделения стикеров: выделение — понятие
+/// режима редактирования, а кусок обязан слушаться и вне его.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowCropHoverState {
+    sticker: Uuid,
+    monitor: MonitorId,
+}
+
+/// Найти живой кусок под точкой экрана (физические пиксели виртуального
+/// десктопа). Возвращает верхний по порядку отрисовки — то есть последний в
+/// `cfg.stickers`, как и везде в проекте: список и есть порядок слоёв.
+///
+/// Свёрнутые куски участвуют наравне с развёрнутыми: у свёрнутого попадание
+/// считается по его иконке у края экрана, иначе развернуть его было бы
+/// нечем. Прямоугольник иконки приходит готовым от вызывающего слоя —
+/// раскладку свёрнутого вида считает `window_crop_chrome`.
+fn window_crop_at(
+    cfg: &Config,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    px: i32,
+    py: i32,
+) -> Option<WindowCropHoverState> {
+    let (monitor, (dx, dy)) = monitor_dip_at(px, py, monitor_bounds)?;
+    let bounds = monitor_bounds.get(monitor)?;
+    let screen = DipRect::new(
+        0.0,
+        0.0,
+        f64::from(bounds.bounds_px.w) / bounds.scale,
+        f64::from(bounds.bounds_px.h) / bounds.scale,
+    );
+
+    // Свёрнутый кусок ловится по СВОЕЙ ИКОНКЕ у края экрана, а не по месту,
+    // где он был до сворачивания: там его уже нет, и считать попадание по
+    // пустому месту значило бы, что иконку нельзя нажать, а на пустоту под
+    // ней — можно. Места раздаются в том же порядке, что и при отрисовке,
+    // иначе клик попал бы не по той иконке, которую человек видит.
+    let mut occupied: Vec<DipRect> = Vec::new();
+    let mut hit_icon: Option<Uuid> = None;
+    for sticker in &cfg.stickers {
+        let StickerSource::WindowCrop { minimized, .. } = &sticker.source else {
+            continue;
+        };
+        if !*minimized || !sticker.visible || sticker.placement.monitor_id != *monitor {
+            continue;
+        }
+        let piece = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+        let Some(icon) = window_crop_chrome::collapsed_icon_rect(piece, screen, &occupied) else {
+            continue;
+        };
+        if hit_icon.is_none()
+            && window_crop_chrome::hit_test_collapsed(icon, (dx, dy))
+                == window_crop_chrome::CollapsedHit::Restore
+        {
+            hit_icon = Some(sticker.id);
+        }
+        occupied.push(icon);
+    }
+    if let Some(id) = hit_icon {
+        return Some(WindowCropHoverState {
+            sticker: id,
+            monitor: monitor.clone(),
+        });
+    }
+
+    // Развёрнутые — по телу куска плюс полоса: она лежит поверх верхней
+    // кромки, но при куске у самого верха экрана прижимается к нему и может
+    // выходить за тело; без этого кнопки в такой полосе не нажимались бы.
+    cfg.stickers
+        .iter()
+        .rev()
+        .filter(|s| {
+            matches!(
+                s.source,
+                StickerSource::WindowCrop {
+                    minimized: false,
+                    ..
+                }
+            )
+        })
+        .filter(|s| s.visible && s.placement.monitor_id == *monitor)
+        .find(|s| {
+            // Прямоугольник с учётом поворота — тот же, которым проверяется
+            // попадание в обычный стикер: кусок можно вращать, и считать
+            // попадание по неповёрнутой рамке значило бы ловить клики
+            // рядом с ним и терять по его углам.
+            let piece = hittest::aabb(&s.placement, s.transform.rotation);
+            let layout = window_crop_chrome::chrome_layout(piece, 0.0, screen.h);
+            window_crop_chrome::hit_test(&layout, (dx, dy))
+                != window_crop_chrome::ChromeHit::Outside
+        })
+        .map(|s| WindowCropHoverState {
+            sticker: s.id,
+            monitor: monitor.clone(),
+        })
+}
+
+/// Живой захват одного куска окна: сессия WGC плюс держатель SRV на её
+/// текстуре.
+///
+/// Рантайм, не конфиг: `HWND` не переживает перезапуск, а привязка к нему
+/// пересобирается опознанием окна по приметам — ровно как у групп
+/// (`rst_core::group_match`).
+struct WindowCropRuntime {
+    /// Окно, к которому кусок сейчас привязан.
+    hwnd: usize,
+    capture: rst_win32::window_capture::WindowCapture,
+    /// `None` — кадров ещё не приходило: окно не перерисовывалось с момента
+    /// подписки. Пустой кусок в этот момент — норма, а не ошибка.
+    texture: Option<rst_render::WindowCropTexture>,
+}
+
+/// Пересобрать привязки живых кусков к окнам и забрать пришедшие кадры.
+/// `true` — нужна перерисовка.
+///
+/// Вызывается там же, где синхронизируются спрайты: набор кусков меняется
+/// теми же событиями (добавление, undo, применение пресета), и разводить их
+/// по разным местам значило бы получить кусок без захвата или захват без
+/// куска.
+fn sync_window_crops(
+    device: &Device,
+    cfg: &Config,
+    crops: &mut HashMap<Uuid, WindowCropRuntime>,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    window_snapshot: &[WindowInfo],
+    tx: &mpsc::Sender<OverlayMessage>,
+) -> bool {
+    use rst_core::group_match::{LiveWindow, MemberKey};
+
+    // Кусок удалили — захват обязан умереть вместе с ним, иначе сессия WGC
+    // осталась бы висеть на чужом окне навсегда.
+    crops.retain(|id, _| {
+        cfg.stickers
+            .iter()
+            .any(|s| s.id == *id && matches!(s.source, StickerSource::WindowCrop { .. }))
+    });
+    // Источник закрылся (окно закрыли) — привязку снимаем, кусок при этом
+    // остаётся: по решению пользователя 2026-09-10 он прячется и ждёт, пока
+    // приложение откроется снова.
+    crops.retain(|_, rt| !rt.capture.is_closed());
+
+    let live: Vec<LiveWindow> = window_snapshot
+        .iter()
+        .filter(|w| !w.iconic)
+        .map(|w| LiveWindow {
+            hwnd: w.hwnd,
+            exe_path: w.exe_path.clone(),
+            title: w.title.clone(),
+            class: w.class.clone(),
+        })
+        .collect();
+    // Страховка на случай, когда событие закрытия до нас не дошло: окна
+    // больше нет в перечислении, значит держать на нём сессию захвата не за
+    // что. Свёрнутые окна при этом НЕ считаются исчезнувшими — они
+    // отфильтрованы из `live` выше по другой причине (мусорный
+    // прямоугольник), и снимать с них захват было бы ошибкой: замер
+    // 2026-09-10 показал, что свёрнутый источник просто молчит и оживает
+    // сам после разворота.
+    let iconic: Vec<usize> = window_snapshot
+        .iter()
+        .filter(|w| w.iconic)
+        .map(|w| w.hwnd)
+        .collect();
+    crops.retain(|_, rt| live.iter().any(|w| w.hwnd == rt.hwnd) || iconic.contains(&rt.hwnd));
+
+    let mut changed = false;
+    for sticker in &cfg.stickers {
+        let StickerSource::WindowCrop {
+            window,
+            crop,
+            minimized,
+        } = &sticker.source
+        else {
+            continue;
+        };
+        // Свёрнутый кусок захвата не держит: показывать нечего, а сессия
+        // стоит 2.4 МБ VRAM и будит нас на каждую перерисовку чужого окна
+        // (замеры 2026-09-10). Разворачивание заводит захват заново — тем
+        // же путём, что и первая привязка ниже.
+        if *minimized && WINDOW_CROP_CHROME {
+            // Спрайт снимается вместе с захватом: от свёрнутого куска на
+            // экране остаётся только иконка у края, а содержимое, оставшееся
+            // висеть последним кадром, читалось бы как «свернуть не
+            // сработало».
+            if crops.remove(&sticker.id).is_some() {
+                changed = true;
+            }
+            if let Some(i) = sprites.iter().position(|(id, _)| *id == sticker.id) {
+                sprites.remove(i);
+                changed = true;
+            }
+            continue;
+        }
+        // --- привязка к живому окну ---
+        if !crops.contains_key(&sticker.id) {
+            let key = MemberKey {
+                exe_path: window.exe_path.clone(),
+                title: window.title.clone(),
+                class: window.class.clone(),
+            };
+            // Тот же механизм опознания, что у групп: exe + заголовок, затем
+            // exe + класс. Заголовки меняются до неузнаваемости (браузер
+            // пишет туда имя вкладки), и отказ по заголовку невозможен.
+            // `match_members` отдаёт ИНДЕКС в `live`, а не хэндл.
+            let matched = rst_core::group_match::match_members(&[key], &live)
+                .first()
+                .copied()
+                .flatten()
+                .and_then(|i| live.get(i))
+                .map(|w| w.hwnd);
+            let Some(hwnd) = matched else {
+                continue; // приложение не запущено — кусок ждёт
+            };
+            let wake = tx.clone();
+            match rst_win32::window_capture::WindowCapture::new_with_wake(
+                device.d3d_device(),
+                hwnd as isize,
+                Box::new(move || {
+                    // Ошибку отправки глотаем намеренно: закрытый канал
+                    // означает, что координатор уже завершается.
+                    let _ = wake.send(OverlayMessage::WindowCropFrame);
+                }),
+            ) {
+                Ok(capture) => {
+                    tracing::info!(
+                        sticker = %sticker.id,
+                        hwnd,
+                        title = %window.title,
+                        "живой кусок окна привязан к источнику"
+                    );
+                    crops.insert(
+                        sticker.id,
+                        WindowCropRuntime {
+                            hwnd,
+                            capture,
+                            texture: None,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(sticker = %sticker.id, hwnd, error = %e,
+                        "не удалось начать захват куска окна");
+                    continue;
+                }
+            }
+        }
+
+        // --- новый кадр ---
+        let Some(rt) = crops.get_mut(&sticker.id) else {
+            continue;
+        };
+        let Some(frame) = rt.capture.take_frame() else {
+            continue;
+        };
+        let updated = match rt.texture.as_mut() {
+            Some(tex) => device
+                .update_window_crop_texture(tex, &frame.texture)
+                .is_ok(),
+            None => match device.create_window_crop_texture(&frame.texture) {
+                Ok(tex) => {
+                    rt.texture = Some(tex);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(sticker = %sticker.id, error = %e,
+                        "кадр куска окна не принят рендером");
+                    false
+                }
+            },
+        };
+        if !updated {
+            continue;
+        }
+        let Some(tex) = rt.texture.as_ref() else {
+            continue;
+        };
+        // Доли пересчитываются в UV на КАЖДОМ кадре, а не один раз:
+        // окно могли изменить в размере, и кадр пришёл другого размера —
+        // кусок обязан продолжать показывать ту же по смыслу область
+        // (решение пользователя 2026-09-10).
+        let Some(uv) = tex.crop_uv(*crop) else {
+            continue;
+        };
+        let sprite_texture = tex.sprite_texture();
+        let first_frame = !sprites.iter().any(|(id, _)| *id == sticker.id);
+        if first_frame {
+            // Одна строка на кусок, а не на кадр: кадры идут при каждой
+            // перерисовке чужого окна, и строка на кадр забила бы журнал
+            // (так уже было — 96 % журнала за день, см. `input.rs`). Этой
+            // строки хватает, чтобы отличить «кадры не приходят» от «кадры
+            // приходят, но кусок не виден» — живой репорт 2026-09-11: у
+            // куска видна полоса, а содержимого нет.
+            tracing::info!(
+                sticker = %sticker.id,
+                frame_w = frame.width,
+                frame_h = frame.height,
+                uv_offset = ?uv.offset,
+                uv_scale = ?uv.scale,
+                placement_w = sticker.placement.w,
+                placement_h = sticker.placement.h,
+                "первый кадр живого куска окна"
+            );
+        }
+        if let Some((_, sprite)) = sprites.iter_mut().find(|(id, _)| *id == sticker.id) {
+            sprite.texture = sprite_texture;
+            sprite.uv_offset = uv.offset;
+            sprite.uv_scale = uv.scale;
+            sprite.placement = sticker.placement.clone();
+            sprite.transform = sticker.transform;
+        } else {
+            let mut sprite =
+                Sprite::new(sprite_texture, sticker.placement.clone(), sticker.transform);
+            sprite.uv_offset = uv.offset;
+            sprite.uv_scale = uv.scale;
+            sprites.push((sticker.id, sprite));
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// Завершить выделение куска окна: собрать стикер из протяжки.
+///
+/// `Ok(())` — кусок создан, конфиг сохранён. `Err` — отказ, который надо
+/// показать баннером: пустая протяжка, щелчок мимо окна, кусок меньше
+/// минимума. Отказ возвращается типом, а не проглатывается молча: выделение
+/// «ничего не дало» без объяснения читается как поломка.
+///
+/// Режим гаснет снаружи в любом случае — как у резки окон, одно нажатие
+/// даёт одну попытку.
+fn finish_window_crop(
+    edit: &mut EditState,
+    cfg: &mut Config,
+    config_path: &Path,
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+) -> Result<(), rst_core::window_crop::CropError> {
+    use rst_core::window_crop::{CropError, ScreenPoint, select};
+
+    let state = edit
+        .window_crop
+        .as_ref()
+        .ok_or(CropError::DragOutsideWindow)?;
+    let hover = state.hover.as_ref().ok_or(CropError::DragOutsideWindow)?;
+    let anchor = state.anchor.ok_or(CropError::DragTooSmall)?;
+    // Конец протяжки берётся у системы, а не из последнего пойманного
+    // `MouseMove`: между последним движением и отпусканием кнопки курсор
+    // успевает сдвинуться, и кусок получался бы чуть меньше нарисованного.
+    let end =
+        rst_win32::window_pick::cursor_position().map_err(|_| CropError::DragOutsideWindow)?;
+
+    // `WindowRect` держит размеры знаковыми; отрицательная ширина у живого
+    // окна невозможна, но `as u32` на ней дал бы четыре миллиарда и доли,
+    // съехавшие в бесконечность, — поэтому отказ, а не молчаливое приведение.
+    let (ww, wh) = (hover.rect.w, hover.rect.h);
+    if ww <= 0 || wh <= 0 {
+        return Err(CropError::DegenerateWindow);
+    }
+    let window = rst_core::model::Rect {
+        x: hover.rect.x,
+        y: hover.rect.y,
+        w: ww as u32,
+        h: wh as u32,
+    };
+    let selection = select(
+        ScreenPoint {
+            x: anchor.0,
+            y: anchor.1,
+        },
+        ScreenPoint { x: end.x, y: end.y },
+        window,
+    )?;
+
+    // Монитор определяется по ЦЕНТРУ выделения, а не по его левому верхнему
+    // углу: кусок, начатый у самой кромки экрана, иначе уехал бы на соседний
+    // монитор целиком из-за одного пикселя.
+    let cx_px = selection.screen_rect.x + selection.screen_rect.w as i32 / 2;
+    let cy_px = selection.screen_rect.y + selection.screen_rect.h as i32 / 2;
+    let (monitor_id, (cx, cy)) =
+        monitor_dip_at(cx_px, cy_px, monitor_bounds).ok_or(CropError::DragOutsideWindow)?;
+    let scale = monitor_bounds.get(monitor_id).map_or(1.0, |b| b.scale);
+    let monitor_id = monitor_id.clone();
+    let key = hover.key.clone();
+    let crop = selection.crop;
+
+    let before = cfg.clone();
+    cfg.stickers.push(Sticker::new_window_crop(
+        key,
+        crop,
+        monitor_id,
+        cx,
+        cy,
+        f64::from(selection.screen_rect.w) / scale,
+        f64::from(selection.screen_rect.h) / scale,
+    ));
+    commit_undo_snapshot(edit, before);
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, "не удалось сохранить config.json после отделения куска окна");
+    }
+    Ok(())
+}
+
+/// Включить режим отделения куска окна: перехватить мышь на всех мониторах
+/// и поставить крест-курсор.
+///
+/// Повторяет [`enter_mitosis_mode`] дословно, включая крест на ВСЕ мониторы
+/// сразу: форма курсора живёт в окне, и курсор, переехавший на соседний
+/// монитор, иначе молча стал бы стрелкой посреди режима.
+fn enter_window_crop_mode(
+    edit: &mut EditState,
+    monitors_map: &HashMap<MonitorId, MonitorState>,
+    monitor_id: &MonitorId,
+) {
+    for ms in monitors_map.values() {
+        // Интерактивность всех окон и фокус инициатора задаёт
+        // `apply_input_policies` — единый владелец флага прозрачности.
+        // Здесь только курсор и состояние режима.
+        ms.overlay.post_cursor_shape(CursorShape::Cross);
+    }
+    edit.window_crop = Some(WindowCropState {
+        initiator: monitor_id.clone(),
+        hover: None,
+        anchor: None,
+        cursor: None,
+    });
+}
+
+/// Выключить режим отделения куска: вернуть кликопрозрачность и стрелку.
+///
+/// `edit.active` учитывается по той же причине, что в
+/// [`exit_mitosis_mode`]: режим редактирования тоже держит оверлей
+/// кликабельным, и слепое `set_click_through(true)` обесклавило бы его.
+fn exit_window_crop_mode(edit: &mut EditState, monitors_map: &HashMap<MonitorId, MonitorState>) {
+    if edit.window_crop.take().is_none() {
+        return;
+    }
+    for ms in monitors_map.values() {
+        if !edit.active {
+            // Прозрачность вернёт `apply_input_policies`; захват снимаем
+            // здесь же, не дожидаясь конца итерации: захват, переживший
+            // выход из режима, — это залипшая мышь.
+            ms.overlay.force_release_capture();
+        }
+        ms.overlay.post_cursor_shape(CursorShape::Arrow);
+    }
+}
+
 /// Выключить режим резки: вернуть кликопрозрачность и стрелку.
 ///
 /// `edit.active` учитывается намеренно: режим редактирования тоже держит
@@ -924,7 +2085,9 @@ fn exit_mitosis_mode(edit: &mut EditState, monitors_map: &HashMap<MonitorId, Mon
     }
     for ms in monitors_map.values() {
         if !edit.active {
-            ms.overlay.set_click_through(true);
+            // Прозрачность вернёт `apply_input_policies`; захват снимаем
+            // здесь же, не дожидаясь конца итерации: захват, переживший
+            // выход из режима, — это залипшая мышь.
             ms.overlay.force_release_capture();
         }
         ms.overlay.post_cursor_shape(CursorShape::Arrow);
@@ -991,6 +2154,64 @@ fn is_single_instance_app(cfg: &Config, exe: &Path) -> bool {
 /// взамен переключения колесом. Гистерезис держит ось от дрожания на
 /// диагонали; текущее значение для него берётся из состояния, поэтому ось
 /// живёт в `MitosisState`, хотя и вычисляется заново на каждое движение.
+/// Пересчитать окно под курсором в режиме отделения куска.
+/// `true` — картинка изменилась и нужна перерисовка.
+///
+/// Пока протяжка идёт (`anchor` занят), наведение НЕ пересчитывается: окно
+/// выбрано в момент нажатия, и переезд курсора на соседнее окно посреди
+/// протяжки не должен менять источник куска — иначе отпускание кнопки дало бы
+/// кусок не того окна, над которым человек начинал.
+fn update_window_crop_hover(
+    edit: &mut EditState,
+    window_snapshot: &[WindowInfo],
+    monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    cfg: &Config,
+) -> bool {
+    let Some(state) = edit.window_crop.as_mut() else {
+        return false;
+    };
+    let Ok(cursor) = rst_win32::window_pick::cursor_position() else {
+        return false;
+    };
+    let before = state.hover.as_ref().map(|h| h.hwnd);
+    let cursor_before = state.cursor.clone();
+    state.cursor = monitor_dip_at(cursor.x, cursor.y, monitor_bounds)
+        .map(|(id, (dx, dy))| (id.clone(), dx, dy));
+
+    if state.anchor.is_some() {
+        // Протяжка идёт — источник зафиксирован, меняется только курсор.
+        return state.cursor != cursor_before;
+    }
+
+    let target = rst_win32::window_pick::window_at(window_snapshot, cursor)
+        .and_then(|hwnd| window_snapshot.iter().find(|w| w.hwnd == hwnd))
+        // Денай-лист — тот же, что закрывает окна от закрепления и от резки:
+        // список окон, которые пользователь запретил трогать вообще.
+        .filter(|w| {
+            !occluders::is_denylisted(
+                window_exe_path(w).as_deref(),
+                Some(&w.title),
+                &cfg.settings.denylist,
+            )
+        })
+        // Свёрнутое окно отсекается: у него мусорный прямоугольник
+        // (`WindowInfo::rect` — «у свёрнутых окон мусорные, не
+        // использовать»), а тянуть рамку по мусорным границам значило бы
+        // выделить кусок неизвестно чего.
+        .filter(|w| !w.iconic);
+
+    state.hover = target.map(|w| WindowCropHover {
+        hwnd: w.hwnd,
+        key: rst_core::model::CropWindowKey {
+            exe_path: w.exe_path.clone(),
+            title: w.title.clone(),
+            class: w.class.clone(),
+        },
+        rect: w.rect,
+    });
+    state.hover.as_ref().map(|h| h.hwnd) != before || state.cursor != cursor_before
+}
+
 fn update_mitosis_hover(
     edit: &mut EditState,
     window_snapshot: &[WindowInfo],
@@ -1171,10 +2392,12 @@ fn start_mitosis(
 /// приложения (холодный старт с диска не уложился в таймаут), и запрещать
 /// по одной осечке значило бы отобрать функцию у приложений, которые на
 /// самом деле работают. Успешный митоз счётчик обнуляет.
+#[allow(clippy::too_many_arguments)]
 fn finish_mitosis(
     edit: &mut EditState,
     cfg: &mut Config,
     config_path: &Path,
+    groups: &mut GroupsState,
     window_pins: &WindowPins,
     outcome: Result<usize, MitosisRefusal>,
 ) {
@@ -1190,10 +2413,40 @@ fn finish_mitosis(
             if let Some(name) = &pending.exe_name {
                 edit.mitosis_failures.remove(name);
             }
+            // Резали окно открытой группы — ребёнок вступает в неё сразу
+            // (заказ пользователя 2026-09-09). Делается ПОСЛЕ постановки
+            // ребёнка на место: группа запоминает места по живому снимку, и
+            // вступать в неё, стоя не там, значило бы записать в группу
+            // мусорную геометрию.
+            // Перечисляем окна ПРЯМО СЕЙЧАС, а не берём снимок трекера: он
+            // дебаунсится и обновляется асинхронно, а окну здесь секунда от
+            // роду — в снимке его может ещё не быть вовсе.
+            let live_windows = rst_win32::window_enum::enumerate();
+            let adopted = adopt_mitosis_child(
+                groups,
+                cfg,
+                config_path,
+                &live_windows,
+                pending.original_hwnd,
+                new_hwnd,
+            );
+            // Ребёнок стоит впереди — он только что родился поверх всех.
+            // Если в группу его приняли, он её член и вопросов нет; но
+            // усыновление могло и не состояться (резали не член группы, окно
+            // ещё не попало в перечисление). Тогда без этой строки первый же
+            // снимок после снятия гейта прочитал бы чужой передний план как
+            // «пользователь ушёл» и спрятал группу — тот самый симптом,
+            // ради которого всё затевалось (остаточный путь из аудита
+            // 2026-09-09). Запоминаем ребёнка как «то, поверх чего показана
+            // группа»: уходом считается СМЕНА переднего плана после этого.
+            if groups.shown_group().is_some() {
+                groups.note_shown_over(Some(new_hwnd));
+            }
             tracing::info!(
                 original = pending.original_hwnd,
                 clone = new_hwnd,
                 placed,
+                adopted,
                 "митоз состоялся"
             );
         }
@@ -1221,6 +2474,94 @@ fn finish_mitosis(
             show_banner(edit, &pending.monitor_id, text);
         }
     }
+}
+
+/// Принять окно, родившееся от митоза, в открытую группу — если резали её
+/// члена.
+///
+/// Заказ пользователя 2026-09-09: «если я провожу митоз на окне, которое
+/// находится в группе, то новое окно от митоза также попадает в группу
+/// мгновенно». Без этого группа из двух окон после разреза одного из них
+/// оставалась группой из двух, а третье окно жило рядом чужим — и следующий
+/// показ группы поднимал не всё, что человек видит своей группой.
+///
+/// `windows` — ЖИВОЕ перечисление, а не снимок трекера: снимок дебаунсится и
+/// обновляется асинхронно, а окну здесь секунда от роду — в снимке его может
+/// ещё не быть вовсе. Перечисляет вызывающий, чтобы саму механику можно было
+/// проверить тестом без Win32.
+///
+/// `false` — принимать некуда: группа не открыта, резали не её окно, ребёнок
+/// не перечисляется. Все три случая нормальны и молчаливы: митоз состоялся,
+/// просто он не про группу.
+fn adopt_mitosis_child(
+    groups: &mut GroupsState,
+    cfg: &mut Config,
+    config_path: &Path,
+    windows: &[WindowInfo],
+    parent: usize,
+    child: usize,
+) -> bool {
+    let Some(id) = groups.active() else {
+        return false;
+    };
+    // Индекс члена, которого резали: его приметы — основа для примет
+    // ребёнка (`group_match::sibling_key`).
+    let parent_index = {
+        let Some(open) = groups.open() else {
+            return false;
+        };
+        let Some(group) = cfg.groups.iter().find(|g| g.id == id) else {
+            return false;
+        };
+        match (0..group.members.len()).find(|i| open.window_of(*i) == Some(parent)) {
+            Some(i) => i,
+            None => return false,
+        }
+    };
+    let Some(live) = windows.iter().find(|w| w.hwnd == child) else {
+        return false;
+    };
+    let Some(group) = cfg.groups.iter_mut().find(|g| g.id == id) else {
+        return false;
+    };
+    let parent_member = &group.members[parent_index];
+    let parent_key = rst_core::group_match::MemberKey {
+        exe_path: parent_member.exe_path.clone(),
+        title: parent_member.title.clone(),
+        class: parent_member.class.clone(),
+    };
+    let key = rst_core::group_match::sibling_key(
+        &parent_key,
+        &rst_core::group_match::LiveWindow {
+            hwnd: live.hwnd,
+            exe_path: live.exe_path.clone(),
+            title: live.title.clone(),
+            class: live.class.clone(),
+        },
+    );
+    let member = rst_core::model::GroupMember {
+        exe_path: key.exe_path,
+        title: key.title,
+        class: key.class,
+        // Где ребёнок стоит на самом деле, запишет `note_places` по двум
+        // одинаковым живым снимкам — у него для этого есть защита от записи
+        // кадров анимации.
+        place: None,
+    };
+    if !groups.adopt_window(group, parent, child, member) {
+        return false;
+    }
+    let number = group.number;
+    if let Err(e) = config::save(cfg, config_path) {
+        tracing::warn!(error = %e, "не удалось сохранить группу после митоза");
+    }
+    tracing::info!(
+        group = number,
+        parent,
+        child,
+        "окно от митоза принято в открытую группу"
+    );
+    true
 }
 
 /// Засчитать приложению отказ «второго окна не будет». `true` — это был
@@ -1437,6 +2778,25 @@ enum OverlayMessage {
     /// читалось как рывок (замер в приложении 2026-08-22: период кадров
     /// 17 мс, интервалы показа — 17 мс, но раз в секунду 25 мс).
     VideoFrameReady,
+    /// Окно-источник живого куска перерисовалось, и захват положил новый
+    /// кадр (запрос пользователя 2026-09-10;
+    /// `rst_win32::window_capture::WindowCapture`).
+    ///
+    /// Сообщением, а не опросом по таймеру, — это и есть то, ради чего
+    /// выбран Windows.Graphics.Capture: замер 2026-09-10 показал ноль
+    /// кадров за три секунды неподвижного окна, то есть в покое эта ветка
+    /// не срабатывает вовсе и обещание SPEC §13 «в полном покое программа
+    /// не должна просыпаться вообще» остаётся в силе. Опрос по таймеру
+    /// сломал бы его на ровном месте.
+    WindowCropFrame,
+    /// Событие отдельного окна живого куска (`rst_win32::crop_window`):
+    /// перетащили, закрыли, свернули, развернули, источник исчез.
+    ///
+    /// Отдельное окно на кусок — механизм, прошедший замер на окне ДРУГОГО
+    /// процесса (`scratchpad/probe_v1`, фазы 1–2): клик мимо окна куска
+    /// доходит до чужой программы, фокус не уводится, залипаний ноль.
+    /// Большой оверлей при этом остаётся в покое прозрачным целиком.
+    CropWindow(Uuid, rst_win32::crop_window::CropWindowEvent),
     /// Фоновый поток митоза закончил ожидание второго окна
     /// (docs/M9_WINDOW_MITOSIS_DESIGN.md §4.4): `Ok(hwnd)` — новое окно
     /// появилось и его надо поставить на вторую половину, `Err(refusal)` —
@@ -1809,16 +3169,28 @@ fn close_panels_of_monitor(edit: &mut EditState, id: &MonitorId) {
     if edit.confirm.as_ref().is_some_and(|s| s.monitor_id == *id) {
         edit.confirm = None;
     }
-    if edit.window_picker.as_ref().is_some_and(|s| s.monitor_id == *id) {
+    if edit
+        .window_picker
+        .as_ref()
+        .is_some_and(|s| s.monitor_id == *id)
+    {
         edit.window_picker = None;
     }
-    if edit.preset_picker.as_ref().is_some_and(|s| s.monitor_id == *id) {
+    if edit
+        .preset_picker
+        .as_ref()
+        .is_some_and(|s| s.monitor_id == *id)
+    {
         edit.preset_picker = None;
     }
     if edit.gap_panel.as_ref().is_some_and(|s| s.monitor_id == *id) {
         edit.gap_panel = None;
     }
-    if edit.group_manager.as_ref().is_some_and(|s| s.monitor_id == *id) {
+    if edit
+        .group_manager
+        .as_ref()
+        .is_some_and(|s| s.monitor_id == *id)
+    {
         edit.group_manager = None;
     }
     if edit
@@ -1828,7 +3200,11 @@ fn close_panels_of_monitor(edit: &mut EditState, id: &MonitorId) {
     {
         edit.window_pick_list = None;
     }
-    if edit.pinned_panel.as_ref().is_some_and(|s| s.monitor_id == *id) {
+    if edit
+        .pinned_panel
+        .as_ref()
+        .is_some_and(|s| s.monitor_id == *id)
+    {
         edit.pinned_panel = None;
     }
     if edit.banner.as_ref().is_some_and(|s| s.monitor_id == *id) {
@@ -2141,6 +3517,25 @@ struct EditState {
     /// и обработчики ввода. Отдельная структура рядом означала бы четвёртый
     /// параметр в половине сигнатур файла.
     mitosis: Option<MitosisState>,
+    /// Кусок под курсором вне режима редактирования (решение пользователя
+    /// 2026-09-11: полоса с кнопками видна только при наведении). `None` —
+    /// курсор мимо всех кусков, обвязка не рисуется.
+    ///
+    /// Отдельно от `selection`: выделение — понятие режима редактирования,
+    /// а кусок обязан слушаться и вне его.
+    window_crop_hover: Option<WindowCropHoverState>,
+    /// Куски, которые сейчас показывает ОТДЕЛЬНОЕ окно (`crop_windows` в
+    /// `run()`). Их содержимое оверлей не рисует — иначе под окном куска было
+    /// бы второе такое же изображение. Живёт в `EditState`, потому что его
+    /// читает `redraw()`, у которого нет доступа к самим окнам.
+    crop_windows_shown: HashSet<Uuid>,
+    /// Режим отделения куска чужого окна (запрос пользователя 2026-09-10).
+    /// `None` — режим выключен, и это подавляющую часть времени: как и
+    /// резка, режим живёт от хоткея до одного выделения.
+    ///
+    /// Живёт рядом с `mitosis` и по той же причине (см. её доккомментарий):
+    /// состояние видят и цикл `run()`, и `redraw()`, и обработчики ввода.
+    window_crop: Option<WindowCropState>,
     /// Разрез, который уже начался: оригинал ужат, второй экземпляр
     /// запущен, ждём его окно в фоновом потоке. Переживает выключение
     /// самого режима (он гаснет сразу по клику), потому что несёт то, без
@@ -2155,6 +3550,51 @@ struct EditState {
     /// Рантайм, не конфиг: это черновик наблюдения, а не решение. В
     /// config.json попадает только итог — сам список.
     mitosis_failures: HashMap<String, u32>,
+}
+
+/// Состояние режима отделения куска чужого окна (запрос пользователя
+/// 2026-09-10; [`rst_core::model::StickerSource::WindowCrop`]).
+///
+/// Устроен как режим резки окон и по той же причине: оба перехватывают мышь
+/// на всех мониторах, оба живут от хоткея до одного действия, оба рисуют
+/// предпросмотр под курсором. Отличие одно — здесь пользователь не просто
+/// наводит на окно, а ТЯНЕТ прямоугольник внутри него, поэтому к наведению
+/// добавлена точка начала протяжки.
+struct WindowCropState {
+    /// Монитор, с которого режим включили — см. [`MitosisState::initiator`]:
+    /// «главный» монитор обязан быть один, два `SetForegroundWindow` подряд
+    /// на разные окна дерутся между собой.
+    initiator: MonitorId,
+    /// Окно под курсором — пересчитывается на каждое движение мыши, пока
+    /// протяжка не началась. `None` — курсор не над чужим окном: подсвечивать
+    /// нечего и тянуть не от чего.
+    hover: Option<WindowCropHover>,
+    /// Начало протяжки в физических пикселях виртуального десктопа.
+    /// `None` — пользователь ещё только наводит.
+    ///
+    /// Физические пиксели, а не DIP: протяжка идёт ВНУТРИ чужого окна, а
+    /// прямоугольник окна приходит из `WindowInfo::rect` тоже в физических
+    /// (границы DWM). Считать доли окна, смешав две системы координат, —
+    /// верный способ получить съезжающий на масштабе кусок.
+    anchor: Option<(i32, i32)>,
+    /// Где сейчас курсор: монитор и DIP-координаты на нём — для подсказки,
+    /// которая едет за курсором (как у режима резки).
+    cursor: Option<(MonitorId, f64, f64)>,
+}
+
+/// Окно, над которым сейчас курсор в режиме отделения куска.
+struct WindowCropHover {
+    hwnd: usize,
+    /// Приметы окна — снимаются в момент наведения, а не в момент отпускания
+    /// кнопки: пока пользователь тянет, заголовок может смениться (браузер
+    /// пишет туда имя вкладки), и кусок запомнил бы заголовок уже другой
+    /// страницы. Уезжают в [`rst_core::model::CropWindowKey`], по ним кусок
+    /// опознает своё окно после перезапуска.
+    key: rst_core::model::CropWindowKey,
+    /// Прямоугольник окна, физические пиксели виртуального десктопа
+    /// (`WindowInfo::rect` — границы DWM, а не `GetWindowRect`), тот же
+    /// источник, что у [`MitosisHover::rect`].
+    rect: WindowRect,
 }
 
 /// Состояние режима резки окон (`docs/M9_WINDOW_MITOSIS_DESIGN.md`).
@@ -3056,6 +4496,13 @@ fn run(
     let mut sprites: Vec<(Uuid, Sprite)> = Vec::new();
     let mut animations: HashMap<Uuid, StickerAnimation> = HashMap::new();
     let mut videos: HashMap<Uuid, VideoPlayback> = HashMap::new();
+    // Живые куски чужих окон: сессия захвата на каждый такой стикер.
+    // Рантайм, не конфиг, — как и `videos`: привязка к `HWND` пересобирается
+    // опознанием окна по приметам после каждого перезапуска.
+    let mut window_crops: HashMap<Uuid, WindowCropRuntime> = HashMap::new();
+    // Отдельные окна живых кусков — показывают содержимое вне режима
+    // редактирования (`sync_crop_windows`).
+    let mut crop_windows: HashMap<Uuid, CropWindowSlot> = HashMap::new();
     for sticker in &cfg.stickers {
         if let Some((sprite, anim)) = load_sticker_sprite(&device, sticker) {
             sprites.push((sticker.id, sprite));
@@ -3263,6 +4710,13 @@ fn run(
     // декодировать невидимое», ARCHITECTURE.md §4.3, просто на уровне всей
     // сессии, а не одного стикера).
     let mut session_locked = false;
+    // Последняя применённая к каждому окну политика ввода — см.
+    // `apply_input_policies`. Ключ — `HWND` окна, а не `MonitorId`: при смене
+    // DPI и переподключении монитора окно оверлея пересоздаётся с ТЕМ ЖЕ id.
+    // Новое окно рождается прозрачным, и кэш по id, помнящий «уже
+    // Interactive», не применил бы решение к нему повторно — режим
+    // редактирования на этом мониторе молча перестал бы работать.
+    let mut applied_input: HashMap<isize, rst_win32::overlay::OverlayInputPolicy> = HashMap::new();
 
     // Последний снимок окон трекера (M4_OCCLUDERS_DESIGN.md §1) — обычная
     // локальная переменная `run()`, не поле `EditState`: маска перекрытия не
@@ -3332,6 +4786,9 @@ fn run(
         pinned_follow_until: None,
         banner: None,
         mitosis: None,
+        window_crop: None,
+        window_crop_hover: None,
+        crop_windows_shown: HashSet::new(),
         mitosis_pending: None,
         mitosis_failures: HashMap::new(),
         pending_animation: None,
@@ -4059,8 +5516,75 @@ fn run(
                     need_redraw = true;
                 }
             }
+            OverlayMessage::Event(monitor_id, OverlayEvent::ToggleWindowCropMode) => {
+                // След в журнале по тому же поводу, что у режима резки: если
+                // режим «не включается», по строке сразу видно, доехал ли
+                // хоткей до координатора вообще.
+                tracing::info!(
+                    monitor = %monitor_id.0,
+                    was_active = edit.window_crop.is_some(),
+                    edit_mode = edit.active,
+                    "хоткей отделения куска окна"
+                );
+                if edit.window_crop.is_some() {
+                    // Без `continue`: он унёс бы выполнение мимо перерисовки
+                    // в конце тела цикла, и подсветка окна осталась бы на
+                    // экране после выхода из режима (тот же капкан, что у
+                    // режима резки — см. его ветку выше).
+                    exit_window_crop_mode(&mut edit, &monitors_map);
+                    need_redraw = true;
+                } else {
+                    // Два полноэкранных режима одновременно — экран, на
+                    // котором ничего не понятно: оба перехватывают мышь на
+                    // всех мониторах. Резка уступает место, ровно как она
+                    // сама потеснила бы режим редактирования.
+                    exit_mitosis_mode(&mut edit, &monitors_map);
+                    if edit.active {
+                        if let Some(ms) = monitors_map.get_mut(&monitor_id) {
+                            let renderer = Renderer {
+                                device: &device,
+                                target: &mut ms.target,
+                            };
+                            toggle_edit_mode(
+                                &ms.overlay,
+                                &mut edit,
+                                &mut cfg,
+                                &mut sprites,
+                                &mut animations,
+                                &mut videos,
+                                audio_mixer.as_ref(),
+                                &renderer,
+                                &config_path,
+                                &monitor_geometry,
+                                &monitor_bounds,
+                                &mut window_pins,
+                                &window_snapshot,
+                            );
+                            sync_other_monitors_edit_mode(&monitors_map, &monitor_id, edit.active);
+                        }
+                    }
+                    if edit.group_editor.is_some() {
+                        close_group_editor(&mut groups, &mut edit, &monitors_map);
+                    }
+                    edit.gap_panel.take();
+                    enter_window_crop_mode(&mut edit, &monitors_map, &monitor_id);
+                    // Первое наведение считается сразу, не дожидаясь движения
+                    // мыши: курсор уже где-то стоит, и режим, включившийся
+                    // «пустым», читался бы как неработающий (тот же вывод,
+                    // что для режима резки).
+                    update_window_crop_hover(&mut edit, &window_snapshot, &monitor_bounds, &cfg);
+                    need_redraw = true;
+                }
+            }
             OverlayMessage::MitosisFinished(outcome) => {
-                finish_mitosis(&mut edit, &mut cfg, &config_path, &window_pins, outcome);
+                finish_mitosis(
+                    &mut edit,
+                    &mut cfg,
+                    &config_path,
+                    &mut groups,
+                    &window_pins,
+                    outcome,
+                );
                 need_redraw = true;
             }
             OverlayMessage::Event(_, OverlayEvent::ToggleAllStickers) => {
@@ -4640,7 +6164,131 @@ fn run(
                 // ради полосы перемотки (`set_hover_click_target`) или ради
                 // панели зазора (`open_gap_panel`). В сцену они не уходят:
                 // вне режима редактирования стикеры не двигают и не выделяют.
-                if edit.mitosis.is_some() {
+                if edit.window_crop.is_some() {
+                    // Режим отделения куска окна. Как и резка, мышь здесь не
+                    // редактирует сцену: оверлей стал кликабельным только
+                    // ради выделения прямоугольника в чужом окне.
+                    match event {
+                        InputEvent::MouseMove { .. } => {
+                            // Перерисовка на КАЖДОЕ движение: пока тянут
+                            // рамку, она обязана идти за курсором без
+                            // отставания.
+                            update_window_crop_hover(
+                                &mut edit,
+                                &window_snapshot,
+                                &monitor_bounds,
+                                &cfg,
+                            );
+                            need_redraw = true;
+                        }
+                        InputEvent::MouseDown { .. } => {
+                            // Начало протяжки берётся у системы в физических
+                            // пикселях — в той же системе координат, в которой
+                            // приходит прямоугольник окна (`WindowInfo::rect`,
+                            // границы DWM). Смешивать её с DIP нельзя: на
+                            // мониторе с масштабом доли окна поехали бы.
+                            if let Ok(p) = rst_win32::window_pick::cursor_position()
+                                && let Some(state) = edit.window_crop.as_mut()
+                                && state.hover.is_some()
+                            {
+                                state.anchor = Some((p.x, p.y));
+                            }
+                            need_redraw = true;
+                        }
+                        InputEvent::MouseUp { .. } => {
+                            // Режим гаснет ВСЕГДА, состоялось выделение или
+                            // нет — как у резки окон: одно нажатие даёт одну
+                            // попытку. Баннер отказа поэтому показывается
+                            // уже после выхода из режима.
+                            let initiator = edit
+                                .window_crop
+                                .as_ref()
+                                .map(|s| s.initiator.clone())
+                                .unwrap_or_else(|| monitor_id.clone());
+                            let dragged = edit
+                                .window_crop
+                                .as_ref()
+                                .is_some_and(|s| s.anchor.is_some());
+                            let outcome = dragged.then(|| {
+                                finish_window_crop(
+                                    &mut edit,
+                                    &mut cfg,
+                                    &config_path,
+                                    &monitor_bounds,
+                                )
+                            });
+                            exit_window_crop_mode(&mut edit, &monitors_map);
+                            // Привязка к источнику — СРАЗУ, не дожидаясь
+                            // кадра: кадр приходит только по подписке, а
+                            // подписка заводится здесь. Без этого вызова
+                            // кусок ждал бы первой перерисовки окна, которой
+                            // никто не заказывал, и выглядел бы мёртвым.
+                            if matches!(outcome, Some(Ok(()))) {
+                                sync_window_crops(
+                                    &device,
+                                    &cfg,
+                                    &mut window_crops,
+                                    &mut sprites,
+                                    &window_snapshot,
+                                    &tx,
+                                );
+                            }
+                            if let Some(Err(refusal)) = outcome {
+                                show_banner(
+                                    &mut edit,
+                                    &initiator,
+                                    crate::i18n::window_crop_refusal(refusal),
+                                );
+                            }
+                            need_redraw = true;
+                        }
+                        // Захват мыши потерян (переключение сессии, чужой
+                        // `SetCapture`) — протяжку нельзя достроить честно, и
+                        // режим закрывается без создания куска. Оставить
+                        // режим висеть значило бы перехваченную мышь на всех
+                        // мониторах без видимой причины.
+                        InputEvent::CaptureLost => {
+                            exit_window_crop_mode(&mut edit, &monitors_map);
+                            need_redraw = true;
+                        }
+                        InputEvent::MouseWheel { .. } => {}
+                    }
+                } else if edit.window_crop_hover.is_some() {
+                    // Обвязка живого куска. Сюда события доходят только
+                    // потому, что оверлею отданы области попадания
+                    // (`sync_window_crop_hit_rects`): вне их мышь идёт в
+                    // окна под нами, как будто оверлея нет.
+                    match event {
+                        InputEvent::MouseMove { .. } => {
+                            // Наведение пересчитывается тут же: теперь
+                            // движения доходят по-настоящему, а не по
+                            // случайному пробуждению цикла.
+                            if sync_window_crop_hover(&mut edit, &cfg, &monitor_bounds) {
+                                need_redraw = true;
+                            }
+                        }
+                        InputEvent::MouseDown { .. } => {
+                            if let Ok(p) = rst_win32::window_pick::cursor_position() {
+                                match handle_crop_chrome_click(
+                                    &mut edit,
+                                    &mut cfg,
+                                    &config_path,
+                                    &monitor_bounds,
+                                    p.x,
+                                    p.y,
+                                ) {
+                                    CropChromeAction::Changed | CropChromeAction::DragStarted => {
+                                        need_redraw = true;
+                                    }
+                                    CropChromeAction::None => {}
+                                }
+                            }
+                        }
+                        InputEvent::MouseUp { .. }
+                        | InputEvent::MouseWheel { .. }
+                        | InputEvent::CaptureLost => {}
+                    }
+                } else if edit.mitosis.is_some() {
                     // Режим резки окон. Мышь здесь не редактирует сцену
                     // вообще: оверлей стал кликабельным только ради выбора
                     // чужого окна, и любое событие, кроме перечисленных,
@@ -4761,6 +6409,20 @@ fn run(
                 },
             ) if edit.mitosis.is_some() => {
                 exit_mitosis_mode(&mut edit, &monitors_map);
+                need_redraw = true;
+            }
+            // Перед веткой меню групп по той же причине, что и резка:
+            // режимы взаимоисключающие, но порядок веток — единственное,
+            // что это гарантирует, если взаимоисключение однажды нарушат.
+            OverlayMessage::Event(
+                _,
+                OverlayEvent::Key {
+                    vk: VK_ESCAPE,
+                    pressed: true,
+                    ..
+                },
+            ) if edit.window_crop.is_some() => {
+                exit_window_crop_mode(&mut edit, &monitors_map);
                 need_redraw = true;
             }
             OverlayMessage::Event(
@@ -5129,6 +6791,35 @@ fn run(
                 // Вне режима редактирования окно клик-прозрачно — эти
                 // события приходить не должны, но игнорируем на всякий случай.
             }
+            OverlayMessage::CropWindow(id, event) => {
+                if handle_crop_window_event(
+                    &mut edit,
+                    &mut cfg,
+                    &config_path,
+                    &monitor_bounds,
+                    &mut crop_windows,
+                    id,
+                    event,
+                ) {
+                    need_redraw = true;
+                }
+            }
+            OverlayMessage::WindowCropFrame => {
+                // Окно-источник перерисовалось. Ветка выполняет ровно две
+                // вещи — забрать кадр и попросить перерисовку; ни опроса, ни
+                // таймера здесь нет, иначе рухнуло бы обещание SPEC §13
+                // (замер 2026-09-10: в покое кадры не приходят вовсе).
+                if sync_window_crops(
+                    &device,
+                    &cfg,
+                    &mut window_crops,
+                    &mut sprites,
+                    &window_snapshot,
+                    &tx,
+                ) {
+                    need_redraw = true;
+                }
+            }
             OverlayMessage::Windows(TrackerWindowEvent::Changed(windows)) => {
                 // M4: снимок окон трекера — пересчитываем группы окклюдеров
                 // по всем мониторам (M4_OCCLUDERS_DESIGN.md §1) и просим
@@ -5136,6 +6827,21 @@ fn run(
                 // стикер неверно относительно нового расположения окон.
                 tracing::debug!(count = windows.len(), "снимок окон обновлён");
                 window_snapshot = windows;
+                // Живые куски пересобирают привязку на КАЖДОМ снимке: так
+                // кусок сам оживает, когда приложение запустили заново, и
+                // сам отвязывается, когда окно закрыли. Отдельного опроса
+                // для этого заводить нельзя — снимок трекера и есть событие
+                // «состав окон изменился».
+                // Перерисовку эта ветка просит в своём конце безусловно,
+                // поэтому отдельный `need_redraw` здесь был бы затёрт.
+                sync_window_crops(
+                    &device,
+                    &cfg,
+                    &mut window_crops,
+                    &mut sprites,
+                    &window_snapshot,
+                    &tx,
+                );
                 // Редизайн пинов (SPEC «Закрепление окна»): рантайм-
                 // обслуживание закреплённых окон — снос уничтоженных,
                 // z-order-слоты/временный topmost по фокусу, move-lock
@@ -5188,7 +6894,15 @@ fn run(
                     // (выбор пользователя: «постоянно, пока группа открыта»).
                     // Порог против дрожания округления живёт в `note_places`,
                     // иначе конфиг переписывался бы на каждом снимке.
+                    // Во время митоза геометрия окна ПЕРЕХОДНАЯ: оригинал
+                    // ужат в половину ещё в момент клика и стоит так все
+                    // секунды ожидания второго окна, а при отказе
+                    // возвращается обратно. `note_places` записывает место,
+                    // простоявшее два снимка подряд, — то есть успел бы
+                    // записать в группу половинку как «место окна» и оставить
+                    // её там навсегда (остаточный путь из аудита 2026-09-09).
                     if let Some(id) = groups.active()
+                        && edit.mitosis_pending.is_none()
                         && let Some(index) = cfg.groups.iter().position(|g| g.id == id)
                     {
                         let live = live_group_places(&window_snapshot, &monitor_bounds);
@@ -5623,6 +7337,18 @@ fn run(
         if sync_video_timeline(&mut edit, &cfg, &videos, &monitor_bounds) {
             need_redraw = true;
         }
+        // Обвязка куска: полоса с кнопками видна только при наведении
+        // (решение пользователя 2026-09-11).
+        if sync_window_crop_hover(&mut edit, &cfg, &monitor_bounds) {
+            need_redraw = true;
+        }
+        // Попиксельная кликопрозрачность (`sync_window_crop_hit_rects`)
+        // ОТКЛЮЧЕНА 2026-09-11 после двух залипаний мыши у пользователя.
+        // Причина — два независимых хозяина одного флага `WS_EX_TRANSPARENT`:
+        // `set_hit_rects` с пустым списком включал прозрачность ровно в тех
+        // режимах (редактирование, выделение куска), где окно обязано ловить
+        // мышь, и дрался с `set_click_through`. Вернётся только с единым
+        // владельцем флага и после живой проверки.
         // Кадр выезда панели редактирования.
         if sync_cursor_panel_slide(&mut edit, &cfg, &monitor_geometry) {
             need_redraw = true;
@@ -5655,19 +7381,12 @@ fn run(
                 .as_ref()
                 .filter(|t| t.hover_mode && (t.over_strip || edit.timeline_dragging))
                 .map(|t| t.monitor_id.clone());
-            if want_click_target != edit.timeline_click_target {
-                if let Some(old) = edit.timeline_click_target.take() {
-                    if let Some(ms) = monitors_map.get(&old) {
-                        ms.overlay.set_hover_click_target(false);
-                    }
-                }
-                if let Some(new_id) = &want_click_target {
-                    if let Some(ms) = monitors_map.get(new_id) {
-                        ms.overlay.set_hover_click_target(true);
-                    }
-                }
-                edit.timeline_click_target = want_click_target;
-            }
+            // Сам флаг прозрачности здесь больше не пишется: полосу перемотки
+            // учитывает `apply_input_policies` (режим `HoverTarget`) вместе
+            // со всеми остальными владельцами ввода. Раньше эта ветка писала
+            // флаг независимо и могла выключить ввод открытой панели зазора
+            // или меню групп (аудит `y1_audit_report.md`, конфликт 3).
+            edit.timeline_click_target = want_click_target;
             // Медиа-хоткеи (пробел/PgUp/PgDn) включены, пока курсор на
             // стикере с полосой, — по НАВЕДЕНИЮ, а не по попаданию в саму
             // полосу: клавиши логично работают со всего стикера, на который
@@ -5878,11 +7597,9 @@ fn run(
             );
             if edit.group_editor.is_none() {
                 groups.close_editor();
-            } else if !edit.active
-                && let Some(ms) = monitors_map.get(&edit.cursor_monitor)
-            {
-                ms.overlay.set_click_through(false);
             }
+            // Интерактивность и фокус окна меню задаёт `apply_input_policies`
+            // по `group_editor.monitor_id` — единый владелец флага.
             need_redraw = true;
         }
         if std::mem::take(&mut edit.pending_open_group_manager) {
@@ -5939,6 +7656,31 @@ fn run(
         // выбора окон, снимок обязан оставаться живым независимо от
         // `mask_needed(cfg)` (дизайн §5.1) — иначе если ВСЕ стикеры сейчас
         // `Always`, трекер спит, и список окон в панели не наполнится вовсе.
+        // Как окнам ловить мышь — решается ОДИН раз за итерацию, после того
+        // как все ветки уже поменяли состояние (единый владелец флага
+        // прозрачности, `apply_input_policies`).
+        apply_input_policies(
+            &edit,
+            &cfg,
+            &monitors_map,
+            &monitor_bounds,
+            &primary_id,
+            session_locked,
+            &mut applied_input,
+        );
+        // Отдельные окна кусков: создать, переставить, свернуть, убрать —
+        // после того как все ветки поменяли состояние.
+        if sync_crop_windows(
+            &mut edit,
+            &cfg,
+            &window_crops,
+            &window_snapshot,
+            &monitor_bounds,
+            &tx,
+            &mut crop_windows,
+        ) {
+            need_redraw = true;
+        }
         let new_mask_needed = tracker_mask_needed(&cfg, &edit, &groups);
         if new_mask_needed != last_mask_needed {
             last_mask_needed = new_mask_needed;
@@ -6088,7 +7830,10 @@ fn toggle_edit_mode(
     let exiting = edit.active;
     reset_edit_mode_panels(edit, exiting);
     edit.active = !edit.active;
-    overlay.set_click_through(!edit.active);
+    // Флаг прозрачности и фокус задаёт `apply_input_policies` в конце
+    // итерации: при входе — интерактивно, фокус основному монитору (хоткей
+    // зарегистрирован на нём); при выходе — прозрачно со снятием захвата.
+    let _ = overlay;
     if edit.active {
         // Панель инструментов выезжает снизу, а не появляется рывком —
         // тот же плавный вход, что и при возврате из свёрнутого состояния
@@ -6194,7 +7939,8 @@ fn sync_other_monitors_edit_mode(
 ) {
     for (other_id, other_ms) in monitors_map.iter() {
         if other_id != initiator_id {
-            other_ms.overlay.set_interactive(edit_active);
+            // Интерактивность задаёт `apply_input_policies`. Захват при
+            // выходе снимаем здесь же, не дожидаясь конца итерации.
             if !edit_active {
                 other_ms.overlay.force_release_capture();
             }
@@ -6263,6 +8009,9 @@ fn sticker_image_path(source: &StickerSource) -> Option<&Path> {
     match source {
         StickerSource::File { path, .. } => Some(path),
         StickerSource::Pasted { path } => Some(path),
+        // Кусок чужого окна файлом не подпирается: его текстура приходит
+        // кадрами от захвата, а не читается с диска.
+        StickerSource::WindowCrop { .. } => None,
     }
 }
 
@@ -7613,9 +9362,7 @@ fn cursor_shape_for_zone(zone: &Zone) -> CursorShape {
         // Группа отвечает теми же курсорами, что одиночный стикер: рука над
         // телом, двусторонняя стрелка над ручкой — жест-то тот же самый.
         Zone::MultiBody => CursorZone::StickerBody.cursor_shape(),
-        Zone::MultiResize(kind) => {
-            CursorZone::ResizeHandle(to_win32_handle(*kind)).cursor_shape()
-        }
+        Zone::MultiResize(kind) => CursorZone::ResizeHandle(to_win32_handle(*kind)).cursor_shape(),
     }
 }
 
@@ -7743,7 +9490,6 @@ fn apply_transform(
     }
 }
 
-
 /// Монитор, на котором «живёт» тулбар — монитор ПОСЛЕДНЕГО выделенного
 /// стикера (тулбара нет, если не выделено ничего). Общая точка для двух
 /// решений, которые обязаны совпадать (M3, docs/M3_STEP4_REVIEW.md, пункт
@@ -7862,6 +9608,21 @@ fn tracker_mask_needed(cfg: &Config, edit: &EditState, groups: &GroupsState) -> 
         // выглядел бы сломанным — ровно тот же случай, что у списка выбора
         // окна выше (docs/M9_WINDOW_MITOSIS_DESIGN.md §5).
         || edit.mitosis.is_some()
+        // Режим выделения куска окна ищет окно под курсором по тому же
+        // снимку, что и резка (`window_at`). Без него режим работал только
+        // тогда, когда трекер случайно не спал по другой причине.
+        || edit.window_crop.is_some()
+        // Живые куски окон привязываются к источнику по снимку трекера:
+        // после перезапуска программы, и когда приложение-источник закрыли
+        // и открыли снова (решение пользователя 2026-09-10: кусок ждёт
+        // возвращения окна). Без снимка кусок оставался пустым навсегда —
+        // живой репорт 2026-09-11, после перезапуска ни одной привязки.
+        // Трекер событийный (WinEvent-хуки, без опроса), поэтому это не
+        // нарушает SPEC §13: в покое он не будит программу.
+        || cfg
+            .stickers
+            .iter()
+            .any(|s| matches!(s.source, StickerSource::WindowCrop { .. }))
         || !edit.pinned_windows.is_empty()
         || groups.shown_group().is_some()
 }
@@ -10818,11 +12579,8 @@ fn open_group_editor(
         groups.close_editor();
         return;
     }
-    if !edit.active
-        && let Some(ms) = monitors_map.get(&monitor_id)
-    {
-        ms.overlay.set_click_through(false);
-    }
+    // Интерактивность и фокус окна меню задаёт `apply_input_policies`.
+    let _ = (monitors_map, monitor_id);
 }
 
 /// Закрыть меню редактирования групп, вернув оверлею кликопрозрачность.
@@ -10839,7 +12597,7 @@ fn close_group_editor(
         return;
     }
     if let Some(ms) = monitors_map.get(&panels.monitor_id) {
-        ms.overlay.set_click_through(true);
+        // Прозрачность вернёт `apply_input_policies`; захват снимаем сразу.
         ms.overlay.force_release_capture();
     }
 }
@@ -11430,6 +13188,81 @@ fn finish_group_raise(
     true
 }
 
+/// Судить ли по этому снимку о том, ушёл ли пользователь от показанной
+/// группы. `false` — происходящее с передним планом сейчас НЕ означает
+/// ухода, и прятать группу нельзя.
+///
+/// Вынесено из [`maintain_group_visibility`] отдельно от Win32 (2026-09-09):
+/// это шесть накопившихся правил, каждое из которых появилось после живого
+/// репорта, а проверить их было нечем — передний план и состояние оболочки
+/// берутся у системы прямо в теле функции. Здесь они приходят аргументами,
+/// и правила стали проверяемыми тестом.
+fn should_judge_group_visibility(
+    groups: &GroupsState,
+    edit: &EditState,
+    shell_switching: bool,
+    foreground: Option<usize>,
+    windows: &[WindowInfo],
+) -> bool {
+    // Пока показано системное всплывающее меню (Alt+Tab, Task View, меню
+    // снап-раскладок), переднего плана в обычном смысле нет: активна сама
+    // оболочка. Прятать по нему группу значило бы прятать её ровно в тот
+    // момент, когда пользователь в Alt+Tab выбирает её же окно.
+    if shell_switching {
+        return false;
+    }
+    // Залп окон группы ещё не улёгся — передний план сейчас перебрасывают
+    // сами показываемые окна, а не пользователь (см. `just_shown`).
+    if groups.just_shown() {
+        return false;
+    }
+    // Показ ещё не доведён: часть окон разворачивается. Спрятать группу,
+    // которую мы сами не успели показать, — худший из возможных исходов:
+    // пользователь нажал хоткей и не увидел ничего.
+    if groups.raise_pending() {
+        return false;
+    }
+    // Идёт митоз — передний план сейчас не про уход пользователя.
+    //
+    // Заказ пользователя 2026-09-09: «при митозе окна группы группа не
+    // сворачивалась». Раньше сворачивалась, и по-честному: митоз ЗАПУСКАЕТ
+    // ВТОРОЙ ЭКЗЕМПЛЯР приложения, его окно рождается поверх всех и забирает
+    // фокус. Членом группы оно в этот момент ещё не числится, поэтому правило
+    // читало происходящее как «пользователь ушёл на постороннее окно» и
+    // прятало всю группу — ровно в секунду, когда человек смотрел на
+    // результат своего разреза.
+    //
+    // Гейт покрывает обе фазы: `mitosis` — прицеливание (оно же забирает
+    // фокус на оверлей-инициатор), `mitosis_pending` — ожидание второго окна,
+    // которое длится до нескольких секунд. После успеха ребёнок становится
+    // членом группы, и постороннего переднего плана больше нет; после отказа
+    // гейт снимается, и следующий снимок трекера решает судьбу группы
+    // обычным правилом.
+    if edit.mitosis.is_some() || edit.mitosis_pending.is_some() {
+        return false;
+    }
+    // Передний план, которого нет в перечислении окон, — не окно
+    // пользователя: так выглядят наши собственные оверлеи (они `no_activate`
+    // и отсеиваются `is_real_window`), панель задач и всплывающие меню.
+    // Прятать по ним группу нельзя: пользователь никуда не уходил.
+    let Some(foreground_hwnd) = foreground else {
+        return false;
+    };
+    if !windows.iter().any(|w| w.hwnd == foreground_hwnd) {
+        return false;
+    }
+    // Впереди то же окно, что и до показа группы, — переключения не было.
+    // Либо пользователь никуда не уходил, либо приложение вернуло себе фокус
+    // само (замер 2026-08-26: Steam делает это через 1.1 секунды и повторно,
+    // если фокус отобрать). Ни то ни другое не повод прятать группу: «уход» —
+    // это СМЕНА переднего плана после показа, а не сам факт, что впереди не
+    // член группы.
+    if groups.is_shown_over(foreground_hwnd) {
+        return false;
+    }
+    true
+}
+
 /// Сменился передний план: группа, показанная хоткеем, прячется, если
 /// пользователь ушёл на постороннее окно.
 ///
@@ -11453,42 +13286,14 @@ fn maintain_group_visibility(
     if !state.shown {
         return false;
     }
-    // Пока показано системное всплывающее меню (Alt+Tab, Task View, меню
-    // снап-раскладок), переднего плана в обычном смысле нет: активна сама
-    // оболочка. Прятать по нему группу значило бы прятать её ровно в тот
-    // момент, когда пользователь в Alt+Tab выбирает её же окно.
-    if rst_win32::window_enum::shell_switching() {
-        return false;
-    }
-    // Залп окон группы ещё не улёгся — передний план сейчас перебрасывают
-    // сами показываемые окна, а не пользователь (см. `just_shown`).
-    if groups.just_shown() {
-        return false;
-    }
-    // Показ ещё не доведён: часть окон разворачивается. Спрятать группу,
-    // которую мы сами не успели показать, — худший из возможных исходов:
-    // пользователь нажал хоткей и не увидел ничего.
-    if groups.raise_pending() {
-        return false;
-    }
     let foreground = rst_win32::window_enum::foreground_hwnd();
-    // Передний план, которого нет в перечислении окон, — не окно
-    // пользователя: так выглядят наши собственные оверлеи (они `no_activate`
-    // и отсеиваются `is_real_window`), панель задач и всплывающие меню.
-    // Прятать по ним группу нельзя: пользователь никуда не уходил.
-    let Some(foreground_hwnd) = foreground else {
-        return false;
-    };
-    if !windows.iter().any(|w| w.hwnd == foreground_hwnd) {
-        return false;
-    }
-    // Впереди то же окно, что и до показа группы, — переключения не было.
-    // Либо пользователь никуда не уходил, либо приложение вернуло себе фокус
-    // само (замер 2026-08-26: Steam делает это через 1.1 секунды и повторно,
-    // если фокус отобрать). Ни то ни другое не повод прятать группу: «уход» —
-    // это СМЕНА переднего плана после показа, а не сам факт, что впереди не
-    // член группы.
-    if groups.is_shown_over(foreground_hwnd) {
+    if !should_judge_group_visibility(
+        groups,
+        edit,
+        rst_win32::window_enum::shell_switching(),
+        foreground,
+        windows,
+    ) {
         return false;
     }
     let facts = group_member_facts(&group, groups, edit, windows, foreground);
@@ -12168,9 +13973,8 @@ fn open_gap_panel(
         applied_pct: pct,
         last_pos: (frame.cx, frame.cy),
     });
-    if !edit.active {
-        ms.overlay.set_click_through(false);
-    }
+    // Интерактивность и фокус окна панели задаёт `apply_input_policies`.
+    let _ = ms;
 }
 
 /// Закрыть панель величины зазора и вернуть оверлею кликопрозрачность.
@@ -12185,7 +13989,7 @@ fn close_gap_panel(edit: &mut EditState, monitors_map: &HashMap<MonitorId, Monit
         return;
     }
     if let Some(ms) = monitors_map.get(&state.monitor_id) {
-        ms.overlay.set_click_through(true);
+        // Прозрачность вернёт `apply_input_policies`; захват снимаем сразу.
         // Захват мыши мог остаться, если панель закрыли посреди жеста, —
         // окно, которое ловит мышь, уже кликопрозрачно, и отпустить захват
         // ему будет нечем.
@@ -13837,7 +15641,8 @@ fn toolbar_wheel(
     notches: i32,
     monitor_id: &MonitorId,
 ) -> bool {
-    if edit.cursor_monitor != *monitor_id || toolbar_monitor(&edit.selection, cfg) != Some(monitor_id)
+    if edit.cursor_monitor != *monitor_id
+        || toolbar_monitor(&edit.selection, cfg) != Some(monitor_id)
     {
         return false;
     }
@@ -15165,7 +16970,8 @@ fn snap_resize(
 ) -> transform_ops::TransformedState {
     let edges = snap::ResizeEdges::of(handle);
     let free_rect = hittest::aabb(&free.placement, 0.0);
-    let (want_x, want_y) = snap::snap_resize_delta(free_rect, monitor, peers, edges, config, disabled);
+    let (want_x, want_y) =
+        snap::snap_resize_delta(free_rect, monitor, peers, edges, config, disabled);
     if want_x == 0.0 && want_y == 0.0 {
         return free;
     }
@@ -15483,17 +17289,7 @@ fn resize_many(
     let identity = Transform::default();
     let free = transform_ops::resize(&frame, &identity, handle, delta, dm, false);
     let snapped = snap_resize(
-        free,
-        &frame,
-        &identity,
-        handle,
-        delta,
-        dm,
-        false,
-        monitor,
-        peers,
-        snap_cfg,
-        magnet_off,
+        free, &frame, &identity, handle, delta, dm, false, monitor, peers, snap_cfg, magnet_off,
     );
     let after = DipRect::from_center(
         snapped.placement.cx,
@@ -15704,6 +17500,12 @@ fn redraw(
                         )
                 });
             if culled {
+                continue;
+            }
+            // Кусок, который сейчас показывает ОТДЕЛЬНОЕ окно, оверлей не
+            // рисует: иначе под окном куска было бы второе такое же
+            // изображение.
+            if edit.crop_windows_shown.contains(&sticker.id) {
                 continue;
             }
             if let Some((_, sprite)) = sprites.iter().find(|(id, _)| *id == sticker.id) {
@@ -16156,6 +17958,129 @@ fn redraw(
     // docs/M9_WINDOW_MITOSIS_DESIGN.md §4.3) — поверх сцены, но ПОД
     // баннером: баннер объясняет отказ и обязан читаться даже поверх
     // предпросмотра.
+    // --- Обвязка живых кусков: полоса при наведении и свёрнутые иконки ---
+    if WINDOW_CROP_CHROME {
+        let screen = screen_dip_rect((width_px, height_px), scale);
+        let mut prims = Vec::new();
+        // Свёрнутые куски рисуются ВСЕГДА, а не по наведению: иконка и есть
+        // единственный след свёрнутого куска, спрятать её значило бы потерять
+        // его насовсем. Места раздаются по порядку списка, и каждый следующий
+        // видит занятые — иначе иконки легли бы друг на друга.
+        let mut occupied: Vec<DipRect> = Vec::new();
+        for sticker in &cfg.stickers {
+            let StickerSource::WindowCrop { minimized, .. } = &sticker.source else {
+                continue;
+            };
+            if !*minimized || !sticker.visible || sticker.placement.monitor_id != *monitor_id {
+                continue;
+            }
+            let piece = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+            let Some(icon) = window_crop_chrome::collapsed_icon_rect(
+                piece,
+                DipRect::new(0.0, 0.0, screen.w, screen.h),
+                &occupied,
+            ) else {
+                continue;
+            };
+            prims.extend(window_crop_chrome::collapsed_primitives(icon));
+            occupied.push(icon);
+        }
+        // Полоса — только у куска под курсором и только на его мониторе.
+        if let Some(hover) = &edit.window_crop_hover
+            && hover.monitor == *monitor_id
+            && let Some(sticker) = cfg.stickers.iter().find(|s| s.id == hover.sticker)
+            && let StickerSource::WindowCrop {
+                window,
+                minimized: false,
+                ..
+            } = &sticker.source
+        {
+            let piece = hittest::aabb(&sticker.placement, sticker.transform.rotation);
+            let layout = window_crop_chrome::chrome_layout(piece, 0.0, screen.h);
+            // Подпись — имя exe без пути: полный путь в полосу не влезет, а
+            // заголовок окна меняется на лету (браузер пишет туда имя
+            // вкладки) и полоса дёргалась бы при каждой смене.
+            let app = window
+                .exe_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            prims.extend(window_crop_chrome::chrome_primitives(&layout, &app, true));
+        }
+        if !prims.is_empty() {
+            primitives_to_sprites(
+                &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+            );
+        }
+    }
+
+    if let Some(crop_state) = &edit.window_crop {
+        let screen = screen_dip_rect((width_px, height_px), scale);
+        // Затемнение — ПЕРВЫМ примитивом: всё остальное в режиме рисуется
+        // поверх него. Оно идёт на каждый монитор, а не только на тот, где
+        // курсор: режим перехватывает мышь на всех экранах сразу, и
+        // затемнить лишь один значило бы показать, что остальные «живые»,
+        // хотя клики там тоже не проходят.
+        let mut prims = vec![window_crop_overlay::screen_dim(DipRect::new(
+            0.0, 0.0, screen.w, screen.h,
+        ))];
+        if let Some(hover) = &crop_state.hover
+            && let Some(bounds) = monitor_bounds.get(monitor_id)
+        {
+            let r = bounds.bounds_px;
+            // Та же отсечка, что у режима резки: окно живёт в координатах
+            // виртуального десктопа, и без неё каждый монитор гнал бы в кадр
+            // рамку окна, стоящего на соседнем.
+            let intersects = hover.rect.x < r.x + r.w as i32
+                && hover.rect.x + hover.rect.w > r.x
+                && hover.rect.y < r.y + r.h as i32
+                && hover.rect.y + hover.rect.h > r.y;
+            if intersects {
+                let scale = bounds.scale;
+                prims.extend(window_crop_overlay::window_outline(DipRect::new(
+                    f64::from(hover.rect.x - r.x) / scale,
+                    f64::from(hover.rect.y - r.y) / scale,
+                    f64::from(hover.rect.w) / scale,
+                    f64::from(hover.rect.h) / scale,
+                )));
+            }
+        }
+        // Рамка протяжки — только на мониторе, где сейчас курсор: якорь
+        // хранится в координатах виртуального десктопа, и переводить его в
+        // DIP имеет смысл лишь относительно того монитора, на котором его
+        // видно вместе с курсором.
+        if let Some(anchor) = crop_state.anchor
+            && let Some((cursor_monitor, cx, cy)) = &crop_state.cursor
+            && cursor_monitor == monitor_id
+            && let Some(bounds) = monitor_bounds.get(monitor_id)
+        {
+            let r = bounds.bounds_px;
+            let scale = bounds.scale;
+            prims.extend(window_crop_overlay::drag_marquee(
+                (
+                    f64::from(anchor.0 - r.x) / scale,
+                    f64::from(anchor.1 - r.y) / scale,
+                ),
+                (*cx, *cy),
+            ));
+        }
+        // Подсказка — только на мониторе с курсором: одна и та же плашка на
+        // всех экранах читалась бы как несколько разных сообщений.
+        if let Some((cursor_monitor, cx, cy)) = &crop_state.cursor
+            && cursor_monitor == monitor_id
+        {
+            prims.extend(window_crop_overlay::cursor_hint(
+                (*cx, *cy),
+                (screen.w, screen.h),
+                crop_state.hover.is_some(),
+                crop_state.anchor.is_some(),
+            ));
+        }
+        primitives_to_sprites(
+            &prims, ui_cache, renderer, monitor_id, text_scale, &mut frame,
+        );
+    }
+
     if let Some(mitosis_state) = &edit.mitosis {
         let mut prims = Vec::new();
         if let Some(hover) = &mitosis_state.hover {
@@ -17178,6 +19103,9 @@ mod tests {
             pinned_follow_until: None,
             banner: None,
             mitosis: None,
+            window_crop: None,
+            window_crop_hover: None,
+            crop_windows_shown: HashSet::new(),
             mitosis_pending: None,
             mitosis_failures: HashMap::new(),
             pending_animation: None,
@@ -17187,7 +19115,7 @@ mod tests {
             ui_anim_last: None,
             toolbar: None,
             cursor_panel: None,
-        cursor_panel_monitor: None,
+            cursor_panel_monitor: None,
             cursor_panel_hovered: false,
             cursor_panel_slide: PanelSlide::fixed(1.0),
             settings_rect: None,
@@ -17313,6 +19241,206 @@ mod tests {
         assert_eq!(facts[0].id, 11);
     }
 
+    // --- Митоз и группы (заказ пользователя 2026-09-09) ---
+    /// Разрезали окно открытой группы — второе окно вступает в неё сразу
+    /// (заказ пользователя 2026-09-09). Проверяем не «функция вызвалась», а
+    /// то, ради чего всё делалось: группа знает про новое окно, и её состав
+    /// остался согласованным.
+    #[test]
+    fn a_window_born_from_mitosis_joins_the_open_group() {
+        let group = group_of([11, 22]);
+        let live = vec![live_window(11, false), live_window(22, false)];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        let mut cfg = Config::default();
+        cfg.groups.push(group.clone());
+        let tmp = TempConfig::new();
+
+        // Ребёнок родился рядом с членом 11 и уже перечисляется системой.
+        let mut child = live_window(33, false);
+        child.exe_path = PathBuf::from("C:/app11.exe"); // тот же exe, что у родителя
+        child.title = "окно 11 — копия".to_string();
+        let windows = vec![live[0].clone(), live[1].clone(), child];
+
+        assert!(adopt_mitosis_child(
+            &mut groups,
+            &mut cfg,
+            tmp.path(),
+            &windows,
+            11,
+            33
+        ));
+
+        let after = &cfg.groups[0];
+        assert_eq!(after.members.len(), 3, "в группе стало три члена");
+        let open = groups.open().expect("группа открыта");
+        assert_eq!(
+            open.window_of(2),
+            Some(33),
+            "новый член знает своё окно по индексу"
+        );
+        assert!(
+            (0..after.members.len()).all(|i| open.window_of(i).is_some()),
+            "длины членов и окон совпали — на это опирается машина видимости"
+        );
+        assert!(tmp.saved(), "состав группы сохранён на диск");
+    }
+
+    /// Резали окно, не входящее в группу, — группа не растёт. Иначе любой
+    /// разрез на экране дописывал бы в неё посторонние окна.
+    #[test]
+    fn mitosis_of_a_stranger_window_leaves_the_group_alone() {
+        let group = group_of([11, 22]);
+        let live = vec![live_window(11, false), live_window(22, false)];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        let mut cfg = Config::default();
+        cfg.groups.push(group.clone());
+        let tmp = TempConfig::new();
+
+        let windows = vec![
+            live[0].clone(),
+            live[1].clone(),
+            live_window(44, false), // посторонний родитель
+            live_window(55, false), // его ребёнок
+        ];
+        assert!(!adopt_mitosis_child(
+            &mut groups,
+            &mut cfg,
+            tmp.path(),
+            &windows,
+            44,
+            55
+        ));
+        assert_eq!(cfg.groups[0].members.len(), 2, "состав не тронут");
+        assert!(!tmp.saved(), "и на диск ничего не писалось");
+    }
+
+    /// Ребёнка ещё нет в перечислении (окно родилось, но система его пока не
+    /// отдаёт) — вступать нечему, и это молчаливый нормальный исход, а не
+    /// повод портить группу.
+    #[test]
+    fn a_child_missing_from_the_enumeration_is_not_adopted() {
+        let group = group_of([11, 22]);
+        let live = vec![live_window(11, false), live_window(22, false)];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        let mut cfg = Config::default();
+        cfg.groups.push(group.clone());
+        let tmp = TempConfig::new();
+
+        assert!(!adopt_mitosis_child(
+            &mut groups,
+            &mut cfg,
+            tmp.path(),
+            &live,
+            11,
+            33
+        ));
+        assert_eq!(cfg.groups[0].members.len(), 2);
+    }
+
+    /// Группа показана, впереди ПОСТОРОННЕЕ окно — обычно это «пользователь
+    /// ушёл», и группу надо прятать. Но если посторонний передний план
+    /// появился из-за митоза (второй экземпляр приложения рождается поверх
+    /// всех и забирает фокус), прятать нельзя: человек в этот момент смотрит
+    /// на результат своего разреза.
+    #[test]
+    fn mitosis_keeps_the_group_from_collapsing() {
+        let group = group_of([11, 22]);
+        let live = vec![
+            live_window(11, false),
+            live_window(22, false),
+            live_window(33, false), // ребёнок митоза — ещё не член группы
+        ];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        groups.note_shown_over(Some(11));
+        groups.finish_raise();
+        let mut edit = mask_gate_edit_state();
+
+        // Без митоза посторонний передний план — повод судить о видимости.
+        assert!(
+            should_judge_group_visibility(&groups, &edit, false, Some(33), &live),
+            "обычный уход на чужое окно судится как уход"
+        );
+
+        // Прицеливание митоза.
+        edit.mitosis = Some(MitosisState {
+            initiator: monitor_id("main"),
+            axis: SplitAxis::Vertical,
+            hover: None,
+            cursor: None,
+        });
+        assert!(
+            !should_judge_group_visibility(&groups, &edit, false, Some(33), &live),
+            "пока целятся резать — группу не трогаем"
+        );
+
+        // Ожидание второго окна: длится секундами, и всё это время чужой
+        // передний план — наших рук дело.
+        edit.mitosis = None;
+        edit.mitosis_pending = Some(MitosisPending {
+            original_hwnd: 11,
+            original_rect: WindowRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
+            clone_rect: WindowRect {
+                x: 100,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
+            monitor_id: monitor_id("main"),
+            exe_name: None,
+        });
+        assert!(
+            !should_judge_group_visibility(&groups, &edit, false, Some(33), &live),
+            "пока ждём второе окно — группу не трогаем"
+        );
+
+        // Митоз кончился (успехом или отказом) — правило снова обычное.
+        edit.mitosis_pending = None;
+        assert!(
+            should_judge_group_visibility(&groups, &edit, false, Some(33), &live),
+            "после митоза гейт снимается, а не залипает"
+        );
+    }
+
+    /// Остальные правила гейта не изменились: они накапливались по живым
+    /// репортам, и молча потерять любое из них при выносе было бы худшим
+    /// исходом рефакторинга.
+    #[test]
+    fn the_visibility_gate_keeps_its_older_rules() {
+        let group = group_of([11, 22]);
+        let live = vec![live_window(11, false), live_window(22, false)];
+        let mut groups = GroupsState::default();
+        opened(&mut groups, &group, &live);
+        groups.note_shown_over(Some(11));
+        groups.finish_raise();
+        let edit = mask_gate_edit_state();
+
+        assert!(
+            !should_judge_group_visibility(&groups, &edit, true, Some(22), &live),
+            "Alt+Tab и меню оболочки — не уход пользователя"
+        );
+        assert!(
+            !should_judge_group_visibility(&groups, &edit, false, None, &live),
+            "переднего плана нет вовсе — судить не о чем"
+        );
+        assert!(
+            !should_judge_group_visibility(&groups, &edit, false, Some(999), &live),
+            "передний план не из перечисления окон — это наш оверлей или панель задач"
+        );
+        assert!(
+            !should_judge_group_visibility(&groups, &edit, false, Some(11), &live),
+            "впереди то же окно, что и до показа, — переключения не было"
+        );
+    }
+
     #[test]
     fn tracker_stays_awake_while_a_group_is_shown() {
         // Ровно тот баг, что нашёлся 2026-08-26: без этого условия трекер
@@ -17393,6 +19521,40 @@ mod tests {
         cfg.settings.snap_shrink_pct = 4;
         let edit = mask_gate_edit_state();
         assert!(!tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
+    }
+
+    #[test]
+    fn tracker_wakes_for_a_live_window_crop() {
+        // Живой кусок привязывается к окну по снимку трекера. Спящий трекер
+        // после перезапуска означал кусок, не нашедший своё окно, — пустой
+        // навсегда (живой репорт 2026-09-11).
+        let mut cfg = Config::default();
+        cfg.stickers.push(Sticker::new_window_crop(
+            rst_core::model::CropWindowKey::default(),
+            rst_core::model::CropRect::default(),
+            monitor_id("main"),
+            100.0,
+            100.0,
+            50.0,
+            50.0,
+        ));
+        let edit = mask_gate_edit_state();
+        assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
+    }
+
+    #[test]
+    fn tracker_wakes_for_window_crop_selection_mode() {
+        // Режим выделения ищет окно под курсором по снимку трекера, как и
+        // резка окон.
+        let cfg = Config::default();
+        let mut edit = mask_gate_edit_state();
+        edit.window_crop = Some(WindowCropState {
+            initiator: monitor_id("main"),
+            hover: None,
+            anchor: None,
+            cursor: None,
+        });
+        assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
     }
 
     #[test]
@@ -17811,8 +19973,18 @@ mod tests {
     #[test]
     fn the_toolbar_over_a_group_shows_the_last_selected() {
         let (mut cfg, mut edit, a, b) = group_harness();
-        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().transform.opacity = 0.2;
-        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().transform.opacity = 0.9;
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == a)
+            .unwrap()
+            .transform
+            .opacity = 0.2;
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == b)
+            .unwrap()
+            .transform
+            .opacity = 0.9;
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
         let panel = edit.toolbar.as_ref().expect("тулбар над группой есть");
         assert_eq!(
@@ -17916,8 +20088,18 @@ mod tests {
     #[test]
     fn opacity_from_the_slider_makes_the_whole_group_equal() {
         let (mut cfg, mut edit, a, b) = group_harness();
-        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().transform.opacity = 0.2;
-        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().transform.opacity = 0.9;
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == a)
+            .unwrap()
+            .transform
+            .opacity = 0.2;
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == b)
+            .unwrap()
+            .transform
+            .opacity = 0.9;
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
 
         // Тянем ручку ползунка в середину дорожки: значение виджета меняется
@@ -17929,9 +20111,12 @@ mod tests {
             .widget::<Slider>(toolbar::TB_SLIDER)
             .unwrap()
             .bounds();
-        edit.toolbar.as_mut().unwrap().pointer_event(PointerEvent::Down {
-            pos: (track.cx, track.cy),
-        });
+        edit.toolbar
+            .as_mut()
+            .unwrap()
+            .pointer_event(PointerEvent::Down {
+                pos: (track.cx, track.cy),
+            });
         poll_toolbar_opacity_live(&mut edit, &mut cfg, &mut []);
 
         let opacities: Vec<f64> = [a, b]
@@ -17969,11 +20154,19 @@ mod tests {
     fn the_layers_panel_levels_the_group_only_on_the_first_edit() {
         let (mut cfg, mut edit, a, b) = group_harness();
         // У стикеров РАЗНЫЕ правила видимости до правки.
-        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().visibility = VisibilityRule {
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == a)
+            .unwrap()
+            .visibility = VisibilityRule {
             mode: VisibilityMode::Desktop,
             rules: Vec::new(),
         };
-        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().visibility = VisibilityRule {
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == b)
+            .unwrap()
+            .visibility = VisibilityRule {
             mode: VisibilityMode::NeverOverlap,
             rules: Vec::new(),
         };
@@ -18014,7 +20207,11 @@ mod tests {
         assert!(!level_picker_group(&mut edit, &mut cfg));
 
         // Правку ведущего раздаём остальным.
-        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().visibility = VisibilityRule {
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == b)
+            .unwrap()
+            .visibility = VisibilityRule {
             mode: VisibilityMode::OverlapDenylist,
             rules: vec![OverlapRule {
                 process_name: Some("code.exe".to_string()),
@@ -18074,11 +20271,23 @@ mod tests {
             "уровень пережил выключение — его возвращает один клик"
         );
         assert!(
-            !cfg.stickers.iter().find(|s| s.id == a).unwrap().playback.muted,
+            !cfg.stickers
+                .iter()
+                .find(|s| s.id == a)
+                .unwrap()
+                .playback
+                .muted,
             "картинка звука не имеет и её настройка не трогается"
         );
         assert!(toggle_video_mute(&mut cfg, &[a, b]));
-        assert!(!cfg.stickers.iter().find(|s| s.id == b).unwrap().playback.muted);
+        assert!(
+            !cfg.stickers
+                .iter()
+                .find(|s| s.id == b)
+                .unwrap()
+                .playback
+                .muted
+        );
     }
 
     // --- Многомониторность: находки прицельного аудита 2026-09-07 ---
@@ -18259,7 +20468,14 @@ mod tests {
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
         let pos = press_toolbar(&mut edit, toolbar::TB_EYE);
 
-        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+        let effect = toolbar_actions(
+            &mut edit,
+            &mut cfg,
+            tmp.path(),
+            &mut [],
+            pos,
+            &one_geometry(),
+        );
 
         assert_eq!(effect, ToolbarEffect::Done);
         assert!(
@@ -18279,7 +20495,14 @@ mod tests {
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
         let pos = press_toolbar(&mut edit, toolbar::TB_DELETE);
 
-        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+        let effect = toolbar_actions(
+            &mut edit,
+            &mut cfg,
+            tmp.path(),
+            &mut [],
+            pos,
+            &one_geometry(),
+        );
 
         assert_eq!(effect, ToolbarEffect::Delete);
         assert_eq!(cfg.stickers.len(), 2, "сам разбор ничего не удаляет");
@@ -18295,7 +20518,14 @@ mod tests {
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
         let pos = press_toolbar(&mut edit, toolbar::TB_DUPLICATE);
 
-        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+        let effect = toolbar_actions(
+            &mut edit,
+            &mut cfg,
+            tmp.path(),
+            &mut [],
+            pos,
+            &one_geometry(),
+        );
 
         assert_eq!(effect, ToolbarEffect::Resync);
         assert_eq!(cfg.stickers.len(), 4, "продублированы оба");
@@ -18312,8 +20542,18 @@ mod tests {
     #[test]
     fn submitting_the_field_applies_opacity_to_the_whole_group() {
         let (mut cfg, mut edit, a, b) = group_harness();
-        cfg.stickers.iter_mut().find(|s| s.id == a).unwrap().transform.opacity = 0.1;
-        cfg.stickers.iter_mut().find(|s| s.id == b).unwrap().transform.opacity = 0.9;
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == a)
+            .unwrap()
+            .transform
+            .opacity = 0.1;
+        cfg.stickers
+            .iter_mut()
+            .find(|s| s.id == b)
+            .unwrap()
+            .transform
+            .opacity = 0.9;
         let tmp = TempConfig::new();
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
 
@@ -18336,11 +20576,27 @@ mod tests {
         panel.key_event(Key::Digit(0));
         panel.key_event(Key::Enter);
 
-        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+        let effect = toolbar_actions(
+            &mut edit,
+            &mut cfg,
+            tmp.path(),
+            &mut [],
+            pos,
+            &one_geometry(),
+        );
         assert_eq!(effect, ToolbarEffect::Done);
         for id in [a, b] {
-            let o = cfg.stickers.iter().find(|s| s.id == id).unwrap().transform.opacity;
-            assert!((o - 0.4).abs() < 1e-9, "прозрачность общая и равна введённой: {o}");
+            let o = cfg
+                .stickers
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .transform
+                .opacity;
+            assert!(
+                (o - 0.4).abs() < 1e-9,
+                "прозрачность общая и равна введённой: {o}"
+            );
         }
         assert!(tmp.saved());
     }
@@ -18354,12 +20610,24 @@ mod tests {
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
         let pos = press_toolbar(&mut edit, toolbar::TB_VOLUME);
 
-        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+        let effect = toolbar_actions(
+            &mut edit,
+            &mut cfg,
+            tmp.path(),
+            &mut [],
+            pos,
+            &one_geometry(),
+        );
 
         assert_eq!(effect, ToolbarEffect::Done);
         for id in [a, b] {
             assert!(
-                cfg.stickers.iter().find(|s| s.id == id).unwrap().playback.muted,
+                cfg.stickers
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .playback
+                    .muted,
                 "звук выключен у всей группы"
             );
         }
@@ -18381,7 +20649,14 @@ mod tests {
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
         let pos = press_toolbar(&mut edit, toolbar::TB_TIMELINE);
 
-        toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+        toolbar_actions(
+            &mut edit,
+            &mut cfg,
+            tmp.path(),
+            &mut [],
+            pos,
+            &one_geometry(),
+        );
 
         for id in [a, b] {
             assert!(
@@ -18407,13 +20682,23 @@ mod tests {
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
         let frame = edit.toolbar.as_ref().unwrap().frame();
         // Левый нижний угол корпуса — там отступ панели, виджетов нет.
-        let pos = (frame.cx - frame.w / 2.0 + 1.0, frame.cy + frame.h / 2.0 - 1.0);
+        let pos = (
+            frame.cx - frame.w / 2.0 + 1.0,
+            frame.cy + frame.h / 2.0 - 1.0,
+        );
         edit.toolbar
             .as_mut()
             .unwrap()
             .pointer_event(PointerEvent::Down { pos });
 
-        let effect = toolbar_actions(&mut edit, &mut cfg, tmp.path(), &mut [], pos, &one_geometry());
+        let effect = toolbar_actions(
+            &mut edit,
+            &mut cfg,
+            tmp.path(),
+            &mut [],
+            pos,
+            &one_geometry(),
+        );
 
         assert_eq!(effect, ToolbarEffect::Done);
         assert_eq!(cfg, before, "конфиг не тронут");
@@ -18530,13 +20815,23 @@ mod tests {
         let consumed = toolbar_wheel(&mut edit, &mut cfg, &mut [], 2, &monitor_id("main"));
         assert!(consumed, "колесо над тулбаром съедено им");
         for id in [a, b] {
-            let v = cfg.stickers.iter().find(|s| s.id == id).unwrap().playback.volume;
+            let v = cfg
+                .stickers
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .playback
+                .volume;
             assert!(
                 (v - 0.6).abs() < 1e-9,
                 "громкость доехала до конфига у всей группы: {v}"
             );
         }
-        assert_eq!(edit.undo_stack.len(), 1, "один шаг истории на щелчок колеса");
+        assert_eq!(
+            edit.undo_stack.len(),
+            1,
+            "один шаг истории на щелчок колеса"
+        );
     }
 
     /// Колесо мимо тулбара тулбар не трогает — иначе прокрутка над списком
@@ -18547,10 +20842,22 @@ mod tests {
         rebuild_toolbar(&mut edit, &cfg, 1080.0);
         edit.cursor_monitor = monitor_id("main");
         edit.cursor_pos = (5.0, 5.0);
-        assert!(!toolbar_wheel(&mut edit, &mut cfg, &mut [], 2, &monitor_id("main")));
+        assert!(!toolbar_wheel(
+            &mut edit,
+            &mut cfg,
+            &mut [],
+            2,
+            &monitor_id("main")
+        ));
         // И на чужом мониторе — тоже нет.
         edit.cursor_monitor = monitor_id("other");
-        assert!(!toolbar_wheel(&mut edit, &mut cfg, &mut [], 2, &monitor_id("other")));
+        assert!(!toolbar_wheel(
+            &mut edit,
+            &mut cfg,
+            &mut [],
+            2,
+            &monitor_id("other")
+        ));
     }
 
     // --- Магнит при изменении размера (запрос пользователя 2026-09-01) ---
@@ -18967,7 +21274,14 @@ mod tests {
             monitor_id: monitor_id("main"),
             exe_name: Some("code.exe".to_string()),
         });
-        finish_mitosis(&mut edit, &mut cfg, &path, &WindowPins::new(), Ok(2));
+        finish_mitosis(
+            &mut edit,
+            &mut cfg,
+            &path,
+            &mut GroupsState::default(),
+            &WindowPins::new(),
+            Ok(2),
+        );
         assert!(!edit.mitosis_failures.contains_key("code.exe"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -22035,6 +24349,156 @@ mod tests {
         }
     }
 
+    // --- Попадание в живой кусок окна (2026-09-11) ---
+
+    fn crop_sticker(cx: f64, cy: f64, w: f64, h: f64, minimized: bool) -> Sticker {
+        let mut s = Sticker::new_window_crop(
+            rst_core::model::CropWindowKey {
+                exe_path: std::path::PathBuf::from(r"C:\app\app.exe"),
+                title: "Окно".to_string(),
+                class: "Cls".to_string(),
+            },
+            rst_core::model::CropRect::default(),
+            monitor_id("main"),
+            cx,
+            cy,
+            w,
+            h,
+        );
+        if let StickerSource::WindowCrop { minimized: m, .. } = &mut s.source {
+            *m = minimized;
+        }
+        s
+    }
+
+    fn cfg_with(stickers: Vec<Sticker>) -> Config {
+        let mut cfg = Config::default();
+        cfg.stickers = stickers;
+        cfg
+    }
+
+    #[test]
+    fn window_crop_at_finds_the_crop_under_the_cursor() {
+        let cfg = cfg_with(vec![crop_sticker(500.0, 400.0, 200.0, 100.0, false)]);
+        let mon = one_monitor();
+        let hit = window_crop_at(&cfg, &mon, 500, 400).expect("центр куска");
+        assert_eq!(hit.sticker, cfg.stickers[0].id);
+        assert_eq!(hit.monitor, monitor_id("main"));
+        assert!(
+            window_crop_at(&cfg, &mon, 500, 200).is_none(),
+            "выше куска попадания быть не должно"
+        );
+    }
+
+    #[test]
+    fn window_crop_at_takes_the_topmost_when_they_overlap() {
+        // Порядок слоёв — это порядок списка, как и везде в проекте:
+        // последний нарисован поверх, значит он и ловит курсор.
+        let lower = crop_sticker(500.0, 400.0, 200.0, 100.0, false);
+        let upper = crop_sticker(500.0, 400.0, 200.0, 100.0, false);
+        let upper_id = upper.id;
+        let cfg = cfg_with(vec![lower, upper]);
+        let hit = window_crop_at(&cfg, &one_monitor(), 500, 400).expect("попадание");
+        assert_eq!(hit.sticker, upper_id, "ловит верхний, а не первый в списке");
+    }
+
+    #[test]
+    fn window_crop_at_ignores_ordinary_stickers() {
+        // Обвязка окна — только у кусков. Обычная картинка под курсором не
+        // должна снимать кликопрозрачность: это перехватило бы чужие клики
+        // на ровном месте.
+        let mut plain = crop_sticker(500.0, 400.0, 200.0, 100.0, false);
+        plain.source = StickerSource::File {
+            path: std::path::PathBuf::from("a.png"),
+            media_type: MediaType::Image,
+        };
+        let cfg = cfg_with(vec![plain]);
+        assert!(window_crop_at(&cfg, &one_monitor(), 500, 400).is_none());
+    }
+
+    #[test]
+    fn window_crop_at_ignores_hidden_crop() {
+        let mut s = crop_sticker(500.0, 400.0, 200.0, 100.0, false);
+        s.visible = false;
+        let cfg = cfg_with(vec![s]);
+        assert!(
+            window_crop_at(&cfg, &one_monitor(), 500, 400).is_none(),
+            "скрытый кусок курсор не ловит — его на экране нет"
+        );
+    }
+
+    #[test]
+    fn minimized_crop_is_caught_by_its_icon_not_by_its_old_place() {
+        // Свёрнутый кусок ловится по иконке у края экрана. Считать попадание
+        // по месту, где он был, — значит сделать иконку ненажимаемой, а
+        // пустоту под ней нажимаемой.
+        let cfg = cfg_with(vec![crop_sticker(500.0, 400.0, 200.0, 100.0, true)]);
+        let mon = one_monitor();
+        assert!(
+            window_crop_at(&cfg, &mon, 500, 400).is_none(),
+            "на старом месте свёрнутого куска ловить нечего"
+        );
+        let piece = hittest::aabb(&cfg.stickers[0].placement, 0.0);
+        let icon = window_crop_chrome::collapsed_icon_rect(
+            piece,
+            DipRect::new(0.0, 0.0, 1920.0, 1080.0),
+            &[],
+        )
+        .expect("место под иконку");
+        let hit = window_crop_at(
+            &cfg,
+            &mon,
+            (icon.x + icon.w / 2.0) as i32,
+            (icon.y + icon.h / 2.0) as i32,
+        );
+        assert_eq!(
+            hit.map(|h| h.sticker),
+            Some(cfg.stickers[0].id),
+            "по иконке свёрнутый кусок обязан ловиться"
+        );
+    }
+
+    #[test]
+    fn crop_bar_above_the_piece_is_part_of_it() {
+        // Полоса лежит поверх верхней кромки, но у куска на самом верху
+        // экрана прижимается к границе монитора и может выйти за тело.
+        // Кнопки в такой полосе обязаны оставаться нажимаемыми.
+        let cfg = cfg_with(vec![crop_sticker(500.0, 60.0, 200.0, 100.0, false)]);
+        let piece = hittest::aabb(&cfg.stickers[0].placement, 0.0);
+        let layout = window_crop_chrome::chrome_layout(piece, 0.0, 1080.0);
+        let hit = window_crop_at(
+            &cfg,
+            &one_monitor(),
+            (layout.close.x + layout.close.w / 2.0) as i32,
+            (layout.close.y + layout.close.h / 2.0) as i32,
+        );
+        assert!(hit.is_some(), "точка на кнопке закрытия принадлежит куску");
+    }
+
+    #[test]
+    fn window_crop_at_returns_none_outside_any_monitor() {
+        let cfg = cfg_with(vec![crop_sticker(500.0, 400.0, 200.0, 100.0, false)]);
+        assert!(
+            window_crop_at(&cfg, &one_monitor(), -5000, -5000).is_none(),
+            "точка вне мониторов не даёт ни куска, ни паники"
+        );
+    }
+
+    #[test]
+    fn window_crop_at_uses_rotated_bounds() {
+        // Повёрнутый кусок занимает БОЛЬШЕ места по осям, чем его
+        // собственные ширина и высота. Считать попадание по неповёрнутой
+        // рамке значило бы терять клики по его углам.
+        let mut s = crop_sticker(500.0, 400.0, 200.0, 40.0, false);
+        s.transform.rotation = std::f64::consts::FRAC_PI_2;
+        let cfg = cfg_with(vec![s]);
+        let hit = window_crop_at(&cfg, &one_monitor(), 500, 480);
+        assert!(
+            hit.is_some(),
+            "после поворота на 90° кусок вытянулся по вертикали и точка внутри него"
+        );
+    }
+
     fn one_monitor() -> HashMap<MonitorId, MonitorBounds> {
         HashMap::from([(
             monitor_id("main"),
@@ -22686,6 +25150,9 @@ mod tests {
             pinned_follow_until: None,
             banner: None,
             mitosis: None,
+            window_crop: None,
+            window_crop_hover: None,
+            crop_windows_shown: HashSet::new(),
             mitosis_pending: None,
             mitosis_failures: HashMap::new(),
             pending_animation: None,
@@ -22695,7 +25162,7 @@ mod tests {
             ui_anim_last: None,
             toolbar: None,
             cursor_panel: None,
-        cursor_panel_monitor: None,
+            cursor_panel_monitor: None,
             cursor_panel_hovered: false,
             cursor_panel_slide: PanelSlide::fixed(1.0),
             settings_rect: None,

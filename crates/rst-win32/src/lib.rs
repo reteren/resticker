@@ -7,6 +7,7 @@
 pub mod autostart;
 pub mod boot_session;
 pub mod clipboard;
+pub mod crop_window;
 pub mod dwm;
 mod error;
 pub mod file_dialog;
@@ -21,6 +22,7 @@ pub mod sound;
 pub mod thumb_cache;
 pub mod tray;
 pub mod virtual_desktops;
+pub mod window_capture;
 pub mod window_enum;
 mod window_icon;
 pub mod window_mitosis;

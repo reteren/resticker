@@ -226,8 +226,7 @@ pub fn build(cards: &[StripCard], screen: Box2D) -> StripPanel {
     };
     let per_row = fits_by_width.min(MAX_PER_ROW);
     let in_row = cards.len().min(per_row).max(1) as f64;
-    let strip_w =
-        (chrome + in_row * CARD_W + (in_row - 1.0) * CARD_GAP).min(available);
+    let strip_w = (chrome + in_row * CARD_W + (in_row - 1.0) * CARD_GAP).min(available);
 
     // Рядов — сколько нужно карточкам, но не больше, чем влезает по высоте:
     // на вырожденном экране лента не должна вылезти за его край. Карточки,
@@ -1104,10 +1103,7 @@ mod tests {
             seventh.cx,
             first.cx
         );
-        assert!(
-            seventh.cy > first.cy,
-            "второй ряд обязан быть ниже первого"
-        );
+        assert!(seventh.cy > first.cy, "второй ряд обязан быть ниже первого");
     }
 
     /// Ширина ленты считается по самому длинному ряду, а не по всем

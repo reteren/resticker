@@ -272,6 +272,41 @@ impl MouseCapture {
         event
     }
 
+    /// Разобрать мышиное сообщение БЕЗ `SetCapture`.
+    ///
+    /// Для режима попиксельной кликопрозрачности (живой кусок окна слушается
+    /// вне режима редактирования): окно ловит мышь лишь над небольшими
+    /// областями, и монопольный захват всей мыши системы ради кнопки
+    /// размером с иконку несоразмерен и опасен — при пропаже парного
+    /// `WM_LBUTTONUP` мышь залипает на всём компьютере (живой инцидент
+    /// 2026-09-11, см. доккоммент [`Self::force_release`]).
+    ///
+    /// Перетаскивание этим путём не поддерживается: без захвата курсор,
+    /// ушедший за границу области, перестал бы слать сообщения. Драгу нужен
+    /// отдельный, явно ограниченный по времени механизм.
+    pub fn handle_message_no_capture(&mut self, msg: u32, lparam: LPARAM) -> Option<InputEvent> {
+        let pos = lparam_point(lparam);
+        match msg {
+            WM_LBUTTONDOWN => Some(InputEvent::MouseDown {
+                pos,
+                modifiers: Modifiers::default(),
+            }),
+            WM_LBUTTONUP => Some(InputEvent::MouseUp {
+                pos,
+                modifiers: Modifiers::default(),
+            }),
+            // `dragging: false` всегда: без захвата перетаскивания в этом
+            // режиме нет по устройству — курсор, ушедший за границу области,
+            // перестал бы слать сообщения, и жест оборвался бы молча.
+            WM_MOUSEMOVE => Some(InputEvent::MouseMove {
+                pos,
+                modifiers: Modifiers::default(),
+                dragging: false,
+            }),
+            _ => None,
+        }
+    }
+
     /// Снять захват безусловно, в обход обычного цикла Down→Up/CaptureLost —
     /// для случаев, когда приложение решает выйти из режима, где захват
     /// вообще уместен (выход из режима редактирования), а не дожидается
@@ -884,6 +919,58 @@ mod tests {
     }
 
     #[test]
+    fn releasing_capture_before_the_button_up_swallows_the_up() {
+        // Ловушка 2026-09-11, закреплённая тестом. В `wndproc` стоял внешний
+        // «сторож»: захват есть, а кнопка физически отпущена — снять захват.
+        // На `WM_LBUTTONUP` кнопка УЖЕ отпущена, и сторож снимал захват
+        // раньше автомата. Автомат видел «захвата нет» — и отпускание
+        // пропадало. Ни одно выделение куска не завершалось, ни одно
+        // перетаскивание не заканчивалось.
+        //
+        // Правило: захват снимает автомат, по `WM_LBUTTONUP` или по
+        // `WM_MOUSEMOVE` с отпущенной кнопкой (`handle_message_checked`), и
+        // никто снаружи раньше него.
+        let pos = Point { x: 1, y: 2 };
+        let mods = Modifiers::default();
+
+        let (captured, _, _) = transition(false, WM_LBUTTONDOWN, pos, mods);
+        assert!(captured, "нажатие ставит захват");
+
+        let (_, op, event) = transition(true, WM_LBUTTONUP, pos, mods);
+        assert_eq!(
+            op,
+            CaptureOp::Release,
+            "отпускание при захвате снимает его само"
+        );
+        assert!(
+            matches!(event, Some(InputEvent::MouseUp { .. })),
+            "и выдаёт событие отпускания"
+        );
+
+        // А вот что происходило, когда захват сняли снаружи раньше автомата:
+        let (_, _, swallowed) = transition(false, WM_LBUTTONUP, pos, mods);
+        assert!(
+            swallowed.is_none(),
+            "без захвата автомат отпускание не выдаёт — снимать захват раньше него нельзя"
+        );
+    }
+
+    #[test]
+    fn button_released_while_captured_still_ends_the_gesture() {
+        // Та защита, которую пытался дать внешний сторож, в автомате уже
+        // есть и работает ПРАВИЛЬНО — с событием: движение при захвате и
+        // отпущенной кнопке превращается в настоящее отпускание.
+        let mut c = MouseCapture::new(HWND(std::ptr::null_mut()));
+        c.captured = true;
+        let ev = c.handle_message_checked(WM_MOUSEMOVE, WPARAM(0), LPARAM(0), false);
+        assert!(
+            matches!(ev, Some(InputEvent::MouseUp { .. })),
+            "залипший захват снимается с событием отпускания, а не молча"
+        );
+        assert!(!c.is_captured(), "и захвата больше нет");
+    }
+
+    #[test]
     fn transition_state_machine() {
         let pos = Point { x: 1, y: 2 };
         let mods = Modifiers::default();
@@ -1261,5 +1348,38 @@ mod tests {
         );
         // Неклиентская зона (HTCAPTION) — отдаём в DefWindowProc.
         assert_eq!(cm.handle_set_cursor(LPARAM(2)), None);
+    }
+
+    #[test]
+    fn no_capture_path_never_sets_capture() {
+        // Живой инцидент 2026-09-11: `SetCapture` на оверлее сделал его
+        // монопольным получателем ВСЕЙ мыши системы, и у пользователя
+        // залипла мышь на всём компьютере. Путь без захвата обязан
+        // оставаться без захвата при любой последовательности сообщений.
+        let mut c = MouseCapture::new(HWND(std::ptr::null_mut()));
+        for msg in [WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_LBUTTONUP, WM_LBUTTONDOWN] {
+            let _ = c.handle_message_no_capture(msg, LPARAM(0));
+            assert!(
+                !c.is_captured(),
+                "путь без захвата поставил захват на сообщении {msg:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_capture_move_is_never_a_drag() {
+        // Без захвата курсор, ушедший за границу области, перестаёт слать
+        // сообщения — жест оборвался бы молча. Поэтому движение здесь
+        // никогда не объявляется перетаскиванием.
+        let mut c = MouseCapture::new(HWND(std::ptr::null_mut()));
+        let _ = c.handle_message_no_capture(WM_LBUTTONDOWN, LPARAM(0));
+        let ev = c.handle_message_no_capture(WM_MOUSEMOVE, LPARAM(0));
+        assert!(matches!(
+            ev,
+            Some(InputEvent::MouseMove {
+                dragging: false,
+                ..
+            })
+        ));
     }
 }

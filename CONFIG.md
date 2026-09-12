@@ -71,7 +71,8 @@
     "edit_mode": "Ctrl+Alt+S",
     "toggle_all_stickers": "Ctrl+Alt+H",
     "mute_all": "Ctrl+Alt+M",
-    "window_mitosis": "Ctrl+Alt+F"   // митоз: разрезать окно пополам
+    "window_mitosis": "Ctrl+Alt+F",  // митоз: разрезать окно пополам
+    "window_crop": "Ctrl+Alt+C"      // отделить живой кусок чужого окна
   },
 
   "groups": [ /* см. раздел `groups` ниже */ ],
@@ -97,7 +98,7 @@
       "created_at": "2026-07-29T05:59:58Z",
 
       "source": {
-        "kind": "file",             // file | window | pasted
+        "kind": "file",             // file | pasted | window_crop
         "path": "D:\\refs\\pose_01.png",
         "media_type": "image"       // image | animation | video
       },
@@ -153,10 +154,17 @@
       "order": 4,
       "created_at": "2026-07-30T11:02:44Z",
       "source": {
-        "kind": "window",
-        "exe_path": "C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe",
-        "window_class": "Qt5152QWindowIcon",
-        "title_pattern": "OBS *"
+        "kind": "window_crop",
+        "window": {
+          "exe_path": "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+          "title": "Chess.com",
+          "class": "Chrome_WidgetWin_1"
+        },
+        "crop": {
+          "x": 0.125, "y": 0.200,
+          "w": 0.625, "h": 0.600
+        },
+        "minimized": false
       },
       "placement": {
         "monitor_id": "\\\\?\\DISPLAY#GSM5B09#...",
@@ -181,7 +189,15 @@
 |---|---|---|
 | `file` | абсолютный путь | Файл не копируется. Пропал — стикер показывает заглушку, настройки сохраняются |
 | `pasted` | путь внутри `%APPDATA%\resticker\pasted\` | Материализуется при вставке. Удаляется вместе со стикером |
-| `window` | путь к exe + класс окна + паттерн заголовка | HWND в конфиг не пишется, он не переживает перезапуск |
+| `window_crop` | приметы окна, прямоугольник crop и состояние сворачивания | HWND в конфиг не пишется; живой источник переподключается после перезапуска |
+
+`window_crop` хранит вложенный объект `window` с полями `exe_path`, `title` и
+`class`. Это устойчивые приметы источника, а не HWND: после закрытия источник
+временно скрывает crop и ждёт, после запуска окна с теми же приметами
+переподключается. Объект `crop` содержит `x`, `y`, `w`, `h` — доли (0..1)
+клиентской области исходного окна, не физические пиксели. `minimized` —
+состояние самого crop, по умолчанию `false`; сворачивание исходного окна
+останавливает кадры до его восстановления и не меняет доли crop.
 
 ### `visibility.mode`
 
@@ -352,7 +368,7 @@
 1. Прочитать пресет, применить миграции схемы если нужно
 2. Для каждого стикера проверить доступность источника:
      kind=file    → существует ли файл
-     kind=window  → найдено ли подходящее окно среди запущенных
+     kind=window_crop → найдено ли подходящее окно среди запущенных
 3. Если что-то недоступно — показать диалог со списком:
      • D:\refs\pose_01.png — файл не найден
      • OBS Studio — программа не запущена

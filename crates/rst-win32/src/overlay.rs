@@ -21,6 +21,7 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Foundation::{
     COLORREF, ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
@@ -40,17 +41,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GW_HWNDPREV, GWL_EXSTYLE,
     GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindow, GetWindowDisplayAffinity,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible,
-    KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-    SetLayeredWindowAttributes, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA,
-    WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCDESTROY, WM_POWERBROADCAST, WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTCLIENT, HTTRANSPARENT,
+    HWND_TOPMOST, IsWindowVisible, KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST,
+    WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use windows::core::{PCWSTR, w};
 
@@ -128,6 +130,25 @@ const WM_APP_MEDIA_HOTKEYS: u32 = WM_APP + 3;
 /// передаёт только описание.
 const WM_APP_REREGISTER_HOTKEYS: u32 = WM_APP + 4;
 
+/// Применить политику ввода окна — ЕДИНСТВЕННЫЙ писатель флага
+/// `WS_EX_TRANSPARENT` для режимов, которые решает координатор
+/// (см. [`OverlayInputPolicy`]).
+///
+/// Сообщением на поток окна, а не прямыми вызовами с потока координатора:
+/// снятие захвата, запись списка областей и смена стиля выполняются ВНУТРИ
+/// ОДНОГО обработчика. Поток окна разбирает сообщения по одному, поэтому
+/// мышиному событию некуда вклиниться между шагами.
+///
+/// Именно этого не хватало прежнему `set_hit_rects`: он менял стиль сразу, а
+/// список — позже, отдельным сообщением. В промежутке стиль уже «не
+/// прозрачен», а список ещё пуст, и обычный путь ставил `SetCapture` —
+/// монопольный захват всей мыши системы (аудит 2026-09-11,
+/// `scratchpad/y1_audit_report.md` §2.4.1; живой инцидент — мышь залипла у
+/// пользователя на всём компьютере).
+///
+/// `LPARAM` несёт `Box<OverlayInputPolicy>`; обработчик забирает владение.
+const WM_APP_INPUT_POLICY: u32 = WM_APP + 5;
+
 /// Смещение кода угла поворота в кодировке `WPARAM` — коды `0..ROTATE_BASE`
 /// заняты фиксированными формами, `ROTATE_BASE + N` (`N` — 0..359) кодирует
 /// `CursorShape::Rotate` под произвольным углом (фидбэк пользователя
@@ -183,6 +204,43 @@ pub enum HotkeyName {
     /// Хоткей режима резки окон — «митоз»
     /// (docs/M9_WINDOW_MITOSIS_DESIGN.md).
     WindowMitosis,
+    /// Хоткей отделения куска чужого окна (`Ctrl+Alt+C`, запрос пользователя
+    /// 2026-09-10; `rst_core::model::StickerSource::WindowCrop`).
+    WindowCrop,
+}
+
+/// Как окну оверлея ловить мышь.
+///
+/// Решает координатор — ОДИН раз за итерацию по полному состоянию, и
+/// применяет одним вызовом [`OverlayWindow::apply_input_policy`]. Раньше
+/// флаг `WS_EX_TRANSPARENT` писали четыре независимых механизма, и они
+/// перезаписывали друг друга: закрытие одной панели выключало ввод другой, а
+/// попиксельная кликопрозрачность возвращала прозрачность посреди режима
+/// редактирования (аудит 2026-09-11, `scratchpad/y1_audit_report.md` §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayInputPolicy {
+    /// Кликопрозрачно целиком: мышь идёт сквозь окно, захвата нет.
+    Transparent,
+    /// Интерактивно целиком. `take_focus` — забрать фокус; допускается
+    /// только у одного окна за раз: два `SetForegroundWindow` подряд на
+    /// разные окна дерутся между собой (M3_PREP_NOTES.md §3.5).
+    Interactive { take_focus: bool },
+    /// Ловить мышь только в этих прямоугольниках (КЛИЕНТСКИЕ координаты,
+    /// физические пиксели), остальное — сквозь окно к окнам под ним.
+    /// Захват мыши в этом режиме запрещён (см. гейт в `wndproc`).
+    HitRects(Vec<(i32, i32, i32, i32)>),
+    /// Ловить мышь всем окном, НЕ забирая фокус, с разрешённым захватом —
+    /// ровно то, что прежде делал `set_hover_click_target(true)` для полосы
+    /// перемотки видео.
+    ///
+    /// Отдельный режим, а не `HitRects` с прямоугольником полосы: ползунок
+    /// перемотки тащат, и перетаскиванию нужен захват мыши, который в
+    /// `HitRects` запрещён. Без захвата нажатие пришло бы одним путём, а
+    /// отпускание другим, и флаг «тащат» мог бы не сброситься — окно
+    /// осталось бы интерактивным на весь монитор. Этот режим воспроизводит
+    /// прежнее рабочее поведение полосы бит в бит, но под единым владельцем
+    /// флага прозрачности.
+    HoverTarget,
 }
 
 /// Безопасное событие оверлей-окна для координатора (docs/M2_INTEGRATION_PLAN.md,
@@ -282,6 +340,12 @@ pub enum OverlayEvent {
     /// событие и входит в режим, и выходит из него — решает координатор по
     /// тому, активен ли режим сейчас.
     ToggleMitosisMode,
+    /// Включить или выключить режим отделения куска чужого окна
+    /// (`Ctrl+Alt+C`, запрос пользователя 2026-09-10;
+    /// `rst_core::model::StickerSource::WindowCrop`). Переключатель — как
+    /// [`Self::ToggleMitosisMode`]: одно и то же событие и входит в режим, и
+    /// выходит из него, решает координатор по тому, активен ли режим сейчас.
+    ToggleWindowCropMode,
 }
 
 /// Оверлей-окно на один монитор и его поток сообщений.
@@ -551,6 +615,32 @@ impl OverlayWindow {
         self.toggle_exstyle(WS_EX_TRANSPARENT.0, !target);
     }
 
+    /// Применить политику ввода (см. [`OverlayInputPolicy`] и
+    /// [`WM_APP_INPUT_POLICY`]).
+    ///
+    /// Вся работа — снять захват, записать области, сменить стиль, забрать
+    /// фокус — делается на потоке окна внутри одного обработчика. Отсюда
+    /// только постится сообщение.
+    pub fn apply_input_policy(&self, policy: OverlayInputPolicy) {
+        let ptr = Box::into_raw(Box::new(policy));
+        // SAFETY: hwnd — наше живое окно; PostMessageW потокобезопасен,
+        // владение боксом переходит обработчику.
+        unsafe {
+            if PostMessageW(
+                Some(self.hwnd),
+                WM_APP_INPUT_POLICY,
+                WPARAM(0),
+                LPARAM(ptr as isize),
+            )
+            .is_err()
+            {
+                // Сообщение не встало в очередь — забираем бокс обратно,
+                // иначе это утечка на каждый несостоявшийся вызов.
+                drop(Box::from_raw(ptr));
+            }
+        }
+    }
+
     /// Включить/выключить временные хоткеи управления видео-стикером под
     /// курсором: пробел — пауза/воспроизведение, PgUp/PgDn — громкость
     /// (запрос пользователя 2026-08-22).
@@ -645,16 +735,47 @@ impl OverlayWindow {
     /// `SWP_FRAMECHANGED` (см. ниже, почему без него смена не вступает в
     /// силу).
     fn toggle_exstyle(&self, bits: u32, set: bool) {
+        apply_exstyle(self.hwnd, bits, set);
+    }
+}
+
+/// Выставить биты `set` и снять биты `clear` в `GWL_EXSTYLE` ОДНОЙ записью, с
+/// обязательным `SWP_FRAMECHANGED` (см. [`apply_exstyle`]).
+fn apply_exstyle_masks(hwnd: HWND, set: u32, clear: u32) {
+    // SAFETY: hwnd — наше живое окно; смена GWL_EXSTYLE безопасна с любого
+    // потока (в отличие от владения самим HWND).
+    unsafe {
+        let ex = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & !clear) | set;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Выставить/снять биты `GWL_EXSTYLE` с обязательным `SWP_FRAMECHANGED`.
+///
+/// Свободная функция, а не метод: её зовёт и обёртка на `OverlayWindow`, и
+/// обработчик [`WM_APP_INPUT_POLICY`] прямо на потоке окна, где
+/// `OverlayWindow` нет — только `HWND`.
+fn apply_exstyle(hwnd: HWND, bits: u32, set: bool) {
+    {
         // SAFETY: hwnd — наше живое окно; смена GWL_EXSTYLE безопасна с
         // любого потока (в отличие от владения самим HWND).
         unsafe {
-            let mut ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32;
+            let mut ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
             if set {
                 ex |= bits;
             } else {
                 ex &= !bits;
             }
-            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex as isize);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex as isize);
             // SetWindowLongPtrW само по себе не гарантирует, что менеджер
             // окон немедленно перечитает кэшированные ex-стили (MS Learn:
             // «Some window data is cached, so changes you make ... will not
@@ -663,7 +784,7 @@ impl OverlayWindow {
             // перемещения/ресайза/z-order/фокуса (найдено брейнштормом
             // ботов-воркеров, 2026-08-09).
             let _ = SetWindowPos(
-                self.hwnd,
+                hwnd,
                 None,
                 0,
                 0,
@@ -673,7 +794,9 @@ impl OverlayWindow {
             );
         }
     }
+}
 
+impl OverlayWindow {
     /// Переставить и/или изменить размер уже созданного окна под новые
     /// физические границы монитора — тот же монитор (`MonitorId` не
     /// поменялся), но сменилось разрешение/позиция в `WM_DISPLAYCHANGE`
@@ -1022,6 +1145,12 @@ unsafe fn keep_topmost(hwnd: HWND, guard: &mut TopmostGuard) {
 /// fn`), владение — у `run_message_loop`, освобождается в `WM_NCDESTROY`.
 struct WndState {
     capture: MouseCapture,
+    /// Прямоугольники попиксельной кликопрозрачности в КЛИЕНТСКИХ
+    /// координатах окна (физические пиксели) — см. [`WM_APP_INPUT_POLICY`].
+    /// Пустой список означает «правило не действует»: окно ведёт себя как
+    /// раньше, и режим редактирования, делающий его интерактивным целиком,
+    /// ничего не замечает.
+    hit_rects: Vec<RECT>,
     cursor: CursorManager,
     tx: Sender<OverlayEvent>,
     /// Временные хоткеи управления видео (см. [`MEDIA_PLAY_PAUSE_HOTKEY_ID`]).
@@ -1127,6 +1256,10 @@ fn hotkey_name_of(id: i32) -> Option<HotkeyName> {
         // сообщать НАДО: это самостоятельная функция программы, а не
         // одна из девяти взаимозаменяемых цифр.
         crate::hotkey::MITOSIS_HOTKEY_ID => Some(HotkeyName::WindowMitosis),
+        // Ровно по той же причине, что митоз: самостоятельная функция
+        // программы, а не одна из девяти взаимозаменяемых цифр, — молчать
+        // о занятой комбинации нельзя.
+        crate::hotkey::WINDOW_CROP_HOTKEY_ID => Some(HotkeyName::WindowCrop),
         _ => None,
     }
 }
@@ -1258,6 +1391,7 @@ fn run_message_loop(
 
     let state = Box::new(WndState {
         capture: MouseCapture::new(hwnd),
+        hit_rects: Vec::new(),
         cursor: CursorManager::new(),
         tx: event_tx,
         media_hotkeys: Vec::new(),
@@ -1396,6 +1530,8 @@ fn run_message_loop(
                 let _ = hotkey_tx.send(OverlayEvent::UnpinAll);
             } else if id == crate::hotkey::MITOSIS_HOTKEY_ID {
                 let _ = hotkey_tx.send(OverlayEvent::ToggleMitosisMode);
+            } else if id == crate::hotkey::WINDOW_CROP_HOTKEY_ID {
+                let _ = hotkey_tx.send(OverlayEvent::ToggleWindowCropMode);
             } else if id == crate::hotkey::PIN_OPEN_GROUP_HOTKEY_ID {
                 // ДО `group_number_of`: id 20 вне диапазона открытия (8..=16),
                 // но ветка держится рядом с unpin_all, где живёт её константа.
@@ -1665,6 +1801,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // SAFETY: hwnd — валидное окно этого потока.
             let click_through =
                 unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0 != 0;
+            // ВНЕШНЕГО сторожа захвата здесь нет — и это намеренно.
+            //
+            // 2026-09-11 здесь стояла проверка «захват держится, а кнопка
+            // физически отпущена → снять захват». Она срабатывала РАНЬШЕ
+            // автомата `MouseCapture` и на каждом `WM_LBUTTONUP`: в этот момент
+            // кнопка уже отпущена, захват ещё есть — проверка снимала его, и
+            // автомат, увидев «захвата нет», отпускание ПРОГЛАТЫВАЛ
+            // (`transition`: `WM_LBUTTONUP` без захвата не даёт события).
+            // Итог — ни одно отпускание кнопки во всей программе не доходило:
+            // выделение куска не завершалось, перетаскивания не заканчивались.
+            //
+            // Нужная защита уже встроена в сам автомат:
+            // `MouseCapture::handle_message` зовёт `handle_message_checked` с
+            // физическим состоянием кнопки и превращает `WM_MOUSEMOVE` при
+            // отпущенной кнопке в настоящее отпускание — С СОБЫТИЕМ. Снимать
+            // захват снаружи раньше автомата нельзя.
+            // Захват разрешён ТОЛЬКО в режиме редактирования, где окно
+            // интерактивно целиком. В режиме попиксельной
+            // кликопрозрачности (`hit_rects` непуст) окно ловит мышь лишь
+            // над кусками, и монопольный захват всей системы ради кнопки
+            // размером с иконку — несоразмерная и опасная плата.
+            let hit_rect_mode =
+                unsafe { state_ptr.as_ref() }.is_some_and(|state| !state.hit_rects.is_empty());
+            if hit_rect_mode {
+                if let Some(state) = unsafe { state_ptr.as_mut() } {
+                    // Событие уходит координатору БЕЗ `SetCapture`: клики по
+                    // полосе куска в захвате не нуждаются.
+                    if let Some(event) = state.capture.handle_message_no_capture(msg, lparam) {
+                        let _ = state.tx.send(OverlayEvent::Input(event));
+                        return LRESULT(0);
+                    }
+                }
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
             if !click_through {
                 if let Some(state) = unsafe { state_ptr.as_mut() } {
                     if let Some(event) = state.capture.handle_message(msg, wparam, lparam) {
@@ -1728,6 +1898,127 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_RELEASE_CAPTURE => {
             if let Some(state) = unsafe { state_ptr.as_mut() } {
                 state.capture.force_release();
+            }
+            LRESULT(0)
+        }
+        WM_NCHITTEST => {
+            // Попиксельная кликопрозрачность. Пустой список — правило не
+            // действует: окно ведёт себя как раньше (режим редактирования
+            // делает его интерактивным целиком, и трогать его здесь нельзя).
+            let inside = match unsafe { state_ptr.as_ref() } {
+                Some(state) if !state.hit_rects.is_empty() => {
+                    // `lparam` несёт ЭКРАННУЮ точку; прямоугольники заданы в
+                    // клиентских координатах, поэтому переводим точку, а не
+                    // прямоугольники: окно двигают, а список — нет.
+                    let sx = (lparam.0 & 0xFFFF) as i16 as i32;
+                    let sy = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                    let mut pt = POINT { x: sx, y: sy };
+                    // SAFETY: hwnd — живое окно этого потока.
+                    let ok =
+                        unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt) }
+                            .as_bool();
+                    if !ok {
+                        // Перевод не удался — безопаснее пропустить мышь
+                        // насквозь, чем перехватить весь монитор.
+                        Some(false)
+                    } else {
+                        Some(state.hit_rects.iter().any(|r| {
+                            pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
+                        }))
+                    }
+                }
+                _ => None,
+            };
+            match inside {
+                Some(true) => LRESULT(HTCLIENT as isize),
+                // `HTTRANSPARENT` — система повторит поиск в окне под нами,
+                // то есть клик и движение уйдут туда, куда ушли бы без
+                // оверлея вовсе.
+                Some(false) => LRESULT(HTTRANSPARENT as isize),
+                None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+            }
+        }
+        WM_APP_INPUT_POLICY => {
+            if lparam.0 == 0 {
+                return LRESULT(0);
+            }
+            // SAFETY: указатель пришёл из `Box::into_raw` в
+            // `apply_input_policy`; владение забираем здесь ровно один раз.
+            let policy = *unsafe { Box::from_raw(lparam.0 as *mut OverlayInputPolicy) };
+            // Пустой список областей — это «ловить нигде», то есть та же
+            // прозрачность. Разворачиваем здесь, а не надеемся на вызывающего:
+            // `HitRects(vec![])` со снятым флагом прозрачности означал бы окно,
+            // которое не прозрачно, но и не ловит ничего, — худшее из обоих.
+            let policy = match policy {
+                OverlayInputPolicy::HitRects(r) if r.is_empty() => OverlayInputPolicy::Transparent,
+                other => other,
+            };
+            if let Some(state) = unsafe { state_ptr.as_mut() } {
+                // ШАГ 1 — снять захват ДО смены стиля. Захват, переживший
+                // смену режима, — это и есть залипшая мышь. Держать его
+                // позволено только режиму, где окно интерактивно целиком.
+                if !matches!(
+                    policy,
+                    OverlayInputPolicy::Interactive { .. } | OverlayInputPolicy::HoverTarget
+                ) {
+                    state.capture.force_release();
+                }
+                // ШАГ 2 — области. До смены стиля, чтобы первое же мышиное
+                // сообщение после неё видело уже правильный список.
+                state.hit_rects = match &policy {
+                    OverlayInputPolicy::HitRects(rects) => rects
+                        .iter()
+                        .map(|&(x, y, w, h)| RECT {
+                            left: x,
+                            top: y,
+                            right: x + w,
+                            bottom: y + h,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+            }
+            // ШАГ 3 — стиль.
+            //   Transparent — прозрачно и без фокуса;
+            //   Interactive — не прозрачно, фокус разрешён;
+            //   HitRects    — не прозрачно (иначе до WM_NCHITTEST дело не
+            //                 дойдёт), но NOACTIVATE остаётся: клик по кнопке
+            //                 куска не должен уводить фокус из окна, в
+            //                 котором человек печатает.
+            let (transparent, noactivate) = match &policy {
+                OverlayInputPolicy::Transparent => (true, true),
+                OverlayInputPolicy::Interactive { .. } => (false, false),
+                OverlayInputPolicy::HitRects(_) => (false, true),
+                // Как прежний `set_hover_click_target(true)`: снята только
+                // прозрачность, NOACTIVATE остаётся — клик по полосе
+                // перемотки не должен уводить фокус из окна пользователя.
+                OverlayInputPolicy::HoverTarget => (false, true),
+            };
+            // Оба бита — ОДНОЙ записью. Две отдельные записи оставляли окно на
+            // мгновение в состоянии, которого нет ни в одном режиме
+            // (прозрачность уже снята, `NOACTIVATE` ещё прежний), и его видели
+            // другие потоки — в том числе системный поиск окна под курсором.
+            // Так же ловил его тест при параллельном прогоне (2026-09-11).
+            let mut set = 0u32;
+            let mut clear = 0u32;
+            if transparent {
+                set |= WS_EX_TRANSPARENT.0;
+            } else {
+                clear |= WS_EX_TRANSPARENT.0;
+            }
+            if noactivate {
+                set |= WS_EX_NOACTIVATE.0;
+            } else {
+                clear |= WS_EX_NOACTIVATE.0;
+            }
+            apply_exstyle_masks(hwnd, set, clear);
+            // ШАГ 4 — фокус, только после смены стиля: окну с NOACTIVATE
+            // система фокус не отдаст.
+            if matches!(policy, OverlayInputPolicy::Interactive { take_focus: true }) {
+                // SAFETY: hwnd — живое окно этого потока.
+                unsafe {
+                    let _ = SetForegroundWindow(hwnd);
+                }
             }
             LRESULT(0)
         }
@@ -2181,6 +2472,112 @@ mod tests {
         assert_eq!(overlay.size(), (1920, 1080));
     }
 
+    /// Дождаться, пока стиль окна удовлетворит условию: политика ввода
+    /// применяется СООБЩЕНИЕМ на потоке окна, то есть асинхронно, и читать
+    /// стиль сразу после вызова значило бы проверять старое состояние.
+    fn wait_exstyle(hwnd: HWND, want: impl Fn(u32) -> bool) -> u32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            // SAFETY: чтение стиля своего же окна.
+            let ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+            if want(ex) || std::time::Instant::now() > deadline {
+                return ex;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    // В этих тестах фокус НЕ забирается (`take_focus: false`): прогон тестов
+    // на рабочей машине иначе уводил бы фокус из окна, в котором человек
+    // печатает.
+
+    #[test]
+    fn input_policy_interactive_clears_transparency_and_noactivate() {
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
+                .expect("создание оверлея");
+        overlay.apply_input_policy(OverlayInputPolicy::Interactive { take_focus: false });
+        let ex = wait_exstyle(overlay.hwnd(), |ex| {
+            ex & (WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0) == 0
+        });
+        assert_eq!(
+            ex & WS_EX_TRANSPARENT.0,
+            0,
+            "интерактивное окно не прозрачно"
+        );
+        assert_eq!(
+            ex & WS_EX_NOACTIVATE.0,
+            0,
+            "интерактивному окну фокус разрешён"
+        );
+    }
+
+    #[test]
+    fn input_policy_transparent_restores_both_bits() {
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
+                .expect("создание оверлея");
+        overlay.apply_input_policy(OverlayInputPolicy::Interactive { take_focus: false });
+        wait_exstyle(overlay.hwnd(), |ex| ex & WS_EX_TRANSPARENT.0 == 0);
+        overlay.apply_input_policy(OverlayInputPolicy::Transparent);
+        let ex = wait_exstyle(overlay.hwnd(), |ex| {
+            ex & (WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0)
+                == (WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0)
+        });
+        assert_ne!(ex & WS_EX_TRANSPARENT.0, 0, "прозрачность вернулась");
+        assert_ne!(ex & WS_EX_NOACTIVATE.0, 0, "и без фокуса");
+    }
+
+    #[test]
+    fn input_policy_hit_rects_keeps_noactivate() {
+        // Попиксельный режим снимает прозрачность (иначе до WM_NCHITTEST
+        // дело не дойдёт), но НЕ даёт окну фокус: клик по кнопке куска не
+        // должен уводить фокус из окна, в котором человек печатает.
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
+                .expect("создание оверлея");
+        overlay.apply_input_policy(OverlayInputPolicy::HitRects(vec![(10, 10, 50, 50)]));
+        let ex = wait_exstyle(overlay.hwnd(), |ex| ex & WS_EX_TRANSPARENT.0 == 0);
+        assert_eq!(
+            ex & WS_EX_TRANSPARENT.0,
+            0,
+            "области требуют снятой прозрачности"
+        );
+        assert_ne!(ex & WS_EX_NOACTIVATE.0, 0, "но фокус окно не получает");
+    }
+
+    #[test]
+    fn input_policy_hover_target_matches_old_hover_click_target() {
+        // Полоса перемотки обязана вести себя ровно как раньше: снята только
+        // прозрачность, фокус окно не получает.
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
+                .expect("создание оверлея");
+        overlay.apply_input_policy(OverlayInputPolicy::HoverTarget);
+        let ex = wait_exstyle(overlay.hwnd(), |ex| ex & WS_EX_TRANSPARENT.0 == 0);
+        assert_eq!(ex & WS_EX_TRANSPARENT.0, 0, "полоса ловит мышь");
+        assert_ne!(ex & WS_EX_NOACTIVATE.0, 0, "и не уводит фокус");
+    }
+
+    #[test]
+    fn input_policy_empty_hit_rects_means_transparent() {
+        // `HitRects(vec![])` со снятой прозрачностью — окно, которое не
+        // прозрачно, но и не ловит ничего. Примитив обязан развернуть такой
+        // вход в прозрачность сам, не надеясь на вызывающего.
+        let (overlay, _events) =
+            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
+                .expect("создание оверлея");
+        overlay.apply_input_policy(OverlayInputPolicy::Interactive { take_focus: false });
+        wait_exstyle(overlay.hwnd(), |ex| ex & WS_EX_TRANSPARENT.0 == 0);
+        overlay.apply_input_policy(OverlayInputPolicy::HitRects(Vec::new()));
+        let ex = wait_exstyle(overlay.hwnd(), |ex| ex & WS_EX_TRANSPARENT.0 != 0);
+        assert_ne!(
+            ex & WS_EX_TRANSPARENT.0,
+            0,
+            "пустой список областей обязан дать прозрачное окно"
+        );
+    }
+
     #[test]
     fn set_click_through_toggles_exstyle_bits() {
         let (overlay, _events) =
@@ -2317,6 +2714,7 @@ mod tests {
     fn install_hotkeys_isolates_conflicts_and_updates_owned_set() {
         let state = WndState {
             capture: MouseCapture::new(HWND(std::ptr::null_mut())),
+            hit_rects: Vec::new(),
             cursor: CursorManager::new(),
             tx: mpsc::channel::<OverlayEvent>().0,
             media_hotkeys: Vec::new(),

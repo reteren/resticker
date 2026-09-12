@@ -47,6 +47,24 @@ pub struct LiveWindow {
     pub class: String,
 }
 
+/// Снять приметы окна, родившегося рядом с уже входящим в группу
+/// (митоз, 2026-09-09).
+///
+/// Ребёнок получает именно живые `exe_path`/`title`/`class`: нельзя
+/// подставлять родительский заголовок или добавлять `HWND` в строку, потому
+/// что такой искусственный признак не переживёт следующий запуск. Если
+/// заголовок ребёнка непустой и отличается, он становится точной приметой;
+/// пустой или совпадающий заголовок честно остаётся неоднозначным — без
+/// нового стабильного поля в [`MemberKey`] различить такие два окна после
+/// перезапуска невозможно.
+pub fn sibling_key(_parent: &MemberKey, child: &LiveWindow) -> MemberKey {
+    MemberKey {
+        exe_path: child.exe_path.clone(),
+        title: child.title.clone(),
+        class: child.class.clone(),
+    }
+}
+
 /// Сопоставить запомненные приметы членов группы с живыми окнами: для
 /// каждого члена — индекс его окна в `live` или `None`.
 ///
@@ -64,8 +82,8 @@ pub struct LiveWindow {
 /// достаться двум членам группы. Пять окон одного браузера обязаны уйти
 /// пяти членам, а не все одному. Поэтому это жадное присваивание по
 /// убыванию силы совпадения: сначала раздаются все дословные заголовки
-/// (член за членом в порядке `members`, окно — первое свободное в порядке
-/// `live`), затем — кандидаты по exe+классу, пары «член × окно»
+/// (член за членом в порядке `members`, окно — свободное с наименьшим
+/// `HWND`), затем — кандидаты по exe+классу, пары «член × окно»
 /// обрабатываются по убыванию похожести заголовков (слабую, но
 /// единственную пару не может украсть сильная пара другого члена), и
 /// каждое отданное окно вычёркивается из кандидатов для всех следующих.
@@ -77,23 +95,29 @@ pub struct LiveWindow {
 /// сменившегося заголовка. Похожесть ([`title_similarity`]) решает только
 /// между кандидатами с одинаковыми exe и классом.
 ///
-/// Пустые входы — корректный `Vec` из `None` (без паники). Порядок окна
-/// внутри `live` — тай-брейк: при равной силе побеждает более ранний.
+/// Пустые входы — корректный `Vec` из `None` (без паники). При равной силе
+/// сначала побеждает меньший `HWND`, а исходный индекс используется только
+/// как последний тай-брейк: перестановка `live` не должна менять привязку.
 pub fn match_members(members: &[MemberKey], live: &[LiveWindow]) -> Vec<Option<usize>> {
     let mut assigned = vec![None; members.len()];
     let mut taken = vec![false; live.len()];
 
     // Приоритет а): exe + дословный заголовок — самая сильная ставка,
     // раздаётся первой и вся целиком, чтобы более слабое правило (б) не
-    // отобрало у неё окно.
+    // отобрало у неё окно. При одинаковых ключах берём меньший HWND, а не
+    // первое место в `live`, чтобы порядок перечисления не влиял на выбор.
     for (m, member) in members.iter().enumerate() {
-        for (w, window) in live.iter().enumerate() {
-            if !taken[w] && exact_by_exe_and_title(member, window) {
-                assigned[m] = Some(w);
-                taken[w] = true;
-                break;
-            }
-        }
+        let Some(w) = live
+            .iter()
+            .enumerate()
+            .filter(|(w, window)| !taken[*w] && exact_by_exe_and_title(member, window))
+            .min_by_key(|(w, window)| (window.hwnd, *w))
+            .map(|(w, _)| w)
+        else {
+            continue;
+        };
+        assigned[m] = Some(w);
+        taken[w] = true;
     }
 
     // Приоритет б): exe + класс — этого достаточно, чтобы претендовать на
@@ -102,7 +126,8 @@ pub fn match_members(members: &[MemberKey], live: &[LiveWindow]) -> Vec<Option<u
     // свободное окно», затем отдаются по убыванию похожести заголовков.
     // Сортировка важнее, чем кажется: без неё первым членам достались бы
     // их «средние» пары, а у последних не осталось бы единственно
-    // возможных — порядок отдачи должен следовать силе.
+    // возможных — порядок отдачи должен следовать силе; при равной силе
+    // выбираем меньший HWND, поэтому перестановка `live` безопасна.
     let mut candidates: Vec<(usize, usize, f64)> = Vec::new();
     for (m, member) in members.iter().enumerate() {
         if assigned[m].is_some() {
@@ -115,8 +140,12 @@ pub fn match_members(members: &[MemberKey], live: &[LiveWindow]) -> Vec<Option<u
             candidates.push((m, w, title_similarity(&member.title, &window.title)));
         }
     }
-    candidates
-        .sort_by(|(ma, wa, sa), (mb, wb, sb)| sb.total_cmp(sa).then(ma.cmp(mb)).then(wa.cmp(wb)));
+    candidates.sort_by(|(ma, wa, sa), (mb, wb, sb)| {
+        sb.total_cmp(sa)
+            .then(ma.cmp(mb))
+            .then(live[*wa].hwnd.cmp(&live[*wb].hwnd))
+            .then(wa.cmp(wb))
+    });
     for (m, w, _) in candidates {
         if assigned[m].is_none() && !taken[w] {
             assigned[m] = Some(w);
@@ -229,6 +258,13 @@ mod tests {
         }
     }
 
+    fn assigned_hwnds(members: &[MemberKey], windows: &[LiveWindow]) -> Vec<Option<usize>> {
+        match_members(members, windows)
+            .into_iter()
+            .map(|matched| matched.map(|index| windows[index].hwnd))
+            .collect()
+    }
+
     const CHROME: &str = r"C:\apps\chrome.exe";
     const NOTEPAD: &str = r"C:\apps\notepad.exe";
     const CHROME_CLASS: &str = "Chrome_WidgetWin_1";
@@ -326,7 +362,7 @@ mod tests {
         // «угадать нельзя». Это и была ошибка из жалобы пользователя:
         // отказ по заголовку теряет окна группы, когда у приложения
         // несколько окон. Заголовок должен выбирать между кандидатами, а
-        // не запрещать; при равной похожести побеждает первое в `live`.
+        // не запрещать; при равной похожести побеждает меньший HWND.
         let members = [member(r"C:\apps\calc.exe", "Расчёт", "CalcFrame")];
         let windows = [
             live(0x401, r"C:\apps\calc.exe", "Конвертер валют", "CalcFrame"),
@@ -343,6 +379,90 @@ mod tests {
         let members = [member(r"C:\apps\panel.exe", "", "WorkerW")];
         let windows = [live(0x800, r"C:\apps\panel.exe", "", "WorkerW")];
         assert_eq!(match_members(&members, &windows), vec![Some(0)]);
+    }
+
+    #[test]
+    fn sibling_key_uses_the_child_observations() {
+        // Отличающийся заголовок — единственная уже имеющаяся стабильная
+        // примета второго экземпляра, поэтому в группу нужно записать его,
+        // а не повторно скопировать ключ родителя.
+        let parent = member(CHROME, "Parent", CHROME_CLASS);
+        let child = live(0x801, CHROME, "Child", CHROME_CLASS);
+        assert_eq!(
+            sibling_key(&parent, &child),
+            member(CHROME, "Child", CHROME_CLASS)
+        );
+    }
+
+    #[test]
+    fn child_with_empty_title_does_not_steal_parent_window() {
+        // Пустой заголовок ребёнка нельзя заменять заголовком родителя:
+        // точное совпадение родителя тогда всегда забирает его окно первым.
+        // Здесь ребёнок первым стоит в `live`, но родитель всё равно получает
+        // своё окно по заголовку, а ребёнок — оставшееся.
+        let parent = member(CHROME, "Parent", CHROME_CLASS);
+        let child = live(0x802, CHROME, "", CHROME_CLASS);
+        let members = [parent.clone(), sibling_key(&parent, &child)];
+        let windows = [child, live(0x801, CHROME, "Parent", CHROME_CLASS)];
+        assert_eq!(
+            assigned_hwnds(&members, &windows),
+            vec![Some(0x801), Some(0x802)]
+        );
+    }
+
+    #[test]
+    fn live_window_order_does_not_change_assignment() {
+        // У разных заголовков результат должен зависеть от примет, а не от
+        // порядка, в котором Win32 перечислил окна.
+        let parent = member(CHROME, "Parent", CHROME_CLASS);
+        let child = live(0x802, CHROME, "Child", CHROME_CLASS);
+        let members = [parent.clone(), sibling_key(&parent, &child)];
+        let first = [
+            live(0x802, CHROME, "Child", CHROME_CLASS),
+            live(0x801, CHROME, "Parent", CHROME_CLASS),
+        ];
+        let second = [
+            live(0x801, CHROME, "Parent", CHROME_CLASS),
+            live(0x802, CHROME, "Child", CHROME_CLASS),
+        ];
+        assert_eq!(
+            assigned_hwnds(&members, &first),
+            vec![Some(0x801), Some(0x802)]
+        );
+        assert_eq!(
+            assigned_hwnds(&members, &first),
+            assigned_hwnds(&members, &second)
+        );
+    }
+
+    #[test]
+    fn identical_sibling_keys_are_deterministic_but_not_identifiable() {
+        // Если оба экземпляра сохранили одинаковые exe, класс и заголовок,
+        // ключи не содержат способа узнать, кто из них родитель. Жадное
+        // сопоставление всё же не отдаёт одно окно дважды и выбирает HWND
+        // детерминированно; это устраняет влияние порядка `live`, но не
+        // решает фундаментальную неоднозначность без нового поля модели.
+        let parent = member(CHROME, "Same title", CHROME_CLASS);
+        let child = live(0x802, CHROME, "Same title", CHROME_CLASS);
+        let child_key = sibling_key(&parent, &child);
+        assert_eq!(parent, child_key);
+        let members = [parent, child_key];
+        let first = [
+            live(0x802, CHROME, "Same title", CHROME_CLASS),
+            live(0x801, CHROME, "Same title", CHROME_CLASS),
+        ];
+        let second = [
+            live(0x801, CHROME, "Same title", CHROME_CLASS),
+            live(0x802, CHROME, "Same title", CHROME_CLASS),
+        ];
+        assert_eq!(
+            assigned_hwnds(&members, &first),
+            vec![Some(0x801), Some(0x802)]
+        );
+        assert_eq!(
+            assigned_hwnds(&members, &first),
+            assigned_hwnds(&members, &second)
+        );
     }
 
     // --- match_members: взаимная однозначность ---

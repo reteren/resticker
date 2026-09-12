@@ -225,7 +225,7 @@ pub const MIN_SIZE_FETCH_TIMEOUT_MS: u32 = 25;
 ///
 /// `(0, 0, 0, 0)` — окно свёрнуто или система не отдала границы: перевода
 /// нет, вызывающий получает «сырое» значение в GetWindowRect-пространстве.
-fn dwm_frame_offset(hwnd: HWND) -> (i32, i32, i32, i32) {
+pub fn dwm_frame_offset(hwnd: HWND) -> (i32, i32, i32, i32) {
     let mut gwr = RECT::default();
     // SAFETY: GetWindowRect — чтение экранного прямоугольника, безопасно
     // и для чужих, и для мёртвых окон (вернёт ошибку).

@@ -261,6 +261,15 @@ pub const PIN_OPEN_GROUP_HOTKEY_ID: i32 = 20;
 /// за собой остальные хоткеи программы.
 pub const MITOSIS_HOTKEY_ID: i32 = 21;
 
+/// Хоткей отделения куска чужого окна (`Ctrl+Alt+C`, запрос пользователя
+/// 2026-09-10; [`rst_core::model::StickerSource::WindowCrop`]).
+///
+/// К группам отношения не имеет, но живёт в этой же нумерации и
+/// регистрируется тем же пакетом — по той же причине, что и
+/// [`MITOSIS_HOTKEY_ID`]: занятая кем-то комбинация не должна утаскивать
+/// за собой остальные хоткеи программы.
+pub const WINDOW_CROP_HOTKEY_ID: i32 = 22;
+
 /// Все хоткеи групп одним списком: девятка открытия плюс меню, удаление,
 /// «открепить всё», «закрепить открытую группу» и режим резки окон.
 ///
@@ -282,6 +291,7 @@ pub fn group_hotkey_combos(hotkeys: &Hotkeys) -> Vec<(i32, HotkeyCombo)> {
         (UNPIN_ALL_HOTKEY_ID, hotkeys.unpin_all.as_deref()),
         (PIN_OPEN_GROUP_HOTKEY_ID, hotkeys.pin_open_group.as_deref()),
         (MITOSIS_HOTKEY_ID, hotkeys.window_mitosis.as_deref()),
+        (WINDOW_CROP_HOTKEY_ID, hotkeys.window_crop.as_deref()),
     ] {
         if let Some(combo) = raw.and_then(|s| HotkeyCombo::parse(s).ok()) {
             combos.push((id, combo));
@@ -650,6 +660,56 @@ mod tests {
             .expect("хоткей митоза обязан регистрироваться");
         assert_eq!(*id, 21);
         assert_eq!(combo.display_string(), "Ctrl+Alt+F");
+    }
+
+    #[test]
+    fn group_hotkey_combos_registers_window_crop_under_id_twenty_two() {
+        // Ровно та же ловушка, что у митоза: хоткей отделения куска окна
+        // ездит в пакете групп только ради изоляции конфликтов, и его
+        // потеря при правке пакета выглядит как «функция не включается».
+        let combos = group_hotkey_combos(&Hotkeys::default());
+        let (id, combo) = combos
+            .iter()
+            .find(|(id, _)| *id == WINDOW_CROP_HOTKEY_ID)
+            .expect("хоткей отделения куска окна обязан регистрироваться");
+        assert_eq!(*id, 22);
+        assert_eq!(combo.display_string(), "Ctrl+Alt+C");
+    }
+
+    #[test]
+    fn default_hotkeys_have_no_duplicate_combinations() {
+        // Две функции на одной комбинации — это молча неработающая вторая:
+        // RegisterHotKey отдаёт пару первому, а второй отваливается
+        // конфликтом, который выглядит как «кнопка ничего не делает».
+        // Проверяется на ВСЁМ наборе, а не на новом хоткее: следующая
+        // добавка так же обязана не наступить на занятое.
+        let h = Hotkeys::default();
+        let mut all: Vec<String> = group_hotkey_combos(&h)
+            .iter()
+            .map(|(_, c)| c.display_string())
+            .collect();
+        for raw in [
+            h.edit_mode.as_deref(),
+            h.toggle_all_stickers.as_deref(),
+            h.mute_all.as_deref(),
+            h.pin_focused_window.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            all.push(
+                HotkeyCombo::parse(raw)
+                    .expect("дефолтный хоткей обязан разбираться")
+                    .display_string(),
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for combo in &all {
+            assert!(
+                seen.insert(combo.clone()),
+                "комбинация {combo} назначена двум функциям сразу"
+            );
+        }
     }
 
     #[test]

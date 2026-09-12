@@ -274,6 +274,7 @@ const HOTKEY_FIELDS = [
   ['hotkey-mute-all', 'mute_all'],
   ['hotkey-pin', 'pin_focused_window'],
   ['hotkey-mitosis', 'window_mitosis'],
+  ['hotkey-window-crop', 'window_crop'],
   ['hotkey-unpin-all', 'unpin_all'],
   ['hotkey-groups-menu', 'edit_groups_menu'],
   ['hotkey-delete-group', 'delete_open_group'],

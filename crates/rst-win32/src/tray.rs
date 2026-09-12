@@ -347,7 +347,7 @@ fn create_window() -> Result<HWND, Win32Error> {
 /// сборки — тот же принцип независимости от деталей упаковки. `None` —
 /// `current_exe()` не удался или в бинарнике нет иконки (например, тестовый
 /// прогон без реальной сборки `tauri_build`).
-fn app_icon() -> Option<HICON> {
+pub(crate) fn app_icon() -> Option<HICON> {
     let exe = std::env::current_exe().ok()?;
     let text = exe.as_os_str().to_str()?;
     let mut wide: Vec<u16> = text.encode_utf16().collect();

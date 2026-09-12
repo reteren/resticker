@@ -73,6 +73,40 @@ pub fn onboarding_notification(hotkey: &str) -> (String, String) {
     )
 }
 
+/// Заголовок окна живого куска в Alt+Tab и на панели задач.
+///
+/// С пометкой «piece», а не голым именем приложения: иначе в Alt+Tab стояли
+/// бы два одинаковых «Калькулятора» — само приложение и его кусок, и выбрать
+/// нужный можно было бы только наугад.
+pub fn crop_window_title(app: &str) -> String {
+    if app.trim().is_empty() {
+        "Window piece".to_string()
+    } else {
+        format!("{app} — piece")
+    }
+}
+
+/// Тост отказа при отделении куска окна (запрос пользователя 2026-09-10).
+///
+/// Каждый текст говорит, ЧТО сделать иначе: выделение, которое «просто
+/// ничего не дало», читается как поломка программы, а не как промах рукой.
+pub fn window_crop_refusal(refusal: rst_core::window_crop::CropError) -> String {
+    use rst_core::window_crop::CropError;
+    match refusal {
+        CropError::DragOutsideWindow => {
+            "No piece taken: the drag has to start inside a window. Point at one, then drag."
+                .to_string()
+        }
+        CropError::DragTooSmall => {
+            "No piece taken: that selection is too small to show. Drag a bigger rectangle."
+                .to_string()
+        }
+        CropError::DegenerateWindow => {
+            "No piece taken: that window has no visible area to copy from.".to_string()
+        }
+    }
+}
+
 /// Название конфликтующего хоткея в тексте тоста — какое действие сейчас
 /// недоступно.
 /// Текст баннера, когда митоз окна не состоялся
@@ -141,6 +175,7 @@ fn hotkey_action_label(name: rst_win32::overlay::HotkeyName) -> &'static str {
         HotkeyName::MuteAll => "muting all stickers",
         HotkeyName::PinFocusedWindow => "pinning/unpinning the focused window",
         HotkeyName::WindowMitosis => "window mitosis (split a window in two)",
+        HotkeyName::WindowCrop => "tearing off a piece of a window",
     }
 }
 
