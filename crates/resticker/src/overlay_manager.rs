@@ -1120,9 +1120,14 @@ fn apply_input_policies(
 /// это `PostMessage`.
 struct CropWindowSlot {
     window: rst_win32::crop_window::CropWindow,
+    /// Номер этого окна — с ним сверяются приходящие события.
+    generation: u64,
     bounds: rst_core::model::Rect,
     minimized: bool,
     opacity: u8,
+    /// Состояние булавки «поверх всех окон», уже применённое к окну. Хранится
+    /// рядом с окном, чтобы не переспрашивать Win32 про стиль каждый кадр.
+    always_on_top: bool,
 }
 
 /// Прямоугольник стикера в физических пикселях виртуального десктопа —
@@ -1200,10 +1205,26 @@ fn sync_crop_windows(
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     tx: &mpsc::Sender<OverlayMessage>,
     crop_windows: &mut HashMap<Uuid, CropWindowSlot>,
+    generation: &mut u64,
 ) -> bool {
     use rst_win32::crop_window::{CropWindow, CropWindowOptions, SourceRect};
 
     let show = !edit.active && edit.window_crop.is_none() && edit.mitosis.is_none();
+    // Пока открыта панель resticker, куски НЕ держатся поверх всех окон.
+    //
+    // Меню набора групп (`Ctrl+Alt+G`) намеренно ВЫХОДИТ из режима
+    // редактирования (см. обработчик `OverlayEvent::ToggleGroupsMenu`), то есть
+    // окна кусков в этот момент живы. Пока булавка была безусловной, они
+    // накрывали собой панель: «моя панель в режиме редактирования групп
+    // находится ниже этих окон» (репорт пользователя 2026-09-12). Оверлей и
+    // куски оба `WS_EX_TOPMOST`, и внутри этой полосы z-порядка выигрывает тот,
+    // кого подняли последним, — значит одним топмостом вопрос не решается.
+    //
+    // Куски при этом НЕ снимаются: панель набора группы перечисляет живые
+    // окна, и кусок обязан оставаться среди них. Меняется только полоса
+    // z-порядка, и только пока панель открыта; в конфиге булавка не трогается,
+    // после закрытия панели состояние возвращается само.
+    let panel_open = edit.group_editor.is_some() || edit.group_manager.is_some();
     let mut changed = false;
 
     // Окна, которые больше не нужны: режим редактирования, кусок удалён или
@@ -1232,6 +1253,7 @@ fn sync_crop_windows(
             window,
             crop,
             minimized,
+            always_on_top,
         } = &sticker.source
         else {
             continue;
@@ -1262,6 +1284,16 @@ fn sync_crop_windows(
             if slot.opacity != opacity {
                 let _ = slot.window.set_opacity(opacity);
                 slot.opacity = opacity;
+            }
+            // Булавку обычно переключает сам человек в полосе, и окно
+            // применяет её раньше, чем конфиг об этом узнаёт. Сверка нужна для
+            // обратного пути: состояние изменилось в конфиге (отмена действия,
+            // пресет, правка файла руками) — окно обязано догнать его, не
+            // пересоздаваясь.
+            let want_top = *always_on_top && !panel_open;
+            if slot.always_on_top != want_top {
+                let _ = slot.window.set_always_on_top(want_top);
+                slot.always_on_top = want_top;
             }
             continue;
         }
@@ -1303,7 +1335,11 @@ fn sync_crop_windows(
         } else {
             window.title.clone()
         };
-        let window_title = crate::i18n::crop_window_title(&app);
+        // Метка — первые 4 символа идентификатора стикера: заголовок обязан
+        // быть уникальным, иначе группа окон не отличит два куска одного
+        // приложения друг от друга (у них совпадают и exe, и класс окна).
+        let tag: String = sticker.id.simple().to_string().chars().take(4).collect();
+        let window_title = crate::i18n::crop_window_title(&app, &tag);
         let mut options = CropWindowOptions::new(bounds, source_rect, app);
         options.window_title = window_title;
         if let Some(b) = monitor_bounds.get(&sticker.placement.monitor_id) {
@@ -1311,25 +1347,35 @@ fn sync_crop_windows(
             options.dpi = (b.scale * 96.0).round() as u32;
         }
         options.opacity = opacity;
+        // Окно создаётся сразу в нужной полосе z-порядка: поставить топмост
+        // вторым шагом означало бы показать кусок поверх всего на один кадр.
+        options.always_on_top = *always_on_top && !panel_open;
         match CropWindow::create(source_hwnd, options) {
             Ok((cw_window, events)) => {
                 // Переходник: события окна куска — в общую очередь
                 // координатора. Поток сам завершится, когда окно закроют
                 // (отправитель событий уничтожается вместе с ним).
+                *generation += 1;
+                let gen_id = *generation;
                 let fwd = tx.clone();
                 let id = sticker.id;
                 std::thread::spawn(move || {
                     for ev in events {
-                        if fwd.send(OverlayMessage::CropWindow(id, ev)).is_err() {
+                        if fwd
+                            .send(OverlayMessage::CropWindow(id, gen_id, ev))
+                            .is_err()
+                        {
                             break;
                         }
                     }
                 });
                 let mut slot = CropWindowSlot {
                     window: cw_window,
+                    generation: gen_id,
                     bounds,
                     minimized: false,
                     opacity,
+                    always_on_top: *always_on_top && !panel_open,
                 };
                 if *minimized {
                     if let Some(point) = crop_window_icon_point(cfg, sticker.id, monitor_bounds) {
@@ -1337,7 +1383,11 @@ fn sync_crop_windows(
                     }
                     slot.minimized = true;
                 }
-                tracing::info!(sticker = %sticker.id, "окно живого куска создано");
+                tracing::info!(
+                    sticker = %sticker.id,
+                    generation = gen_id,
+                    "окно живого куска создано"
+                );
                 crop_windows.insert(sticker.id, slot);
                 changed = true;
             }
@@ -1357,6 +1407,7 @@ fn sync_crop_windows(
 
 /// Разобрать событие отдельного окна куска. `true` — нужна перерисовка.
 fn handle_crop_window_event(
+    generation: u64,
     edit: &mut EditState,
     cfg: &mut Config,
     config_path: &Path,
@@ -1366,6 +1417,17 @@ fn handle_crop_window_event(
     event: rst_win32::crop_window::CropWindowEvent,
 ) -> bool {
     use rst_win32::crop_window::CropWindowEvent as E;
+    // Событие от УЖЕ СНЯТОГО окна игнорируется целиком: пока оно шло по
+    // каналу, кусок могли снять и создать заново, и старое событие применило
+    // бы к новому окну прежнее место или закрыло бы его (разбор G1,
+    // 2026-09-12).
+    if crop_windows
+        .get(&id)
+        .is_some_and(|slot| slot.generation != generation)
+    {
+        tracing::debug!(sticker = %id, generation, "событие устаревшего окна куска пропущено");
+        return false;
+    }
     match event {
         E::Geometry { x, y, w, h } => {
             // Окно куска сообщает свой прямоугольник: его перетащили за полосу
@@ -1412,13 +1474,57 @@ fn handle_crop_window_event(
             // Через общий путь удаления со снимком undo: крестик на куске —
             // то же удаление стикера, и undo обязан его вернуть.
             let before = cfg.clone();
+            let had = cfg.stickers.iter().any(|s| s.id == id);
             cfg.stickers.retain(|s| s.id != id);
             commit_undo_snapshot(edit, before);
             crop_windows.remove(&id);
-            if let Err(e) = config::save(cfg, config_path) {
+            let saved = config::save(cfg, config_path);
+            if let Err(e) = &saved {
                 tracing::warn!(error = %e, "не удалось сохранить config.json после закрытия куска");
             }
+            // Замер, предложенный разбором G1 (2026-09-12): без этой строки
+            // нельзя отличить «закрытие не дошло до координатора» от
+            // «дошло, но запись осталась». Одна строка на закрытие — журнал
+            // от неё не распухнет.
+            tracing::info!(
+                sticker = %id,
+                generation,
+                was_in_config = had,
+                crops_left = cfg
+                    .stickers
+                    .iter()
+                    .filter(|s| matches!(s.source, StickerSource::WindowCrop { .. }))
+                    .count(),
+                saved = saved.is_ok(),
+                "кусок окна закрыт"
+            );
             true
+        }
+        E::AlwaysOnTopToggled(on) => {
+            // Окно уже применило булавку само — координатору остаётся записать
+            // решение, чтобы оно пережило перезапуск. Слот обновляется здесь
+            // же: иначе следующая синхронизация увидела бы расхождение и
+            // послала окну команду вернуть как было.
+            if let Some(slot) = crop_windows.get_mut(&id) {
+                slot.always_on_top = on;
+            }
+            let mut found = false;
+            if let Some(s) = cfg.stickers.iter_mut().find(|s| s.id == id)
+                && let StickerSource::WindowCrop { always_on_top, .. } = &mut s.source
+            {
+                *always_on_top = on;
+                found = true;
+            }
+            if !found {
+                return false;
+            }
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после переключения булавки куска");
+            }
+            tracing::info!(sticker = %id, always_on_top = on, "булавка куска переключена");
+            // Перерисовка не нужна: кусок вне режима редактирования рисует
+            // себя сам, оверлей его не показывает.
+            false
         }
         E::MinimizeClicked | E::RestoreClicked => {
             let want = matches!(event, E::MinimizeClicked);
@@ -1799,6 +1905,8 @@ fn sync_window_crops(
             window,
             crop,
             minimized,
+            // Булавка к захвату отношения не имеет: она про z-порядок окна.
+            always_on_top: _,
         } = &sticker.source
         else {
             continue;
@@ -2796,7 +2904,14 @@ enum OverlayMessage {
     /// процесса (`scratchpad/probe_v1`, фазы 1–2): клик мимо окна куска
     /// доходит до чужой программы, фокус не уводится, залипаний ноль.
     /// Большой оверлей при этом остаётся в покое прозрачным целиком.
-    CropWindow(Uuid, rst_win32::crop_window::CropWindowEvent),
+    ///
+    /// Второе поле — ПОКОЛЕНИЕ окна: у каждого созданного окна куска свой
+    /// номер. Окно живёт на своём потоке, и его события могут прийти уже
+    /// после того, как окно сняли и создали заново (тот же кусок вернулся из
+    /// отмены, вышли из режима редактирования). Без номера запоздалое
+    /// событие старого окна применилось бы к новому — например, вернуло бы
+    /// ему прежнее место (разбор G1, 2026-09-12).
+    CropWindow(Uuid, u64, rst_win32::crop_window::CropWindowEvent),
     /// Фоновый поток митоза закончил ожидание второго окна
     /// (docs/M9_WINDOW_MITOSIS_DESIGN.md §4.4): `Ok(hwnd)` — новое окно
     /// появилось и его надо поставить на вторую половину, `Err(refusal)` —
@@ -4503,6 +4618,9 @@ fn run(
     // Отдельные окна живых кусков — показывают содержимое вне режима
     // редактирования (`sync_crop_windows`).
     let mut crop_windows: HashMap<Uuid, CropWindowSlot> = HashMap::new();
+    // Номер следующего окна куска: растёт на каждое созданное окно и никогда
+    // не повторяется, поэтому событие старого окна нельзя спутать с новым.
+    let mut crop_generation: u64 = 0;
     for sticker in &cfg.stickers {
         if let Some((sprite, anim)) = load_sticker_sprite(&device, sticker) {
             sprites.push((sticker.id, sprite));
@@ -6791,8 +6909,9 @@ fn run(
                 // Вне режима редактирования окно клик-прозрачно — эти
                 // события приходить не должны, но игнорируем на всякий случай.
             }
-            OverlayMessage::CropWindow(id, event) => {
+            OverlayMessage::CropWindow(id, generation, event) => {
                 if handle_crop_window_event(
+                    generation,
                     &mut edit,
                     &mut cfg,
                     &config_path,
@@ -7678,6 +7797,7 @@ fn run(
             &monitor_bounds,
             &tx,
             &mut crop_windows,
+            &mut crop_generation,
         ) {
             need_redraw = true;
         }
@@ -11606,35 +11726,6 @@ fn handle_window_picker_up(
         return true;
     }
 
-    let desktop_only_clicked = edit
-        .window_picker
-        .as_mut()
-        .and_then(|s| {
-            s.panel
-                .widget_mut::<Button>(window_picker::PICKER_BTN_DESKTOP_ONLY)
-        })
-        .is_some_and(Button::take_click);
-    if desktop_only_clicked && matches!(target, PickerTarget::Sticker(_)) {
-        commit_undo_snapshot(edit, cfg.clone());
-        level_picker_group(edit, cfg);
-        let sticker = cfg
-            .stickers
-            .iter_mut()
-            .find(|s| s.id == sticker_id)
-            .expect("наличие стикера проверено выше");
-        sticker.visibility = window_picker::apply_desktop_only_preset(&sticker.visibility);
-        spread_picker_visibility(edit, cfg, sticker_id);
-        if let Err(e) = config::save(cfg, config_path) {
-            tracing::warn!(error = %e, "не удалось сохранить config.json после пресета «только рабочий стол»");
-        }
-        // Тот же пересчёт, что и после «выбрать все» выше — тот же класс
-        // бага (occluder_cache остаётся на старых правилах видимости до
-        // следующего несвязанного события трекера).
-        *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
-        rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
-        return true;
-    }
-
     let groups = window_picker::group_by_process(window_snapshot);
     for (g, group) in groups.iter().enumerate() {
         let toggled = edit
@@ -13757,7 +13848,16 @@ fn build_group_editor(
     // собирать группу.
     let cards: Vec<group_strip::StripCard> = windows
         .iter()
-        .filter(|info| info.pid != own_pid)
+        // Свои окна отбрасываются, чтобы в кандидаты не попали оверлеи и
+        // панели самого resticker, — но ОКНО ЖИВОГО КУСКА исключение: это
+        // обычное окно приложения, и пользователь вправе собрать группу из
+        // него («я до сих пор не могу использовать эти окна в группах», репорт
+        // 2026-09-12). Отличаем его по классу окна: полосы кусков и оверлеи
+        // сюда не доходят вовсе — их отфильтровал `is_real_window` при
+        // перечислении (`WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`).
+        .filter(|info| {
+            info.pid != own_pid || info.class == rst_win32::crop_window::WINDOW_CLASS
+        })
         .map(|info| group_strip::StripCard {
             hwnd: info.hwnd,
             title: info.title.clone(),

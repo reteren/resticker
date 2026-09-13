@@ -47,7 +47,16 @@ pub fn window_at(snapshot: &[WindowInfo], point: ScreenPoint) -> Option<usize> {
     let own_pid = std::process::id();
     snapshot
         .iter()
-        .filter(|w| !w.iconic && w.pid != own_pid && rect_contains(&w.rect, point))
+        // Своё окно куска — полноценное окно, и закреплять его можно наравне
+        // с чужими (запрос пользователя 2026-09-12: «окно вырезаное я мог
+        // закреплять как обычное окно»). Остальные свои окна — оверлеи и
+        // панели — по-прежнему не кандидаты: навести курсор на оверлей значит
+        // навести его на то, что нарисовано поверх настоящего окна.
+        .filter(|w| {
+            !w.iconic
+                && (w.pid != own_pid || w.class == crate::crop_window::WINDOW_CLASS)
+                && rect_contains(&w.rect, point)
+        })
         // z_order монотонно растёт сверху вниз (window_enum) — минимум и есть
         // верхнее окно; гонок между элементами одного снимка нет по построению.
         .min_by_key(|w| w.z_order)
@@ -133,6 +142,28 @@ mod tests {
         assert_eq!(
             window_at(&snapshot, ScreenPoint { x: 100, y: 100 }),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn own_crop_window_is_a_candidate_unlike_other_own_windows() {
+        // Окно живого куска принадлежит нашему процессу, но это обычное окно
+        // приложения, и закреплять его можно наравне с чужими (запрос
+        // пользователя 2026-09-12). Остальные свои окна — оверлеи и панели —
+        // кандидатами не становятся, иначе наведение на нарисованный поверх
+        // окна оверлей выбирало бы оверлей.
+        let mut crop = info(1, 0, 0, 200, 200, 0);
+        crop.pid = std::process::id();
+        crop.class = crate::crop_window::WINDOW_CLASS.to_string();
+        let mut overlay = info(2, 0, 0, 200, 200, 1);
+        overlay.pid = std::process::id();
+        overlay.class = "resticker_overlay".to_string();
+        let foreign = info(3, 0, 0, 200, 200, 2);
+        let snapshot = vec![crop, overlay, foreign];
+        assert_eq!(
+            window_at(&snapshot, ScreenPoint { x: 100, y: 100 }),
+            Some(1),
+            "кусок выигрывает как верхнее окно, оверлей не участвует вовсе"
         );
     }
 

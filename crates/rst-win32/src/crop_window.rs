@@ -37,7 +37,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
     VK_LBUTTON,
 };
-use windows::Win32::UI::WindowsAndMessaging::HTTRANSPARENT;
+use windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect,
     GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect, HTCLIENT, IDC_ARROW, KillTimer,
@@ -54,12 +54,34 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MINMAXINFO, WM_GETMINMAXINFO, WM_NCCALCSIZE, WM_SIZING, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT,
     WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE};
 use windows::core::{BOOL, PCWSTR, w};
 
 const CLASS_NAME: PCWSTR = w!("resticker_crop_window");
+/// Класс обоих окон куска — тем же текстом, что [`CLASS_NAME`], но строкой
+/// Rust.
+///
+/// Нужен координатору, чтобы опознать СВОЁ окно куска в перечислении окон.
+/// Окна собственного процесса он в остальном отбрасывает (иначе в кандидаты
+/// группы попали бы оверлеи и панели), а кусок обязан быть доступен наравне с
+/// чужими окнами: он и есть обычное окно (разбор P2, 2026-09-13).
+pub const WINDOW_CLASS: &str = "resticker_crop_window";
 const WINDOW_TITLE: PCWSTR = w!("resticker_crop_window");
 const WM_APP_COMMAND: u32 = WM_APP + 1;
+/// Снять окна куска по решению координатора — БЕЗ события «кусок закрыт».
+///
+/// Отдельно от `WM_CLOSE` намеренно. `WM_CLOSE` приходит и от системы:
+/// Alt+F4, закрытие кнопкой на панели задач, закрытие из Alt+Tab — окно куска
+/// теперь обычное окно приложения, и все эти пути ему доступны. Пока оба
+/// случая обрабатывались одинаково, системное закрытие уничтожало окна, но
+/// НЕ удаляло стикер: кусок выглядел удалённым, оставаясь в конфиге, и
+/// возвращался, как только окна пересоздавались — например, после выхода из
+/// режима выделения нового куска (живой репорт пользователя 2026-09-12:
+/// «закрытое ранее окно снова появится», «работает через раз»).
+const WM_APP_SHUTDOWN: u32 = WM_APP + 2;
 const STRIP_HEIGHT_DIP: u32 = 28;
 /// Сколько полоса держится после ухода курсора, мс.
 ///
@@ -95,6 +117,11 @@ const COLOR_HOVER: COLORREF = COLORREF(0x00362f2f);
 /// человек узнаёт его без подписи, и деструктивная кнопка обязана
 /// отличаться от соседней.
 const COLOR_CLOSE_HOVER: COLORREF = COLORREF(0x001c2bc4);
+/// Включённая булавка — синий акцент `ACCENT` (#3B6FE0) из палитры.
+///
+/// Не серая подсветка наведения: та означает «курсор здесь», а эта —
+/// «переключатель включён», и путать их нельзя. Цвет держится и без курсора.
+const COLOR_PIN_ON: COLORREF = COLORREF(0x00e06f3b);
 /// Кегль подписи, DIP.
 const TEXT_SIZE_DIP: i32 = 12;
 /// Сторона глифа кнопки, DIP.
@@ -133,6 +160,12 @@ pub struct CropWindowOptions {
     pub window_title: String,
     /// Непрозрачность DWM-превью, 0..=255.
     pub opacity: u8,
+    /// Держать кусок поверх всех окон.
+    ///
+    /// `false` — обычное окно, уходящее под другие (репорт пользователя
+    /// 2026-09-12). Включается булавкой на полосе и хранится в конфиге, так
+    /// что окно пересоздаётся уже в нужном состоянии, без мигания.
+    pub always_on_top: bool,
 }
 
 impl CropWindowOptions {
@@ -146,6 +179,7 @@ impl CropWindowOptions {
             window_title: String::new(),
             app_name: app_name.into(),
             opacity: u8::MAX,
+            always_on_top: false,
         }
     }
 }
@@ -169,6 +203,10 @@ pub enum CropWindowEvent {
     MinimizeClicked,
     /// Нажат квадрат свёрнутого куска.
     RestoreClicked,
+    /// Нажата булавка в полосе: человек включил или выключил «поверх всех
+    /// окон». Окно применяет новое состояние сразу само — событие нужно
+    /// координатору, чтобы записать решение в конфиг и пережить перезапуск.
+    AlwaysOnTopToggled(bool),
     /// Источник исчез или DWM больше не принимает обновления превью.
     SourceGone,
 }
@@ -258,6 +296,15 @@ impl CropWindow {
         self.post_command(Command::SetBounds(bounds))
     }
 
+    /// Держать кусок поверх всех окон (или перестать).
+    ///
+    /// Нужно координатору для двух случаев: восстановить состояние из конфига
+    /// у уже созданного окна и отменить переключение, если записать решение в
+    /// конфиг не удалось.
+    pub fn set_always_on_top(&self, on: bool) -> Result<(), CropWindowError> {
+        self.post_command(Command::SetAlwaysOnTop(on))
+    }
+
     /// Ужать содержимое до квадрата 32×32 DIP в точке координатора.
     pub fn minimize(&self, point: Point) -> Result<(), CropWindowError> {
         self.post_command(Command::Minimize(point))
@@ -296,11 +343,13 @@ impl CropWindow {
 
 impl Drop for CropWindow {
     fn drop(&mut self) {
-        // WM_CLOSE идёт в GUI-поток: там сначала снимается capture, затем
-        // отменяется DWM registration и уничтожаются оба собственных окна.
+        // `WM_APP_SHUTDOWN`, а НЕ `WM_CLOSE`: закрытие по решению координатора
+        // не должно выглядеть как «человек закрыл кусок» и удалять стикер —
+        // окна снимаются и при входе в режим выделения, и в режиме
+        // редактирования, где кусок рисует оверлей.
         if !self.hwnd.0.is_null() {
             // SAFETY: hwnd — наше окно; сообщение безопасно с любого потока.
-            let _ = unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            let _ = unsafe { PostMessageW(Some(self.hwnd), WM_APP_SHUTDOWN, WPARAM(0), LPARAM(0)) };
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -320,8 +369,18 @@ pub struct Point {
 pub enum StripHit {
     None,
     Drag,
+    /// Булавка «поверх всех окон» — крайняя левая из трёх кнопок.
+    Pin,
     Minimize,
     Close,
+}
+
+/// Ширина одной кнопки полосы. Кнопки квадратные (сторона равна высоте
+/// полосы, 28 DIP), но у диагностически узкой полосы им отдаётся не больше
+/// четверти ширины на каждую: три кнопки и зона перетаскивания обязаны
+/// поместиться, иначе полосу стало бы не за что взять.
+fn strip_button_side(width: u32, height: u32) -> u32 {
+    height.min(width / 4)
 }
 
 /// Проверить полосу без окна: тесты геометрии не трогают рабочий стол.
@@ -329,15 +388,19 @@ pub fn hit_test_strip(width: u32, height: u32, x: i32, y: i32) -> StripHit {
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 || height == 0 {
         return StripHit::None;
     }
-    // Треть ширины оставляет drag-зону даже для диагностически узкой полосы;
-    // в обычном куске высота (28 DIP) задаёт квадратные кнопки.
-    let button = height.min(width / 3);
+    let button = strip_button_side(width, height);
+    if button == 0 {
+        return StripHit::Drag;
+    }
     let close_left = width.saturating_sub(button) as i32;
     let minimize_left = width.saturating_sub(button.saturating_mul(2)) as i32;
-    if button > 0 && x >= close_left {
+    let pin_left = width.saturating_sub(button.saturating_mul(3)) as i32;
+    if x >= close_left {
         StripHit::Close
-    } else if button > 0 && x >= minimize_left {
+    } else if x >= minimize_left {
         StripHit::Minimize
+    } else if x >= pin_left {
+        StripHit::Pin
     } else {
         StripHit::Drag
     }
@@ -522,6 +585,7 @@ enum Command {
     SetBounds(Rect),
     Minimize(Point),
     Restore(Rect),
+    SetAlwaysOnTop(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,6 +607,12 @@ struct WindowState {
     opacity: u8,
     app_name: Vec<u16>,
     minimized: bool,
+    /// Кусок держится поверх всех окон (булавка в полосе нажата).
+    ///
+    /// Хранится в состоянии, а не вычитывается из стиля окна каждый раз:
+    /// по нему рисуется вид булавки, и он же решает, в какой полосе z-порядка
+    /// утверждать полосу над содержимым.
+    always_on_top: bool,
     hover_content: bool,
     hover_strip: bool,
     /// Кнопка полосы под курсором — для подсветки. `StripHit::None`/`Drag` —
@@ -649,6 +719,9 @@ impl WindowState {
             unsafe {
                 let _ = ShowWindow(self.strip, SW_SHOWNOACTIVATE);
             }
+            // Порядок окон утверждается при КАЖДОМ показе: пока полоса была
+            // скрыта, содержимое могло всплыть над ней.
+            self.raise_strip();
         } else {
             unsafe {
                 let _ = ShowWindow(self.strip, SW_HIDE);
@@ -694,6 +767,71 @@ impl WindowState {
         }
     }
 
+    /// Поднять полосу над содержимым.
+    ///
+    /// Живой баг 2026-09-12: при изменении размера окно содержимого
+    /// АКТИВИРУЕТСЯ (запрет активации снят ради Alt+Tab), Windows поднимает
+    /// его на верх topmost-полосы — и оно накрывает собой полосу, которая
+    /// лежит на его же верхней кромке. Полоса не пропадала, она уходила ПОД
+    /// содержимое и больше никогда не всплывала: все наши `SetWindowPos`
+    /// стояли с `SWP_NOZORDER`, то есть порядок окон не задавал никто.
+    ///
+    /// Поэтому порядок утверждается явно всякий раз, когда полосу показывают
+    /// или двигают — но ТОЛЬКО внутри своей полосы z-порядка. У куска без
+    /// булавки полосу над содержимым держит владение окном (полоса создана
+    /// владеемой), и поднимать её в topmost нельзя: она висела бы поверх чужих
+    /// окон, под которые сам кусок уже ушёл.
+    fn raise_strip(&self) {
+        if !self.always_on_top {
+            return;
+        }
+        // SAFETY: своё окно этого потока.
+        unsafe {
+            let _ = SetWindowPos(
+                self.strip,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+        }
+    }
+
+    /// Включить или выключить «поверх всех окон» у обоих окон куска.
+    ///
+    /// Стиль `WS_EX_TOPMOST` не пишется напрямую: Windows признаёт его только
+    /// через `SetWindowPos` с `HWND_TOPMOST`/`HWND_NOTOPMOST` — прямая запись
+    /// в стиль оставила бы флаг в `GetWindowLongW` и не изменила бы порядок.
+    ///
+    /// Полоса идёт первой, содержимое вторым: обратный порядок на миг оставил
+    /// бы служебную полосу в topmost над обычным содержимым, и она мигнула бы
+    /// поверх чужого окна.
+    fn set_always_on_top(&mut self, on: bool) {
+        if self.always_on_top == on {
+            return;
+        }
+        self.always_on_top = on;
+        let insert = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        // SAFETY: оба окна — свои, этого потока.
+        unsafe {
+            for hwnd in [self.strip, self.content] {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(insert),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                );
+            }
+            // Булавка нарисована в полосе — её вид обязан обновиться сразу.
+            let _ = InvalidateRect(Some(self.strip), None, false);
+        }
+    }
+
     /// Поставить полосу по текущему прямоугольнику содержимого.
     fn reposition_strip(&mut self) {
         self.refresh_monitor_metrics();
@@ -711,6 +849,7 @@ impl WindowState {
                 SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
+        self.raise_strip();
         self.self_move = false;
     }
 
@@ -928,7 +1067,13 @@ impl WindowState {
                     ((lp.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
                 let strip = strip_rect(self.content_rect, self.screen_top, self.dpi);
-                if resize_hit(strip, self.dpi, x, y) != HTCLIENT {
+                // Кнопки важнее кромки. Они стоят у самого правого края, и их
+                // крайние точки попадают в зону изменения размера: без этой
+                // проверки клик по «закрыть» у края начинал бы тянуть окно.
+                let local = hit_test_strip(strip.w, strip.h, x - strip.x, y - strip.y);
+                if matches!(local, StripHit::Pin | StripHit::Minimize | StripHit::Close) {
+                    LRESULT(HTCLIENT as isize)
+                } else if resize_hit(strip, self.dpi, x, y) != HTCLIENT {
                     LRESULT(HTTRANSPARENT as isize)
                 } else {
                     LRESULT(HTCLIENT as isize)
@@ -1029,6 +1174,10 @@ impl WindowState {
             }
             WM_EXITSIZEMOVE if role == WindowRole::Content => {
                 self.in_size_move = false;
+                // Windows подняла содержимое, пока тянули, — возвращаем полосу
+                // наверх, иначе она осталась бы под ним навсегда.
+                self.raise_strip();
+                self.update_strip_visibility();
                 // Один итоговый отчёт за весь цикл Windows.
                 self.emit(CropWindowEvent::Geometry {
                     x: self.content_rect.x,
@@ -1098,6 +1247,15 @@ impl WindowState {
                 match hit_test_strip(width, height, x, y) {
                     StripHit::Close => self.emit(CropWindowEvent::CloseClicked),
                     StripHit::Minimize => self.emit(CropWindowEvent::MinimizeClicked),
+                    StripHit::Pin => {
+                        // Применяем сразу, не дожидаясь координатора: человек
+                        // нажал кнопку и обязан увидеть результат в тот же
+                        // кадр. Координатор получит событие и запишет решение
+                        // в конфиг, чтобы оно пережило перезапуск.
+                        let on = !self.always_on_top;
+                        self.set_always_on_top(on);
+                        self.emit(CropWindowEvent::AlwaysOnTopToggled(on));
+                    }
                     StripHit::Drag => {
                         if let Some(cursor) = cursor_position() {
                             self.drag.begin(
@@ -1142,7 +1300,13 @@ impl WindowState {
             }
             WM_ERASEBKGND if role == WindowRole::Content => LRESULT(1),
             WM_PAINT if role == WindowRole::Strip => {
-                paint_strip(hwnd, &self.app_name, self.dpi, self.hover_button);
+                paint_strip(
+                    hwnd,
+                    &self.app_name,
+                    self.dpi,
+                    self.hover_button,
+                    self.always_on_top,
+                );
                 LRESULT(0)
             }
             WM_PAINT if role == WindowRole::Content => {
@@ -1200,6 +1364,10 @@ impl WindowState {
                 LRESULT(0)
             }
             WM_CLOSE => {
+                // Сюда доходит ТОЛЬКО системное закрытие: своё координатор
+                // шлёт через `WM_APP_SHUTDOWN`. Для человека Alt+F4 по куску
+                // означает ровно то же, что крестик на полосе, — удалить его.
+                self.emit(CropWindowEvent::CloseClicked);
                 self.finish_drag(true);
                 let content = self.content;
                 let strip = self.strip;
@@ -1214,6 +1382,20 @@ impl WindowState {
                     } else {
                         let _ = DestroyWindow(strip);
                     }
+                }
+                LRESULT(0)
+            }
+            WM_APP_SHUTDOWN => {
+                self.finish_drag(true);
+                let content = self.content;
+                let strip = self.strip;
+                // SAFETY: свои окна этого потока; `DestroyWindow` синхронен,
+                // хэндлы скопированы до вложенной оконной процедуры.
+                unsafe {
+                    if strip != content && !strip.0.is_null() {
+                        let _ = DestroyWindow(strip);
+                    }
+                    let _ = DestroyWindow(content);
                 }
                 LRESULT(0)
             }
@@ -1251,6 +1433,7 @@ impl WindowState {
             }
             Command::Minimize(point) => self.minimize(point),
             Command::Restore(bounds) => self.restore(bounds),
+            Command::SetAlwaysOnTop(on) => self.set_always_on_top(on),
         }
     }
 }
@@ -1316,10 +1499,21 @@ fn create_windows(
     // Свойство «клик по куску не уводит фокус из окна, где человек печатает»
     // (замер V1 фаза 2) держится не флагом, а ответом `MA_NOACTIVATE` на
     // `WM_MOUSEACTIVATE`: мышью окно не активируется, а Alt+Tab — может.
-    let content_style = WS_EX_TOPMOST | WS_EX_APPWINDOW;
+    //
+    // `WS_EX_TOPMOST` НЕ ставится по умолчанию: кусок — обычное окно и обязан
+    // уходить под другие, как любое другое (репорт пользователя 2026-09-12:
+    // «я не хочу чтобы вырезаные окна были алвейз он топ по умолчанию»). Пока
+    // топмост был безусловным, куски накрывали собой даже панели самого
+    // resticker. Поверх всех окон кусок поднимает только булавка на полосе.
+    let topmost = if options.always_on_top {
+        WS_EX_TOPMOST
+    } else {
+        WINDOW_EX_STYLE(0)
+    };
+    let content_style = topmost | WS_EX_APPWINDOW;
     // Полоса остаётся служебным окном: в Alt+Tab был бы второй пункт на один
     // и тот же кусок.
-    let style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    let style = topmost | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
     let title_text = if options.window_title.trim().is_empty() {
         options.app_name.clone()
     } else {
@@ -1352,6 +1546,13 @@ fn create_windows(
             None,
         )
     }?;
+    // Владелец полосы — окно содержимого. Это не косметика: Windows сама
+    // держит владеемое окно ВЫШЕ владельца в z-порядке, и полоса перестаёт
+    // зависеть от того, кто последний всплыл. Раньше её держал наверху только
+    // безусловный `WS_EX_TOPMOST`; без топмоста (а теперь он по умолчанию
+    // снят) полоса ушла бы под собственный кусок при первом же клике по нему —
+    // тот же баг, что уже был при изменении размера 2026-09-12, когда
+    // содержимое активировалось и накрывало полосу.
     let strip_hwnd = match unsafe {
         CreateWindowExW(
             style,
@@ -1362,7 +1563,7 @@ fn create_windows(
             strip.y,
             strip_width,
             strip_height,
-            None,
+            Some(content),
             None,
             Some(hinstance),
             None,
@@ -1390,6 +1591,7 @@ fn create_windows(
         opacity: options.opacity,
         app_name,
         minimized: false,
+        always_on_top: options.always_on_top,
         hover_content: false,
         hover_strip: false,
         hover_button: StripHit::None,
@@ -1471,7 +1673,7 @@ unsafe extern "system" fn crop_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 /// Подпись выводилась растровым системным шрифтом, прижатая к верху полосы;
 /// теперь — Segoe UI со сглаживанием, по центру по вертикали, с многоточием,
 /// если не влезает до кнопок.
-fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit) {
+fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit, always_on_top: bool) {
     let scale = |dip: i32| -> i32 { ((dip * dpi.max(1) as i32) + 48) / 96 };
     let mut paint = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
     let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
@@ -1486,7 +1688,8 @@ fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit) {
     let width = (client.right - client.left).max(1);
     // Та же раскладка, что у `hit_test_strip`: то, что нарисовано, обязано
     // совпадать с тем, куда попадает клик.
-    let button = height.min(width / 3);
+    let button = strip_button_side(width.max(0) as u32, height.max(0) as u32) as i32;
+    let pin_left = width - button * 3;
     let min_left = width - button * 2;
     let close_left = width - button;
 
@@ -1498,10 +1701,25 @@ fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit) {
 
         // --- подсветка кнопки под курсором ---
         let hovered = match hover {
+            StripHit::Pin => Some((pin_left, COLOR_HOVER)),
             StripHit::Minimize => Some((min_left, COLOR_HOVER)),
             StripHit::Close => Some((close_left, COLOR_CLOSE_HOVER)),
             StripHit::None | StripHit::Drag => None,
         };
+        // Включённая булавка — залитая кнопка, а не только другой глиф:
+        // состояние переключателя обязано читаться с одного взгляда, без
+        // наведения курсора.
+        if always_on_top {
+            let rect = RECT {
+                left: pin_left,
+                top: 0,
+                right: pin_left + button,
+                bottom: height,
+            };
+            let brush = CreateSolidBrush(COLOR_PIN_ON);
+            let _ = FillRect(hdc, &rect, brush);
+            let _ = DeleteObject(brush.into());
+        }
         if let Some((left, color)) = hovered {
             let rect = RECT {
                 left,
@@ -1531,7 +1749,7 @@ fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit) {
         let mut text_rect = RECT {
             left: scale(TEXT_PAD_DIP),
             top: 0,
-            right: (min_left - scale(TEXT_PAD_DIP) / 2).max(scale(TEXT_PAD_DIP)),
+            right: (pin_left - scale(TEXT_PAD_DIP) / 2).max(scale(TEXT_PAD_DIP)),
             bottom: height,
         };
         let mut text: Vec<u16> = app_name.strip_suffix(&[0]).unwrap_or(app_name).to_vec();
@@ -1557,6 +1775,19 @@ fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit) {
         let old_pen = windows::Win32::Graphics::Gdi::SelectObject(hdc, pen.into());
         let g = scale(GLYPH_DIP) / 2;
         let cy = height / 2;
+        // «поверх всех окон» — стрелка вверх под чертой: тот же смысл, что у
+        // значка «keep on top» в проигрывателях. Выключенная булавка рисуется
+        // тем же глифом, отличие — залитый фон кнопки (см. выше): два разных
+        // рисунка на одной кнопке человек читает как две разные кнопки.
+        let px = pin_left + button / 2;
+        let _ = MoveToEx(hdc, px - g, cy - g, None);
+        let _ = LineTo(hdc, px + g + 1, cy - g);
+        let _ = MoveToEx(hdc, px, cy + g, None);
+        let _ = LineTo(hdc, px, cy - g + 2);
+        let head = (g / 2).max(2);
+        let _ = MoveToEx(hdc, px - head, cy - g + 2 + head, None);
+        let _ = LineTo(hdc, px, cy - g + 2);
+        let _ = LineTo(hdc, px + head + 1, cy - g + 3 + head);
         // «свернуть» — горизонтальная черта по центру своей кнопки
         let mx = min_left + button / 2;
         let _ = MoveToEx(hdc, mx - g, cy, None);
@@ -1834,16 +2065,51 @@ mod tests {
     #[test]
     fn strip_buttons_and_drag_zone_are_disjoint() {
         assert_eq!(hit_test_strip(320, 28, 20, 14), StripHit::Drag);
+        assert_eq!(hit_test_strip(320, 28, 250, 14), StripHit::Pin);
         assert_eq!(hit_test_strip(320, 28, 280, 14), StripHit::Minimize);
         assert_eq!(hit_test_strip(320, 28, 315, 14), StripHit::Close);
         assert_eq!(hit_test_strip(320, 28, 10, 30), StripHit::None);
     }
 
     #[test]
-    fn small_strip_still_has_two_button_zones() {
-        assert_eq!(hit_test_strip(30, 28, 2, 10), StripHit::Drag);
-        assert_eq!(hit_test_strip(30, 28, 16, 10), StripHit::Minimize);
-        assert_eq!(hit_test_strip(30, 28, 29, 10), StripHit::Close);
+    fn small_strip_still_has_all_three_button_zones() {
+        // Диагностически узкая полоса: кнопки жмутся, но ни одна не исчезает и
+        // ни одна не съедает зону перетаскивания — иначе кусок стало бы не за
+        // что взять.
+        assert_eq!(hit_test_strip(40, 28, 2, 10), StripHit::Drag);
+        assert_eq!(hit_test_strip(40, 28, 12, 10), StripHit::Pin);
+        assert_eq!(hit_test_strip(40, 28, 22, 10), StripHit::Minimize);
+        assert_eq!(hit_test_strip(40, 28, 39, 10), StripHit::Close);
+    }
+
+    #[test]
+    fn strip_zones_never_overlap_across_sizes() {
+        // Три кнопки и зона перетаскивания обязаны оставаться раздельными при
+        // любом размере полосы: раскладку рисует та же `strip_button_side`, и
+        // рассинхрон «нарисовано одно, нажимается другое» уже был живым багом
+        // (кнопки у правого края попадали в зону изменения размера).
+        for width in [24_u32, 40, 64, 120, 320, 1920] {
+            for height in [16_u32, 28, 40] {
+                let button = strip_button_side(width, height);
+                if button == 0 {
+                    assert_eq!(
+                        hit_test_strip(width, height, (width / 2) as i32, 1),
+                        StripHit::Drag,
+                        "полоса без места под кнопки остаётся целиком ручкой"
+                    );
+                    continue;
+                }
+                let seen: Vec<StripHit> = [width - 1, width - button - 1, width - button * 2 - 1]
+                    .iter()
+                    .map(|x| hit_test_strip(width, height, *x as i32, (height / 2) as i32))
+                    .collect();
+                assert_eq!(
+                    seen,
+                    vec![StripHit::Close, StripHit::Minimize, StripHit::Pin],
+                    "порядок кнопок справа налево: закрыть, свернуть, булавка                      (width={width}, height={height})"
+                );
+            }
+        }
     }
 
     #[test]

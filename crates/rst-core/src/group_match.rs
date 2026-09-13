@@ -134,7 +134,16 @@ pub fn match_members(members: &[MemberKey], live: &[LiveWindow]) -> Vec<Option<u
             continue;
         }
         for (w, window) in live.iter().enumerate() {
-            if taken[w] || !exe_class_match(member, window) {
+            if taken[w]
+                || !exe_class_match(member, window)
+                // Заголовок живого куска содержит стабильную метку. Для
+                // такого окна fallback по одному exe и классу опасен:
+                // соседний кусок того же приложения иначе станет якобы
+                // подходящим при любой похожести заголовков.
+                || (is_crop_piece_title(&member.title)
+                    || is_crop_piece_title(&window.title))
+                    && !titles_equal(&member.title, &window.title)
+            {
                 continue;
             }
             candidates.push((m, w, title_similarity(&member.title, &window.title)));
@@ -182,6 +191,25 @@ fn titles_equal(a: &str, b: &str) -> bool {
 /// сравнение дало бы ложный промах после перезапуска, не дав ничего взамен.
 fn classes_equal(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
+}
+
+/// Проверить неизменный заголовок окна живого куска.
+///
+/// Метка добавляется координатором в конец заголовка (`piece <4 hex>`), и
+/// именно она отличает два куска одного приложения после перезапуска.
+/// Отдельная проверка формы метки не даёт обычному окну с произвольным словом
+/// `piece` потерять устойчивое сопоставление по exe и классу.
+fn is_crop_piece_title(title: &str) -> bool {
+    let title = title.trim();
+    let Some((prefix, tag)) = title.rsplit_once(' ') else {
+        return false;
+    };
+    let piece_marker = prefix
+        .strip_suffix("— piece")
+        .or_else(|| prefix.strip_suffix("piece"));
+    piece_marker.is_some_and(|app| !app.trim().is_empty())
+        && tag.len() == 4
+        && tag.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 /// Регистронезависимое равенство путей к exe: файловые системы Windows
@@ -752,6 +780,47 @@ mod tests {
             live(0x502, CHROME, "Отчёты за март", CHROME_CLASS),
         ];
         assert_eq!(match_members(&members, &windows), vec![Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn uniquely_tagged_pieces_are_matched_by_their_exact_title() {
+        // Два куска одного приложения имеют общий exe и класс, поэтому
+        // порядок перечисления HWND не должен менять их слоты.
+        let members = [
+            member(CHROME, "Калькулятор — piece 3f9c", "resticker_crop_window"),
+            member(CHROME, "Калькулятор — piece a0b1", "resticker_crop_window"),
+        ];
+        let windows = [
+            live(
+                0x902,
+                CHROME,
+                "Калькулятор — piece a0b1",
+                "resticker_crop_window",
+            ),
+            live(
+                0x901,
+                CHROME,
+                "Калькулятор — piece 3f9c",
+                "resticker_crop_window",
+            ),
+        ];
+        assert_eq!(
+            assigned_hwnds(&members, &windows),
+            vec![Some(0x901), Some(0x902)]
+        );
+    }
+
+    #[test]
+    fn a_piece_never_falls_back_to_another_piece_or_the_source_window() {
+        // Стабильная метка — это не обычная изменчивая подпись: если нужный
+        // кусок ещё не появился, соседний кусок или окно-источник не должны
+        // занять его слот по общему exe и классу.
+        let piece = member(CHROME, "Калькулятор — piece 3f9c", CHROME_CLASS);
+        let windows = [
+            live(0x903, CHROME, "Калькулятор — piece a0b1", CHROME_CLASS),
+            live(0x904, CHROME, "Калькулятор", CHROME_CLASS),
+        ];
+        assert_eq!(match_members(&[piece], &windows), vec![None]);
     }
 
     #[test]

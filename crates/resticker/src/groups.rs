@@ -27,7 +27,7 @@ use rst_core::group_match::{self, LiveWindow, MemberKey};
 use rst_core::group_shape;
 use rst_core::group_visibility::GroupVisibilityState;
 use rst_core::model::{
-    GroupMember, GroupPlace, MAX_GROUP_MEMBERS, MIN_GROUP_MEMBERS, MonitorId, Rect, WindowGroup,
+    GroupMember, GroupPlace, MonitorId, Rect, WindowGroup, MAX_GROUP_MEMBERS, MIN_GROUP_MEMBERS,
 };
 use rst_win32::window_enum::WindowInfo;
 use uuid::Uuid;
@@ -1135,6 +1135,47 @@ mod tests {
         assert_eq!(placements[0].hwnd, 22);
         assert_eq!(placements[1].hwnd, 11);
         assert_eq!(st.active(), Some(g.id));
+    }
+
+    #[test]
+    fn tagged_piece_members_keep_their_slots_after_a_restart() {
+        // После перезапуска HWND меняются, поэтому проверяем именно холодное
+        // сопоставление по устойчивому заголовку, а не сохранённую binding.
+        let g = saved_group(vec![
+            member("Калькулятор — piece 3f9c", Some(place(0.0, 0.0))),
+            member("Калькулятор — piece a0b1", Some(place(900.0, 0.0))),
+        ]);
+        let mut before_restart = GroupsState::new();
+        before_restart.open_group(
+            &g,
+            &[
+                live(102, "Калькулятор — piece a0b1"),
+                live(101, "Калькулятор — piece 3f9c"),
+            ],
+        );
+        assert_eq!(
+            before_restart.open().expect("группа открыта").window_of(0),
+            Some(101)
+        );
+        assert_eq!(
+            before_restart.open().expect("группа открыта").window_of(1),
+            Some(102)
+        );
+
+        // Новый GroupsState моделирует запуск с чистыми runtime bindings;
+        // изменившиеся HWND не должны менять распределение по слотам.
+        let mut after_restart = GroupsState::new();
+        let placements = after_restart.open_group(
+            &g,
+            &[
+                live(202, "Калькулятор — piece a0b1"),
+                live(201, "Калькулятор — piece 3f9c"),
+            ],
+        );
+        assert_eq!(
+            placements.iter().map(|p| p.hwnd).collect::<Vec<_>>(),
+            vec![201, 202]
+        );
     }
 
     #[test]

@@ -405,4 +405,45 @@ mod tests {
         assert_eq!(without_settings, with_settings);
         assert_eq!(policy(&with_settings, 1), &InputPolicy::Transparent);
     }
+
+    #[test]
+    fn transparent_at_rest_when_coordinator_passes_no_rects() {
+        let result = policies(&[monitor(1, &[]), monitor(2, &[])], InputState::default());
+
+        assert_eq!(policy(&result, 1), &InputPolicy::Transparent);
+        assert_eq!(policy(&result, 2), &InputPolicy::Transparent);
+    }
+
+    #[test]
+    fn editing_makes_every_overlay_interactive() {
+        let result = policies(
+            &[monitor(1, &[]), monitor(2, &[])],
+            InputState {
+                editing: true,
+                ..InputState::default()
+            },
+        );
+
+        assert_eq!(
+            policy(&result, 1),
+            &InputPolicy::Interactive { take_focus: false }
+        );
+        assert_eq!(
+            policy(&result, 2),
+            &InputPolicy::Interactive { take_focus: false }
+        );
+    }
+
+    #[test]
+    fn hit_rects_are_returned_for_non_empty_piece_rects() {
+        let result = policies(&[monitor(1, &[(10, 20, 300, 200)])], InputState::default());
+
+        // Сейчас координатор передаёт пустой список: HTTRANSPARENT не
+        // пробрасывает попадание в окна ДРУГИХ процессов (замер X3,
+        // 2026-09-11), из-за этого мышь залипала.
+        assert_eq!(
+            policy(&result, 1),
+            &InputPolicy::HitRects(vec![(10, 20, 300, 200)])
+        );
+    }
 }
