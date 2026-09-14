@@ -64,6 +64,24 @@ pub fn is_occluder(
     }
 }
 
+/// Есть ли у стикера отдельный окклюдер на чистом рабочем столе.
+///
+/// Маска строится по прямоугольникам живых окон, поэтому «на голом рабочем
+/// столе стикера быть не должно» через [`is_occluder`] не выражается: окон,
+/// по которым строить прямоугольник, там нет. Координатор закрывает всё, что
+/// не занято разрешёнными окнами, когда эта функция возвращает `true`;
+/// правила окон при этом продолжают работать независимо.
+///
+/// Режим намеренно не участвует. Снятая галочка рабочего стола — это решение
+/// человека, и оно обязано работать при любом режиме, включая
+/// [`VisibilityMode::Always`]: «выбрано всё, кроме рабочего стола» — это
+/// ровно то состояние, которое получается, если в панели снять одну эту
+/// галочку, оставив остальные (репорт пользователя 2026-09-13: рабочий стол
+/// должен вести себя как обычная строка списка).
+pub fn desktop_is_occluder(_mode: VisibilityMode, desktop: bool) -> bool {
+    !desktop
+}
+
 /// Правило матчит окно, если совпадает `process_name` ИЛИ `title_pattern`.
 /// Пустое правило (оба `None`) не матчит ничего — окно остаётся окклюдером.
 ///
@@ -396,6 +414,19 @@ mod tests {
         let w = candidate(None, "t", "c");
         assert!(is_occluder(&w, VisibilityMode::Desktop, &[], false));
         assert!(is_occluder(&w, VisibilityMode::NeverOverlap, &[], false));
+    }
+
+    #[test]
+    fn desktop_visibility_is_independent_of_window_rules() {
+        // Снятая галочка рабочего стола работает при ЛЮБОМ режиме, включая
+        // `Always`: состояние «выбрано всё, кроме рабочего стола» получается
+        // в панели одним кликом по этой строке, и оно обязано что-то значить
+        // (репорт пользователя 2026-09-13).
+        assert!(desktop_is_occluder(VisibilityMode::Always, false));
+        assert!(!desktop_is_occluder(VisibilityMode::Always, true));
+        assert!(!desktop_is_occluder(VisibilityMode::OverlapAllowlist, true));
+        assert!(desktop_is_occluder(VisibilityMode::OverlapAllowlist, false));
+        assert!(desktop_is_occluder(VisibilityMode::Desktop, false));
     }
 
     #[test]

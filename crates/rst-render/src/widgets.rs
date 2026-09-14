@@ -2354,6 +2354,14 @@ pub struct Checkbox {
     hover_phase: Phase,
     /// Фаза нажатия 0..1 (§5).
     press_phase: Phase,
+    /// Общая непрозрачность 0..1 — множитель ко всему, что рисует виджет.
+    ///
+    /// Нужна тем панелям, где строки не просто есть или нет, а ПОЯВЛЯЮТСЯ:
+    /// раскрытие списка окон приложения в «Слоях видимости» проявляет их,
+    /// а не выбрасывает готовыми (репорт пользователя 2026-09-13: «0
+    /// анимаций»). Отдельно от `disabled`: тот говорит «трогать нельзя», а
+    /// это — «ещё не доехал».
+    fade: f64,
 }
 
 impl Checkbox {
@@ -2370,7 +2378,14 @@ impl Checkbox {
             icon_toggle: false,
             hover_phase: Phase::new(theme::HOVER_MS),
             press_phase: Phase::new(theme::PRESS_MS),
+            fade: 1.0,
         }
+    }
+
+    /// Общая непрозрачность виджета (см. [`Checkbox::fade`]). `1.0` —
+    /// обычный вид; промежуточные значения проявляют его.
+    pub fn set_fade(&mut self, fade: f64) {
+        self.fade = fade.clamp(0.0, 1.0);
     }
 
     /// Чекбокс стандартного размера (`theme::CHECKBOX_SIZE`) с центром
@@ -2454,7 +2469,7 @@ impl Widget for Checkbox {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
-        let opacity = if self.disabled { 0.45 } else { 1.0 };
+        let opacity = if self.disabled { 0.45 } else { 1.0 } * self.fade.clamp(0.0, 1.0);
         if self.icon_toggle {
             // Кнопка с иконкой замка: то же стекло и те же фазы, что у
             // [`Button`] — всё, что нажимается, обязано отвечать одинаково.
@@ -2739,6 +2754,15 @@ impl Panel {
     /// Идентификатор сфокусированного виджета, если есть.
     pub fn focused_widget(&self) -> Option<WidgetId> {
         self.focus.map(|i| self.widgets[i].id())
+    }
+
+    /// Есть ли у панели незавершённый жест указателя.
+    ///
+    /// Вызывающий слой не должен заменять такую панель во время анимации:
+    /// захват хранит индекс виджета, взведённого на `Down`, и новый контейнер
+    /// не сможет принять его `Up`.
+    pub fn pointer_captured(&self) -> bool {
+        self.capture.is_some()
     }
 
     /// Идентификатор и границы (DIP) наведённого виджета, если есть — для
@@ -4127,9 +4151,11 @@ mod tests {
     fn panel_capture_keeps_dragging_outside() {
         let mut p = Panel::new(0, rect(100.0, 100.0, 200.0, 100.0));
         p.add_widget(Slider::opacity(ID_SLIDER, 100.0, 100.0, 112.0));
+        assert!(!p.pointer_captured());
         p.pointer_event(PointerEvent::Down {
             pos: (100.0, 100.0),
         });
+        assert!(p.pointer_captured(), "Down должен удерживать захват панели");
         let r = p.pointer_event(PointerEvent::Move {
             pos: (1000.0, 500.0),
         });
@@ -4138,6 +4164,7 @@ mod tests {
         p.pointer_event(PointerEvent::Up {
             pos: (1000.0, 500.0),
         });
+        assert!(!p.pointer_captured(), "Up должен снять захват панели");
     }
 
     #[test]

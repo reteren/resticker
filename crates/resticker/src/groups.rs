@@ -27,7 +27,7 @@ use rst_core::group_match::{self, LiveWindow, MemberKey};
 use rst_core::group_shape;
 use rst_core::group_visibility::GroupVisibilityState;
 use rst_core::model::{
-    GroupMember, GroupPlace, MonitorId, Rect, WindowGroup, MAX_GROUP_MEMBERS, MIN_GROUP_MEMBERS,
+    GroupMember, GroupPlace, MAX_GROUP_MEMBERS, MIN_GROUP_MEMBERS, MonitorId, Rect, WindowGroup,
 };
 use rst_win32::window_enum::WindowInfo;
 use uuid::Uuid;

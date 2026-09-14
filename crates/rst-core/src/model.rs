@@ -727,12 +727,34 @@ impl Default for Transform {
 }
 
 /// Правило видимости стикера (SPEC.md, раздел 7).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VisibilityRule {
     pub mode: VisibilityMode,
     /// Используется при режимах never_overlap / overlap_allowlist.
     pub rules: Vec<OverlapRule>,
+    /// Видим ли стикер, когда на мониторе нет окон.
+    ///
+    /// Отдельное поле нужно, потому что allow-list окон отвечает только на
+    /// вопрос «над какими окнами оставить стикер», а чистый рабочий стол —
+    /// отдельное состояние. Для старого конфига отсутствие поля означает
+    /// прежнее поведение: на рабочем столе стикер виден.
+    #[serde(default = "default_desktop_visibility")]
+    pub desktop: bool,
+}
+
+fn default_desktop_visibility() -> bool {
+    true
+}
+
+impl Default for VisibilityRule {
+    fn default() -> Self {
+        Self {
+            mode: VisibilityMode::Always,
+            rules: Vec::new(),
+            desktop: true,
+        }
+    }
 }
 
 /// Режимы видимости (SPEC.md, раздел 7).

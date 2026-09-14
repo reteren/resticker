@@ -50,12 +50,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
+    GWL_EXSTYLE, GetWindowLongW, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, WINDOWPOS,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
     MINMAXINFO, WM_GETMINMAXINFO, WM_NCCALCSIZE, WM_SIZING, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT,
     WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE};
 use windows::core::{BOOL, PCWSTR, w};
@@ -526,6 +526,12 @@ pub enum DragUpdate {
     Ended(Point),
 }
 
+impl Default for DragTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DragTracker {
     /// Пустой tracker без активного capture.
     pub const fn new() -> Self {
@@ -709,6 +715,20 @@ impl WindowState {
     }
 
     fn update_strip_visibility(&self) {
+        // Замер, а не отладочный мусор: полоса куска пропадала уже трижды и
+        // каждый раз по новой причине. Одна строка на КАЖДОЕ решение показать
+        // или скрыть её — и журнал сразу говорит, что именно решило, вместо
+        // очередного круга догадок. Уровень `debug`: в обычной работе он
+        // выключен и ничего не стоит.
+        tracing::debug!(
+            minimized = self.minimized,
+            dragging = self.drag.is_active(),
+            hover_content = self.hover_content,
+            hover_strip = self.hover_strip,
+            topmost = self.content_is_topmost(),
+            pin = self.always_on_top,
+            "решение о показе полосы куска"
+        );
         if self.minimized {
             // Свёрнутый квадрат не имеет полосы: иначе она перекрыла бы
             // единственную область, по которой его можно восстановить.
@@ -777,19 +797,33 @@ impl WindowState {
     /// стояли с `SWP_NOZORDER`, то есть порядок окон не задавал никто.
     ///
     /// Поэтому порядок утверждается явно всякий раз, когда полосу показывают
-    /// или двигают — но ТОЛЬКО внутри своей полосы z-порядка. У куска без
-    /// булавки полосу над содержимым держит владение окном (полоса создана
-    /// владеемой), и поднимать её в topmost нельзя: она висела бы поверх чужих
-    /// окон, под которые сам кусок уже ушёл.
+    /// или двигают — и обязательно в ТОЙ ЖЕ полосе z-порядка, где сейчас
+    /// содержимое.
+    ///
+    /// Полоса z-порядка берётся у самого окна содержимого, а не из нашего
+    /// флага булавки. Содержимое могут поднять в topmost снаружи — например,
+    /// человек закрепил кусок как обычное окно (`crate::window_pin`), и это
+    /// теперь разрешено. Пока полоса оставалась в обычной полосе, topmost-кусок
+    /// накрывал её собой, и она исчезала навсегда: «когда я закрепляю окно у
+    /// меня пропадает верхний контрол бар и я не могу двигать окно… при этом
+    /// всём я могу скейлить окно» (репорт пользователя 2026-09-13). Размер
+    /// менялся потому, что рамка живёт у содержимого, а перетаскивание — только
+    /// за полосу, которой не стало.
+    ///
+    /// `HWND_NOTOPMOST` для обычного куска — не «опустить», а «встать наверх
+    /// обычной полосы»: это ставит полосу выше содержимого, не поднимая её над
+    /// чужими окнами, под которыми сам кусок уже лежит.
     fn raise_strip(&self) {
-        if !self.always_on_top {
-            return;
-        }
+        let insert = if self.content_is_topmost() {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
         // SAFETY: своё окно этого потока.
         unsafe {
             let _ = SetWindowPos(
                 self.strip,
-                Some(HWND_TOPMOST),
+                Some(insert),
                 0,
                 0,
                 0,
@@ -799,35 +833,48 @@ impl WindowState {
         }
     }
 
+    /// Окно содержимого сейчас в topmost-полосе.
+    ///
+    /// Читается у самого окна, а не из поля: topmost могли изменить снаружи,
+    /// и наш флаг булавки об этом не знает.
+    fn content_is_topmost(&self) -> bool {
+        // SAFETY: своё живое окно; `GetWindowLongW` не падает и на мёртвом.
+        let ex = unsafe { GetWindowLongW(self.content, GWL_EXSTYLE) } as u32;
+        ex & WS_EX_TOPMOST.0 != 0
+    }
+
     /// Включить или выключить «поверх всех окон» у обоих окон куска.
     ///
     /// Стиль `WS_EX_TOPMOST` не пишется напрямую: Windows признаёт его только
     /// через `SetWindowPos` с `HWND_TOPMOST`/`HWND_NOTOPMOST` — прямая запись
     /// в стиль оставила бы флаг в `GetWindowLongW` и не изменила бы порядок.
     ///
-    /// Полоса идёт первой, содержимое вторым: обратный порядок на миг оставил
-    /// бы служебную полосу в topmost над обычным содержимым, и она мигнула бы
-    /// поверх чужого окна.
+    /// Сначала содержимое, потом полоса: полосу ставит `raise_strip`, который
+    /// смотрит на фактическую полосу z-порядка содержимого. Обратный порядок
+    /// на миг оставил бы служебную полосу в topmost над обычным содержимым, и
+    /// она мигнула бы поверх чужого окна.
     fn set_always_on_top(&mut self, on: bool) {
         if self.always_on_top == on {
             return;
         }
         self.always_on_top = on;
         let insert = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
-        // SAFETY: оба окна — свои, этого потока.
+        // SAFETY: свои окна этого потока.
         unsafe {
-            for hwnd in [self.strip, self.content] {
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(insert),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-                );
-            }
-            // Булавка нарисована в полосе — её вид обязан обновиться сразу.
+            let _ = SetWindowPos(
+                self.content,
+                Some(insert),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+        }
+        self.raise_strip();
+        // Булавка нарисована в полосе — её вид обязан обновиться сразу.
+        // SAFETY: своё окно этого потока.
+        unsafe {
             let _ = InvalidateRect(Some(self.strip), None, false);
         }
     }
@@ -1188,6 +1235,31 @@ impl WindowState {
                 LRESULT(0)
             }
             WM_WINDOWPOSCHANGED if role == WindowRole::Content => {
+                // Полосу z-порядка содержимого могли сменить снаружи —
+                // закрепление окна (`crate::window_pin`), раскладка группы,
+                // показ группы. Полоса обязана уйти в ту же полосу немедленно,
+                // а не при следующем наведении: иначе topmost-содержимое
+                // накрывает её, и кусок становится нечем двигать (репорт
+                // пользователя 2026-09-13).
+                //
+                // `SWP_NOZORDER` в сообщении означает «порядок не менялся» —
+                // такие сообщения (их большинство: любое перемещение) проходят
+                // мимо, лишних `SetWindowPos` не будет.
+                //
+                let zorder_changed = if lp.0 == 0 {
+                    // Структуры нет — судить не о чем; считаем, что порядок
+                    // мог измениться, и утверждаем его заново. Дешевле одного
+                    // лишнего `SetWindowPos`, чем потерянная полоса.
+                    true
+                } else {
+                    // SAFETY: `lp` у этого сообщения — указатель на `WINDOWPOS`,
+                    // живой на время обработки; читаем только флаги.
+                    let flags = unsafe { (*(lp.0 as *const WINDOWPOS)).flags };
+                    !flags.contains(SWP_NOZORDER)
+                };
+                if zorder_changed && !self.minimized {
+                    self.raise_strip();
+                }
                 // Окно куска подвинул кто-то снаружи: раскладка группы,
                 // закрепление, привязка Windows. Сообщаем координатору, иначе
                 // он вернёт окно на место из конфига.
@@ -2080,6 +2152,217 @@ mod tests {
         assert_eq!(hit_test_strip(40, 28, 12, 10), StripHit::Pin);
         assert_eq!(hit_test_strip(40, 28, 22, 10), StripHit::Minimize);
         assert_eq!(hit_test_strip(40, 28, 39, 10), StripHit::Close);
+    }
+
+    /// Включённая булавка не должна прятать полосу под собственным куском.
+    ///
+    /// Живой репорт пользователя 2026-09-13: «когда я закрепляю окно у меня
+    /// пропадает верхний контрол бар и я не могу двигать окно, даже когда я уже
+    /// снимаю алвейз он топ то контрол бар не появится. при этом всём я могу
+    /// скейлить окно». Размер менялся потому, что рамка живёт у самого
+    /// содержимого, а тянут кусок ТОЛЬКО за полосу — и её не стало.
+    ///
+    /// Причина была в порядке двух `SetWindowPos`: внутри одной полосы
+    /// z-порядка выигрывает тот, кого переставили последним, а содержимое шло
+    /// вторым — и в обе стороны, поэтому выключение булавки положения не
+    /// исправляло.
+    ///
+    /// Тест на реальных окнах: другой проверки тут быть не может — речь ровно
+    /// про то, как Windows упорядочивает два живых окна. Свои окна создаются и
+    /// уничтожаются в одном запуске, чужие не трогаются, ввод не синтезируется.
+    #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 --lib pin_keeps_the_strip -- --ignored"]
+    fn pin_keeps_the_strip_above_the_piece() {
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GW_HWNDNEXT, GetWindow, WS_EX_TOOLWINDOW, WS_POPUP,
+            WS_VISIBLE,
+        };
+
+        let hinstance = unsafe { GetModuleHandleW(None) }.expect("модуль").into();
+        // Собственное окно-источник: чужие окна для тестов не берём.
+        let source = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!("resticker_crop_pin_test"),
+                WS_POPUP | WS_VISIBLE,
+                80,
+                80,
+                240,
+                180,
+                None,
+                None,
+                Some(hinstance),
+                None,
+            )
+        }
+        .expect("окно-источник");
+
+        let options = CropWindowOptions::new(
+            Rect {
+                x: 100,
+                y: 100,
+                w: 200,
+                h: 150,
+            },
+            SourceRect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 150,
+            },
+            "test",
+        );
+        let (crop, _events) = CropWindow::create(source, options).expect("окно куска");
+        let content = crop.hwnd();
+        let strip = crop.strip_hwnd();
+
+        // Полоса выше содержимого, если, спускаясь от неё по z-порядку, мы
+        // встречаем содержимое. Именно это решает, за что человек может взять
+        // кусок: полоса под содержимым недостижима для мыши.
+        let strip_is_above_content = || -> bool {
+            let mut below = unsafe { GetWindow(strip, GW_HWNDNEXT) };
+            while let Ok(hwnd) = below {
+                if hwnd.0.is_null() {
+                    return false;
+                }
+                if hwnd == content {
+                    return true;
+                }
+                below = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
+            }
+            false
+        };
+        // Дать потоку окна разобрать сообщения о смене порядка.
+        let settle = || std::thread::sleep(Duration::from_millis(150));
+
+        settle();
+        assert!(
+            strip_is_above_content(),
+            "у нового куска полоса лежит на его верхней кромке, а не под ним"
+        );
+
+        crop.set_always_on_top(true).expect("включить булавку");
+        settle();
+        assert!(
+            strip_is_above_content(),
+            "булавка включена — полоса обязана остаться над куском, иначе его нечем двигать"
+        );
+
+        crop.set_always_on_top(false).expect("выключить булавку");
+        settle();
+        assert!(
+            strip_is_above_content(),
+            "после выключения булавки полоса обязана вернуться над куском"
+        );
+
+        drop(crop);
+        unsafe {
+            let _ = DestroyWindow(source);
+        }
+    }
+
+    /// Полоса обязана появляться по наведению и при включённой булавке.
+    ///
+    /// Замер, а не догадка: репорт «закрепляю — пропадает контрол бар»
+    /// (2026-09-13) объясняли то порядком `SetWindowPos`, то полосой
+    /// z-порядка, и обе версии проверка отвергла — Windows сама держит
+    /// владеемое окно над владельцем. Значит проверять надо не порядок, а
+    /// ПОКАЗ полосы.
+    ///
+    /// Наведение имитируется сообщением СВОЕМУ окну (`PostMessageW`), а не
+    /// синтетическим вводом: курсор пользователя при этом не трогается вовсе.
+    #[test]
+    #[ignore = "требует реальный десктоп; запуск вручную: cargo test -p rst-win32 --lib strip_shows_on_hover -- --ignored"]
+    fn strip_shows_on_hover_with_pin_on_and_off() {
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, IsWindowVisible, WM_MOUSEMOVE, WS_EX_TOOLWINDOW,
+            WS_POPUP, WS_VISIBLE,
+        };
+
+        let hinstance = unsafe { GetModuleHandleW(None) }.expect("модуль").into();
+        let source = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!("resticker_crop_hover_test"),
+                WS_POPUP | WS_VISIBLE,
+                80,
+                80,
+                240,
+                180,
+                None,
+                None,
+                Some(hinstance),
+                None,
+            )
+        }
+        .expect("окно-источник");
+
+        let options = CropWindowOptions::new(
+            Rect {
+                x: 100,
+                y: 100,
+                w: 200,
+                h: 150,
+            },
+            SourceRect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 150,
+            },
+            "test",
+        );
+        let (crop, _events) = CropWindow::create(source, options).expect("окно куска");
+        let content = crop.hwnd();
+        let strip = crop.strip_hwnd();
+
+        let settle = || std::thread::sleep(Duration::from_millis(120));
+        let hover = || {
+            // Точка в середине клиентской области содержимого.
+            let lp = LPARAM(((75_i32) << 16 | 100_i32) as isize);
+            // SAFETY: своё окно; сообщение безопасно с любого потока.
+            unsafe {
+                let _ = PostMessageW(Some(content), WM_MOUSEMOVE, WPARAM(0), lp);
+            }
+        };
+        let strip_visible = || unsafe { IsWindowVisible(strip) }.as_bool();
+
+        settle();
+        assert!(!strip_visible(), "без наведения полосы не видно");
+
+        hover();
+        settle();
+        assert!(
+            strip_visible(),
+            "наведение на обычный кусок обязано показывать полосу"
+        );
+
+        crop.set_always_on_top(true).expect("включить булавку");
+        settle();
+        hover();
+        settle();
+        assert!(
+            strip_visible(),
+            "с включённой булавкой полоса обязана показываться так же — иначе кусок нечем двигать"
+        );
+
+        crop.set_always_on_top(false).expect("выключить булавку");
+        settle();
+        hover();
+        settle();
+        assert!(
+            strip_visible(),
+            "после выключения булавки полоса обязана возвращаться"
+        );
+
+        drop(crop);
+        unsafe {
+            let _ = DestroyWindow(source);
+        }
     }
 
     #[test]

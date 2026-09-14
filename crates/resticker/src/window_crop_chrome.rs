@@ -293,7 +293,9 @@ pub fn collapsed_icon_rect(
         return None;
     }
     let side = theme::BUTTON_SIZE.min(monitor.w).min(monitor.h);
-    if !(side > 0.0) {
+    // `is_finite` отдельно от сравнения: NaN обязан отсеиваться, а
+    // `side <= 0.0` для NaN ложно.
+    if !side.is_finite() || side <= 0.0 {
         return None;
     }
     first_free_along_edge(nearest_edge(piece, monitor), piece, monitor, occupied, side)

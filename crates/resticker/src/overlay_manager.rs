@@ -56,6 +56,7 @@ use rst_core::presets;
 use rst_core::selection_set::SelectionSet;
 use rst_core::snap::{self, SnapConfig};
 use rst_core::transform_ops::{self, DragModifiers};
+use rst_core::ui_motion::{CARD_DURATION_MS, Phase};
 use rst_media::animation as media_animation;
 use rst_media::paste;
 use rst_render::glass::Surface;
@@ -1046,7 +1047,7 @@ fn apply_input_policies(
         .map(|g| &g.monitor_id)
         .or_else(|| edit.group_manager.as_ref().map(|g| &g.monitor_id))
         .or_else(|| edit.gap_panel.as_ref().map(|g| &g.monitor_id))
-        .and_then(|id| index_of(id));
+        .and_then(index_of);
 
     // Полоса перемотки участвует только вне режима редактирования
     // (`hover_mode`) — ровно как прежнее условие `timeline_click_target`: в
@@ -1139,13 +1140,27 @@ fn crop_window_bounds(
     let b = monitor_bounds.get(&sticker.placement.monitor_id)?;
     let p = &sticker.placement;
     let s = b.scale;
+    // Не меньше `MIN_CROP_SIDE_DIP` по каждой стороне.
+    //
+    // Тот же минимум, который Windows соблюдает при изменении размера мышью
+    // (`WM_GETMINMAXINFO` в `crop_window.rs`), — но соблюдать его обязано и
+    // СОЗДАНИЕ. Иначе кусок шириной 1–3 px получал полосу, на которой три
+    // кнопки не помещаются вовсе: при такой ширине кнопке достаётся ноль
+    // пикселей, и полоса целиком становится ручкой перетаскивания — кусок
+    // нельзя ни закрыть, ни свернуть, ни закрепить (ревью P5, 2026-09-13).
+    let min_side = (f64::from(MIN_CROP_SIDE_DIP) * s).round().max(1.0);
     Some(rst_core::model::Rect {
         x: b.bounds_px.x + ((p.cx - p.w / 2.0) * s).round() as i32,
         y: b.bounds_px.y + ((p.cy - p.h / 2.0) * s).round() as i32,
-        w: (p.w * s).round().max(1.0) as u32,
-        h: (p.h * s).round().max(1.0) as u32,
+        w: (p.w * s).round().max(min_side) as u32,
+        h: (p.h * s).round().max(min_side) as u32,
     })
 }
+
+/// Минимальная сторона окна живого куска, DIP — ровно та же, что у
+/// `rst_win32::crop_window`: окно, созданное меньше этого, не смогло бы
+/// показать свои же кнопки.
+const MIN_CROP_SIDE_DIP: u32 = 48;
 
 /// Точка, где встанет иконка свёрнутого куска, — физические пиксели.
 ///
@@ -1210,21 +1225,6 @@ fn sync_crop_windows(
     use rst_win32::crop_window::{CropWindow, CropWindowOptions, SourceRect};
 
     let show = !edit.active && edit.window_crop.is_none() && edit.mitosis.is_none();
-    // Пока открыта панель resticker, куски НЕ держатся поверх всех окон.
-    //
-    // Меню набора групп (`Ctrl+Alt+G`) намеренно ВЫХОДИТ из режима
-    // редактирования (см. обработчик `OverlayEvent::ToggleGroupsMenu`), то есть
-    // окна кусков в этот момент живы. Пока булавка была безусловной, они
-    // накрывали собой панель: «моя панель в режиме редактирования групп
-    // находится ниже этих окон» (репорт пользователя 2026-09-12). Оверлей и
-    // куски оба `WS_EX_TOPMOST`, и внутри этой полосы z-порядка выигрывает тот,
-    // кого подняли последним, — значит одним топмостом вопрос не решается.
-    //
-    // Куски при этом НЕ снимаются: панель набора группы перечисляет живые
-    // окна, и кусок обязан оставаться среди них. Меняется только полоса
-    // z-порядка, и только пока панель открыта; в конфиге булавка не трогается,
-    // после закрытия панели состояние возвращается само.
-    let panel_open = edit.group_editor.is_some() || edit.group_manager.is_some();
     let mut changed = false;
 
     // Окна, которые больше не нужны: режим редактирования, кусок удалён или
@@ -1290,10 +1290,9 @@ fn sync_crop_windows(
             // обратного пути: состояние изменилось в конфиге (отмена действия,
             // пресет, правка файла руками) — окно обязано догнать его, не
             // пересоздаваясь.
-            let want_top = *always_on_top && !panel_open;
-            if slot.always_on_top != want_top {
-                let _ = slot.window.set_always_on_top(want_top);
-                slot.always_on_top = want_top;
+            if slot.always_on_top != *always_on_top {
+                let _ = slot.window.set_always_on_top(*always_on_top);
+                slot.always_on_top = *always_on_top;
             }
             continue;
         }
@@ -1349,7 +1348,7 @@ fn sync_crop_windows(
         options.opacity = opacity;
         // Окно создаётся сразу в нужной полосе z-порядка: поставить топмост
         // вторым шагом означало бы показать кусок поверх всего на один кадр.
-        options.always_on_top = *always_on_top && !panel_open;
+        options.always_on_top = *always_on_top;
         match CropWindow::create(source_hwnd, options) {
             Ok((cw_window, events)) => {
                 // Переходник: события окна куска — в общую очередь
@@ -1375,7 +1374,7 @@ fn sync_crop_windows(
                     bounds,
                     minimized: false,
                     opacity,
-                    always_on_top: *always_on_top && !panel_open,
+                    always_on_top: *always_on_top,
                 };
                 if *minimized {
                     if let Some(point) = crop_window_icon_point(cfg, sticker.id, monitor_bounds) {
@@ -1406,6 +1405,12 @@ fn sync_crop_windows(
 }
 
 /// Разобрать событие отдельного окна куска. `true` — нужна перерисовка.
+///
+/// Аргументов много по той же причине, что у соседних обработчиков
+/// координатора: состояние режима, конфиг, путь к нему, геометрия мониторов и
+/// таблица окон кусков нужны все, а прятать их в структуру-обёртку значило бы
+/// заводить тип ради одного вызова.
+#[allow(clippy::too_many_arguments)]
 fn handle_crop_window_event(
     generation: u64,
     edit: &mut EditState,
@@ -1930,7 +1935,7 @@ fn sync_window_crops(
             continue;
         }
         // --- привязка к живому окну ---
-        if !crops.contains_key(&sticker.id) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = crops.entry(sticker.id) {
             let key = MemberKey {
                 exe_path: window.exe_path.clone(),
                 title: window.title.clone(),
@@ -1966,14 +1971,11 @@ fn sync_window_crops(
                         title = %window.title,
                         "живой кусок окна привязан к источнику"
                     );
-                    crops.insert(
-                        sticker.id,
-                        WindowCropRuntime {
-                            hwnd,
-                            capture,
-                            texture: None,
-                        },
-                    );
+                    slot.insert(WindowCropRuntime {
+                        hwnd,
+                        capture,
+                        texture: None,
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(sticker = %sticker.id, hwnd, error = %e,
@@ -2959,6 +2961,7 @@ impl EditState {
         }
         if let Some(st) = self.window_picker.as_mut() {
             moving |= st.panel.animate(dt_ms);
+            moving |= st.animate_accordion(dt_ms);
         }
         if let Some(st) = self.preset_picker.as_mut() {
             moving |= st.panel.animate(dt_ms);
@@ -3869,6 +3872,48 @@ struct WindowPickerState {
     /// как у `toolbar`/`cursor_panel`/`confirm` (M3, docs/M3_STEP4_REVIEW.md,
     /// пункт 2.1).
     monitor_id: MonitorId,
+    /// Активная группа accordion и фазовый переход её дочерних строк.
+    expanded_group: Option<usize>,
+    accordion_phase: Phase,
+    hovered_group: Option<usize>,
+    collapse_delay_ms: f64,
+    accordion_needs_rebuild: bool,
+}
+
+impl WindowPickerState {
+    /// Начать раскрытие секции приложения `group`.
+    ///
+    /// Переход с одного приложения на другое начинает анимацию ЗАНОВО: фаза
+    /// уже доехала до единицы для прежней секции, и без сброса новая
+    /// раскрылась бы мгновенно — ровно то «резко открывается», на которое
+    /// жаловался пользователь (2026-09-13).
+    fn start_expanding(&mut self, group: usize) {
+        if self.expanded_group != Some(group) {
+            self.expanded_group = Some(group);
+            self.accordion_phase.set_value(0.0);
+            self.accordion_needs_rebuild = true;
+        }
+        self.accordion_phase.set_target(true);
+    }
+
+    fn animate_accordion(&mut self, dt_ms: f64) -> bool {
+        let mut moving = false;
+        if self.hovered_group.is_none() {
+            self.collapse_delay_ms = (self.collapse_delay_ms - dt_ms).max(0.0);
+            moving = self.collapse_delay_ms > 0.0;
+            if self.collapse_delay_ms == 0.0 {
+                self.accordion_phase.set_target(false);
+            }
+        } else {
+            self.collapse_delay_ms = window_picker::ACCORDION_COLLAPSE_DELAY_MS;
+            self.accordion_phase.set_target(true);
+        }
+        moving |= self.accordion_phase.advance(dt_ms);
+        if !moving && self.accordion_phase.value() == 0.0 && self.expanded_group.take().is_some() {
+            self.accordion_needs_rebuild = true;
+        }
+        moving
+    }
 }
 
 /// Открытая панель быстрого переключения пресетов (M7, SPEC.md §3.8) —
@@ -5793,7 +5838,14 @@ fn run(
                 // Хоткей «закрепить/открепить сфокусированное окно»
                 // (редизайн пинов, SPEC «Закрепление окна», пункт 1) —
                 // работает независимо от режима редактирования.
-                toggle_focused_pin(&mut edit, &cfg, &monitor_bounds, &mut window_pins);
+                toggle_focused_pin(
+                    &mut edit,
+                    &mut cfg,
+                    &config_path,
+                    &monitor_bounds,
+                    &mut window_pins,
+                    &mut crop_windows,
+                );
                 // `pinned_window_dip_placement`, который рисует пульс, читает
                 // координаторский `window_snapshot` — он обновляется только
                 // асинхронно, по следующему `Windows(Changed)` от трекера
@@ -7560,6 +7612,20 @@ fn run(
             now_ui.duration_since(prev).as_secs_f64() * 1000.0
         });
         let ui_moving = edit.animate_ui(dt_ms.min(UI_FRAME_CAP_MS));
+        let picker_animating = edit.window_picker.as_ref().is_some_and(|state| {
+            state.accordion_phase.is_animating() || state.accordion_needs_rebuild
+        });
+        if picker_animating {
+            // Accordion геометрия должна идти вместе с фазой: иначе видимые
+            // hit-rects и нарисованные строки расходятся на промежуточных
+            // кадрах. Пересборка сохраняет правила из cfg, а состояние hover
+            // живёт в WindowPickerState.
+            rebuild_window_picker(&mut edit, &cfg, &window_snapshot, &monitor_geometry);
+            if let Some(state) = edit.window_picker.as_mut() {
+                state.accordion_needs_rebuild = false;
+            }
+            need_redraw = true;
+        }
         if ui_moving {
             edit.ui_anim_last = Some(now_ui);
             need_redraw = true;
@@ -7589,15 +7655,25 @@ fn run(
             last_anim_deadline = next_tick_deadline;
             let _ = anim_deadline_tx.send(next_tick_deadline);
         }
-        // Секундный будильник нужен ровно трём вещам, и все три условны:
-        // ловить меню снап-раскладок у закреплённых окон, крутить таймеры
-        // автомата потери монитора и повторять восстановление устройства
-        // после неудачи. Нет ни одной причины — тикер спит, и в покое
+        // Секундный будильник нужен ровно четырём вещам, и все четыре
+        // условны: ловить меню снап-раскладок у закреплённых окон, крутить
+        // таймеры автомата потери монитора, повторять восстановление
+        // устройства после неудачи — и держать панель редактирования групп
+        // выше окон кусков. Нет ни одной причины — тикер спит, и в покое
         // программа не просыпается вовсе (SPEC.md §13).
+        //
+        // Четвёртая причина: подъём панели над куском утверждается в итерации
+        // цикла, а цикл стоит на `rx.recv()`. Кусок же поднимает себя сам, со
+        // своего потока (наведение курсора, конец изменения размера,
+        // переключение булавки) — и без будильника панель осталась бы под ним
+        // до следующего случайного события (ревью P5, 2026-09-13). Будильник
+        // живёт ровно пока открыта панель.
         let tick_wanted = !session_locked
             && (!edit.pinned_windows.is_empty()
                 || loss_tracker.has_pending_losses()
-                || device_needs_recovery);
+                || device_needs_recovery
+                || edit.group_editor.is_some()
+                || edit.group_manager.is_some());
         if tick_wanted != last_tick_wanted {
             last_tick_wanted = tick_wanted;
             let _ = tick_wanted_tx.send(tick_wanted);
@@ -7800,6 +7876,26 @@ fn run(
             &mut crop_generation,
         ) {
             need_redraw = true;
+        }
+        // Панель редактирования групп обязана быть ВЫШЕ окон кусков.
+        //
+        // Одного `WS_EX_TOPMOST` у оверлея для этого мало: кусок с включённой
+        // булавкой живёт в той же topmost-полосе, и внутри полосы выигрывает
+        // тот, кого подняли последним. Меню набора групп намеренно выходит из
+        // режима редактирования (см. `OverlayEvent::ToggleGroupsMenu`), то есть
+        // окна кусков в этот момент живы — и накрывали панель собой (репорт
+        // пользователя 2026-09-12).
+        //
+        // Здесь, а не в момент открытия панели: кусок поднимает себя сам при
+        // наведении курсора (`raise_strip`) и при переключении булавки, поэтому
+        // порядок утверждается каждую итерацию, пока панель открыта. Обход
+        // z-order сам себя останавливает — подъём происходит только если кусок
+        // реально оказался выше (аудит P3, 2026-09-13).
+        if edit.group_editor.is_some() || edit.group_manager.is_some() {
+            for ms in monitors_map.values() {
+                ms.overlay
+                    .raise_above_class(rst_win32::crop_window::WINDOW_CLASS);
+            }
         }
         let new_mask_needed = tracker_mask_needed(&cfg, &edit, &groups);
         if new_mask_needed != last_mask_needed {
@@ -9776,21 +9872,29 @@ fn refresh_occlusion(
         // Правило (mode, rules) каждой уже собранной группы этого монитора —
         // для группировки стикеров без Hash на `Vec<OverlapRule>` (сравниваем
         // напрямую через `==`; дёшево при типичном числе стикеров/групп).
-        let mut signatures: Vec<(VisibilityMode, Vec<OverlapRule>)> = Vec::new();
+        let mut signatures: Vec<(VisibilityMode, Vec<OverlapRule>, bool)> = Vec::new();
         let mut groups: Vec<OccluderSet> = Vec::new();
         for sticker in cfg
             .stickers
             .iter()
             .filter(|s| s.placement.monitor_id == *monitor_id)
-            .filter(|s| s.visibility.mode != VisibilityMode::Always)
+            // «Видно везде» маски не требует — но только если рабочий стол
+            // тоже выбран. Снятая галочка рабочего стола прячет стикер на
+            // голом экране при любом режиме, и такому стикеру маска нужна.
+            .filter(|s| s.visibility.mode != VisibilityMode::Always || !s.visibility.desktop)
         {
-            let sig = (sticker.visibility.mode, sticker.visibility.rules.clone());
+            let sig = (
+                sticker.visibility.mode,
+                sticker.visibility.rules.clone(),
+                sticker.visibility.desktop,
+            );
             let group_idx = match signatures.iter().position(|s| *s == sig) {
                 Some(i) => i,
                 None => {
                     let rects = occluder_rects_for(
                         sig.0,
                         &sig.1,
+                        sig.2,
                         never_overlap_taskbar,
                         window_snapshot,
                         &bounds.bounds_px,
@@ -9832,19 +9936,47 @@ fn refresh_occlusion(
 fn occluder_rects_for(
     mode: VisibilityMode,
     rules: &[OverlapRule],
+    desktop: bool,
     never_overlap_taskbar: bool,
     window_snapshot: &[WindowInfo],
     monitor_bounds_px: &Rect,
 ) -> Vec<Rect> {
     let visible: Vec<&WindowInfo> = window_snapshot.iter().filter(|w| !w.iconic).collect();
     let mut rects = Vec::new();
+    let is_occ = |w: &WindowInfo| {
+        occluders::is_occluder(
+            &OccluderCandidate {
+                exe_path: window_exe_path(w),
+                title: w.title.clone(),
+                class: w.class.clone(),
+            },
+            mode,
+            rules,
+            never_overlap_taskbar,
+        )
+    };
+    // Снятая галочка рабочего стола: прячемся везде, КРОМЕ разрешённых окон.
+    //
+    // Маска складывается из прямоугольников, поэтому «голый рабочий стол»
+    // задаётся от противного — берём монитор целиком и вычитаем окна, поверх
+    // которых стикер остаётся виден. Части, накрытые окнами-окклюдерами,
+    // добавит общий проход ниже: маска — объединение, и пересечения ей не
+    // вредят (репорт пользователя 2026-09-13: «мог выбрать рабочий стол и
+    // пару окон» — значит и обратное сочетание обязано работать).
+    if occluders::desktop_is_occluder(mode, desktop) {
+        let keep: Vec<Rect> = visible
+            .iter()
+            .filter(|w| !is_occ(w))
+            .filter_map(|w| window_rect_to_core(&w.rect))
+            .collect();
+        for piece in occluders::subtract_rects(*monitor_bounds_px, &keep) {
+            if let Some(clipped) = occluders::clip_rect(&piece, monitor_bounds_px) {
+                rects.push(clipped);
+            }
+        }
+    }
     for (i, w) in visible.iter().enumerate() {
-        let candidate = OccluderCandidate {
-            exe_path: window_exe_path(w),
-            title: w.title.clone(),
-            class: w.class.clone(),
-        };
-        if !occluders::is_occluder(&candidate, mode, rules, never_overlap_taskbar) {
+        if !is_occ(w) {
             continue;
         }
         let Some(win_rect) = window_rect_to_core(&w.rect) else {
@@ -10926,6 +11058,11 @@ fn open_window_picker(
         ),
         scroll: 0,
         monitor_id,
+        expanded_group: None,
+        accordion_phase: Phase::new(CARD_DURATION_MS),
+        hovered_group: None,
+        collapse_delay_ms: 0.0,
+        accordion_needs_rebuild: false,
     });
     rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
 }
@@ -10996,6 +11133,11 @@ fn rebuild_window_picker(
     let Some(state) = &mut edit.window_picker else {
         return;
     };
+    if state.panel.pointer_captured() {
+        // Не заменяем контейнер во время жеста: захват хранит индекс
+        // виджета, взведённого на Down, и новый контейнер потеряет Up.
+        return;
+    }
     let target = state.target;
     let Some(&(w, h, scale)) = monitor_geometry.get(&state.monitor_id) else {
         edit.window_picker = None;
@@ -11035,12 +11177,17 @@ fn rebuild_window_picker(
         h: window_picker::PICKER_HEIGHT,
         rotation: 0.0,
     };
-    let mut result = window_picker::build_picker_panel(
+    let layout = window_picker::PickerLayout {
+        expanded_group: state.expanded_group,
+        expansion: state.accordion_phase.eased(),
+    };
+    let mut result = window_picker::build_picker_panel_with_layout(
         &visibility,
         window_snapshot,
         state.scroll,
         frame,
         desktop_preset,
+        layout,
     );
     // Снимок окон мог сжаться (окна закрылись) — скролл, валидный раньше,
     // теперь может указывать за конец списка и строить пустую страницу;
@@ -11049,12 +11196,13 @@ fn rebuild_window_picker(
     // не строит ни одной строки).
     if result.total_rows > 0 && state.scroll >= result.total_rows {
         state.scroll = result.total_rows - 1;
-        result = window_picker::build_picker_panel(
+        result = window_picker::build_picker_panel_with_layout(
             &visibility,
             window_snapshot,
             state.scroll,
             frame,
             desktop_preset,
+            layout,
         );
     } else if result.total_rows == 0 {
         state.scroll = 0;
@@ -11638,9 +11786,8 @@ fn px_rect_differs(target: &pinned_window::PxRect, live: &WindowRect, eps: i32) 
 }
 
 /// Опросить действия панели выбора окон после `Up` (M4_WINDOW_PICKER_DESIGN.md
-/// §1, §4): «Выбрать все» и чекбоксы процессов — каждое переключение своим
-/// шагом истории, как у тулбара. Чекбоксы окон всегда disabled (дизайн §7.6)
-/// и здесь не опрашиваются — выбор только на уровне процесса.
+/// §1, §4): «Выбрать все», desktop-строка, приложения и раскрытые окна —
+/// каждое переключение своим шагом истории, как у тулбара.
 #[allow(clippy::too_many_arguments)]
 fn handle_window_picker_up(
     edit: &mut EditState,
@@ -11726,15 +11873,46 @@ fn handle_window_picker_up(
         return true;
     }
 
+    let desktop_clicked = edit
+        .window_picker
+        .as_mut()
+        .and_then(|s| {
+            s.panel
+                .widget_mut::<Checkbox>(window_picker::PICKER_ROW_DESKTOP)
+        })
+        .and_then(Checkbox::take_changed)
+        .is_some();
+    if desktop_clicked && matches!(target, PickerTarget::Sticker(_)) {
+        commit_undo_snapshot(edit, cfg.clone());
+        level_picker_group(edit, cfg);
+        let sticker = cfg
+            .stickers
+            .iter_mut()
+            .find(|s| s.id == sticker_id)
+            .expect("наличие стикера проверено выше");
+        sticker.visibility = window_picker::toggle_desktop_only(&sticker.visibility);
+        spread_picker_visibility(edit, cfg, sticker_id);
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после переключения строки «Рабочий стол»");
+        }
+        *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
+        rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+        return true;
+    }
+
     let groups = window_picker::group_by_process(window_snapshot);
     for (g, group) in groups.iter().enumerate() {
+        let row_id = if group.process_name.is_some() {
+            Some(window_picker::PICKER_ROW_PROCESS_BASE + g as WidgetId)
+        } else if group.windows.len() == 1 {
+            Some(window_picker::PICKER_ROW_WINDOW_BASE + ((g as WidgetId) << 16))
+        } else {
+            None
+        };
         let toggled = edit
             .window_picker
             .as_mut()
-            .and_then(|s| {
-                s.panel
-                    .widget_mut::<Checkbox>(window_picker::PICKER_ROW_PROCESS_BASE + g as WidgetId)
-            })
+            .and_then(|s| row_id.and_then(|id| s.panel.widget_mut::<Checkbox>(id)))
             .and_then(Checkbox::take_changed)
             .is_some();
         if !toggled {
@@ -11748,6 +11926,10 @@ fn handle_window_picker_up(
                     .find(|p| p.hwnd == hwnd)
                     .map(|p| host_rules_as_visibility(&p.hosts))
                     .unwrap_or_else(|| host_rules_as_visibility(&HostFilter::Anywhere));
+                // A process row in the host picker retains process-level
+                // semantics.  Individual title rules are only for expanded
+                // child rows below; using them here makes the subsequent
+                // deny-list conversion treat the clicked process as allowed.
                 window_picker::toggle_process_group(&current, group)
             };
             if let Some(updated) = updated {
@@ -11763,7 +11945,12 @@ fn handle_window_picker_up(
             .iter_mut()
             .find(|s| s.id == sticker_id)
             .expect("наличие стикера проверено выше");
-        if let Some(new_rule) = window_picker::toggle_process_group(&sticker.visibility, group) {
+        let new_rule = if group.windows.len() == 1 && !group.windows[0].title.is_empty() {
+            window_picker::toggle_window(&sticker.visibility, group, 0)
+        } else {
+            window_picker::toggle_process_group(&sticker.visibility, group)
+        };
+        if let Some(new_rule) = new_rule {
             sticker.visibility = new_rule;
         }
         spread_picker_visibility(edit, cfg, sticker_id);
@@ -11775,6 +11962,58 @@ fn handle_window_picker_up(
         *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
         rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
         return true;
+    }
+
+    // Раскрытая группа получает настоящие hit-rects дочерних чекбоксов;
+    // декодируем их id обратно в индексы снимка, не полагаясь на позицию в
+    // виртуализированном окне.
+    for (g, group) in groups.iter().enumerate() {
+        for w in 0..group.windows.len() {
+            let id =
+                window_picker::PICKER_ROW_WINDOW_BASE + ((g as WidgetId) << 16) + w as WidgetId;
+            let toggled = edit
+                .window_picker
+                .as_mut()
+                .and_then(|s| s.panel.widget_mut::<Checkbox>(id))
+                .and_then(Checkbox::take_changed)
+                .is_some();
+            if !toggled {
+                continue;
+            }
+            if let PickerTarget::PinnedHost(hwnd) = target {
+                let updated = {
+                    let current = edit
+                        .pinned_windows
+                        .iter()
+                        .find(|p| p.hwnd == hwnd)
+                        .map(|p| host_rules_as_visibility(&p.hosts))
+                        .unwrap_or_else(|| host_rules_as_visibility(&HostFilter::Anywhere));
+                    window_picker::toggle_window(&current, group, w)
+                };
+                if let Some(updated) = updated {
+                    apply_host_rules(edit, hwnd, updated, window_snapshot, monitor_bounds);
+                }
+                rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+                return true;
+            }
+            commit_undo_snapshot(edit, cfg.clone());
+            level_picker_group(edit, cfg);
+            let sticker = cfg
+                .stickers
+                .iter_mut()
+                .find(|s| s.id == sticker_id)
+                .expect("наличие стикера проверено выше");
+            if let Some(new_rule) = window_picker::toggle_window(&sticker.visibility, group, w) {
+                sticker.visibility = new_rule;
+            }
+            spread_picker_visibility(edit, cfg, sticker_id);
+            if let Err(e) = config::save(cfg, config_path) {
+                tracing::warn!(error = %e, "не удалось сохранить config.json после переключения окна в панели выбора окон");
+            }
+            *occluder_cache = refresh_occlusion(cfg, monitor_bounds, window_snapshot);
+            rebuild_window_picker(edit, cfg, window_snapshot, monitor_geometry);
+            return true;
+        }
     }
     true
 }
@@ -13855,9 +14094,7 @@ fn build_group_editor(
         // 2026-09-12). Отличаем его по классу окна: полосы кусков и оверлеи
         // сюда не доходят вовсе — их отфильтровал `is_real_window` при
         // перечислении (`WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`).
-        .filter(|info| {
-            info.pid != own_pid || info.class == rst_win32::crop_window::WINDOW_CLASS
-        })
+        .filter(|info| info.pid != own_pid || info.class == rst_win32::crop_window::WINDOW_CLASS)
         .map(|info| group_strip::StripCard {
             hwnd: info.hwnd,
             title: info.title.clone(),
@@ -14410,6 +14647,18 @@ fn pin_window(
         return false;
     };
     let bounds = &monitor_bounds[monitor_id];
+    // Закрепляют ли кусок собственного окна — это меняет разбор репортов вида
+    // «закрепил, и пропал верхний бар» (2026-09-13): по журналу сразу видно,
+    // было ли целью окно куска или обычное чужое окно.
+    if let Some(info) = window_snapshot.iter().find(|w| w.hwnd == hwnd) {
+        tracing::info!(
+            hwnd,
+            class = %info.class,
+            title = %info.title,
+            is_crop_piece = info.class == rst_win32::crop_window::WINDOW_CLASS,
+            "закрепление окна"
+        );
+    }
     let result = match window_pins.pin(hwnd as u64, hwnd) {
         // Маркер на окне есть, а в книжке окна нет — осиротевшее закрепление
         // прошлого запуска (жёсткое завершение оставляет маркер на ЧУЖОМ
@@ -14799,15 +15048,87 @@ fn unpin_window(edit: &mut EditState, window_pins: &mut WindowPins, hwnd: usize)
 /// результат не зависит от того, спит трекер или нет. Ветка отпина
 /// (выше) от снимка не зависит вовсе — она читает только
 /// `EditState::pinned_windows` и живой `foreground_hwnd()`.
+/// Какое окно закрепит хоткей закрепления.
+///
+/// Обычно — окно в фокусе. Исключение — живой кусок окна под курсором: кусок
+/// НИКОГДА не бывает в фокусе, и это не случайность, а его свойство
+/// (`WM_MOUSEACTIVATE` → `MA_NOACTIVATE`, замер 2026-09-10: клик по куску не
+/// должен уводить курсор ввода из окна, где человек печатает). Пока правило
+/// было «только фокус», закрепить кусок хоткеем было нельзя вовсе: нажатия
+/// уходили в никуда, и человек находил обходной путь — свернуть кусок и
+/// открыть заново с панели задач, потому что ТАК окно становится фокусным
+/// (живой репорт пользователя 2026-09-14, подтверждён журналом: шесть нажатий
+/// хоткея подряд без единого закрепления, седьмое — после сворачивания).
+///
+/// Курсор над куском — достаточный признак намерения: кусок занимает
+/// маленькую область, и держать на нём курсор, нажимая хоткей закрепления,
+/// случайно не выходит.
+/// Какому куску принадлежит окно `hwnd`, если это вообще окно куска.
+fn crop_sticker_of_window(
+    crop_windows: &HashMap<Uuid, CropWindowSlot>,
+    hwnd: usize,
+) -> Option<Uuid> {
+    crop_windows
+        .iter()
+        .find(|(_, slot)| slot.window.hwnd().0 as usize == hwnd)
+        .map(|(id, _)| *id)
+}
+
+fn pin_hotkey_target(snapshot: &[WindowInfo]) -> Option<usize> {
+    let piece_under_cursor = rst_win32::window_pick::cursor_position()
+        .ok()
+        .and_then(|point| rst_win32::window_pick::window_at(snapshot, point))
+        .filter(|hwnd| {
+            snapshot
+                .iter()
+                .any(|w| w.hwnd == *hwnd && w.class == rst_win32::crop_window::WINDOW_CLASS)
+        });
+    piece_under_cursor.or_else(rst_win32::window_enum::foreground_hwnd)
+}
+
 fn toggle_focused_pin(
     edit: &mut EditState,
-    cfg: &Config,
+    cfg: &mut Config,
+    config_path: &Path,
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
     window_pins: &mut WindowPins,
+    crop_windows: &mut HashMap<Uuid, CropWindowSlot>,
 ) {
-    let Some(hwnd) = rst_win32::window_enum::foreground_hwnd() else {
-        return;
+    // Снимок берётся один раз на весь путь: он нужен и для выбора цели, и
+    // для самого закрепления.
+    let fresh_snapshot = rst_win32::window_enum::enumerate();
+    let hwnd = match pin_hotkey_target(&fresh_snapshot) {
+        Some(hwnd) => hwnd,
+        None => return,
     };
+    // У живого куска закрепление своё — булавка на его полосе, и она живёт
+    // в конфиге. Заводить поверх собственного окна второй механизм
+    // (`WindowPins`) значило бы держать два разных «поверх всех окон» на
+    // одном окне: они расходятся, и человек видит то булавку в одном
+    // состоянии, а окно в другом, то потерянную полосу. Хоткей переключает
+    // ровно ту же булавку, что и кнопка.
+    if let Some(id) = crop_sticker_of_window(crop_windows, hwnd) {
+        let mut now_on = None;
+        if let Some(sticker) = cfg.stickers.iter_mut().find(|s| s.id == id)
+            && let StickerSource::WindowCrop { always_on_top, .. } = &mut sticker.source
+        {
+            *always_on_top = !*always_on_top;
+            now_on = Some(*always_on_top);
+        }
+        let Some(on) = now_on else {
+            return;
+        };
+        if let Some(slot) = crop_windows.get_mut(&id) {
+            let _ = slot.window.set_always_on_top(on);
+            slot.always_on_top = on;
+        }
+        if let Err(e) = config::save(cfg, config_path) {
+            tracing::warn!(error = %e, "не удалось сохранить config.json после булавки куска хоткеем");
+        }
+        tracing::info!(sticker = %id, always_on_top = on, "булавка куска переключена хоткеем");
+        rst_win32::sound::play_pin_sound(cfg.settings.pin_sound_volume);
+        return;
+    }
     if edit.pinned_windows.iter().any(|p| p.hwnd == hwnd as isize) {
         unpin_window(edit, window_pins, hwnd);
         // Звук на открепление хоткеем тоже (запрос пользователя 2026-08-19:
@@ -14818,7 +15139,6 @@ fn toggle_focused_pin(
         rst_win32::sound::play_pin_sound(cfg.settings.pin_sound_volume);
         return;
     }
-    let fresh_snapshot = rst_win32::window_enum::enumerate();
     let Some(win) = fresh_snapshot.iter().find(|w| w.hwnd == hwnd) else {
         return;
     };
@@ -14903,6 +15223,10 @@ fn host_rules_as_visibility(hosts: &HostFilter) -> VisibilityRule {
         HostFilter::Anywhere => VisibilityRule {
             mode: VisibilityMode::Always,
             rules: Vec::new(),
+            // У закрепления нет понятия «чистый рабочий стол» — оно про
+            // окна-хозяева. Берём значение по умолчанию, чтобы строка
+            // рабочего стола в панели не выглядела снятой без причины.
+            ..VisibilityRule::default()
         },
         // Список хозяев — allow-list, в том числе ПУСТОЙ: снятые все
         // галочки должны остаться снятыми, иначе кнопка «Снять все»
@@ -14910,6 +15234,7 @@ fn host_rules_as_visibility(hosts: &HostFilter) -> VisibilityRule {
         HostFilter::Only(rules) => VisibilityRule {
             mode: VisibilityMode::OverlapAllowlist,
             rules: rules.clone(),
+            ..VisibilityRule::default()
         },
     }
 }
@@ -16316,6 +16641,21 @@ fn handle_input(
                         state.panel.pointer_event(PointerEvent::Move {
                             pos: (dip_x, dip_y),
                         });
+                        let hovered = state
+                            .panel
+                            .hovered_widget()
+                            .and_then(|(id, _)| window_picker::hovered_process_group(id));
+                        if hovered != state.hovered_group {
+                            state.hovered_group = hovered;
+                            if let Some(group) = hovered {
+                                state.start_expanding(group);
+                                state.collapse_delay_ms =
+                                    window_picker::ACCORDION_COLLAPSE_DELAY_MS;
+                            } else {
+                                state.collapse_delay_ms =
+                                    window_picker::ACCORDION_COLLAPSE_DELAY_MS;
+                            }
+                        }
                     }
                     return true;
                 }
@@ -16469,6 +16809,19 @@ fn handle_input(
                             pos: (dip_x, dip_y),
                         })
                         .redraw;
+                    let hovered = state
+                        .panel
+                        .hovered_widget()
+                        .and_then(|(id, _)| window_picker::hovered_process_group(id));
+                    if hovered != state.hovered_group {
+                        state.hovered_group = hovered;
+                        if let Some(group) = hovered {
+                            state.start_expanding(group);
+                            state.collapse_delay_ms = window_picker::ACCORDION_COLLAPSE_DELAY_MS;
+                        } else {
+                            state.collapse_delay_ms = window_picker::ACCORDION_COLLAPSE_DELAY_MS;
+                        }
+                    }
                 }
             }
             // Панель свойств закреплённого окна — тот же паттерн hover, что
@@ -19120,7 +19473,11 @@ mod tests {
                 monitor_id: monitor_id(monitor),
                 ..Default::default()
             },
-            visibility: rst_core::model::VisibilityRule { mode, rules },
+            visibility: rst_core::model::VisibilityRule {
+                mode,
+                rules,
+                ..rst_core::model::VisibilityRule::default()
+            },
             ..Sticker::default()
         }
     }
@@ -19859,6 +20216,11 @@ mod tests {
             ),
             scroll: 0,
             monitor_id: monitor_id("main"),
+            expanded_group: None,
+            accordion_phase: Phase::new(CARD_DURATION_MS),
+            hovered_group: None,
+            collapse_delay_ms: 0.0,
+            accordion_needs_rebuild: false,
         });
         assert!(tracker_mask_needed(&cfg, &edit, &GroupsState::default()));
     }
@@ -20261,6 +20623,7 @@ mod tests {
             .visibility = VisibilityRule {
             mode: VisibilityMode::Desktop,
             rules: Vec::new(),
+            ..VisibilityRule::default()
         };
         cfg.stickers
             .iter_mut()
@@ -20269,6 +20632,7 @@ mod tests {
             .visibility = VisibilityRule {
             mode: VisibilityMode::NeverOverlap,
             rules: Vec::new(),
+            ..VisibilityRule::default()
         };
         let before = cfg.clone();
 
@@ -20288,6 +20652,11 @@ mod tests {
             ),
             scroll: 0,
             monitor_id: monitor_id("main"),
+            expanded_group: None,
+            accordion_phase: Phase::new(CARD_DURATION_MS),
+            hovered_group: None,
+            collapse_delay_ms: 0.0,
+            accordion_needs_rebuild: false,
         });
 
         // Панель открыта, но человек ещё ничего не нажал — конфиг нетронут.
@@ -20317,6 +20686,7 @@ mod tests {
                 process_name: Some("code.exe".to_string()),
                 title_pattern: None,
             }],
+            ..VisibilityRule::default()
         };
         spread_picker_visibility(&edit, &mut cfg, b);
         assert_eq!(
@@ -23196,6 +23566,20 @@ mod tests {
             z_order: 1,
             ..Default::default()
         });
+        snapshot.push(WindowInfo {
+            hwnd: hwnd + 2,
+            rect: WindowRect {
+                x: 20,
+                y: 20,
+                w: 640,
+                h: 480,
+            },
+            pid: std::process::id() + 3,
+            exe_path: PathBuf::from(r"C:\Windows\System32\notepad.exe"),
+            title: "Чужое окно".to_string(),
+            z_order: 2,
+            ..Default::default()
+        });
 
         let target = edit.pending_open_picker.take().expect("цель редактора");
         open_window_picker(&mut edit, &cfg, &snapshot, &monitor_geometry, target);
@@ -23274,6 +23658,206 @@ mod tests {
                 .iter()
                 .any(|r| r.process_name.as_deref() == Some("chrome.exe")),
             "повторный клик возвращает процесс в список хозяев"
+        );
+    }
+
+    #[test]
+    fn sticker_picker_process_ids_ignore_desktop_row_and_keep_window_ids() {
+        let sticker = sticker_with_visibility("main", VisibilityMode::Always, Vec::new());
+        let sticker_id = sticker.id;
+        let mut cfg = Config::default();
+        cfg.stickers.push(sticker);
+        let mut edit = mask_gate_edit_state();
+        edit.selection.click(Some(sticker_id));
+        let snapshot = vec![
+            window(
+                Some(r"C:\Apps\alpha.exe"),
+                "Alpha",
+                "",
+                WindowRect {
+                    x: 0,
+                    y: 0,
+                    w: 400,
+                    h: 300,
+                },
+                false,
+            ),
+            window(
+                Some(r"C:\Apps\beta.exe"),
+                "Beta one",
+                "",
+                WindowRect {
+                    x: 10,
+                    y: 10,
+                    w: 400,
+                    h: 300,
+                },
+                false,
+            ),
+            window(
+                Some(r"C:\Apps\beta.exe"),
+                "Beta two",
+                "",
+                WindowRect {
+                    x: 20,
+                    y: 20,
+                    w: 400,
+                    h: 300,
+                },
+                false,
+            ),
+        ];
+        let monitor_bounds = single_monitor_bounds("main", bounds(0, 0, 1920, 1080));
+        let monitor_geometry = HashMap::from([(monitor_id("main"), (1920u32, 1080u32, 1.0f32))]);
+        let config_path = std::env::temp_dir().join(format!(
+            "resticker_picker_ids_{}_{}.json",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        open_window_picker(
+            &mut edit,
+            &cfg,
+            &snapshot,
+            &monitor_geometry,
+            PickerTarget::Sticker(sticker_id),
+        );
+        let groups = window_picker::group_by_process(&snapshot);
+        let beta = groups
+            .iter()
+            .position(|g| g.process_name.as_deref() == Some("beta.exe"))
+            .expect("группа beta.exe в списке");
+        assert!(
+            edit.window_picker
+                .as_ref()
+                .and_then(|s| s
+                    .panel
+                    .widget::<Checkbox>(window_picker::PICKER_ROW_DESKTOP))
+                .is_some(),
+            "строка «Рабочий стол» имеет собственный id"
+        );
+        let process_id = window_picker::PICKER_ROW_PROCESS_BASE + beta as WidgetId;
+        let process_pos = edit
+            .window_picker
+            .as_ref()
+            .and_then(|s| s.panel.widget::<Checkbox>(process_id))
+            .map(|cb| {
+                let r = cb.bounds();
+                (r.cx, r.cy)
+            })
+            .expect("чекбокс beta.exe по индексу группы");
+        if let Some(state) = edit.window_picker.as_mut() {
+            state
+                .panel
+                .pointer_event(PointerEvent::Down { pos: process_pos });
+        }
+        let mut occluder_cache: HashMap<MonitorId, Vec<OccluderSet>> = HashMap::new();
+        handle_window_picker_up(
+            &mut edit,
+            &mut cfg,
+            &config_path,
+            &snapshot,
+            &monitor_geometry,
+            &monitor_bounds,
+            &mut occluder_cache,
+            process_pos,
+        );
+        let visibility = &cfg.stickers[0].visibility;
+        assert!(
+            visibility.rules.iter().any(|rule| {
+                rule.process_name.as_deref() == Some("beta.exe") && rule.title_pattern.is_none()
+            }),
+            "клик по beta.exe меняет правило beta.exe, а не соседнего приложения"
+        );
+        assert!(
+            !window_picker::window_is_checked(visibility, &snapshot[1])
+                && !window_picker::window_is_checked(visibility, &snapshot[2])
+                && window_picker::window_is_checked(visibility, &snapshot[0]),
+            "состояние beta.exe изменено независимо от alpha.exe"
+        );
+
+        if let Some(state) = edit.window_picker.as_mut() {
+            state.expanded_group = Some(beta);
+            state.accordion_phase.set_target(true);
+            state.accordion_phase.advance(CARD_DURATION_MS);
+        }
+        rebuild_window_picker(&mut edit, &cfg, &snapshot, &monitor_geometry);
+        let child_id = window_picker::PICKER_ROW_WINDOW_BASE + ((beta as WidgetId) << 16) + 1;
+        assert!(
+            edit.window_picker
+                .as_ref()
+                .and_then(|s| s.panel.widget::<Checkbox>(child_id))
+                .is_some(),
+            "раскрытая строка окна сохраняет кодируемый id"
+        );
+        assert_eq!(
+            window_picker::hovered_process_group(child_id),
+            Some(beta),
+            "id дочернего окна декодируется в ту же группу во время анимации"
+        );
+    }
+
+    #[test]
+    fn picker_rebuild_during_pointer_capture_keeps_click_target_alive() {
+        let sticker = sticker_with_visibility("main", VisibilityMode::Always, Vec::new());
+        let sticker_id = sticker.id;
+        let mut cfg = Config::default();
+        cfg.stickers.push(sticker);
+        let mut edit = mask_gate_edit_state();
+        edit.selection.click(Some(sticker_id));
+        let snapshot = vec![window(
+            Some(r"C:\Apps\alpha.exe"),
+            "Alpha",
+            "",
+            WindowRect {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 300,
+            },
+            false,
+        )];
+        let monitor_geometry = HashMap::from([(monitor_id("main"), (1920u32, 1080u32, 1.0f32))]);
+        open_window_picker(
+            &mut edit,
+            &cfg,
+            &snapshot,
+            &monitor_geometry,
+            PickerTarget::Sticker(sticker_id),
+        );
+        let process_id = window_picker::PICKER_ROW_PROCESS_BASE;
+        let process_pos = edit
+            .window_picker
+            .as_ref()
+            .and_then(|state| state.panel.widget::<Checkbox>(process_id))
+            .map(|cb| {
+                let r = cb.bounds();
+                (r.cx, r.cy)
+            })
+            .expect("чекбокс alpha.exe по индексу группы");
+        let state = edit.window_picker.as_mut().expect("редактор открыт");
+        state
+            .panel
+            .pointer_event(PointerEvent::Down { pos: process_pos });
+        assert!(state.panel.pointer_captured());
+
+        // Пересборка, пришедшая на промежуточном кадре аккордеона, не должна
+        // заменить панель и стереть Down до того, как придёт Up.
+        state.accordion_phase.set_target(true);
+        state.accordion_phase.advance(CARD_DURATION_MS / 2.0);
+        rebuild_window_picker(&mut edit, &cfg, &snapshot, &monitor_geometry);
+        let state = edit.window_picker.as_mut().expect("редактор не закрылся");
+        assert!(state.panel.pointer_captured());
+        state
+            .panel
+            .pointer_event(PointerEvent::Up { pos: process_pos });
+        assert!(
+            state
+                .panel
+                .widget_mut::<Checkbox>(process_id)
+                .expect("чекбокс сохранился")
+                .take_changed()
+                .is_some(),
+            "Up после кадра анимации должен дойти до того же чекбокса"
         );
     }
 
@@ -24114,6 +24698,8 @@ mod tests {
         let rects = occluder_rects_for(
             VisibilityMode::NeverOverlap,
             &[],
+            // рабочий стол выбран — отдельного окклюдера нет
+            true,
             false,
             &windows,
             &bounds(0, 0, 1920, 1080),
@@ -24121,6 +24707,136 @@ mod tests {
         assert!(
             rects.is_empty(),
             "свёрнутое окно не должно давать оклюдер-прямоугольник"
+        );
+    }
+
+    #[test]
+    fn pin_hotkey_prefers_a_crop_piece_under_the_cursor() {
+        // Кусок никогда не бывает окном в фокусе — он намеренно не забирает
+        // фокус по клику. Пока хоткей смотрел только на фокус, закрепить
+        // кусок им было нельзя вовсе: нажатия уходили в никуда (живой репорт
+        // 2026-09-14, подтверждён журналом). Курсор над куском — признак
+        // намерения, и он перевешивает фокус.
+        let mut piece = window(
+            None,
+            "Orca — piece 7b28",
+            "resticker_crop_window",
+            WindowRect {
+                x: 100,
+                y: 100,
+                w: 400,
+                h: 300,
+            },
+            false,
+        );
+        piece.hwnd = 0x501;
+        let mut other = window(
+            Some("chrome.exe"),
+            "Браузер",
+            "Chrome_WidgetWin_1",
+            WindowRect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            false,
+        );
+        other.hwnd = 0x502;
+        other.z_order = 5;
+        let snapshot = vec![piece, other];
+        // Чистая часть решения: окно куска обязано опознаваться по классу и
+        // лежать выше в z-order, чтобы попасть под курсор.
+        let hit = rst_win32::window_pick::window_at(
+            &snapshot,
+            rst_win32::window_pick::ScreenPoint { x: 200, y: 200 },
+        );
+        assert_eq!(hit, Some(0x501), "под курсором именно кусок");
+        assert!(
+            snapshot
+                .iter()
+                .any(|w| w.hwnd == 0x501 && w.class == rst_win32::crop_window::WINDOW_CLASS),
+            "кусок опознаётся по классу окна"
+        );
+    }
+
+    #[test]
+    fn unchecked_desktop_hides_everywhere_except_the_chosen_windows() {
+        // Снятая галочка «Рабочий стол» при выбранном окне: стикер обязан
+        // остаться видимым ПОВЕРХ этого окна и спрятаться на всём остальном
+        // экране. Пользователь описал это сочетание прямо: «могу выбрать
+        // рабочий стол и пару окон» — значит и обратное обязано работать
+        // (репорт 2026-09-13).
+        let rule = OverlapRule {
+            process_name: Some("chrome.exe".to_string()),
+            title_pattern: None,
+        };
+        let windows = vec![window(
+            Some("chrome.exe"),
+            "t",
+            "c",
+            WindowRect {
+                x: 200,
+                y: 100,
+                w: 400,
+                h: 300,
+            },
+            false,
+        )];
+        let rects = occluder_rects_for(
+            VisibilityMode::OverlapAllowlist,
+            &[rule],
+            false,
+            false,
+            &windows,
+            &bounds(0, 0, 1920, 1080),
+        );
+        let covers = |x: i32, y: i32| {
+            rects
+                .iter()
+                .any(|r| x >= r.x && x < r.x + r.w as i32 && y >= r.y && y < r.y + r.h as i32)
+        };
+        assert!(
+            !covers(300, 200),
+            "поверх выбранного окна стикер остаётся видимым: {rects:?}"
+        );
+        assert!(
+            covers(1000, 800),
+            "на голом рабочем столе стикера быть не должно: {rects:?}"
+        );
+    }
+
+    #[test]
+    fn checked_desktop_leaves_the_bare_screen_alone() {
+        // Зеркало предыдущего теста: пока галочка стоит, пустой экран маску
+        // не получает — иначе стикер исчез бы там, где всегда был виден.
+        let rule = OverlapRule {
+            process_name: Some("chrome.exe".to_string()),
+            title_pattern: None,
+        };
+        let windows = vec![window(
+            Some("chrome.exe"),
+            "t",
+            "c",
+            WindowRect {
+                x: 200,
+                y: 100,
+                w: 400,
+                h: 300,
+            },
+            false,
+        )];
+        let rects = occluder_rects_for(
+            VisibilityMode::OverlapAllowlist,
+            &[rule],
+            true,
+            false,
+            &windows,
+            &bounds(0, 0, 1920, 1080),
+        );
+        assert!(
+            rects.is_empty(),
+            "единственное окно разрешено, рабочий стол выбран — прятаться негде: {rects:?}"
         );
     }
 
@@ -24141,6 +24857,8 @@ mod tests {
         let rects = occluder_rects_for(
             VisibilityMode::NeverOverlap,
             &[],
+            // рабочий стол выбран — отдельного окклюдера нет
+            true,
             false,
             &windows,
             &bounds(0, 0, 1920, 1080),
@@ -24169,6 +24887,8 @@ mod tests {
         let rects = occluder_rects_for(
             VisibilityMode::OverlapAllowlist,
             &[rule],
+            // рабочий стол выбран — отдельного окклюдера нет
+            true,
             false,
             &windows,
             &bounds(0, 0, 1920, 1080),
@@ -24221,6 +24941,8 @@ mod tests {
         let rects = occluder_rects_for(
             VisibilityMode::OverlapAllowlist,
             &[rule],
+            // рабочий стол выбран — отдельного окклюдера нет
+            true,
             false,
             &windows,
             &bounds(0, 0, 1920, 1080),
@@ -24279,6 +25001,8 @@ mod tests {
         let rects = occluder_rects_for(
             VisibilityMode::OverlapAllowlist,
             &[rule],
+            // рабочий стол выбран — отдельного окклюдера нет
+            true,
             false,
             &windows,
             &bounds(0, 0, 1920, 1080),
@@ -24472,9 +25196,10 @@ mod tests {
     }
 
     fn cfg_with(stickers: Vec<Sticker>) -> Config {
-        let mut cfg = Config::default();
-        cfg.stickers = stickers;
-        cfg
+        Config {
+            stickers,
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -24573,6 +25298,36 @@ mod tests {
             (layout.close.y + layout.close.h / 2.0) as i32,
         );
         assert!(hit.is_some(), "точка на кнопке закрытия принадлежит куску");
+    }
+
+    #[test]
+    fn a_hairline_crop_still_gets_a_window_wide_enough_for_its_buttons() {
+        // Кусок шириной в несколько точек — обычная промашка рукой при
+        // протяжке. Окно такого размера не смогло бы показать три кнопки
+        // полосы: при ширине меньше четырёх точек кнопке достаётся ноль
+        // пикселей, полоса целиком становится ручкой, и кусок нельзя ни
+        // закрыть, ни свернуть, ни закрепить (ревью P5, 2026-09-13).
+        let cfg = cfg_with(vec![crop_sticker(500.0, 400.0, 2.0, 3.0, false)]);
+        let bounds =
+            crop_window_bounds(&cfg.stickers[0], &one_monitor()).expect("монитор стикера есть");
+        assert!(
+            bounds.w >= MIN_CROP_SIDE_DIP && bounds.h >= MIN_CROP_SIDE_DIP,
+            "окно куска не уже минимума: {}×{}",
+            bounds.w,
+            bounds.h
+        );
+        // Та же арифметика, что у полосы: кнопке обязана достаться ширина.
+        assert!(bounds.w / 4 > 0, "в полосе такой ширины кнопки существуют");
+    }
+
+    #[test]
+    fn a_crop_bigger_than_the_minimum_keeps_its_own_size() {
+        // Зажим не должен трогать нормальный кусок: иначе он тихо менял бы
+        // размер окна за спиной пользователя.
+        let cfg = cfg_with(vec![crop_sticker(500.0, 400.0, 200.0, 100.0, false)]);
+        let bounds =
+            crop_window_bounds(&cfg.stickers[0], &one_monitor()).expect("монитор стикера есть");
+        assert_eq!((bounds.w, bounds.h), (200, 100));
     }
 
     #[test]

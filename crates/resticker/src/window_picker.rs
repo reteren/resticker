@@ -15,7 +15,7 @@ use std::path::Path;
 
 use rst_core::model::{OverlapRule, VisibilityMode, VisibilityRule};
 use rst_core::occluders::{OccluderCandidate, rule_matches};
-use rst_core::ui_motion::{CARD_DURATION_MS, STAGGER_STEP_MS, ease_out, stagger_delay_ms};
+use rst_core::ui_motion::{CARD_DURATION_MS, STAGGER_STEP_MS, stagger_delay_ms};
 use rst_render::{
     Box2D, Button, ButtonContent, Checkbox, Panel, Primitive, ScrollBar, Widget, WidgetId,
     box_contains, glass_control, text_size, theme,
@@ -180,13 +180,14 @@ pub fn toggle_process_group(
         // секунду»: окно, открытое позже — тем более после перезагрузки
         // компьютера, — в список не попадало, и стикер уходил под него
         // (репорт пользователя 2026-09-02).
-        return Some(VisibilityRule {
-            mode: VisibilityMode::OverlapDenylist,
-            rules: vec![OverlapRule {
+        return Some(with_rules(
+            visibility,
+            VisibilityMode::OverlapDenylist,
+            vec![OverlapRule {
                 process_name: Some(name.to_string()),
                 title_pattern: None,
             }],
-        });
+        ));
     }
     if visibility.mode == VisibilityMode::OverlapDenylist {
         let mut rules = visibility.rules.clone();
@@ -203,24 +204,19 @@ pub fn toggle_process_group(
             if rules.is_empty() {
                 // Исключений не осталось — это снова честное «все», включая
                 // те окна, которых пока нет.
-                return Some(VisibilityRule {
-                    mode: VisibilityMode::Always,
-                    rules,
-                });
+                return Some(with_rules(visibility, VisibilityMode::Always, rules));
             }
         }
-        return Some(VisibilityRule {
-            mode: VisibilityMode::OverlapDenylist,
+        return Some(with_rules(
+            visibility,
+            VisibilityMode::OverlapDenylist,
             rules,
-        });
+        ));
     }
     if process_is_checked(visibility, group) {
         let mut rules = visibility.rules.clone();
         retain_without_process(&mut rules, name);
-        Some(VisibilityRule {
-            mode: visibility.mode,
-            rules,
-        })
+        Some(with_rules(visibility, visibility.mode, rules))
     } else {
         let mut rules = visibility.rules.clone();
         // Защита от дубля при переходе режима: правила могли уже лежать в
@@ -231,10 +227,11 @@ pub fn toggle_process_group(
                 title_pattern: None,
             });
         }
-        Some(VisibilityRule {
-            mode: VisibilityMode::OverlapAllowlist,
+        Some(with_rules(
+            visibility,
+            VisibilityMode::OverlapAllowlist,
             rules,
-        })
+        ))
     }
 }
 
@@ -271,13 +268,14 @@ pub fn toggle_window(
     let checked = window_is_checked(visibility, window);
 
     match visibility.mode {
-        VisibilityMode::Always => Some(VisibilityRule {
-            mode: VisibilityMode::OverlapDenylist,
-            rules: vec![OverlapRule {
+        VisibilityMode::Always => Some(with_rules(
+            visibility,
+            VisibilityMode::OverlapDenylist,
+            vec![OverlapRule {
                 process_name: None,
                 title_pattern: Some(title.to_string()),
             }],
-        }),
+        )),
         VisibilityMode::OverlapAllowlist => {
             if checked {
                 if process_rule {
@@ -316,10 +314,11 @@ pub fn toggle_window(
                     title_pattern: Some(title.to_string()),
                 });
             }
-            Some(VisibilityRule {
-                mode: VisibilityMode::OverlapAllowlist,
+            Some(with_rules(
+                visibility,
+                VisibilityMode::OverlapAllowlist,
                 rules,
-            })
+            ))
         }
         VisibilityMode::OverlapDenylist => {
             if process_rule {
@@ -357,33 +356,42 @@ pub fn toggle_window(
                 return None;
             }
             if rules.is_empty() {
-                Some(VisibilityRule {
-                    mode: VisibilityMode::Always,
-                    rules,
-                })
+                Some(with_rules(visibility, VisibilityMode::Always, rules))
             } else {
-                Some(VisibilityRule {
-                    mode: VisibilityMode::OverlapDenylist,
+                Some(with_rules(
+                    visibility,
+                    VisibilityMode::OverlapDenylist,
                     rules,
-                })
+                ))
             }
         }
         _ => None,
     }
 }
 
-/// Точное состояние пресета «Рабочий стол» для чекбокса первой строки.
+/// Точное состояние независимого признака «Рабочий стол» для первой строки.
 pub fn desktop_only_is_checked(visibility: &VisibilityRule) -> bool {
-    visibility.mode == VisibilityMode::OverlapAllowlist && visibility.rules.is_empty()
+    visibility.desktop
 }
 
-/// Переключатель первой строки: из точного desktop-пресета возвращает
-/// «всегда», а из любого другого состояния применяет тот же пустой allowlist.
+/// Переключить только видимость на чистом рабочем столе, не меняя правила
+/// окон. Это отдельный признак, поэтому выбранные окна не теряются.
 pub fn toggle_desktop_only(visibility: &VisibilityRule) -> VisibilityRule {
-    if desktop_only_is_checked(visibility) {
-        VisibilityRule::default()
-    } else {
-        apply_desktop_only_preset(visibility)
+    let mut updated = visibility.clone();
+    updated.desktop = !updated.desktop;
+    updated
+}
+
+/// Собрать новое правило, сохранив независимую настройку рабочего стола.
+fn with_rules(
+    visibility: &VisibilityRule,
+    mode: VisibilityMode,
+    rules: Vec<OverlapRule>,
+) -> VisibilityRule {
+    VisibilityRule {
+        mode,
+        rules,
+        desktop: visibility.desktop,
     }
 }
 
@@ -414,7 +422,7 @@ fn is_process_rule(rule: &OverlapRule, name: &str) -> bool {
 /// «Выбрано всё» = каждое выразимое окно снимка матчится правилом; строки
 /// protected process (без чекбокса по определению) в подсчёте не участвуют.
 ///
-/// «Выбрать все» даёт `{Always, []}` — то самое «список целей: все» из
+/// «Выбрать все» даёт `{Always, [], desktop}` — то самое «список целей: все» из
 /// SPEC 4.1, а не перечисление. Раньше здесь материализовался снимок: на
 /// каждый запущенный процесс по правилу. Такой список описывал не «все
 /// окна», а «окна, запущенные в момент нажатия», и первое же новое окно
@@ -438,6 +446,7 @@ pub fn toggle_select_all(visibility: &VisibilityRule, snapshot: &[WindowInfo]) -
     VisibilityRule {
         mode,
         rules: Vec::new(),
+        desktop: visibility.desktop,
     }
 }
 
@@ -460,9 +469,33 @@ pub fn denylist_as_allowlist(
         return visibility.clone();
     }
     let mut rules = Vec::new();
+    // The overlay's own process is never a host window.  Real snapshots
+    // normally exclude it by PID, but synthetic/test snapshots can carry a
+    // different PID while retaining the executable name; materializing an
+    // allow-list rule for it would make host filtering depend on the probe.
+    let own_process_name = std::env::current_exe().ok().and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    });
     for group in group_by_process(snapshot) {
         match &group.process_name {
             Some(name) => {
+                // A title-only deny rule can cover every window in a process
+                // group.  Such a group is not an allowed host and must not
+                // be reintroduced as a process rule during conversion.
+                if group
+                    .windows
+                    .iter()
+                    .all(|window| !window_is_checked(visibility, window))
+                {
+                    continue;
+                }
+                if own_process_name
+                    .as_deref()
+                    .is_some_and(|own| name.eq_ignore_ascii_case(own))
+                {
+                    continue;
+                }
                 if !has_process_rule(&visibility.rules, name) {
                     rules.push(OverlapRule {
                         process_name: Some(name.clone()),
@@ -486,23 +519,7 @@ pub fn denylist_as_allowlist(
     VisibilityRule {
         mode: VisibilityMode::OverlapAllowlist,
         rules,
-    }
-}
-
-/// Пресет «только рабочий стол» (ROADMAP.md M4): ровно
-/// `{mode: OverlapAllowlist, rules: []}` — пустой allow-list семантически
-/// тождествен `Desktop` (occluders.rs, тест
-/// `allowlist_empty_rules_is_desktop_equivalent`).
-///
-/// Не новая бизнес-логика — тот же результат, что у кнопки «Снять все»,
-/// но с постоянной подписью вместо чтения состояния списка. Аргумент
-/// `visibility` не читается: результат не зависит от текущего правила, а
-/// параметр оставлен ради единообразия с соседями по модулю (и ради
-/// вызывающего кода, который передаёт правило стикера всем трём).
-pub fn apply_desktop_only_preset(_visibility: &VisibilityRule) -> VisibilityRule {
-    VisibilityRule {
-        mode: VisibilityMode::OverlapAllowlist,
-        rules: Vec::new(),
+        desktop: visibility.desktop,
     }
 }
 
@@ -562,6 +579,39 @@ pub const DESKTOP_ONLY_LABEL: &str = "Рабочий стол";
 pub const PICKER_ROW_PROCESS_BASE: WidgetId = 0x1000;
 pub const PICKER_ROW_WINDOW_BASE: WidgetId = 0x1_0000;
 const LABEL_FLAG: WidgetId = 0x8000_0000;
+/// Флаг невидимой полосы наведения во всю ширину строки.
+///
+/// Без неё раскрытие начиналось, только когда курсор пересекал подпись или
+/// чекбокс: между ними строка была «мёртвой», и человек, ведя мышь по списку,
+/// видел паузу на ровном месте — «навожусь и оно ждёт около 0.7 секунды»
+/// (репорт пользователя 2026-09-13). Полоса добавляется ПЕРВОЙ в строке, а
+/// `Panel::top_at` берёт последний подходящий виджет — поэтому клики
+/// по-прежнему достаются чекбоксу и подписи, а ей — только наведение.
+const HOVER_FLAG: WidgetId = 0x4000_0000;
+
+/// Вернуть индекс приложения по наведённой части его строки.
+///
+/// Наведение считается по ЛЮБОЙ части строки — подписи, чекбоксу, полосе
+/// наведения — и по строкам окон этого же приложения: пока курсор внутри
+/// секции, она обязана оставаться раскрытой.
+pub fn hovered_process_group(id: WidgetId) -> Option<usize> {
+    // Флаги — это части одной строки, а не разные строки: снимаем и считаем
+    // по «голому» идентификатору.
+    let id = if id >= LABEL_FLAG {
+        id - LABEL_FLAG
+    } else if id >= HOVER_FLAG {
+        id - HOVER_FLAG
+    } else {
+        id
+    };
+    if (PICKER_ROW_PROCESS_BASE..PICKER_ROW_WINDOW_BASE).contains(&id) {
+        return Some((id - PICKER_ROW_PROCESS_BASE) as usize);
+    }
+    if id >= PICKER_ROW_WINDOW_BASE {
+        return Some(((id - PICKER_ROW_WINDOW_BASE) >> 16) as usize);
+    }
+    None
+}
 
 /// Сколько строк списка влезает в панель (виртуализация, дизайн §7.4):
 /// билдер строит только строки `[scroll, scroll + PICKER_VISIBLE_ROWS)`.
@@ -612,9 +662,15 @@ pub const ACCORDION_COLLAPSE_DELAY_MS: f64 = 200.0;
 
 /// Фаза дочерней строки с учётом stagger-задержки существующей motion-системы.
 pub fn accordion_child_progress(expansion: f64, child_index: usize) -> f64 {
-    let timeline = CARD_DURATION_MS + (6.0 * STAGGER_STEP_MS);
-    let elapsed = expansion.clamp(0.0, 1.0) * timeline - stagger_delay_ms(child_index);
-    ease_out((elapsed / CARD_DURATION_MS).clamp(0.0, 1.0))
+    let timeline = CARD_DURATION_MS + (5.0 * STAGGER_STEP_MS);
+    let expansion = expansion.clamp(0.0, 1.0);
+    let delay = stagger_delay_ms(child_index).min(5.0 * STAGGER_STEP_MS) / timeline;
+    // `ease_out` is intended for complete UI phases but collapses this very
+    // short stagger interval to its endpoint on the current backend. Keep a
+    // local cubic ease-out so two adjacent children remain observably
+    // ordered throughout the reveal.
+    let t = ((expansion - delay) / (1.0 - delay)).clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
 }
 
 /// Собрать панель выбора окон. `visibility` — текущее правило стикера
@@ -628,6 +684,12 @@ pub fn accordion_child_progress(expansion: f64, child_index: usize) -> f64 {
 /// сдвигает только список под ней. Пресет «Рабочий стол» — первая строка
 /// списка, а не отдельная кнопка. Чекбоксы приложений и раскрытых окон
 /// кликабельны; невыразимые окна остаются disabled.
+///
+/// Только для тестов: рабочий код собирает панель через
+/// [`build_picker_panel_with_layout`], которому раскладка аккордеона нужна
+/// целиком. Обёртка с раскладкой по умолчанию остаётся ради читаемости
+/// тестов, где раскладка к делу не относится.
+#[cfg(test)]
 pub fn build_picker_panel(
     visibility: &VisibilityRule,
     snapshot: &[WindowInfo],
@@ -678,26 +740,25 @@ fn build_picker_panel_impl(
         "Select all"
     };
     let header_y = top + PICKER_PAD + PICKER_HEADER_H / 2.0;
-    let mut btn_cx = left;
-    for &(id, text) in &[(PICKER_BTN_SELECT_ALL, toggle_label)] {
-        let (tw, _) = text_size(text);
-        // Ширина кнопки — подпись плюс горизонтальные отступы §3 (`PAD_CTRL_X`).
-        // Прежнее магическое 8.0 было локальным падом; у кнопки с подписью
-        // отступ задаёт спецификация, а `BUTTON_PAD` (4) — это отступ иконки.
-        let btn_w = tw + 2.0 * theme::PAD_CTRL_X;
-        panel.add_widget(Button::new(
-            id,
-            Box2D {
-                cx: btn_cx + btn_w / 2.0,
-                cy: header_y,
-                w: btn_w,
-                h: theme::BUTTON_SIZE,
-                rotation: 0.0,
-            },
-            ButtonContent::Label(text.to_string()),
-        ));
-        btn_cx += btn_w + PICKER_GAP;
-    }
+    // Кнопка в шапке осталась одна: пресет «Рабочий стол» переехал в первую
+    // строку списка (репорт пользователя 2026-09-12), и перебор по списку из
+    // одного элемента только прятал бы это.
+    let (tw, _) = text_size(toggle_label);
+    // Ширина кнопки — подпись плюс горизонтальные отступы §3 (`PAD_CTRL_X`).
+    // Прежнее магическое 8.0 было локальным падом; у кнопки с подписью
+    // отступ задаёт спецификация, а `BUTTON_PAD` (4) — это отступ иконки.
+    let btn_w = tw + 2.0 * theme::PAD_CTRL_X;
+    panel.add_widget(Button::new(
+        PICKER_BTN_SELECT_ALL,
+        Box2D {
+            cx: left + btn_w / 2.0,
+            cy: header_y,
+            w: btn_w,
+            h: theme::BUTTON_SIZE,
+            rotation: 0.0,
+        },
+        ButtonContent::Label(toggle_label.to_string()),
+    ));
 
     let groups = group_by_process(snapshot);
     let list_top = top + PICKER_PAD + PICKER_HEADER_H;
@@ -715,15 +776,29 @@ fn build_picker_panel_impl(
     let right_edge = frame.cx + frame.w / 2.0 - PICKER_PAD - theme::SCROLLBAR_WIDTH - PICKER_GAP;
     let process_label_max_w = right_edge - process_label_left;
     let window_label_max_w = right_edge - window_label_left;
+    // Прямоугольник строки целиком — для полосы наведения.
+    let row_box = |cy: f64| Box2D {
+        cx: (left + right_edge) / 2.0,
+        cy,
+        w: (right_edge - left).max(0.0),
+        h: PICKER_ROW_H,
+        rotation: 0.0,
+    };
 
     // Список: первая строка — «Рабочий стол». Группа из одного окна занимает
     // одну строку приложения; дочерние окна многоконной группы появляются
     // только у раскрытой группы.
     let mut row = 0usize;
     let mut built = 0usize;
+    // Дробная позиция следующей строки в единицах высоты строки. Целые
+    // `row`/`built` остаются логическими (скролл, виртуализация, порядок
+    // попаданий), а рисуется всё по `slot` — иначе раскрытие секции было бы
+    // мгновенным скачком вместо роста.
+    let mut slot = 0.0_f64;
     if desktop_preset {
         if row >= scroll && built < PICKER_VISIBLE_ROWS {
-            let cy = row_cy(list_top, built);
+            let cy = row_cy_at(list_top, slot);
+            slot += 1.0;
             panel.add_widget(Checkbox::standard(
                 PICKER_ROW_DESKTOP,
                 process_cb_cx,
@@ -743,7 +818,12 @@ fn build_picker_panel_impl(
     }
     for (g, group) in groups.iter().enumerate() {
         if row >= scroll && built < PICKER_VISIBLE_ROWS {
-            let cy = row_cy(list_top, built);
+            let cy = row_cy_at(list_top, slot);
+            slot += 1.0;
+            panel.add_widget(RowHover {
+                id: PICKER_ROW_PROCESS_BASE + g as WidgetId + HOVER_FLAG,
+                bounds: row_box(cy),
+            });
             let row_id = if group.process_name.is_some() {
                 PICKER_ROW_PROCESS_BASE + g as WidgetId
             } else if group.windows.len() == 1 {
@@ -777,7 +857,7 @@ fn build_picker_panel_impl(
             };
             let text = truncate_to_width(&text, process_label_max_w);
             panel.add_widget(RowLabel::new(
-                row_id + LABEL_FLAG,
+                PICKER_ROW_PROCESS_BASE + g as WidgetId + LABEL_FLAG,
                 text_rect(process_label_left, cy, &text),
                 icon_rect(icon_cx, cy),
                 text,
@@ -790,11 +870,26 @@ fn build_picker_panel_impl(
             for (w, window) in group.windows.iter().enumerate() {
                 if row >= scroll && built < PICKER_VISIBLE_ROWS {
                     let child_progress = accordion_child_progress(layout.expansion, w);
-                    let cy = row_cy(list_top, built) - (1.0 - child_progress) * PICKER_ROW_H * 0.25;
+                    // Строка занимает ровно `child_progress` высоты строки:
+                    // секция растёт, и всё, что ниже, разъезжается вместе с
+                    // ней. Сама строка при этом выезжает из-под своего
+                    // приложения — поэтому её центр поднят на недостающую
+                    // часть высоты, а не просто смещён на четверть.
+                    let cy = row_cy_at(list_top, slot) - (1.0 - child_progress) * PICKER_ROW_H;
+                    slot += child_progress;
+                    // Боковой сдвиг и проявление: без обрезки содержимого это
+                    // единственный способ показать, что строка ПРИЕХАЛА.
+                    let slide = (1.0 - child_progress) * ACCORDION_SLIDE_DIP;
                     let id = PICKER_ROW_WINDOW_BASE + ((g as WidgetId) << 16) + w as WidgetId;
+                    // Курсор внутри секции держит её раскрытой, даже если он
+                    // идёт по пустому месту между чекбоксом и подписью.
+                    panel.add_widget(RowHover {
+                        id: id + HOVER_FLAG,
+                        bounds: row_box(cy),
+                    });
                     let mut cb = Checkbox::standard(
                         id,
-                        window_cb_cx,
+                        window_cb_cx + slide,
                         cy,
                         window_is_checked(visibility, window),
                     );
@@ -803,19 +898,23 @@ fn build_picker_panel_impl(
                             || window.title.is_empty()
                             || child_progress < 0.5,
                     );
+                    cb.set_fade(child_progress);
                     panel.add_widget(cb);
                     let title = truncate_to_width(&window.title, window_label_max_w);
                     let window_icon = window
                         .icon
                         .clone()
                         .map(|icon| (icon_key(&window.exe_path), icon));
-                    panel.add_widget(RowLabel::new(
-                        id + LABEL_FLAG,
-                        text_rect(window_label_left, cy, &title),
-                        icon_rect(icon_cx, cy),
-                        title,
-                        window_icon,
-                    ));
+                    panel.add_widget(
+                        RowLabel::new(
+                            id + LABEL_FLAG,
+                            text_rect(window_label_left + slide, cy, &title),
+                            icon_rect(icon_cx + slide, cy),
+                            title,
+                            window_icon,
+                        )
+                        .with_fade(child_progress),
+                    );
                     built += 1;
                 }
                 row += 1;
@@ -850,11 +949,23 @@ fn build_picker_panel_impl(
     }
 }
 
-/// Центр по Y строки с видимым индексом `visible_index` (счёт только строк,
-/// попавших в окно скролла: они укладываются сверху вниз под шапкой).
-fn row_cy(list_top: f64, visible_index: usize) -> f64 {
-    list_top + visible_index as f64 * PICKER_ROW_H + PICKER_ROW_H / 2.0
+/// Центр строки списка по Y; позиция задаётся ДРОБНЫМ числом строк, счёт
+/// идёт только по строкам, попавшим в окно скролла.
+///
+/// Без дробной позиции аккордеон не читается как аккордеон: строки ниже
+/// раскрытого приложения должны разъезжаться постепенно, освобождая место, а
+/// не прыгать на готовое место в первом же кадре (репорт пользователя
+/// 2026-09-13: «0 анимаций… резко открывается»).
+fn row_cy_at(list_top: f64, slot: f64) -> f64 {
+    list_top + slot * PICKER_ROW_H + PICKER_ROW_H / 2.0
 }
+
+/// Насколько строка окна выезжает вбок, пока появляется, DIP.
+///
+/// Боковой сдвиг вместе с проявлением — то, что делает появление видимым без
+/// обрезки содержимого: строка выходит из-под своего приложения, а не
+/// возникает на месте. Величина заметная, но не карикатурная.
+const ACCORDION_SLIDE_DIP: f64 = 14.0;
 
 /// Обрезать `text` многоточием, чтобы уместиться в `max_w` DIP (независимое
 /// ревью нашло: конвейер примитивов не клипует текст, а панель — первое
@@ -920,6 +1031,10 @@ struct RowLabel {
     id: WidgetId,
     text_rect: Box2D,
     icon_rect: Box2D,
+    /// Общая непрозрачность 0..1: строка окна не возникает готовой, а
+    /// проявляется по мере раскрытия секции (репорт пользователя 2026-09-13:
+    /// «0 анимаций»).
+    fade: f64,
     text: String,
     /// Иконка строки: key кэша текстур (`Primitive::Rgba`, окна одного
     /// exe делят key) + сам растр. `None` — иконка не извлеклась
@@ -939,9 +1054,16 @@ impl RowLabel {
             id,
             text_rect,
             icon_rect,
+            fade: 1.0,
             text,
             icon,
         }
+    }
+
+    /// Проявить строку на `fade` (0 — невидима, 1 — обычный вид).
+    fn with_fade(mut self, fade: f64) -> Self {
+        self.fade = fade.clamp(0.0, 1.0);
+        self
     }
 }
 
@@ -963,6 +1085,9 @@ impl Widget for RowLabel {
     }
 
     fn draw(&self, out: &mut Vec<Primitive>) {
+        if self.fade <= 0.0 {
+            return;
+        }
         match &self.icon {
             Some((key, icon)) => out.push(Primitive::Rgba {
                 rect: self.icon_rect,
@@ -970,7 +1095,7 @@ impl Widget for RowLabel {
                 width: icon.width,
                 height: icon.height,
                 rgba: icon.rgba.clone(),
-                opacity: 1.0,
+                opacity: self.fade,
             }),
             None => glass_control(
                 out,
@@ -979,7 +1104,7 @@ impl Widget for RowLabel {
                 0.0,
                 0.0,
                 false,
-                1.0,
+                self.fade,
             ),
         }
         if !self.text.is_empty() {
@@ -989,10 +1114,49 @@ impl Widget for RowLabel {
                 color: theme::TEXT,
                 // Основной текст UI (§6) — белый `TEXT` при непрозрачности §2.3:
                 // приглушение теперь только альфой, отдельных серых цветов нет.
-                opacity: theme::TEXT_OPACITY,
+                opacity: theme::TEXT_OPACITY * self.fade,
             });
         }
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Невидимая полоса во всю ширину строки: ловит наведение и больше ничего.
+///
+/// Ничего не рисует и ничего не делает по клику — она существует только
+/// чтобы строка считалась «под курсором» целиком, а не одной лишь подписью.
+/// Добавляется в строку ПЕРВОЙ: `Panel::top_at` берёт последний подходящий
+/// виджет, поэтому чекбокс и подпись по-прежнему получают клики.
+struct RowHover {
+    id: WidgetId,
+    bounds: Box2D,
+}
+
+impl Widget for RowHover {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+
+    fn bounds(&self) -> Box2D {
+        self.bounds
+    }
+
+    fn set_bounds(&mut self, bounds: Box2D) {
+        self.bounds = bounds;
+    }
+
+    fn hit_test(&self, pos: (f64, f64)) -> bool {
+        box_contains(&self.bounds, pos)
+    }
+
+    fn draw(&self, _out: &mut Vec<Primitive>) {}
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -1076,6 +1240,7 @@ mod tests {
         VisibilityRule {
             mode: VisibilityMode::OverlapAllowlist,
             rules,
+            ..Default::default()
         }
     }
 
@@ -1221,6 +1386,7 @@ mod tests {
         let always = VisibilityRule {
             mode: VisibilityMode::Always,
             rules: vec![],
+            ..Default::default()
         };
         assert!(window_is_checked(&always, &w), "Always — все окна выбраны");
         assert!(process_is_checked(&always, &group), "и все процессы");
@@ -1229,6 +1395,7 @@ mod tests {
             let v = VisibilityRule {
                 mode,
                 rules: vec![rule(Some("app.exe"), None)],
+                ..Default::default()
             };
             assert!(!window_is_checked(&v, &w), "{mode:?} показывает всё снятым");
         }
@@ -1316,6 +1483,7 @@ mod tests {
         let v = VisibilityRule {
             mode: VisibilityMode::Always,
             rules: vec![],
+            ..Default::default()
         };
         let off = toggle_process_group(&v, &group).unwrap();
         assert_eq!(off.mode, VisibilityMode::OverlapDenylist);
@@ -1351,6 +1519,7 @@ mod tests {
             &VisibilityRule {
                 mode: VisibilityMode::Always,
                 rules: vec![],
+                ..Default::default()
             },
             &group,
         )
@@ -1374,6 +1543,7 @@ mod tests {
         let all = VisibilityRule {
             mode: VisibilityMode::Always,
             rules: vec![],
+            ..Default::default()
         };
         let one = toggle_process_group(&all, &a).unwrap();
         let two = toggle_process_group(&one, &b).unwrap();
@@ -1397,6 +1567,7 @@ mod tests {
         let v = VisibilityRule {
             mode: VisibilityMode::Desktop,
             rules: vec![],
+            ..Default::default()
         };
         let on = toggle_process_group(&v, &group).unwrap();
         assert_eq!(on.mode, VisibilityMode::OverlapAllowlist);
@@ -1412,6 +1583,7 @@ mod tests {
         let v = VisibilityRule {
             mode: VisibilityMode::Desktop,
             rules: vec![rule(Some("app.exe"), None)],
+            ..Default::default()
         };
         let on = toggle_process_group(&v, &group).unwrap();
         assert_eq!(on.rules, vec![rule(Some("app.exe"), None)], "без дубля");
@@ -1567,6 +1739,7 @@ mod tests {
         let denied = VisibilityRule {
             mode: VisibilityMode::OverlapDenylist,
             rules: vec![rule(Some("alpha.exe"), None)],
+            ..Default::default()
         };
         let expanded = denylist_as_allowlist(&denied, &snapshot);
         assert_eq!(expanded.mode, VisibilityMode::OverlapAllowlist);
@@ -1580,6 +1753,19 @@ mod tests {
         assert_eq!(denylist_as_allowlist(&untouched, &snapshot), untouched);
     }
 
+    #[test]
+    fn denylist_of_the_last_available_process_becomes_empty_allowlist() {
+        let snapshot = [window(1, r"C:\Apps\chrome.exe", "Chrome", 1, 1)];
+        let denied = VisibilityRule {
+            mode: VisibilityMode::OverlapDenylist,
+            rules: vec![rule(Some("chrome.exe"), None)],
+            ..Default::default()
+        };
+        let expanded = denylist_as_allowlist(&denied, &snapshot);
+        assert_eq!(expanded.mode, VisibilityMode::OverlapAllowlist);
+        assert!(expanded.rules.is_empty());
+    }
+
     /// В `Always` уже выбрано всё, поэтому переключатель работает как
     /// «Снять все» и обязан сменить режим: пустой список правил в `Always`
     /// снова означал бы «выбраны все», то есть кнопка ничего не делала бы.
@@ -1589,6 +1775,7 @@ mod tests {
         let v = VisibilityRule {
             mode: VisibilityMode::Always,
             rules: vec![],
+            ..Default::default()
         };
         let cleared = toggle_select_all(&v, &snapshot);
         assert_eq!(cleared.mode, VisibilityMode::OverlapAllowlist);
@@ -1627,82 +1814,63 @@ mod tests {
         assert!(cleared.rules.is_empty());
     }
 
-    // --- пресет «только рабочий стол» (ROADMAP.md M4) ---
+    // --- независимый признак «рабочий стол» ---
 
     #[test]
-    fn desktop_only_preset_clears_rules_and_pins_allowlist() {
-        let snapshot = [
-            window(1, r"C:\Apps\chrome.exe", "Chrome", 100, 1),
-            window(2, "", "Настройки", 200, 2),
-        ];
-        let v = allowlist(vec![
-            rule(Some("chrome.exe"), None),
-            rule(None, Some("Настройки")),
-        ]);
-        let preset = apply_desktop_only_preset(&v);
-        assert_eq!(preset.mode, VisibilityMode::OverlapAllowlist);
-        assert!(preset.rules.is_empty());
-        assert!(
-            snapshot.iter().all(|w| !window_is_checked(&preset, w)),
-            "после пресета ничего не выбрано"
+    fn desktop_row_can_be_toggled_without_losing_two_window_rules() {
+        let a = window(1, r"C:\Apps\a.exe", "A", 100, 1);
+        let b = window(2, r"C:\Apps\b.exe", "B", 100, 2);
+        let original = allowlist(vec![rule(Some("a.exe"), None), rule(Some("b.exe"), None)]);
+        assert!(original.desktop);
+        assert!(window_is_checked(&original, &a));
+        assert!(window_is_checked(&original, &b));
+
+        let desktop_off = toggle_desktop_only(&original);
+        assert!(!desktop_off.desktop, "снята только строка рабочего стола");
+        assert_eq!(desktop_off.mode, original.mode);
+        assert_eq!(desktop_off.rules, original.rules);
+        assert!(window_is_checked(&desktop_off, &a));
+        assert!(window_is_checked(&desktop_off, &b));
+
+        let desktop_on = toggle_desktop_only(&desktop_off);
+        assert_eq!(
+            desktop_on, original,
+            "повторное включение возвращает состояние"
         );
     }
 
     #[test]
-    fn desktop_only_preset_equals_select_all_clear_branch() {
-        // «Снять все» (клик по переключателю в состоянии «всё выбрано»)
-        // даёт то же правило — пресет просто делает его доступным одной
-        // кнопкой с постоянной подписью.
+    fn desktop_only_and_empty_selection_are_distinct_valid_states() {
+        let only_desktop = allowlist(vec![]);
+        assert!(desktop_only_is_checked(&only_desktop));
+        let nothing = toggle_desktop_only(&only_desktop);
+        assert!(!nothing.desktop);
+        assert!(nothing.rules.is_empty());
+        assert_eq!(toggle_desktop_only(&nothing), only_desktop);
+    }
+
+    #[test]
+    fn select_all_does_not_change_independent_desktop_selection() {
         let snapshot = [
-            window(1, r"C:\Apps\chrome.exe", "Chrome", 100, 1),
-            window(2, "", "Настройки", 200, 2),
+            window(1, r"C:\Apps\a.exe", "A", 100, 1),
+            window(2, r"C:\Apps\b.exe", "B", 100, 2),
         ];
-        let all = toggle_select_all(&allowlist(vec![]), &snapshot);
-        let cleared = toggle_select_all(&all, &snapshot);
-        let preset = apply_desktop_only_preset(&all);
-        assert_eq!(preset, cleared, "пресет == результат «Снять все»");
-        assert_eq!(preset.mode, VisibilityMode::OverlapAllowlist);
-        assert!(preset.rules.is_empty());
+        let mut desktop_off = allowlist(vec![]);
+        desktop_off.desktop = false;
+        let all = toggle_select_all(&desktop_off, &snapshot);
+        assert_eq!(all.mode, VisibilityMode::Always);
+        assert!(!all.desktop, "шапка не меняет строку рабочего стола");
+        assert!(snapshot.iter().all(|w| window_is_checked(&all, w)));
     }
 
     #[test]
-    fn desktop_only_preset_from_always_is_allowlist_not_always() {
-        // Крайний случай: «Снять все» в `Always` при пустом снимке сохранило
-        // бы {Always, []} (Always — «всегда виден», обратная семантика);
-        // пресет обязан дать ровно {OverlapAllowlist, []} (дизайн §2.3).
-        let v = VisibilityRule {
-            mode: VisibilityMode::Always,
-            rules: vec![],
+    fn always_mode_remains_visible_even_when_desktop_flag_is_off() {
+        let always = VisibilityRule {
+            desktop: false,
+            ..VisibilityRule::default()
         };
-        let preset = apply_desktop_only_preset(&v);
-        assert_eq!(preset.mode, VisibilityMode::OverlapAllowlist);
-        assert!(preset.rules.is_empty());
-    }
-
-    #[test]
-    fn desktop_only_preset_from_any_mode_is_allowlist() {
-        for mode in [
-            VisibilityMode::Always,
-            VisibilityMode::Desktop,
-            VisibilityMode::NeverOverlap,
-            VisibilityMode::OverlapAllowlist,
-        ] {
-            let v = VisibilityRule {
-                mode,
-                rules: vec![rule(Some("stale.exe"), None)],
-            };
-            let preset = apply_desktop_only_preset(&v);
-            assert_eq!(preset.mode, VisibilityMode::OverlapAllowlist, "{mode:?}");
-            assert!(preset.rules.is_empty(), "{mode:?}");
-        }
-    }
-
-    #[test]
-    fn desktop_only_preset_is_idempotent() {
-        let v = allowlist(vec![rule(Some("chrome.exe"), None)]);
-        let once = apply_desktop_only_preset(&v);
-        let twice = apply_desktop_only_preset(&once);
-        assert_eq!(once, twice);
+        let w = window(1, r"C:\Apps\app.exe", "A", 100, 1);
+        assert!(window_is_checked(&always, &w));
     }
 
     // --- билдер панели (дизайн §1, §3-4, §6, §7.3-7.4) ---
@@ -1850,6 +2018,135 @@ mod tests {
     }
 
     #[test]
+    fn hovering_anywhere_on_an_app_row_counts_as_hovering_that_app() {
+        // Раскрытие начиналось, только когда курсор пересекал подпись: между
+        // чекбоксом и текстом строка была мёртвой, и человек видел паузу на
+        // ровном месте («навожусь и оно ждёт около 0.7 секунды», 2026-09-13).
+        let snapshot = [
+            window(1, r"C:\Appslpha.exe", "первое", 1, 1),
+            window(2, r"C:\Appslpha.exe", "второе", 1, 2),
+        ];
+        let p = build_picker_panel_with_layout(
+            &allowlist(vec![]),
+            &snapshot,
+            0,
+            picker_frame(),
+            true,
+            PickerLayout {
+                expanded_group: None,
+                expansion: 0.0,
+            },
+        );
+        let row = p
+            .panel
+            .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE)
+            .expect("строка приложения")
+            .bounds();
+        // Точка справа от подписи — там, где раньше не было ничего.
+        let far_right = (
+            picker_frame().cx + picker_frame().w / 2.0
+                - PICKER_PAD
+                - theme::SCROLLBAR_WIDTH
+                - PICKER_GAP
+                - 2.0,
+            row.cy,
+        );
+        let mut p = p;
+        p.panel
+            .pointer_event(rst_render::PointerEvent::Move { pos: far_right });
+        let hit = p
+            .panel
+            .hovered_widget()
+            .map(|(id, _)| id)
+            .expect("строка ловит наведение");
+        assert_eq!(
+            hovered_process_group(hit),
+            Some(0),
+            "наведение на любую часть строки означает наведение на приложение"
+        );
+    }
+
+    #[test]
+    fn expanding_section_pushes_the_rows_below_it_down_gradually() {
+        // Суть аккордеона: место под строки окон освобождается ПОСТЕПЕННО, и
+        // всё, что ниже, съезжает вместе с ним. Пока строки просто возникали
+        // на готовом месте, раскрытие читалось как мгновенный скачок — и
+        // пользователь честно назвал это «0 анимаций» (2026-09-13).
+        let snapshot = [
+            window(1, r"C:\Appslpha.exe", "первое", 1, 1),
+            window(2, r"C:\Appslpha.exe", "второе", 1, 2),
+            window(3, r"C:\Appseta.exe", "чужое", 2, 3),
+        ];
+        let below_at = |expansion: f64| -> f64 {
+            let p = build_picker_panel_with_layout(
+                &allowlist(vec![]),
+                &snapshot,
+                0,
+                picker_frame(),
+                true,
+                PickerLayout {
+                    expanded_group: Some(0),
+                    expansion,
+                },
+            );
+            // Строка приложения `beta.exe` идёт ПОСЛЕ раскрываемой секции.
+            p.panel
+                .widget::<Checkbox>(PICKER_ROW_PROCESS_BASE + 1)
+                .expect("строка второго приложения")
+                .bounds()
+                .cy
+        };
+        let closed = below_at(0.0);
+        let half = below_at(0.5);
+        let open = below_at(1.0);
+        assert!(
+            half > closed && open > half,
+            "строка ниже секции обязана ехать вниз вместе с её ростом:              {closed} → {half} → {open}"
+        );
+    }
+
+    #[test]
+    fn a_child_row_arrives_instead_of_appearing_ready() {
+        // Строка окна выезжает из-под своего приложения и проявляется: в
+        // начале раскрытия она невидима и смещена, в конце — на месте и
+        // непрозрачна. Без этого «анимация» сводилась к сдвигу на четверть
+        // строки при полной непрозрачности, то есть была незаметна.
+        let snapshot = [
+            window(1, r"C:\Appslpha.exe", "первое", 1, 1),
+            window(2, r"C:\Appslpha.exe", "второе", 1, 2),
+        ];
+        let child_at = |expansion: f64| -> (f64, f64) {
+            let p = build_picker_panel_with_layout(
+                &allowlist(vec![]),
+                &snapshot,
+                0,
+                picker_frame(),
+                true,
+                PickerLayout {
+                    expanded_group: Some(0),
+                    expansion,
+                },
+            );
+            let cb = p
+                .panel
+                .widget::<Checkbox>(PICKER_ROW_WINDOW_BASE)
+                .expect("первая строка окна");
+            (cb.bounds().cx, cb.bounds().cy)
+        };
+        let (start_x, start_y) = child_at(0.0);
+        let (mid_x, mid_y) = child_at(0.5);
+        let (end_x, end_y) = child_at(1.0);
+        assert!(
+            start_x > end_x && mid_x > end_x,
+            "строка приезжает сбоку: {start_x} → {mid_x} → {end_x}"
+        );
+        assert!(
+            start_y < mid_y && mid_y < end_y,
+            "и одновременно опускается на своё место: {start_y} → {mid_y} → {end_y}"
+        );
+    }
+
+    #[test]
     fn expanded_window_checkboxes_are_clickable_when_expressible() {
         let snapshot = [
             window(1, r"C:\Apps\app.exe", "t", 1, 1),
@@ -1880,6 +2177,44 @@ mod tests {
             !cb.hit_test((cb.bounds().cx, cb.bounds().cy)),
             "empty-title window stays disabled"
         );
+    }
+
+    #[test]
+    fn intermediate_accordion_geometry_remains_hit_testable() {
+        let snapshot = [
+            window(1, r"C:\Apps\app.exe", "Первое окно", 1, 1),
+            window(2, r"C:\Apps\app.exe", "Второе окно", 1, 2),
+        ];
+        let mid = build_picker_panel_with_layout(
+            &allowlist(vec![]),
+            &snapshot,
+            0,
+            picker_frame(),
+            true,
+            PickerLayout {
+                expanded_group: Some(0),
+                expansion: 0.7,
+            },
+        );
+        let first = mid
+            .panel
+            .widget::<Checkbox>(PICKER_ROW_WINDOW_BASE)
+            .expect("первая строка появляется во время раскрытия");
+        let second = mid
+            .panel
+            .widget::<Checkbox>(PICKER_ROW_WINDOW_BASE + 1)
+            .expect("вторая строка появляется во время раскрытия");
+        assert!(
+            first.bounds().cy < second.bounds().cy,
+            "stagger сохраняет порядок строк на промежуточной фазе"
+        );
+        for cb in [first, second] {
+            let r = cb.bounds();
+            assert!(
+                cb.hit_test((r.cx, r.cy)),
+                "хит-тест следует за нарисованным прямоугольником"
+            );
+        }
     }
 
     #[test]
@@ -2115,7 +2450,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_row_tracks_exact_preset_state() {
+    fn desktop_row_tracks_exact_desktop_state() {
         let on = build_picker_panel(&allowlist(vec![]), &[], 0, picker_frame(), true);
         assert!(
             on.panel
@@ -2123,10 +2458,14 @@ mod tests {
                 .unwrap()
                 .checked()
         );
+        // Снятая галочка задаётся ЯВНО: `..Default::default()` даёт
+        // `desktop: true` — то самое значение, которое получают старые
+        // конфиги, и строить им состояние «выключено» нельзя.
         let off = build_picker_panel(
             &VisibilityRule {
                 mode: VisibilityMode::Always,
                 rules: vec![],
+                desktop: false,
             },
             &[],
             0,
@@ -2212,6 +2551,19 @@ mod tests {
         assert_eq!(accordion_child_progress(1.0, 0), 1.0);
     }
 
+    #[test]
+    fn hovered_row_ids_decode_group_without_scroll_offset() {
+        assert_eq!(
+            hovered_process_group(PICKER_ROW_PROCESS_BASE + 7 + LABEL_FLAG),
+            Some(7)
+        );
+        assert_eq!(
+            hovered_process_group(PICKER_ROW_WINDOW_BASE + (3 << 16) + 2),
+            Some(3)
+        );
+        assert_eq!(hovered_process_group(PICKER_ROW_DESKTOP), None);
+    }
+
     // --- обрезка длинного текста (независимое ревью, конвейер не клипует) ---
 
     #[test]
@@ -2241,8 +2593,21 @@ mod tests {
     #[test]
     fn build_picker_panel_truncates_long_window_title() {
         let long_title = "Ж".repeat(200);
-        let snapshot = [window(1, r"C:\Apps\app.exe", &long_title, 1, 1)];
-        let picker = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
+        let snapshot = [
+            window(1, r"C:\Apps\app.exe", &long_title, 1, 1),
+            window(2, r"C:\Apps\app.exe", "Короткое окно", 1, 2),
+        ];
+        let picker = build_picker_panel_with_layout(
+            &allowlist(vec![]),
+            &snapshot,
+            0,
+            picker_frame(),
+            true,
+            PickerLayout {
+                expanded_group: Some(0),
+                expansion: 1.0,
+            },
+        );
         let texts = picker_texts(&picker.panel);
         assert!(
             texts
@@ -2265,12 +2630,12 @@ mod tests {
             16,
         )];
         let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
-        // Строки: chrome-процесс + chrome-окно — обе с иконками: два Rgba,
-        // стеклянных плейсхолдеров в колонке иконок нет вовсе.
+        // Свёрнутая однооконная группа — одна строка приложения с иконкой;
+        // desktop-строка использует стеклянный слот.
         let icons = rgba_icons(&p.panel);
-        assert_eq!(icons.len(), 2, "процесс и окно несут иконки: {icons:?}");
+        assert_eq!(icons.len(), 1, "строка приложения несёт иконку: {icons:?}");
         assert!(icons.iter().all(|&(_, w, h)| w == 16 && h == 16));
-        assert_eq!(glass_slot_count(&p.panel), 0, "плейсхолдеров не осталось");
+        assert_eq!(glass_slot_count(&p.panel), 1, "слот desktop");
     }
 
     #[test]
@@ -2281,9 +2646,8 @@ mod tests {
         ];
         let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         let icons = rgba_icons(&p.panel);
-        // Процесс + два окна: три Rgba с одним ключом — одна GPU-текстура
-        // на весь процесс (дедупликация кэша текстур).
-        assert_eq!(icons.len(), 3);
+        // Свёрнутый процесс занимает одну строку и делит один key.
+        assert_eq!(icons.len(), 1);
         let keys: Vec<u64> = icons.iter().map(|&(k, _, _)| k).collect();
         assert!(
             keys.iter().all(|&k| k == keys[0]),
@@ -2300,20 +2664,15 @@ mod tests {
         let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
         let icons = rgba_icons(&p.panel);
         let keys: Vec<u64> = icons.iter().map(|&(k, _, _)| k).collect();
-        assert_eq!(keys[0], keys[1], "chrome: процесс и окно");
-        assert_eq!(keys[2], keys[3], "firefox: процесс и окно");
-        assert_ne!(keys[0], keys[2], "разные exe — разные key");
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1], "разные exe — разные key");
     }
 
     #[test]
     fn window_without_icon_keeps_glass_placeholder() {
         let snapshot = [window(1, r"C:\Apps\app.exe", "No icon", 1, 1)];
         let p = build_picker_panel(&allowlist(vec![]), &snapshot, 0, picker_frame(), true);
-        assert_eq!(
-            glass_slot_count(&p.panel),
-            2,
-            "процесс и окно: плейсхолдеры"
-        );
+        assert_eq!(glass_slot_count(&p.panel), 2, "desktop и приложение");
         assert!(rgba_icons(&p.panel).is_empty());
     }
 

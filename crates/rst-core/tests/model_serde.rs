@@ -130,6 +130,7 @@ fn roundtrip_all_variants() {
             process_name: Some("chrome.exe".to_string()),
             title_pattern: Some("*YouTube*".to_string()),
         }],
+        ..Default::default()
     };
     let sticker_pasted = Sticker {
         order: 1,
@@ -139,6 +140,7 @@ fn roundtrip_all_variants() {
         visibility: VisibilityRule {
             mode: VisibilityMode::Desktop,
             rules: vec![],
+            ..Default::default()
         },
         playback: PlaybackSettings {
             loop_mode: LoopMode::HoldLastFrame,
@@ -173,6 +175,17 @@ fn unknown_fields_ignored() {
 fn missing_fields_defaulted() {
     let cfg: Config = serde_json::from_value(json!({})).unwrap();
     assert_eq!(cfg, Config::default());
+}
+
+#[test]
+fn old_visibility_without_desktop_defaults_to_visible() {
+    let visibility: VisibilityRule = serde_json::from_value(json!({
+        "mode": "overlap_allowlist",
+        "rules": []
+    }))
+    .unwrap();
+
+    assert!(visibility.desktop);
 }
 
 #[test]

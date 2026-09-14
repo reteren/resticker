@@ -40,19 +40,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GW_HWNDPREV, GWL_EXSTYLE,
-    GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindow, GetWindowDisplayAffinity,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTCLIENT, HTTRANSPARENT,
-    HWND_TOPMOST, IsWindowVisible, KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
-    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST,
-    WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
-    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    GWLP_USERDATA, GetClassNameW, GetMessageW, GetSystemMetrics, GetWindow,
+    GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTCLIENT,
+    HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, KillTimer, LWA_ALPHA, MSG,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes,
+    SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA, WM_APP, WM_CAPTURECHANGED,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
+    WM_NCHITTEST, WM_POWERBROADCAST, WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use windows::core::{PCWSTR, w};
 
@@ -856,6 +856,58 @@ impl OverlayWindow {
                 break;
             }
             if pinned.contains(&(hwnd.0 as usize)) {
+                found = true;
+                break;
+            }
+            // SAFETY: hwnd получен из GetWindow, чтение z-order живого окна.
+            above = unsafe { GetWindow(hwnd, GW_HWNDPREV) };
+        }
+        if !found {
+            return false;
+        }
+        // SAFETY: наше окно; SetWindowPos без активации и без движения.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .is_ok()
+        }
+    }
+
+    /// Поднять оверлей над окнами заданного класса, если хоть одно из них
+    /// стоит ВЫШЕ него в z-order.
+    ///
+    /// Зачем отдельно от [`Self::raise_above_pinned`]: тот знает только
+    /// переданный список закреплённых ЧУЖИХ окон, а здесь речь про СВОИ окна
+    /// живых кусков. Кусок с включённой булавкой живёт в той же
+    /// topmost-полосе, что оверлей, и внутри полосы выигрывает тот, кого
+    /// подняли последним. Пока этого подъёма не было, панель редактирования
+    /// групп оказывалась ПОД куском: «моя панель в режиме редактирования
+    /// групп находится ниже этих окон» (репорт пользователя 2026-09-12).
+    ///
+    /// `SetForegroundWindow` из политики ввода на эту роль не годится:
+    /// система вправе ему отказать, а при неизменной политике он вообще не
+    /// повторяется — порядок окон обязан утверждаться отдельным шагом
+    /// (аудит P3, 2026-09-13).
+    ///
+    /// Обход вверх сам себя останавливает, как и у `raise_above_pinned`:
+    /// после подъёма кусок оказывается ниже, и следующий снимок z-order не
+    /// трогает. Возвращает `true`, если подъём реально выполнялся.
+    pub fn raise_above_class(&self, class: &str) -> bool {
+        // SAFETY: hwnd — наше живое окно; GetWindow — чтение z-order.
+        let mut above = unsafe { GetWindow(self.hwnd, GW_HWNDPREV) };
+        let mut found = false;
+        while let Ok(hwnd) = above {
+            if hwnd.0.is_null() {
+                break;
+            }
+            if window_class_is(hwnd, class) {
                 found = true;
                 break;
             }
@@ -2215,6 +2267,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // SAFETY: делегирование необработанных сообщений системному обработчику.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+/// Класс окна равен `expected` (регистронезависимо, как принято у классов
+/// Win32).
+///
+/// Отдельная функция, а не метод: сравнивается класс ЧУЖОГО (в смысле «не
+/// этого объекта») окна, полученного обходом z-order.
+fn window_class_is(hwnd: HWND, expected: &str) -> bool {
+    let mut buffer = [0u16; 256];
+    // SAFETY: буфер наш, длина передана честно; GetClassNameW принимает любой
+    // HWND и возвращает 0 для мёртвого окна.
+    let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    if len <= 0 {
+        return false;
+    }
+    let name = String::from_utf16_lossy(&buffer[..len as usize]);
+    name.eq_ignore_ascii_case(expected)
 }
 
 #[cfg(test)]
