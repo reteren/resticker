@@ -2942,6 +2942,7 @@ dependencies = [
 name = "rst-win32"
 version = "0.1.0"
 dependencies = [
+ "image",
  "rst-core",
  "thiserror 2.0.19",
  "tracing",

@@ -117,11 +117,6 @@ const COLOR_HOVER: COLORREF = COLORREF(0x00362f2f);
 /// человек узнаёт его без подписи, и деструктивная кнопка обязана
 /// отличаться от соседней.
 const COLOR_CLOSE_HOVER: COLORREF = COLORREF(0x001c2bc4);
-/// Включённая булавка — синий акцент `ACCENT` (#3B6FE0) из палитры.
-///
-/// Не серая подсветка наведения: та означает «курсор здесь», а эта —
-/// «переключатель включён», и путать их нельзя. Цвет держится и без курсора.
-const COLOR_PIN_ON: COLORREF = COLORREF(0x00e06f3b);
 /// Кегль подписи, DIP.
 const TEXT_SIZE_DIP: i32 = 12;
 /// Сторона глифа кнопки, DIP.
@@ -394,12 +389,15 @@ pub fn hit_test_strip(width: u32, height: u32, x: i32, y: i32) -> StripHit {
     }
     let close_left = width.saturating_sub(button) as i32;
     let minimize_left = width.saturating_sub(button.saturating_mul(2)) as i32;
-    let pin_left = width.saturating_sub(button.saturating_mul(3)) as i32;
+    // Булавка — СЛЕВА, там же, где её значок у закреплённых окон (запрос
+    // пользователя 2026-09-14: «верни старую визуализацию булавки слева
+    // сверху как и на всех окнах»). Справа остаются только «свернуть» и
+    // «закрыть» — тот порядок, который Windows приучила читать справа.
     if x >= close_left {
         StripHit::Close
     } else if x >= minimize_left {
         StripHit::Minimize
-    } else if x >= pin_left {
+    } else if x < button as i32 {
         StripHit::Pin
     } else {
         StripHit::Drag
@@ -1761,7 +1759,8 @@ fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit, always_o
     // Та же раскладка, что у `hit_test_strip`: то, что нарисовано, обязано
     // совпадать с тем, куда попадает клик.
     let button = strip_button_side(width.max(0) as u32, height.max(0) as u32) as i32;
-    let pin_left = width - button * 3;
+    // Булавка слева, «свернуть» и «закрыть» справа — см. `hit_test_strip`.
+    let pin_left = 0;
     let min_left = width - button * 2;
     let close_left = width - button;
 
@@ -1778,20 +1777,7 @@ fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit, always_o
             StripHit::Close => Some((close_left, COLOR_CLOSE_HOVER)),
             StripHit::None | StripHit::Drag => None,
         };
-        // Включённая булавка — залитая кнопка, а не только другой глиф:
-        // состояние переключателя обязано читаться с одного взгляда, без
-        // наведения курсора.
-        if always_on_top {
-            let rect = RECT {
-                left: pin_left,
-                top: 0,
-                right: pin_left + button,
-                bottom: height,
-            };
-            let brush = CreateSolidBrush(COLOR_PIN_ON);
-            let _ = FillRect(hdc, &rect, brush);
-            let _ = DeleteObject(brush.into());
-        }
+
         if let Some((left, color)) = hovered {
             let rect = RECT {
                 left,
@@ -1819,9 +1805,9 @@ fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit, always_o
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLOR_TEXT);
         let mut text_rect = RECT {
-            left: scale(TEXT_PAD_DIP),
+            left: button + scale(TEXT_PAD_DIP),
             top: 0,
-            right: (pin_left - scale(TEXT_PAD_DIP) / 2).max(scale(TEXT_PAD_DIP)),
+            right: (min_left - scale(TEXT_PAD_DIP) / 2).max(button + scale(TEXT_PAD_DIP)),
             bottom: height,
         };
         let mut text: Vec<u16> = app_name.strip_suffix(&[0]).unwrap_or(app_name).to_vec();
@@ -1847,19 +1833,6 @@ fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit, always_o
         let old_pen = windows::Win32::Graphics::Gdi::SelectObject(hdc, pen.into());
         let g = scale(GLYPH_DIP) / 2;
         let cy = height / 2;
-        // «поверх всех окон» — стрелка вверх под чертой: тот же смысл, что у
-        // значка «keep on top» в проигрывателях. Выключенная булавка рисуется
-        // тем же глифом, отличие — залитый фон кнопки (см. выше): два разных
-        // рисунка на одной кнопке человек читает как две разные кнопки.
-        let px = pin_left + button / 2;
-        let _ = MoveToEx(hdc, px - g, cy - g, None);
-        let _ = LineTo(hdc, px + g + 1, cy - g);
-        let _ = MoveToEx(hdc, px, cy + g, None);
-        let _ = LineTo(hdc, px, cy - g + 2);
-        let head = (g / 2).max(2);
-        let _ = MoveToEx(hdc, px - head, cy - g + 2 + head, None);
-        let _ = LineTo(hdc, px, cy - g + 2);
-        let _ = LineTo(hdc, px + head + 1, cy - g + 3 + head);
         // «свернуть» — горизонтальная черта по центру своей кнопки
         let mx = min_left + button / 2;
         let _ = MoveToEx(hdc, mx - g, cy, None);
@@ -1873,7 +1846,167 @@ fn paint_strip(hwnd: HWND, app_name: &[u16], dpi: u32, hover: StripHit, always_o
         let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_pen);
         let _ = DeleteObject(pen.into());
 
+        // Булавка — тот же рисунок, что у значка закреплённого окна: человек
+        // уже знает его по всем окнам, и второй значок для того же смысла
+        // только путал бы (запрос пользователя 2026-09-14).
+        draw_pin(hdc, pin_left, button, height, always_on_top);
+
         let _ = EndPaint(hwnd, &paint);
+    }
+}
+
+/// Рисунок булавки — тот же PNG, которым помечены закреплённые окна.
+///
+/// Полоса куска рисуется GDI, а не через D3D-оверлей, поэтому картинку
+/// приходится расшифровывать и класть на контекст самим. Исходник берётся из
+/// ресурсов `rst-render`: две копии одного рисунка разошлись бы при первой же
+/// правке, а два разных значка для одного смысла человек читает как две
+/// разные функции.
+const PIN_PNG: &[u8] = include_bytes!("../../rst-render/assets/pinned_badge.png");
+
+/// Расшифрованный рисунок булавки (RGBA, как в файле) — один раз на процесс.
+fn pin_rgba() -> Option<&'static (Vec<u8>, u32, u32)> {
+    static PIN: std::sync::OnceLock<Option<(Vec<u8>, u32, u32)>> = std::sync::OnceLock::new();
+    PIN.get_or_init(|| match image::load_from_memory(PIN_PNG) {
+        Ok(img) => {
+            let rgba = img.into_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            Some((rgba.into_raw(), w, h))
+        }
+        Err(e) => {
+            // Битый ресурс — не повод ронять окно: полоса останется без
+            // значка, а причина видна в журнале (тот же принцип, что у
+            // иконок оверлея).
+            tracing::warn!(error = %e, "рисунок булавки не расшифровался");
+            None
+        }
+    })
+    .as_ref()
+}
+
+/// Положить булавку по центру её кнопки.
+///
+/// Включённая — в полную силу, выключенная — приглушённая: состояние читается
+/// яркостью самого значка, без заливки кнопки. Заливка выглядела как «другая
+/// кнопка», а не как «та же булавка в другом состоянии».
+fn draw_pin(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    left: i32,
+    button: i32,
+    height: i32,
+    on: bool,
+) {
+    use windows::Win32::Graphics::Gdi::AlphaBlend;
+    use windows::Win32::Graphics::Gdi::{
+        AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+        CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, SelectObject,
+    };
+
+    let Some((src, src_w, src_h)) = pin_rgba() else {
+        return;
+    };
+    // Значок соразмерен подписи полосы, а не кнопке целиком: булавка во всю
+    // высоту кнопки выглядела бы тяжелее, чем сама полоса.
+    let side = ((button * 5) / 8).max(8);
+    if side <= 0 || *src_w == 0 || *src_h == 0 {
+        return;
+    }
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: side,
+            biHeight: -side, // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: bmi описывает 32bpp top-down DIB side×side, bits — out-параметр.
+    let bitmap = match unsafe { CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) } {
+        Ok(b) if !bits.is_null() => b,
+        _ => return,
+    };
+    // Усреднение при уменьшении съедает плотность тонких штрихов: рисунок
+    // становится полупрозрачным весь, а не только по краям. Поэтому покрытие
+    // слегка поджимается к единице — штрих остаётся штрихом, сглаживание
+    // краёв сохраняется.
+    const INK: f32 = 1.5;
+    // Приглушение выключенной булавки — по альфе, как у текста полосы.
+    let fade = if on { 1.0_f32 } else { 0.45 };
+    // SAFETY: bits — буфер ровно side*side*4 байта; пишем premultiplied BGRA,
+    // как требует AlphaBlend.
+    //
+    // Уменьшение — усреднением по всем исходным пикселям, попавшим в точку
+    // назначения, а не «по ближайшему»: рисунок булавки состоит из тонких
+    // штрихов, и выборка одного пикселя рвала бы их в пунктир.
+    unsafe {
+        let dst = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (side * side * 4) as usize);
+        let side_u = side as u32;
+        for y in 0..side_u {
+            let y0 = y * *src_h / side_u;
+            let y1 = (((y + 1) * *src_h).div_ceil(side_u))
+                .max(y0 + 1)
+                .min(*src_h);
+            for x in 0..side_u {
+                let x0 = x * *src_w / side_u;
+                let x1 = (((x + 1) * *src_w).div_ceil(side_u))
+                    .max(x0 + 1)
+                    .min(*src_w);
+                let mut sum = 0.0_f32;
+                let mut count = 0.0_f32;
+                for sy in y0..y1 {
+                    for sx in x0..x1 {
+                        let si = ((sy * *src_w + sx) * 4) as usize;
+                        sum += f32::from(src[si + 3]);
+                        count += 1.0;
+                    }
+                }
+                let a = if count > 0.0 {
+                    (sum / count / 255.0 * INK).min(1.0) * fade
+                } else {
+                    0.0
+                };
+                let di = ((y * side_u + x) * 4) as usize;
+                // Цвет штриха — тот же светлый, что у глифов полосы.
+                let lit = (f32::from(0xD8u8) * a).round() as u8;
+                dst[di] = lit;
+                dst[di + 1] = lit;
+                dst[di + 2] = lit;
+                dst[di + 3] = (a * 255.0).round() as u8;
+            }
+        }
+    }
+    // SAFETY: свой контекст и свой битмап; все хэндлы освобождаются ниже.
+    unsafe {
+        let mem = CreateCompatibleDC(Some(hdc));
+        if !mem.is_invalid() {
+            let old = SelectObject(mem, bitmap.into());
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = AlphaBlend(
+                hdc,
+                left + (button - side) / 2,
+                (height - side) / 2,
+                side,
+                side,
+                mem,
+                0,
+                0,
+                side,
+                side,
+                blend,
+            );
+            let _ = SelectObject(mem, old);
+            let _ = DeleteDC(mem);
+        }
+        let _ = DeleteObject(bitmap.into());
     }
 }
 
@@ -2136,8 +2269,10 @@ mod tests {
 
     #[test]
     fn strip_buttons_and_drag_zone_are_disjoint() {
-        assert_eq!(hit_test_strip(320, 28, 20, 14), StripHit::Drag);
-        assert_eq!(hit_test_strip(320, 28, 250, 14), StripHit::Pin);
+        // Булавка — слева, там же, где значок у закреплённых окон; справа
+        // только «свернуть» и «закрыть».
+        assert_eq!(hit_test_strip(320, 28, 10, 14), StripHit::Pin);
+        assert_eq!(hit_test_strip(320, 28, 120, 14), StripHit::Drag);
         assert_eq!(hit_test_strip(320, 28, 280, 14), StripHit::Minimize);
         assert_eq!(hit_test_strip(320, 28, 315, 14), StripHit::Close);
         assert_eq!(hit_test_strip(320, 28, 10, 30), StripHit::None);
@@ -2148,8 +2283,8 @@ mod tests {
         // Диагностически узкая полоса: кнопки жмутся, но ни одна не исчезает и
         // ни одна не съедает зону перетаскивания — иначе кусок стало бы не за
         // что взять.
-        assert_eq!(hit_test_strip(40, 28, 2, 10), StripHit::Drag);
-        assert_eq!(hit_test_strip(40, 28, 12, 10), StripHit::Pin);
+        assert_eq!(hit_test_strip(40, 28, 2, 10), StripHit::Pin);
+        assert_eq!(hit_test_strip(40, 28, 12, 10), StripHit::Drag);
         assert_eq!(hit_test_strip(40, 28, 22, 10), StripHit::Minimize);
         assert_eq!(hit_test_strip(40, 28, 39, 10), StripHit::Close);
     }
@@ -2365,6 +2500,125 @@ mod tests {
         }
     }
 
+    /// Снять полосу куска в PNG — глазами координатора, а не на веру.
+    ///
+    /// Вид полосы уже один раз оказался не тем, что ожидал человек, потому
+    /// что его никто не посмотрел. Тест не проверяет пиксели автоматически:
+    /// он даёт файл, который можно открыть. Путь задаётся `CROP_STRIP_SNAP`.
+    #[test]
+    #[ignore = "снимок для глаз; запуск: CROP_STRIP_SNAP=<путь.png> cargo test -p rst-win32 --lib strip_snapshot -- --ignored"]
+    fn strip_snapshot_for_review() {
+        use std::time::Duration;
+        use windows::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
+            DIB_RGB_COLORS, DeleteDC, SelectObject,
+        };
+        use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WM_MOUSEMOVE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+        };
+
+        let Ok(out_path) = std::env::var("CROP_STRIP_SNAP") else {
+            return;
+        };
+        let hinstance = unsafe { GetModuleHandleW(None) }.expect("модуль").into();
+        let source = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!("resticker_strip_snapshot"),
+                WS_POPUP | WS_VISIBLE,
+                80,
+                80,
+                240,
+                180,
+                None,
+                None,
+                Some(hinstance),
+                None,
+            )
+        }
+        .expect("окно-источник");
+        let mut options = CropWindowOptions::new(
+            Rect {
+                x: 120,
+                y: 120,
+                w: 360,
+                h: 220,
+            },
+            SourceRect {
+                x: 0,
+                y: 0,
+                w: 360,
+                h: 220,
+            },
+            "Orca",
+        );
+        options.always_on_top = std::env::var("CROP_STRIP_PIN").is_ok();
+        let (crop, _events) = CropWindow::create(source, options).expect("окно куска");
+        // Показать полосу: сообщение СВОЕМУ окну, курсор пользователя не трогаем.
+        unsafe {
+            let _ = PostMessageW(
+                Some(crop.hwnd()),
+                WM_MOUSEMOVE,
+                WPARAM(0),
+                LPARAM(((100_i32) << 16 | 100_i32) as isize),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+
+        let strip = crop.strip_hwnd();
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(strip, &mut rect);
+        }
+        let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+        assert!(w > 0 && h > 0, "полоса имеет размер");
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let pixels = unsafe {
+            let mem = CreateCompatibleDC(None);
+            let bitmap = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .expect("DIB под снимок");
+            let old = SelectObject(mem, bitmap.into());
+            let _ = PrintWindow(strip, mem, PRINT_WINDOW_FLAGS(0));
+            let raw = std::slice::from_raw_parts(bits.cast::<u8>(), (w * h * 4) as usize).to_vec();
+            let _ = SelectObject(mem, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(mem);
+            raw
+        };
+        // BGRA → RGBA, непрозрачно: полоса рисуется без альфы.
+        let mut rgba = Vec::with_capacity(pixels.len());
+        for px in pixels.chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+        image::save_buffer(
+            &out_path,
+            &rgba,
+            w as u32,
+            h as u32,
+            image::ExtendedColorType::Rgba8,
+        )
+        .expect("снимок сохранён");
+
+        drop(crop);
+        unsafe {
+            let _ = DestroyWindow(source);
+        }
+    }
+
     #[test]
     fn strip_zones_never_overlap_across_sizes() {
         // Три кнопки и зона перетаскивания обязаны оставаться раздельными при
@@ -2382,14 +2636,14 @@ mod tests {
                     );
                     continue;
                 }
-                let seen: Vec<StripHit> = [width - 1, width - button - 1, width - button * 2 - 1]
+                let seen: Vec<StripHit> = [width - 1, width - button - 1, 0]
                     .iter()
                     .map(|x| hit_test_strip(width, height, *x as i32, (height / 2) as i32))
                     .collect();
                 assert_eq!(
                     seen,
                     vec![StripHit::Close, StripHit::Minimize, StripHit::Pin],
-                    "порядок кнопок справа налево: закрыть, свернуть, булавка                      (width={width}, height={height})"
+                    "справа закрыть и свернуть, слева булавка (width={width}, height={height})"
                 );
             }
         }

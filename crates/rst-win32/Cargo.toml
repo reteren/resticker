@@ -8,6 +8,10 @@ license.workspace = true
 
 [dependencies]
 rst-core = { path = "../rst-core" }
+# Только для расшифровки рисунка булавки на полосе живого куска: полоса
+# рисуется GDI, а картинка лежит PNG-ресурсом. Крейт уже в графе сборки
+# (им пользуется rst-render), поэтому ничего нового не компилируется.
+image = { version = "0.25", default-features = false, features = ["png"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 windows = { version = "0.62", features = [
