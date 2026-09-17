@@ -163,15 +163,22 @@ fn tray_menu_ready(width: f64, height: f64, app: tauri::AppHandle) {
     watch_focus_loss(&app, &w);
 }
 
-/// Закрывать меню, как только фокус ушёл на другое окно.
+/// Закрывать меню, как только пользователь ушёл в другое окно.
 ///
 /// Своим наблюдателем, а не событием окна: `WindowEvent::Focused` для этого
 /// окна не приходит вовсе (замер 2026-09-17 — в обработчик падали только
-/// `Moved`/`Resized`, а меню оставалось висеть на экране после клика мимо
-/// него). Спросить у Windows, какое окно сейчас впереди, можно всегда.
+/// `Moved`/`Resized`, а меню оставалось висеть после клика мимо него).
 ///
-/// Поток живёт ровно пока открыто меню: опрос вдесятеро реже кадра, и по
-/// первому же чужому окну впереди он заканчивается вместе с меню.
+/// Правило двухступенчатое, и это не перестраховка. Windows отдаёт передний
+/// план не всегда: клик по иконке трея такое право даёт, а вот меню,
+/// показанное когда правом владеет чужое полноэкранное приложение, впереди не
+/// окажется. Закрывать по «впереди не мы» в лоб значило бы, что в таком
+/// случае меню мигнёт и исчезнет (ровно это и показал замер). Поэтому:
+/// получили передний план — закрываемся по его потере; не получили — ждём,
+/// пока пользователь не переключится на окно, отличное от того, что было
+/// впереди в момент показа.
+///
+/// Поток живёт ровно пока открыто меню, опрос вдесятеро реже кадра.
 fn watch_focus_loss<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
@@ -182,22 +189,30 @@ fn watch_focus_loss<R: tauri::Runtime>(
     let menu_hwnd = hwnd.0 as isize;
     let app = app.clone();
     std::thread::spawn(move || {
-        // Небольшая фора: между `show` и реальным приходом фокуса Windows
-        // успевает подержать впереди прежнее окно, и наблюдатель закрыл бы
-        // меню в тот же миг, когда его открыли.
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        let opened_over = rst_win32::window_pick::foreground_window();
+        let mut was_ours = false;
         loop {
+            std::thread::sleep(std::time::Duration::from_millis(120));
             let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) else {
                 return;
             };
             if !w.is_visible().unwrap_or(false) {
                 return;
             }
-            if rst_win32::window_pick::foreground_window() != menu_hwnd {
+            let fg = rst_win32::window_pick::foreground_window();
+            if fg == menu_hwnd {
+                was_ours = true;
+                continue;
+            }
+            // Переключение «в никуда» (0) бывает на миг между окнами — это не
+            // уход пользователя.
+            if fg == 0 {
+                continue;
+            }
+            if was_ours || fg != opened_over {
                 let _ = w.hide();
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(120));
         }
     });
 }
