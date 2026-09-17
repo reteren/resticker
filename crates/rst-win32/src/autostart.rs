@@ -6,8 +6,8 @@ use std::path::Path;
 
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW,
-    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW, RegOpenKeyExW,
+    RegSetValueExW,
 };
 use windows::core::PCWSTR;
 
@@ -91,33 +91,6 @@ pub fn set_enabled(enabled: bool, exe_path: &Path) -> Result<(), Win32Error> {
         }
     }
     Ok(())
-}
-
-/// Прочитать текущее состояние автозапуска напрямую из реестра
-/// (источник истины для UI — не то, что записано в config.json).
-pub fn is_enabled() -> Result<bool, Win32Error> {
-    let key = RegKey::open(KEY_QUERY_VALUE)?;
-    let value_name = to_wide(VALUE_NAME);
-    let mut size: u32 = 0;
-    // SAFETY: key.0 действителен; запрос без буфера (None) только читает
-    // требуемый размер в `size`.
-    let ret = unsafe {
-        RegQueryValueExW(
-            key.0,
-            PCWSTR(value_name.as_ptr()),
-            None,
-            None,
-            None,
-            Some(&mut size),
-        )
-    };
-    if ret.0 == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.0 {
-        return Ok(false);
-    }
-    if ret != ERROR_SUCCESS {
-        return Err(Win32Error::Registry(win32_err(ret.0)));
-    }
-    Ok(true)
 }
 
 #[cfg(test)]

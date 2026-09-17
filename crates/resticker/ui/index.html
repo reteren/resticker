@@ -73,9 +73,6 @@
           <path d="M8.1 10.6L12 14.5l3.9-3.9" />
           <path d="M4.6 16.4v1.9a2 2 0 0 0 2 2h10.8a2 2 0 0 0 2-2v-1.9" />
         </symbol>
-        <symbol id="i-plus" viewBox="0 0 24 24">
-          <path d="M12 5.4v13.2M5.4 12h13.2" />
-        </symbol>
       </defs>
     </svg>
 
@@ -109,9 +106,12 @@
             <section class="card" style="flex: 1">
               <div class="cardHeader">
                 <h2 data-i18n="stickers.listLabel">Sticker list</h2>
+                <!-- Без иконки: у символа «плюс» в спрайте не задана обводка,
+                     поэтому он не рисовался вовсе, но занимал 13 px и зазор
+                     слева от подписи — надпись выглядела сдвинутой (репорт
+                     пользователя 2026-09-17). -->
                 <button class="button compact primary" id="add-sticker" type="button">
-                  <svg class="btnIcon" aria-hidden="true"><use href="#i-plus" /></svg>
-                  <span data-i18n="stickers.add">Add…</span>
+                  <span data-i18n="stickers.add">Add</span>
                 </button>
               </div>
               <div class="stickerList" id="sticker-list">
@@ -242,7 +242,7 @@
                 <p class="hint" data-i18n="control.hintRequired">
                   "Edit mode" is required (cannot be cleared). The others are optional.
                 </p>
-                <p class="hint" data-i18n="control.hintRestart">Hotkey changes apply after restarting resticker.</p>
+                <p class="hint" data-i18n="control.hintLive">Hotkey changes take effect as soon as you press Apply — restarting resticker is not needed.</p>
               </section>
 
               <section class="group">

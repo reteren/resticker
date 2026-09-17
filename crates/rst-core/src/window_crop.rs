@@ -96,18 +96,6 @@ pub fn crop_rect(
     select(start, end, window).map(|selection| selection.crop)
 }
 
-/// Удобный вариант для вызывающего слоя, которому нужно только место стикера.
-///
-/// Возвращаемый `Rect` всё ещё в физических пикселях экрана; перевод в DIP
-/// относительно конкретного монитора выполняется после выбора монитора.
-pub fn placement_rect(
-    start: ScreenPoint,
-    end: ScreenPoint,
-    window: Rect,
-) -> Result<Rect, CropError> {
-    select(start, end, window).map(|selection| selection.screen_rect)
-}
-
 fn contains(rect: &Rect, point: ScreenPoint) -> bool {
     let right = i64::from(rect.x) + i64::from(rect.w);
     let bottom = i64::from(rect.y) + i64::from(rect.h);

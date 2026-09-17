@@ -23,7 +23,7 @@ const STRINGS = {
   'tab.denylist': 'Denylist',
 
   'stickers.listLabel': 'Sticker list',
-  'stickers.add': 'Add…',
+  'stickers.add': 'Add',
   'stickers.loading': 'Loading…',
   'stickers.resetAll': 'Reset all',
   'stickers.deleteAll': 'Delete all',
@@ -121,7 +121,8 @@ const STRINGS = {
   'control.modifierRequired': 'At least one modifier is required (Ctrl, Alt, Shift, or Win).',
   'control.unsupportedKey': 'Key "{key}" is not supported. Use A-Z, 0-9, or F1-F24.',
   'control.hintClick': 'Click a field, then press a combination. Esc cancels.',
-  'control.hintRestart': 'Hotkey changes apply immediately after saving.',
+  'control.hintLive':
+    'Hotkey changes take effect as soon as you press Apply — restarting resticker is not needed.',
   'control.hintRequired':
     '"Edit mode" is required (cannot be cleared). The others are optional.',
 

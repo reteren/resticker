@@ -163,8 +163,18 @@ pub struct Hotkeys {
     /// глобальный хоткей, открывающий менеджер групп поверх всего.
     /// `None` — не назначен.
     ///
-    /// Дефолт `Ctrl+Alt+G` — в один ряд с остальными хоткеями программы
-    /// (`Ctrl+Alt+S/H/M/T`).
+    /// Дефолт `Ctrl+Shift+G` — выбор пользователя 2026-09-16, проверенный
+    /// на его машине перед сменой: переключатель раскладки Windows сидит на
+    /// `Alt+Shift`, пока в `HKCU\Keyboard Layout\Toggle` не выставлено `2`.
+    /// На машине, где выставлено, `Ctrl+Shift` заберёт система — и пара
+    /// уедет ровно так же, как когда-то уехал `Alt+Shift+G` ниже.
+    ///
+    /// Разбор таких комбинаций написан (`rst_win32::hotkey_check`), но
+    /// НИ ОТКУДА НЕ ВЫЗЫВАЕТСЯ: предупреждения пользователь сейчас не
+    /// увидит. Подключать его или убирать — открытый вопрос, и до решения
+    /// обещать предупреждение здесь нельзя.
+    ///
+    /// Промежуточным дефолтом был `Ctrl+Alt+G` (в один ряд с `Ctrl+Alt+S/H/M/T`).
     ///
     /// Изначально здесь стоял `Alt+Shift+G`, и это была ошибка, найденная
     /// вживую 2026-08-26. `Alt+Shift` — стандартное сочетание Windows для
@@ -249,6 +259,16 @@ impl Hotkeys {
     /// следом, а не разойдутся с нумерацией.
     pub const GROUP_OPEN_SLOTS: usize = MAX_GROUP_NUMBER as usize;
 
+    /// Комбинация режима редактирования по умолчанию.
+    ///
+    /// Константа, а не литерал в [`Default`]: этот хоткей единственный
+    /// обязательный (остальные снимаются кнопкой «Очистить» в настройках),
+    /// и та же строка нужна как запасной вариант там, где в конфиге стоит
+    /// `null` или неразбираемое значение — иначе пользователь остался бы
+    /// без входа в режим редактирования вовсе. Два литерала в разных
+    /// крейтах разошлись бы при первой же смене дефолта.
+    pub const DEFAULT_EDIT_MODE: &'static str = "Ctrl+Alt+S";
+
     /// Хоткей открытия группы с номером `n` (1..=9). `None` — номер вне
     /// диапазона, ячейка пуста или вектор короче `n`. Индексация вектора
     /// напрямую вынуждала бы вызывающего помнить про поправку `n - 1` —
@@ -264,11 +284,11 @@ impl Hotkeys {
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
-            edit_mode: Some("Ctrl+Alt+S".to_string()),
+            edit_mode: Some(Self::DEFAULT_EDIT_MODE.to_string()),
             toggle_all_stickers: Some("Ctrl+Alt+H".to_string()),
             mute_all: Some("Ctrl+Alt+M".to_string()),
             pin_focused_window: Some("Ctrl+Alt+T".to_string()),
-            edit_groups_menu: Some("Ctrl+Alt+G".to_string()),
+            edit_groups_menu: Some("Ctrl+Shift+G".to_string()),
             delete_open_group: Some("Ctrl+Alt+Shift+G".to_string()),
             open_group_by_number: default_open_group_by_number(),
             unpin_all: Some("Ctrl+Alt+U".to_string()),

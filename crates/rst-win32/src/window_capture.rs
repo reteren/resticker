@@ -62,7 +62,6 @@ pub struct WindowCapture {
     size: Arc<Mutex<SizeInt32>>,
     pending_resize: Arc<Mutex<Option<SizeInt32>>>,
     closed: Arc<AtomicBool>,
-    last_error: Arc<Mutex<Option<String>>>,
 }
 
 struct ComGuard(bool);
@@ -134,7 +133,6 @@ impl WindowCapture {
         let size_state = Arc::new(Mutex::new(size));
         let pending_resize = Arc::new(Mutex::new(None));
         let closed = Arc::new(AtomicBool::new(false));
-        let last_error = Arc::new(Mutex::new(None));
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(wake);
 
         let pool_for_frame = pool.clone();
@@ -209,7 +207,6 @@ impl WindowCapture {
             size: size_state,
             pending_resize,
             closed,
-            last_error,
         })
     }
 
@@ -232,11 +229,6 @@ impl WindowCapture {
         self.size.lock().map(|size| *size).unwrap_or_default()
     }
 
-    /// Ошибка пересоздания пула, возникшая асинхронно во время resize.
-    pub fn take_error(&self) -> Option<String> {
-        self.last_error.lock().ok().and_then(|mut slot| slot.take())
-    }
-
     fn recreate_after_resize(&self) {
         let Some(requested) = self.pending_resize.lock().ok().and_then(|pending| *pending) else {
             return;
@@ -254,9 +246,10 @@ impl WindowCapture {
             2,
             requested,
         ) {
-            if let Ok(mut slot) = self.last_error.lock() {
-                *slot = Some(err.to_string());
-            }
+            // Раньше ошибка складывалась в слот `last_error`, который никто
+            // не читал: отказ пересоздания пула был не просто незаметен —
+            // он даже в журнал не попадал. Слот убран, причина пишется.
+            tracing::warn!(error = %err, "не удалось пересоздать пул кадров захвата после изменения размера");
             return;
         }
         if let Ok(mut size) = self.size.lock() {

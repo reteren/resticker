@@ -206,11 +206,6 @@ impl Phase {
         self.duration_ms
     }
 
-    /// Обновляет длительность перехода.
-    pub fn set_duration_ms(&mut self, duration_ms: f64) {
-        self.duration_ms = duration_ms.max(0.0);
-    }
-
     /// Принудительно задаёт линейное значение фазы (с ограничением в [0.0, 1.0]).
     pub fn set_value(&mut self, value: f64) {
         self.value = value.clamp(0.0, 1.0);
@@ -249,22 +244,6 @@ pub fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f64) -> [u8; 3] {
         lerp(a[0] as f64, b[0] as f64, t).round().clamp(0.0, 255.0) as u8,
         lerp(a[1] as f64, b[1] as f64, t).round().clamp(0.0, 255.0) as u8,
         lerp(a[2] as f64, b[2] as f64, t).round().clamp(0.0, 255.0) as u8,
-    ]
-}
-
-/// Линейная интерполяция RGBA-цвета для перекраски по фазе.
-pub fn lerp_rgba(a: [u8; 4], b: [u8; 4], t: f64) -> [u8; 4] {
-    if t <= 0.0 {
-        return a;
-    }
-    if t >= 1.0 {
-        return b;
-    }
-    [
-        lerp(a[0] as f64, b[0] as f64, t).round().clamp(0.0, 255.0) as u8,
-        lerp(a[1] as f64, b[1] as f64, t).round().clamp(0.0, 255.0) as u8,
-        lerp(a[2] as f64, b[2] as f64, t).round().clamp(0.0, 255.0) as u8,
-        lerp(a[3] as f64, b[3] as f64, t).round().clamp(0.0, 255.0) as u8,
     ]
 }
 

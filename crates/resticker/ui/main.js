@@ -963,19 +963,40 @@ document.getElementById('denylist-list').addEventListener('click', async (e) => 
 
 // ==== Подвал: Применить / ОК / Отмена ====
 
+const applyButton = document.getElementById('apply');
+const okButton = document.getElementById('ok');
+let applying = false;
+
 async function applyChanges() {
-  await invoke('update_settings', { settings: draftSettings });
-  await invoke('update_hotkeys', { hotkeys: draftHotkeys });
-  setStatus(t('footer.applied'));
+  // Обе кнопки запускают один двухшаговый commit: повторный клик в середине
+  // мог отправить вторую пару команд и оставить настройки в смешанном виде.
+  if (applying) return false;
+  applying = true;
+  applyButton.disabled = true;
+  okButton.disabled = true;
+  try {
+    await invoke('update_settings', { settings: draftSettings });
+    await invoke('update_hotkeys', { hotkeys: draftHotkeys });
+    setStatus(t('footer.applied'));
+    return true;
+  } catch (err) {
+    setStatus(t('error.generic', { err }));
+    return false;
+  } finally {
+    applying = false;
+    applyButton.disabled = false;
+    okButton.disabled = false;
+  }
 }
 
-document.getElementById('apply').addEventListener('click', () => {
-  applyChanges();
+applyButton.addEventListener('click', () => {
+  void applyChanges();
 });
 
-document.getElementById('ok').addEventListener('click', async () => {
-  await applyChanges();
-  await getCurrentWindow().close();
+okButton.addEventListener('click', async () => {
+  if (await applyChanges()) {
+    await getCurrentWindow().close();
+  }
 });
 
 document.getElementById('cancel').addEventListener('click', async () => {

@@ -5,8 +5,6 @@
 //! решает, что делать с [`ChromeHit`]. Так десяток кусков не превращается в
 //! постоянный ряд заголовков: полоса строится только при наведении.
 
-#![allow(dead_code)]
-
 use rst_core::hittest::DipRect;
 use rst_render::{Box2D, Icon, Primitive, glass_panel, text_size, theme};
 

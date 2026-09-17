@@ -6,8 +6,6 @@
 //! `HTCAPTION` не двигает окно с `NOACTIVATE`, поэтому drag реализован явно и
 //! завершает захват ровно одним событием `Moved`.
 
-#![allow(dead_code)]
-
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -274,11 +272,6 @@ impl CropWindow {
     /// Сырой HWND полосы; обычно координатору нужен только `hwnd`.
     pub fn strip_hwnd(&self) -> HWND {
         self.strip_hwnd
-    }
-
-    /// Поменять область источника без пересоздания окон.
-    pub fn set_source_rect(&self, source_rect: SourceRect) -> Result<(), CropWindowError> {
-        self.post_command(Command::SetSourceRect(source_rect))
     }
 
     /// Поменять opacity именно DWM-превью, не альфу окна.
@@ -584,7 +577,6 @@ impl DragTracker {
 
 #[derive(Debug)]
 enum Command {
-    SetSourceRect(SourceRect),
     SetOpacity(u8),
     SetBounds(Rect),
     Minimize(Point),
@@ -1487,10 +1479,6 @@ impl WindowState {
 
     fn apply_command(&mut self, command: Command) {
         match command {
-            Command::SetSourceRect(rect) => {
-                self.source_rect = rect;
-                self.sync_thumbnail();
-            }
             Command::SetOpacity(opacity) => {
                 self.opacity = opacity;
                 self.sync_thumbnail();

@@ -40,19 +40,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GW_HWNDPREV, GWL_EXSTYLE,
-    GWLP_USERDATA, GetClassNameW, GetMessageW, GetSystemMetrics, GetWindow,
-    GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTCLIENT,
-    HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, KillTimer, LWA_ALPHA, MSG,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA, WM_APP, WM_CAPTURECHANGED,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN,
-    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
-    WM_NCHITTEST, WM_POWERBROADCAST, WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    GWLP_USERDATA, GetClassNameW, GetMessageW, GetWindow, GetWindowDisplayAffinity,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTCLIENT, HTTRANSPARENT,
+    HWND_TOPMOST, IsWindowVisible, KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW, SW_SHOW,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WHEEL_DELTA,
+    WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST, WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use windows::core::{PCWSTR, w};
 
@@ -376,77 +375,32 @@ impl OverlayWindow {
     /// пиксели виртуального десктопа, docs/M3_PREP_NOTES.md, раздел 3.1 —
     /// обычно `crate::monitors::MonitorInfo::bounds_px`) и запускает его
     /// цикл сообщений на отдельном потоке. На процесс может быть несколько
-    /// окон (M3: окно на монитор).
-    ///
-    /// Глобальный хоткей входа/выхода из режима редактирования
-    /// регистрируется **ровно один раз на процесс** (M3, раздел 3.3):
-    /// `edit_hotkey = Some(combo)` — для окна, владеющего хоткеем (логично
-    /// — окно основного монитора), `None` — для остальных, они создаются
-    /// без регистрации и без конфликтов. `toggle_all_hotkey` — опциональный
-    /// хоткей «показать/скрыть все стикеры» (M2b7): `None`, когда в конфиге
-    /// пусто или комбинация не парсится. `mute_all_hotkey` — тот же паттерн
-    /// для «заглушить все стикеры» (M5d, `hotkeys.mute_all`).
-    /// `pin_focused_hotkey` — тот же опциональный паттерн для
-    /// «закрепить/открепить сфокусированное окно» (редизайн пинов,
-    /// `hotkeys.pin_focused_window`). Конфликт
-    /// регистрации — не паника:
-    /// окно работает, а наружу уходит событие
-    /// [`OverlayEvent::HotkeyConflict`]. Возвращает управление, когда окно
+    /// окон (M3: окно на монитор). Возвращает управление, когда окно
     /// гарантированно создано, и приёмник событий мыши/клавиатуры/хоткеев —
     /// координатор объединяет его со своим каналом команд
     /// (docs/M2_INTEGRATION_PLAN.md, раздел 1).
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_on_monitor(
-        bounds_px: Rect,
-        edit_hotkey: Option<HotkeyCombo>,
-        toggle_all_hotkey: Option<HotkeyCombo>,
-        mute_all_hotkey: Option<HotkeyCombo>,
-        pin_focused_hotkey: Option<HotkeyCombo>,
-    ) -> Result<(Self, Receiver<OverlayEvent>), Win32Error> {
-        Self::create_on_monitor_with_groups(
-            bounds_px,
-            edit_hotkey,
-            toggle_all_hotkey,
-            mute_all_hotkey,
-            pin_focused_hotkey,
-            Vec::new(),
-        )
-    }
-
-    /// То же плюс пакет хоткеев групп (`crate::hotkey::group_hotkey_combos`).
     ///
-    /// Отдельный конструктор, а не шестой аргумент у существующего: групповых
-    /// комбинаций одиннадцать, они приходят одним списком, и добавление
-    /// параметра переписало бы два десятка тестовых вызовов ради `Vec::new()`
-    /// в каждом.
+    /// `combos` — ГОТОВЫЙ набор постоянных хоткеев, тот самый, что отдаёт
+    /// [`all_hotkey_combos`] и принимает [`Self::reload_hotkeys`]. Набор при
+    /// создании окна и набор при перерегистрации из настроек обязаны
+    /// собираться ОДНОЙ функцией, иначе «Применить» и перезапуск программы
+    /// дают разные хоткеи — ровно так и разъехались локальные копии
+    /// комбинаций в координаторе, из-за чего смена бинда откатывалась на
+    /// первом же переподключении монитора.
     ///
-    /// Пакет регистрируется через [`RegisteredHotkeySet::register_all`]:
-    /// `Ctrl+Shift+<цифра>` занята во множестве приложений, и один занятый
-    /// хоткей не должен мешать остальным.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_on_monitor_with_groups(
+    /// Пустой список — окно без единого хоткея: глобальные хоткеи
+    /// регистрирует ровно одно окно на процесс (M3, docs/M3_PREP_NOTES.md,
+    /// раздел 3.3), остальные создаются без них и без конфликтов. Конфликт
+    /// регистрации — не паника: окно работает, а наружу уходит событие
+    /// [`OverlayEvent::HotkeyConflict`].
+    pub fn create_on_monitor_with_hotkeys(
         bounds_px: Rect,
-        edit_hotkey: Option<HotkeyCombo>,
-        toggle_all_hotkey: Option<HotkeyCombo>,
-        mute_all_hotkey: Option<HotkeyCombo>,
-        pin_focused_hotkey: Option<HotkeyCombo>,
-        group_hotkeys: Vec<(i32, HotkeyCombo)>,
+        combos: Vec<(i32, HotkeyCombo)>,
     ) -> Result<(Self, Receiver<OverlayEvent>), Win32Error> {
         let (ready_tx, ready_rx) = mpsc::channel::<ReadyResult>();
         let (event_tx, event_rx) = mpsc::channel::<OverlayEvent>();
 
-        let thread = thread::spawn(move || {
-            run_message_loop(
-                ready_tx,
-                event_tx,
-                bounds_px,
-                edit_hotkey,
-                toggle_all_hotkey,
-                mute_all_hotkey,
-                pin_focused_hotkey,
-                group_hotkeys,
-            )
-        });
+        let thread = thread::spawn(move || run_message_loop(ready_tx, event_tx, bounds_px, combos));
 
         let hwnd = ready_rx
             .recv()
@@ -459,33 +413,6 @@ impl OverlayWindow {
             },
             event_rx,
         ))
-    }
-
-    /// Совместимость с единственным текущим вызывающим кодом
-    /// (`overlay_manager.rs` — до подключения per-monitor создания в M3):
-    /// окно на основной монитор с геометрией системного экрана
-    /// (`GetSystemMetrics`), хоткей режима редактирования регистрируется
-    /// безусловно. При миграции координатора на [`Self::create_on_monitor`]
-    /// метод удаляется.
-    pub fn create(
-        edit_hotkey: HotkeyCombo,
-        toggle_all_hotkey: Option<HotkeyCombo>,
-    ) -> Result<(Self, Receiver<OverlayEvent>), Win32Error> {
-        // SAFETY: GetSystemMetrics безопасен с любого потока, аргумент — константа.
-        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-        let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-        Self::create_on_monitor(
-            Rect {
-                x: 0,
-                y: 0,
-                w: width.max(0) as u32,
-                h: height.max(0) as u32,
-            },
-            Some(edit_hotkey),
-            toggle_all_hotkey,
-            None,
-            None,
-        )
     }
 
     /// Сырой `HWND` для передачи в `rst-render::Renderer::new(hwnd, width, height)`.
@@ -1279,8 +1206,25 @@ fn char_from_wm_char(unit: u16, pending: &mut Option<u16>) -> Option<char> {
 /// настройках их не касается.
 pub fn all_hotkey_combos(hotkeys: &Hotkeys) -> Vec<(i32, HotkeyCombo)> {
     let mut combos = Vec::new();
+    // Режим редактирования — единственный обязательный хоткей программы
+    // (остальные снимаются кнопкой «Очистить» в настройках): `null` или
+    // неразбираемая строка в конфиге не должны оставлять пользователя без
+    // входа в режим, поэтому подставляется дефолт. Фолбэк живёт здесь, а не
+    // у координатора, потому что этот набор собирают ОБА пути — создание
+    // окна при запуске и перерегистрация из настроек; фолбэк на одном из
+    // них означал бы, что «Применить» и перезапуск дают разные хоткеи.
+    if let Some(combo) = hotkeys
+        .edit_mode
+        .as_deref()
+        .and_then(|s| HotkeyCombo::parse(s).ok())
+        .or_else(|| HotkeyCombo::parse(Hotkeys::DEFAULT_EDIT_MODE).ok())
+    {
+        combos.push((EDIT_HOTKEY_ID, combo));
+    }
+    // Остальные постоянные — опциональные: пусто в конфиге значит «не
+    // назначен», и подставлять сюда дефолт нельзя, иначе снятый кнопкой
+    // «Очистить» хоткей возвращался бы сам.
     for (id, raw) in [
-        (EDIT_HOTKEY_ID, hotkeys.edit_mode.as_deref()),
         (TOGGLE_ALL_HOTKEY_ID, hotkeys.toggle_all_stickers.as_deref()),
         (MUTE_ALL_HOTKEY_ID, hotkeys.mute_all.as_deref()),
         (PIN_FOCUSED_HOTKEY_ID, hotkeys.pin_focused_window.as_deref()),
@@ -1417,16 +1361,11 @@ fn group_number_of(id: i32) -> Option<u8> {
         .then(|| (id - base + 1) as u8)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_message_loop(
     ready_tx: Sender<ReadyResult>,
     event_tx: Sender<OverlayEvent>,
     bounds_px: Rect,
-    edit_hotkey: Option<HotkeyCombo>,
-    toggle_all_hotkey: Option<HotkeyCombo>,
-    mute_all_hotkey: Option<HotkeyCombo>,
-    pin_focused_hotkey: Option<HotkeyCombo>,
-    group_hotkeys: Vec<(i32, HotkeyCombo)>,
+    initial_combos: Vec<(i32, HotkeyCombo)>,
 ) {
     let hwnd = match create_window(bounds_px) {
         Ok(v) => v,
@@ -1462,25 +1401,12 @@ fn run_message_loop(
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
     }
 
-    // Стартовый набор — все постоянные хоткеи программы одним пакетом.
-    // `None` в аргументах конструктора означает «не регистрировать»: глобальные
-    // хоткеи регистрирует ровно одно окно на процесс (M3, docs/M3_PREP_NOTES.md,
-    // раздел 3.3), остальные создаются без них.
-    let mut initial_combos: Vec<(i32, HotkeyCombo)> = Vec::new();
-    if let Some(combo) = edit_hotkey {
-        initial_combos.push((EDIT_HOTKEY_ID, combo));
-    }
-    if let Some(combo) = toggle_all_hotkey {
-        initial_combos.push((TOGGLE_ALL_HOTKEY_ID, combo));
-    }
-    if let Some(combo) = mute_all_hotkey {
-        initial_combos.push((MUTE_ALL_HOTKEY_ID, combo));
-    }
-    if let Some(combo) = pin_focused_hotkey {
-        initial_combos.push((PIN_FOCUSED_HOTKEY_ID, combo));
-    }
-    initial_combos.extend(group_hotkeys);
-
+    // Стартовый набор — все постоянные хоткеи программы одним пакетом, ровно
+    // тот же список, что потом приходит на `WM_APP_REREGISTER_HOTKEYS`.
+    // Пустой список — окно без хоткеев: глобальные хоткеи регистрирует ровно
+    // одно окно на процесс (M3, docs/M3_PREP_NOTES.md, раздел 3.3), остальные
+    // создаются без них.
+    //
     // Хоткеи — на этом же потоке (тип `!Send`, ADR-009). Конфликт окно не
     // ломает (ARCHITECTURE.md, раздел 5.1), но наружу уходит событием
     // `OverlayEvent::HotkeyConflict`, чтобы координатор мог предупредить
@@ -2473,9 +2399,11 @@ mod tests {
 
     #[test]
     fn create_then_drop_destroys_window() {
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
-                .expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, test_hotkey())],
+        )
+        .expect("создание оверлея");
         let hwnd = overlay.hwnd();
         assert!(!hwnd.0.is_null());
 
@@ -2495,7 +2423,7 @@ mod tests {
     #[test]
     fn window_uses_given_bounds() {
         let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+            OverlayWindow::create_on_monitor_with_hotkeys(test_bounds(), Vec::new())
                 .expect("создание оверлея");
 
         // Позиция и размер окна — ровно границы монитора, не (0, 0) и не
@@ -2516,7 +2444,7 @@ mod tests {
     #[test]
     fn set_bounds_moves_and_resizes_window() {
         let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+            OverlayWindow::create_on_monitor_with_hotkeys(test_bounds(), Vec::new())
                 .expect("создание оверлея");
         assert_eq!(overlay.size(), (1280, 1024));
 
@@ -2562,9 +2490,11 @@ mod tests {
 
     #[test]
     fn input_policy_interactive_clears_transparency_and_noactivate() {
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
-                .expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, test_hotkey())],
+        )
+        .expect("создание оверлея");
         overlay.apply_input_policy(OverlayInputPolicy::Interactive { take_focus: false });
         let ex = wait_exstyle(overlay.hwnd(), |ex| {
             ex & (WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0) == 0
@@ -2583,9 +2513,11 @@ mod tests {
 
     #[test]
     fn input_policy_transparent_restores_both_bits() {
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
-                .expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, test_hotkey())],
+        )
+        .expect("создание оверлея");
         overlay.apply_input_policy(OverlayInputPolicy::Interactive { take_focus: false });
         wait_exstyle(overlay.hwnd(), |ex| ex & WS_EX_TRANSPARENT.0 == 0);
         overlay.apply_input_policy(OverlayInputPolicy::Transparent);
@@ -2602,9 +2534,11 @@ mod tests {
         // Попиксельный режим снимает прозрачность (иначе до WM_NCHITTEST
         // дело не дойдёт), но НЕ даёт окну фокус: клик по кнопке куска не
         // должен уводить фокус из окна, в котором человек печатает.
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
-                .expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, test_hotkey())],
+        )
+        .expect("создание оверлея");
         overlay.apply_input_policy(OverlayInputPolicy::HitRects(vec![(10, 10, 50, 50)]));
         let ex = wait_exstyle(overlay.hwnd(), |ex| ex & WS_EX_TRANSPARENT.0 == 0);
         assert_eq!(
@@ -2619,9 +2553,11 @@ mod tests {
     fn input_policy_hover_target_matches_old_hover_click_target() {
         // Полоса перемотки обязана вести себя ровно как раньше: снята только
         // прозрачность, фокус окно не получает.
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
-                .expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, test_hotkey())],
+        )
+        .expect("создание оверлея");
         overlay.apply_input_policy(OverlayInputPolicy::HoverTarget);
         let ex = wait_exstyle(overlay.hwnd(), |ex| ex & WS_EX_TRANSPARENT.0 == 0);
         assert_eq!(ex & WS_EX_TRANSPARENT.0, 0, "полоса ловит мышь");
@@ -2633,9 +2569,11 @@ mod tests {
         // `HitRects(vec![])` со снятой прозрачностью — окно, которое не
         // прозрачно, но и не ловит ничего. Примитив обязан развернуть такой
         // вход в прозрачность сам, не надеясь на вызывающего.
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
-                .expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, test_hotkey())],
+        )
+        .expect("создание оверлея");
         overlay.apply_input_policy(OverlayInputPolicy::Interactive { take_focus: false });
         wait_exstyle(overlay.hwnd(), |ex| ex & WS_EX_TRANSPARENT.0 == 0);
         overlay.apply_input_policy(OverlayInputPolicy::HitRects(Vec::new()));
@@ -2649,9 +2587,11 @@ mod tests {
 
     #[test]
     fn set_click_through_toggles_exstyle_bits() {
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
-                .expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, test_hotkey())],
+        )
+        .expect("создание оверлея");
         // SAFETY: чтение стиля своего же окна.
         let initial = unsafe { GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE) } as u32;
         assert_ne!(
@@ -2681,9 +2621,11 @@ mod tests {
 
     #[test]
     fn set_capture_affinity_round_trips_and_verifies() {
-        let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(test_hotkey()), None, None, None)
-                .expect("создание оверлея");
+        let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, test_hotkey())],
+        )
+        .expect("создание оверлея");
 
         let hidden = overlay
             .set_capture_affinity(true)
@@ -2713,7 +2655,7 @@ mod tests {
         // set_click_through, чтобы не бороться за фокус — но сами биты
         // WS_EX_TRANSPARENT|WS_EX_NOACTIVATE переключаются одинаково.
         let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+            OverlayWindow::create_on_monitor_with_hotkeys(test_bounds(), Vec::new())
                 .expect("создание оверлея");
 
         overlay.set_interactive(true);
@@ -2733,17 +2675,6 @@ mod tests {
             "не интерактивно — клик-прозрачно"
         );
         assert_ne!(restored & WS_EX_NOACTIVATE.0, 0);
-    }
-
-    #[test]
-    fn create_covers_system_screen() {
-        // Совместимость с текущим единственным вызывающим кодом: окно на
-        // основной монитор, размер — системный экран.
-        let (overlay, _events) =
-            OverlayWindow::create(test_hotkey(), None).expect("создание оверлея");
-        // SAFETY: GetSystemMetrics безопасен с любого потока.
-        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-        assert_eq!(overlay.size(), (w.max(0) as u32, h.max(0) as u32));
     }
 
     #[test]
@@ -2824,17 +2755,77 @@ mod tests {
         assert_eq!(state.hotkeys.len(), 2);
     }
 
+    /// Живая перерегистрация набора (кнопка «Применить» в настройках):
+    /// комбинация, убранная из конфига, реально освобождается системой, а
+    /// новая достаётся окну — измеряется самой Windows (чужая регистрация
+    /// той же комбинации), а не внутренним состоянием `WndState`.
+    ///
+    /// F13/F14 больше нигде в тестах крейта не заняты: тестовый бинарник
+    /// один на весь крейт и потоки идут параллельно, поэтому комбинации
+    /// тестов не должны пересекаться.
+    #[test]
+    fn reload_hotkeys_frees_old_combo_and_takes_new() {
+        let old = HotkeyCombo::parse("Ctrl+Alt+Shift+F13").expect("валидная комбинация");
+        let fresh = HotkeyCombo::parse("Ctrl+Alt+Shift+F14").expect("валидная комбинация");
+        let (overlay, events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, old)],
+        )
+        .expect("создание оверлея");
+
+        // До перерегистрации старая комбинация принадлежит окну: чужая
+        // регистрация обязана провалиться конфликтом.
+        match crate::hotkey::RegisteredHotkey::register(0x5301, old) {
+            Err(Win32Error::HotkeyConflict(_)) => {}
+            other => panic!("старая комбинация должна быть занята окном: {other:?}"),
+        }
+
+        overlay.reload_hotkeys(vec![(EDIT_HOTKEY_ID, fresh)]);
+
+        loop {
+            match events.recv_timeout(Duration::from_secs(5)) {
+                Ok(OverlayEvent::HotkeysReloaded {
+                    registered,
+                    conflicts,
+                }) => {
+                    assert_eq!(registered, 1, "новая комбинация зарегистрирована");
+                    assert!(conflicts.is_empty(), "конфликтов быть не должно");
+                    break;
+                }
+                // Окно живёт своей жизнью (топмост, курсор) — чужие события
+                // пропускаем, ждём отчёт о перерегистрации.
+                Ok(_) => continue,
+                Err(e) => panic!("окно не прислало HotkeysReloaded: {e}"),
+            }
+        }
+
+        // Старая комбинация снята: теперь её можно занять.
+        let freed = crate::hotkey::RegisteredHotkey::register(0x5301, old)
+            .expect("старая комбинация освобождена перерегистрацией");
+        drop(freed);
+
+        // Новая — за окном.
+        match crate::hotkey::RegisteredHotkey::register(0x5302, fresh) {
+            Err(Win32Error::HotkeyConflict(_)) => {}
+            other => panic!("новая комбинация должна быть занята окном: {other:?}"),
+        }
+    }
+
     #[test]
     fn second_window_with_same_hotkey_reports_conflict() {
         // Экзотическая комбинация — не конфликтует с реальными приложениями
         // на машине разработчика/CI (F22 не используется другими тестами).
         let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F22").expect("валидная комбинация");
-        let (_first, _first_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None, None, None)
-                .expect("первое окно");
-        let (_second, second_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None, None, None)
-                .expect("второе окно");
+        let (_first, _first_events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, combo)],
+        )
+        .expect("первое окно");
+        let (_second, second_events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, combo)],
+        )
+        .expect("второе окно");
 
         // Хоткей регистрируется на pump-потоке до сигнала готовности, поэтому
         // к моменту возврата create() конфликт уже лежит в канале событий.
@@ -2856,11 +2847,13 @@ mod tests {
         // раздел 3.3). Первое окно регистрирует комбинацию, второе создаётся
         // с `None` — без регистрации и без события HotkeyConflict.
         let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F21").expect("валидная комбинация");
-        let (_first, _first_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(combo), None, None, None)
-                .expect("первое окно");
+        let (_first, _first_events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, combo)],
+        )
+        .expect("первое окно");
         let (_second, second_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+            OverlayWindow::create_on_monitor_with_hotkeys(test_bounds(), Vec::new())
                 .expect("второе окно");
 
         match second_events.recv_timeout(Duration::from_millis(300)) {
@@ -2878,17 +2871,19 @@ mod tests {
         // У второго окна другой edit-хоткей (F19), чтобы конфликт пришёл
         // именно от toggle_all, а не от режима редактирования.
         let edit2 = HotkeyCombo::parse("Ctrl+Alt+Shift+F19").expect("валидная комбинация");
-        let (_first, _first_events) = OverlayWindow::create_on_monitor(
+        let (_first, _first_events) = OverlayWindow::create_on_monitor_with_hotkeys(
             test_bounds(),
-            Some(test_hotkey()),
-            Some(toggle),
-            None,
-            None,
+            vec![
+                (EDIT_HOTKEY_ID, test_hotkey()),
+                (TOGGLE_ALL_HOTKEY_ID, toggle),
+            ],
         )
         .expect("первое окно");
-        let (_second, second_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), Some(edit2), Some(toggle), None, None)
-                .expect("второе окно");
+        let (_second, second_events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(EDIT_HOTKEY_ID, edit2), (TOGGLE_ALL_HOTKEY_ID, toggle)],
+        )
+        .expect("второе окно");
 
         // Тот же паттерн, что и для edit-хоткея: конфликт — событие, а не
         // ошибка создания окна.
@@ -2909,12 +2904,16 @@ mod tests {
         // и с другими тестами (F18; F19/F20/F21/F22/F23/F24 заняты соседними
         // тестами).
         let mute = HotkeyCombo::parse("Ctrl+Alt+Shift+F18").expect("валидная комбинация");
-        let (_first, _first_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, Some(mute), None)
-                .expect("первое окно");
-        let (_second, second_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, Some(mute), None)
-                .expect("второе окно");
+        let (_first, _first_events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(MUTE_ALL_HOTKEY_ID, mute)],
+        )
+        .expect("первое окно");
+        let (_second, second_events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(MUTE_ALL_HOTKEY_ID, mute)],
+        )
+        .expect("второе окно");
 
         match second_events.recv_timeout(Duration::from_secs(5)) {
             Ok(OverlayEvent::HotkeyConflict(name, s)) => {
@@ -2933,12 +2932,16 @@ mod tests {
         // реальными приложениями и с другими тестами (F17; F18–F24 заняты
         // соседними тестами).
         let pin = HotkeyCombo::parse("Ctrl+Alt+Shift+F17").expect("валидная комбинация");
-        let (_first, _first_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, Some(pin))
-                .expect("первое окно");
-        let (_second, second_events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, Some(pin))
-                .expect("второе окно");
+        let (_first, _first_events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(PIN_FOCUSED_HOTKEY_ID, pin)],
+        )
+        .expect("первое окно");
+        let (_second, second_events) = OverlayWindow::create_on_monitor_with_hotkeys(
+            test_bounds(),
+            vec![(PIN_FOCUSED_HOTKEY_ID, pin)],
+        )
+        .expect("второе окно");
 
         match second_events.recv_timeout(Duration::from_secs(5)) {
             Ok(OverlayEvent::HotkeyConflict(name, s)) => {
@@ -2953,7 +2956,7 @@ mod tests {
     #[test]
     fn dpi_changed_applies_recommended_rect_and_reports_event() {
         let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+            OverlayWindow::create_on_monitor_with_hotkeys(test_bounds(), Vec::new())
                 .expect("создание оверлея");
 
         // Как в настоящем WM_DPICHANGED: wParam — новый DPI (младшее слово —
@@ -2997,7 +3000,7 @@ mod tests {
     #[test]
     fn dpi_changed_with_zero_dpi_is_ignored() {
         let (overlay, _events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+            OverlayWindow::create_on_monitor_with_hotkeys(test_bounds(), Vec::new())
                 .expect("создание оверлея");
         let before = overlay.size();
         // Нулевой DPI в wParam быть не должен; окно не трогаем (и lParam
@@ -3072,7 +3075,7 @@ mod tests {
         // до канала событий проверяется целиком; системная регистрация
         // (WTSRegisterSessionNotification) здесь не участвует.
         let (overlay, events) =
-            OverlayWindow::create_on_monitor(test_bounds(), None, None, None, None)
+            OverlayWindow::create_on_monitor_with_hotkeys(test_bounds(), Vec::new())
                 .expect("создание оверлея");
         // SAFETY: hwnd — наше живое окно; порядок сообщений в очереди окна
         // гарантируется (FIFO), значит и порядок событий в канале.
@@ -3120,6 +3123,48 @@ mod tests {
         for m in &monitors {
             assert!(m.id.0.starts_with("\\\\?\\DISPLAY#"), "id: {}", m.id.0);
         }
+    }
+
+    /// Набор для регистрации собирается ОДНОЙ функцией и для создания окна,
+    /// и для живой перерегистрации, поэтому подстановка дефолта и пропуск
+    /// снятых хоткеев проверяются прямо здесь: разойдись эти два пути — и
+    /// «Применить» давало бы один набор, а перезапуск другой.
+    #[test]
+    fn all_hotkey_combos_defaults_edit_mode_and_skips_cleared() {
+        let hotkeys = Hotkeys {
+            // Пользователь снял всё, что снимается кнопкой «Очистить».
+            edit_mode: None,
+            toggle_all_stickers: None,
+            mute_all: None,
+            pin_focused_window: None,
+            edit_groups_menu: None,
+            delete_open_group: None,
+            open_group_by_number: Vec::new(),
+            unpin_all: None,
+            pin_open_group: None,
+            window_mitosis: None,
+            window_crop: None,
+        };
+        let combos = all_hotkey_combos(&hotkeys);
+        assert_eq!(
+            combos,
+            vec![(
+                EDIT_HOTKEY_ID,
+                HotkeyCombo::parse(Hotkeys::DEFAULT_EDIT_MODE).expect("дефолт разбирается")
+            )],
+            "остаётся только обязательный режим редактирования — с дефолтной комбинацией"
+        );
+
+        // Неразбираемая строка — тот же случай, что пустая: вход в режим
+        // редактирования не должен пропадать из-за опечатки в config.json.
+        let broken = Hotkeys {
+            edit_mode: Some("Ctrl+Alt+Ы".to_string()),
+            ..hotkeys
+        };
+        assert_eq!(
+            all_hotkey_combos(&broken).first().map(|(id, _)| *id),
+            Some(EDIT_HOTKEY_ID)
+        );
     }
 
     #[test]

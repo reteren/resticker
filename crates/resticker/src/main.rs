@@ -21,20 +21,11 @@ mod group_strip;
 mod groups;
 mod i18n;
 mod input_policy;
-// Бейдж номера монитора (T7). `dead_code`: бейдж подключает координатор в
-// `overlay_manager.rs` отдельной задачей, и до этого момента модуль никто
-// не вызывает — а удалять его нельзя, это готовый API для координатора;
-// предупреждение снимется само при первом использовании.
 mod logging;
-#[allow(dead_code)]
-mod monitor_badge;
-// Чистый билдер примитивов предпросмотра разреза (M9, «Митоз окон», §4.3).
-// `dead_code`: подключает координатор в `overlay_manager.rs` отдельной задачей,
-// и до этого момента модуль никто не вызывает — а удалять его нельзя, это
-// готовый API для координатора; предупреждение снимется само при первом
-// использовании (тот же приём, что у `monitor_badge`).
-#[allow(dead_code)]
+/// Чистый билдер примитивов предпросмотра разреза (M9, «Митоз окон», §4.3).
 mod mitosis_overlay;
+/// Бейдж номера монитора (T7).
+mod monitor_badge;
 mod overlay_manager;
 mod preset_picker;
 mod preset_strip;
@@ -261,8 +252,9 @@ fn update_settings(settings: Settings, overlay: tauri::State<OverlayHandle>) {
     overlay.send(OverlayCommand::UpdateSettings(settings));
 }
 
-/// Заменить `cfg.hotkeys` целиком (вкладка «Управление») — применяется
-/// после перезапуска resticker (доккомент `OverlayCommand::UpdateHotkeys`).
+/// Заменить `cfg.hotkeys` целиком (вкладка «Управление») — новые комбинации
+/// начинают работать сразу, без перезапуска (доккомент
+/// `OverlayCommand::UpdateHotkeys`).
 #[tauri::command]
 fn update_hotkeys(hotkeys: Hotkeys, overlay: tauri::State<OverlayHandle>) {
     overlay.send(OverlayCommand::UpdateHotkeys(hotkeys));
@@ -606,15 +598,6 @@ fn panic_marker_path_for_log(log_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(PANIC_MARKER_FILE)
-}
-
-/// Путь стабилен относительно `%LOCALAPPDATA%`, поэтому координатор может
-/// прочитать ту же метку до того, как главный поток покажет тост и удалит её.
-#[allow(dead_code)] // До подключения стартового баннера вызывается из overlay_manager.
-pub(crate) fn panic_marker_path_from_env() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|base| base.join("resticker").join(PANIC_MARKER_FILE))
 }
 
 /// Запись после `tracing::error!` не должна сама паниковать: двойная паника

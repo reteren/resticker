@@ -79,7 +79,9 @@ pub const MAX_ROWS: usize = 9;
 const MAX_MEMBERS: usize = 8;
 
 const TITLE_LABEL: &str = "Window groups";
-const EMPTY_LABEL: &str = "No groups yet — press Alt+Shift+G to build one.";
+/// Подпись пустого списка, когда хоткей меню набора не назначен вовсе:
+/// советовать нечего, кроме кнопки, которая стоит тут же.
+const EMPTY_LABEL_NO_HOTKEY: &str = "No groups yet — use \"New group\" below.";
 const CLOSE_LABEL: &str = "Close";
 /// Слово «группа» в подписи строки — подпись должна читаться, а не считываться.
 const GROUP_WORD: &str = "Group";
@@ -302,13 +304,38 @@ pub fn height(count: usize, expanded_members: usize) -> f64 {
         + theme::BUTTON_SIZE
 }
 
+/// Подпись пустого списка: комбинацию берёт вызывающий из ЖИВОГО конфига.
+///
+/// Раньше здесь стоял литерал «press Alt+Shift+G» — он пережил две смены
+/// дефолта (`Ctrl+Alt+G`, затем `Ctrl+Shift+G`) и любую перенастройку
+/// пользователем, то есть панель советовала нажать то, что ничего не делает
+/// (и ровно ту пару `Alt+Shift`, которую Windows отдаёт переключателю
+/// раскладки). Строка
+/// собирается здесь, а не у вызывающего, чтобы формулировка обоих случаев
+/// (хоткей есть / хоткея нет) лежала рядом с остальными подписями панели.
+fn empty_label(open_hotkey: Option<&str>) -> String {
+    match open_hotkey {
+        Some(combo) => format!("No groups yet — press {combo} to build one."),
+        None => EMPTY_LABEL_NO_HOTKEY.to_string(),
+    }
+}
+
 /// Собрать панель.
 ///
 /// `expanded` — индекс раскрытой группы в срезе `groups` (`None` — все
 /// свёрнуты). Раскрыта не больше одной: две раскрытые группы по восемь окон
 /// уже не помещаются на экран, а выбирать, какую обрезать, — решение, которое
 /// пользователю объяснить нечем.
-pub fn build(groups: &[WindowGroup], expanded: Option<usize>, frame: Box2D) -> Panel {
+///
+/// `open_hotkey` — комбинация, открывающая меню набора окон, в том виде, в
+/// каком она РЕАЛЬНО зарегистрирована (`None` — не назначена или не
+/// разбирается). Показывается только в подписи пустого списка.
+pub fn build(
+    groups: &[WindowGroup],
+    expanded: Option<usize>,
+    frame: Box2D,
+    open_hotkey: Option<&str>,
+) -> Panel {
     let mut panel = Panel::new(PANEL_ID, frame)
         .with_corner_radius(theme::RADIUS_WINDOW)
         .with_surface(glass::Surface::Modal);
@@ -336,7 +363,7 @@ pub fn build(groups: &[WindowGroup], expanded: Option<usize>, frame: Box2D) -> P
             ID_EMPTY,
             left,
             cy,
-            &truncate_to_width(EMPTY_LABEL, content_w),
+            &truncate_to_width(&empty_label(open_hotkey), content_w),
             theme::TEXT_DIM_OPACITY,
         ));
         // Подпись занимает строку списка ровно как настоящая группа —
@@ -479,6 +506,9 @@ mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    /// Комбинация меню набора в том виде, в каком её отдаёт координатор.
+    const HOTKEY: Option<&str> = Some("Ctrl+Shift+G");
+
     fn member(title: &str) -> GroupMember {
         GroupMember {
             exe_path: PathBuf::from("app.exe"),
@@ -523,12 +553,33 @@ mod tests {
         }
     }
 
+    /// Подсказка пустого списка обязана называть ЖИВУЮ комбинацию: до этого
+    /// здесь стоял литерал `Alt+Shift+G`, переживший смену дефолта, — панель
+    /// советовала нажать то, что не назначено (репорт 2026-09-16).
+    #[test]
+    fn empty_label_names_the_configured_hotkey() {
+        assert!(empty_label(Some("Ctrl+Shift+G")).contains("Ctrl+Shift+G"));
+        assert!(empty_label(Some("Ctrl+Shift+F9")).contains("Ctrl+Shift+F9"));
+    }
+
+    /// Хоткей снят в настройках — советовать нечего, кроме кнопки рядом:
+    /// назвать несуществующую комбинацию было бы тем же обманом.
+    #[test]
+    fn empty_label_without_hotkey_points_at_the_button() {
+        let text = empty_label(None);
+        assert!(
+            !text.contains('+'),
+            "комбинации в тексте быть не должно: {text}"
+        );
+        assert!(text.contains(NEW_LABEL), "должна называть кнопку: {text}");
+    }
+
     #[test]
     fn empty_list_still_builds_a_usable_panel() {
         // Первый запуск: групп нет. Панель обязана открыться и объяснить,
         // что делать, а не показать пустоту.
         let f = frame(0, 0);
-        let panel = build(&[], None, f);
+        let panel = build(&[], None, f, HOTKEY);
         assert!(panel.widget::<StaticText>(ID_EMPTY).is_some());
         assert!(panel.widget::<Button>(BTN_CLOSE).is_some());
     }
@@ -540,7 +591,7 @@ mod tests {
     #[test]
     fn empty_list_label_does_not_overlap_the_action_row() {
         let f = frame(0, 0);
-        let panel = build(&[], None, f);
+        let panel = build(&[], None, f, HOTKEY);
         let label = panel
             .widget::<StaticText>(ID_EMPTY)
             .map(Widget::bounds)
@@ -566,7 +617,7 @@ mod tests {
     fn every_group_gets_its_own_row_and_delete_button() {
         let groups: Vec<WindowGroup> = (1..=3).map(|n| group(n, 2)).collect();
         let f = frame(groups.len(), 0);
-        let panel = build(&groups, None, f);
+        let panel = build(&groups, None, f, HOTKEY);
         for i in 0..groups.len() {
             assert!(
                 panel.widget::<Button>(ROW_BASE + i as WidgetId).is_some(),
@@ -584,7 +635,7 @@ mod tests {
     #[test]
     fn a_collapsed_group_does_not_show_its_windows() {
         let groups = vec![group(1, 3)];
-        let panel = build(&groups, None, frame(1, 0));
+        let panel = build(&groups, None, frame(1, 0), HOTKEY);
         assert!(
             panel.widget::<StaticText>(MEMBER_BASE).is_none(),
             "свёрнутая группа не должна показывать состав"
@@ -594,7 +645,7 @@ mod tests {
     #[test]
     fn an_expanded_group_lists_every_window_inside_it() {
         let groups = vec![group(1, 4)];
-        let panel = build(&groups, Some(0), frame(1, 4));
+        let panel = build(&groups, Some(0), frame(1, 4), HOTKEY);
         for m in 0..4 {
             assert!(
                 panel
@@ -614,7 +665,7 @@ mod tests {
             .map(|n| group(n, MAX_GROUP_MEMBERS))
             .collect();
         let f = frame(groups.len(), MAX_GROUP_MEMBERS);
-        let panel = build(&groups, Some(0), f);
+        let panel = build(&groups, Some(0), f, HOTKEY);
         let mut ids: Vec<WidgetId> = vec![BTN_NEW, BTN_CLOSE];
         for i in 0..groups.len() {
             ids.push(ROW_BASE + i as WidgetId);
@@ -628,8 +679,8 @@ mod tests {
         // Строки состава вставляются под своей группой, а не поверх — иначе
         // раскрытая группа накрыла бы соседнюю.
         let groups: Vec<WindowGroup> = (1..=3).map(|n| group(n, 3)).collect();
-        let collapsed = build(&groups, None, frame(3, 0));
-        let expanded = build(&groups, Some(0), frame(3, 3));
+        let collapsed = build(&groups, None, frame(3, 0), HOTKEY);
+        let expanded = build(&groups, Some(0), frame(3, 3), HOTKEY);
         let row1_collapsed = collapsed
             .widget::<Button>(ROW_BASE + 1)
             .map(Widget::bounds)
@@ -650,7 +701,7 @@ mod tests {
         // и счётчик в скобках, и понять её было нельзя (репорт 2026-08-26).
         // Теперь она читается словами и несёт номер — цифру хоткея.
         let groups = vec![group(7, 2)];
-        let panel = build(&groups, None, frame(1, 0));
+        let panel = build(&groups, None, frame(1, 0), HOTKEY);
         let mut prims = Vec::new();
         panel.draw(&mut prims);
         let readable = prims.iter().any(|p| match p {
@@ -677,7 +728,7 @@ mod tests {
             rotation: 0.0,
         };
         let groups = vec![group(1, 2)];
-        let _ = build(&groups, Some(0), f);
+        let _ = build(&groups, Some(0), f, HOTKEY);
     }
 
     #[test]
@@ -687,7 +738,7 @@ mod tests {
         let mut g = group(1, MAX_GROUP_MEMBERS);
         g.members.push(member("лишнее окно"));
         let f = frame(1, MAX_GROUP_MEMBERS);
-        let panel = build(&[g], Some(0), f);
+        let panel = build(&[g], Some(0), f, HOTKEY);
         assert!(
             panel
                 .widget::<StaticText>(MEMBER_BASE + MAX_MEMBERS as WidgetId)
@@ -702,7 +753,7 @@ mod tests {
         // §4: корпус — одна плита стекла. Раньше фон был «рамка + заливка»
         // (два Fill), теперь — одна Primitive::Glass с Surface::Modal.
         let f = frame(0, 0);
-        let panel = build(&[], None, f);
+        let panel = build(&[], None, f, HOTKEY);
         let mut prims = Vec::new();
         panel.draw(&mut prims);
         assert!(
@@ -722,7 +773,7 @@ mod tests {
         // §8.8: строка списка — карточка стекла, выбранная (раскрытая)
         // строка залита светом. Раньше фон строки был плоской заливкой.
         let groups: Vec<WindowGroup> = (1..=2).map(|n| group(n, 2)).collect();
-        let collapsed = build(&groups, None, frame(2, 0));
+        let collapsed = build(&groups, None, frame(2, 0), HOTKEY);
         let mut prims = Vec::new();
         collapsed.draw(&mut prims);
         assert!(
@@ -735,7 +786,7 @@ mod tests {
             )),
             "свёрнутые строки обязаны быть карточками стекла"
         );
-        let expanded = build(&groups, Some(0), frame(2, 2));
+        let expanded = build(&groups, Some(0), frame(2, 2), HOTKEY);
         let mut prims = Vec::new();
         expanded.draw(&mut prims);
         assert!(

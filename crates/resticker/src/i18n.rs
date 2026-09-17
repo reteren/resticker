@@ -210,6 +210,27 @@ pub fn hotkey_conflict_notification(
     )
 }
 
+/// Тост об итоге живой перерегистрации хоткеев (кнопка «Применить» в
+/// настройках): часть комбинаций занята другими приложениями и не досталась
+/// программе. `more` — сколько ещё комбинаций конфликтует кроме `combo`.
+///
+/// Одно уведомление на весь набор, а не по одному на комбинацию: хоткеев
+/// полтора десятка, и очередь из тостов прочитать невозможно — назвать надо
+/// первую занятую и число остальных.
+pub fn hotkeys_reloaded_conflicts(combo: &str, more: usize) -> (String, String) {
+    let title = "Hotkey not assigned".to_string();
+    let body = if more > 0 {
+        format!(
+            "{combo} and {more} more combinations are already used by other applications — those hotkeys did not take effect."
+        )
+    } else {
+        format!(
+            "The {combo} combination is already used by another application — that hotkey did not take effect."
+        )
+    };
+    (title, body)
+}
+
 /// Тост следующего запуска после аварийного завершения процесса. При
 /// `panic = "abort"` и GUI-подсистеме окно ошибки Windows не появляется, а
 /// резидентная программа просто исчезает — пользователю нужно явно назвать

@@ -281,7 +281,9 @@ fn modal_density_backdrop(canvas: &mut Canvas) {
 /// Отрисовать менеджер групп, при необходимости убрав модальную накладку
 /// для контрольного кадра со старым телом `GLASS_INK @ 0.62`.
 fn draw_group_manager_density(canvas: &mut Canvas, frame: Box2D, old_body: bool) {
-    let panel = crate::group_manager::build(&[], None, frame);
+    // Дефолтная комбинация: снимок плотности сравнивает КОРПУС панели, и
+    // подпись пустого списка обязана быть одинаковой в обоих кадрах.
+    let panel = crate::group_manager::build(&[], None, frame, Some("Ctrl+Shift+G"));
     let mut prims = Vec::new();
     panel.draw(&mut prims);
     if old_body {

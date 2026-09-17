@@ -198,26 +198,24 @@ struct MonitorState {
 /// должно сразу стать интерактивным (`set_interactive`), иначе мышь на нём
 /// проваливалась бы сквозь режим, как и у остальных окон в этот момент
 /// (M3_PREP_NOTES.md §3.5).
-#[allow(clippy::too_many_arguments)]
+///
+/// `hotkeys` — готовый набор постоянных хоткеев: непустой
+/// (`rst_win32::overlay::all_hotkey_combos(&cfg.hotkeys)`) для окна основного
+/// монитора и пустой для остальных. Именно `&cfg.hotkeys`, а не разобранная
+/// когда-то при старте копия: набор пересобирается из ЖИВОГО конфига на
+/// каждое создание окна, иначе смена бинда в настройках откатывалась бы к
+/// старому на первом же переподключении монитора или смене основного экрана.
 fn create_monitor_state(
     device: &Device,
     tx: &Sender<OverlayMessage>,
     info: &monitors::MonitorInfo,
-    edit_hotkey: Option<HotkeyCombo>,
-    toggle_all_hotkey: Option<HotkeyCombo>,
-    mute_all_hotkey: Option<HotkeyCombo>,
-    pin_focused_hotkey: Option<HotkeyCombo>,
-    group_hotkeys: Vec<(i32, HotkeyCombo)>,
+    hotkeys: Vec<(i32, HotkeyCombo)>,
     edit_active: bool,
     hide_from_capture: bool,
 ) -> Option<MonitorState> {
-    let (overlay, events) = match OverlayWindow::create_on_monitor_with_groups(
+    let (overlay, events) = match OverlayWindow::create_on_monitor_with_hotkeys(
         info.bounds_px,
-        edit_hotkey,
-        toggle_all_hotkey,
-        mute_all_hotkey,
-        pin_focused_hotkey,
-        group_hotkeys,
+        hotkeys,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -431,7 +429,12 @@ fn teardown_monitor_state(
 
 /// Хоткей входа/выхода из режима редактирования по умолчанию (CONFIG.md),
 /// если в конфиге он не задан или не парсится.
-const DEFAULT_EDIT_HOTKEY: &str = "Ctrl+Alt+S";
+///
+/// Псевдоним константы модели, а не второй литерал: ту же подстановку делает
+/// `rst_win32::overlay::all_hotkey_combos` при регистрации, и разойтись они
+/// не должны — иначе онбординг назовёт одну комбинацию, а работать будет
+/// другая.
+const DEFAULT_EDIT_HOTKEY: &str = Hotkeys::DEFAULT_EDIT_MODE;
 
 /// Текст тоста первого запуска (ROADMAP.md M8) — `None`, если он уже был
 /// показан (`Settings::onboarding_shown`). Чистая функция: логика решения
@@ -2736,10 +2739,12 @@ pub enum OverlayCommand {
     /// (докком `add_sticker`/`OverlayHandle`): Tauri-поток не трогает диск
     /// напрямую, чтобы не гонять запись параллельно с координатором.
     UpdateSettings(Settings),
-    /// Заменить `cfg.hotkeys` целиком (вкладка «Управление»). Применяется
-    /// только к `config.json` — живая перерегистрация `RegisterHotKey` в
-    /// этом срезе не реализована (хоткеи регистрируются один раз при
-    /// создании окна монитора), эффект — после перезапуска resticker.
+    /// Заменить `cfg.hotkeys` целиком (вкладка «Управление»). Действует
+    /// СРАЗУ: координатор пишет `config.json` и тут же переустанавливает
+    /// весь набор `RegisterHotKey` у окна основного монитора
+    /// (`OverlayWindow::reload_hotkeys`) — перезапуск не нужен. Итог
+    /// перерегистрации приходит обратно событием
+    /// `OverlayEvent::HotkeysReloaded`.
     UpdateHotkeys(Hotkeys),
     SetStickerEnabled(Uuid, bool),
     DeleteSticker(Uuid),
@@ -4479,40 +4484,6 @@ fn run(
         }
     }
 
-    let hotkey = cfg
-        .hotkeys
-        .edit_mode
-        .as_deref()
-        .and_then(|s| HotkeyCombo::parse(s).ok())
-        .or_else(|| HotkeyCombo::parse(DEFAULT_EDIT_HOTKEY).ok())
-        .expect("DEFAULT_EDIT_HOTKEY — валидная комбинация");
-    // В отличие от edit_hotkey, этот хоткей опционален: пустая/некорректная
-    // настройка просто не регистрирует его (нет дефолта-фолбэка).
-    let toggle_all_hotkey = cfg
-        .hotkeys
-        .toggle_all_stickers
-        .as_deref()
-        .and_then(|s| HotkeyCombo::parse(s).ok());
-    // «Заглушить все стикеры» (M5d) — тот же опциональный паттерн, что и
-    // toggle_all_hotkey выше: `AudioMixer::set_muted` уже существует, не
-    // хватало только регистрации самого хоткея.
-    let mute_all_hotkey = cfg
-        .hotkeys
-        .mute_all
-        .as_deref()
-        .and_then(|s| HotkeyCombo::parse(s).ok());
-    // «Закрепить/открепить сфокусированное окно» (редизайн пинов,
-    // `hotkeys.pin_focused_window`, дефолт «Ctrl+Alt+T») — тот же
-    // опциональный паттерн, что у трёх предыдущих; на пустое/непарсящееся
-    // значение регистрируется дефолт (дефолт задан в `Hotkeys::default()`).
-    let pin_focused_hotkey = cfg
-        .hotkeys
-        .pin_focused_window
-        .as_deref()
-        .and_then(|s| HotkeyCombo::parse(s).ok())
-        .or_else(|| HotkeyCombo::parse("Ctrl+Alt+T").ok())
-        .expect("дефолтный пин-хоткей — валидная комбинация");
-
     // M3: окно на каждый подключённый монитор, а не один захардкоженный
     // основной (M3_PREP_NOTES.md, раздел 5). Перечисление — при старте;
     // переперечисление на `WM_DISPLAYCHANGE` (`OverlayEvent::MonitorsChanged`)
@@ -4687,27 +4658,16 @@ fn run(
     for info in &monitor_infos {
         // Глобальные хоткеи — ровно одно окно на процесс (основного
         // монитора), остальные создаются без них, чтобы не конфликтовать.
-        let (edit_hotkey, this_toggle_all, this_mute_all, this_pin_focused, this_groups) =
-            if info.id == primary_id {
-                (
-                    Some(hotkey),
-                    toggle_all_hotkey,
-                    mute_all_hotkey,
-                    Some(pin_focused_hotkey),
-                    rst_win32::hotkey::group_hotkey_combos(&cfg.hotkeys),
-                )
-            } else {
-                (None, None, None, None, Vec::new())
-            };
+        let this_hotkeys = if info.id == primary_id {
+            rst_win32::overlay::all_hotkey_combos(&cfg.hotkeys)
+        } else {
+            Vec::new()
+        };
         if let Some(ms) = create_monitor_state(
             &device,
             &tx,
             info,
-            edit_hotkey,
-            this_toggle_all,
-            this_mute_all,
-            this_pin_focused,
-            this_groups,
+            this_hotkeys,
             false,
             cfg.settings.hide_from_capture,
         ) {
@@ -5995,10 +5955,6 @@ fn run(
                             &device,
                             &tx,
                             info,
-                            None,
-                            None,
-                            None,
-                            None,
                             Vec::new(),
                             edit.active,
                             cfg.settings.hide_from_capture,
@@ -6011,11 +5967,7 @@ fn run(
                             &device,
                             &tx,
                             info,
-                            Some(hotkey),
-                            toggle_all_hotkey,
-                            mute_all_hotkey,
-                            Some(pin_focused_hotkey),
-                            rst_win32::hotkey::group_hotkey_combos(&cfg.hotkeys),
+                            rst_win32::overlay::all_hotkey_combos(&cfg.hotkeys),
                             edit.active,
                             cfg.settings.hide_from_capture,
                         ) {
@@ -6036,32 +5988,16 @@ fn run(
                     if monitors_map.contains_key(&info.id) {
                         continue;
                     }
-                    let (
-                        edit_hotkey,
-                        this_toggle_all,
-                        this_mute_all,
-                        this_pin_focused,
-                        this_groups,
-                    ) = if info.id == new_primary_id {
-                        (
-                            Some(hotkey),
-                            toggle_all_hotkey,
-                            mute_all_hotkey,
-                            Some(pin_focused_hotkey),
-                            rst_win32::hotkey::group_hotkey_combos(&cfg.hotkeys),
-                        )
+                    let this_hotkeys = if info.id == new_primary_id {
+                        rst_win32::overlay::all_hotkey_combos(&cfg.hotkeys)
                     } else {
-                        (None, None, None, None, Vec::new())
+                        Vec::new()
                     };
                     if let Some(ms) = create_monitor_state(
                         &device,
                         &tx,
                         info,
-                        edit_hotkey,
-                        this_toggle_all,
-                        this_mute_all,
-                        this_pin_focused,
-                        this_groups,
+                        this_hotkeys,
                         edit.active,
                         cfg.settings.hide_from_capture,
                     ) {
@@ -6807,21 +6743,11 @@ fn run(
                     );
                 }
                 if let Some(first) = conflicts.first() {
-                    let body = if conflicts.len() > 1 {
-                        format!(
-                            "{} и ещё {}: заняты другими приложениями",
-                            first.combo,
-                            conflicts.len() - 1
-                        )
-                    } else {
-                        format!("{}: занята другим приложением", first.combo)
-                    };
+                    let (title, body) =
+                        crate::i18n::hotkeys_reloaded_conflicts(&first.combo, conflicts.len() - 1);
                     let _ = edit
                         .coordinator_tx
-                        .send(CoordinatorRequest::ShowNotification {
-                            title: "Хоткей не назначен".to_string(),
-                            body,
-                        });
+                        .send(CoordinatorRequest::ShowNotification { title, body });
                 }
             }
             OverlayMessage::Event(_, OverlayEvent::UnpinAll) => {
@@ -12639,6 +12565,22 @@ fn take_group_editor_clicks(
     changed
 }
 
+/// Комбинация, которой открывается меню набора окон, — в том виде, в каком
+/// она РЕАЛЬНО зарегистрирована, или `None`, если не назначена.
+///
+/// Не просто строка из конфига: неразбираемое значение `RegisterHotKey` не
+/// получает (`rst_win32::overlay::all_hotkey_combos` такие пропускает), и
+/// показать его в подсказке значило бы снова советовать нажать то, что не
+/// сработает. Разбор с обратной сборкой даёт ещё и единый вид записи
+/// («ctrl+shift+g» из правленого руками конфига покажется как `Ctrl+Shift+G`).
+fn groups_menu_hotkey_label(cfg: &Config) -> Option<String> {
+    cfg.hotkeys
+        .edit_groups_menu
+        .as_deref()
+        .and_then(|s| HotkeyCombo::parse(s).ok())
+        .map(|combo| combo.display_string())
+}
+
 /// Открыть панель менеджера групп на мониторе панели у курсора.
 ///
 /// Пока открыто меню набора, панель встаёт на ЕГО мониторе, а не там, где
@@ -12663,6 +12605,7 @@ fn open_group_manager(
             &cfg.groups,
             None,
             group_manager_frame(&screen, cfg.groups.len(), 0),
+            groups_menu_hotkey_label(cfg).as_deref(),
         ),
         monitor_id,
         expanded: None,
@@ -12707,6 +12650,7 @@ fn rebuild_group_manager(
             &cfg.groups,
             expanded,
             group_manager_frame(&screen, cfg.groups.len(), members),
+            groups_menu_hotkey_label(cfg).as_deref(),
         ),
         monitor_id,
         expanded,

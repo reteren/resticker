@@ -432,7 +432,7 @@ fn member_without_a_saved_place_reads_back_as_none() {
 #[test]
 fn group_hotkey_defaults_are_exactly_the_spec_combos() {
     let h = Hotkeys::default();
-    assert_eq!(h.edit_groups_menu.as_deref(), Some("Ctrl+Alt+G"));
+    assert_eq!(h.edit_groups_menu.as_deref(), Some("Ctrl+Shift+G"));
     assert_eq!(h.delete_open_group.as_deref(), Some("Ctrl+Alt+Shift+G"));
     for n in 1..=9 {
         assert_eq!(
@@ -456,7 +456,10 @@ fn old_config_without_t5_fields_gains_group_hotkey_defaults() {
     .unwrap();
 
     assert_eq!(cfg.hotkeys.edit_mode.as_deref(), Some("Ctrl+Alt+S"));
-    assert_eq!(cfg.hotkeys.edit_groups_menu.as_deref(), Some("Ctrl+Alt+G"));
+    assert_eq!(
+        cfg.hotkeys.edit_groups_menu.as_deref(),
+        Some("Ctrl+Shift+G")
+    );
     assert_eq!(
         cfg.hotkeys.delete_open_group.as_deref(),
         Some("Ctrl+Alt+Shift+G")
@@ -474,7 +477,10 @@ fn fixture_v1_gains_group_hotkey_defaults() {
         cfg.hotkeys.toggle_all_stickers.as_deref(),
         Some("Ctrl+Alt+H")
     );
-    assert_eq!(cfg.hotkeys.edit_groups_menu.as_deref(), Some("Ctrl+Alt+G"));
+    assert_eq!(
+        cfg.hotkeys.edit_groups_menu.as_deref(),
+        Some("Ctrl+Shift+G")
+    );
     assert_eq!(cfg.hotkeys.open_group_by_number.len(), 9);
 }
 
