@@ -1,7 +1,7 @@
 {
   "$schema": "../../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "resticker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "dev.resticker.app",
   "build": {
     "frontendDist": "ui"
@@ -20,7 +20,7 @@
         "decorations": false,
         "transparent": true,
         "shadow": false,
-        "theme": "dark",
+        "theme": "Dark",
         "windowEffects": {
           "effects": [
             "acrylic"
@@ -41,7 +41,7 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "focus": true,
-        "theme": "dark",
+        "theme": "Dark",
         "windowEffects": {
           "effects": [
             "acrylic"

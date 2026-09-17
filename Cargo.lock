@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "resticker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2882,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "rst-audio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cpal",
  "thiserror 2.0.19",
@@ -2892,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "rst-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -2904,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "rst-media"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "rst-core",
@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "rst-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fontdue",
  "image",
@@ -2929,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "rst-video"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ffmpeg-sys-next",
  "thiserror 2.0.19",
@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "rst-win32"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "rst-core",
