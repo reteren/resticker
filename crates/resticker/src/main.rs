@@ -41,7 +41,7 @@ mod window_picker;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Mutex, mpsc};
 
 use anyhow::Context;
 use rst_core::model::{Config, Hotkeys, OverlapRule, Settings};
@@ -49,102 +49,234 @@ use tauri::{Emitter, Manager, WindowEvent};
 use uuid::Uuid;
 
 use overlay_manager::{CoordinatorRequest, OverlayCommand, OverlayHandle};
-use rst_win32::tray::{self, MenuItem, TrayEvent, TrayIcon};
+use rst_win32::tray::{TrayEvent, TrayIcon};
 
-const MENU_OPEN_SETTINGS: u32 = 1;
-const MENU_TOGGLE_VISIBLE: u32 = 2;
-const MENU_EXIT: u32 = 3;
-/// «Режим редактирования» — дубль глобального хоткея на случай, когда его
-/// перехватывает чужая программа.
-const MENU_EDIT_MODE: u32 = 4;
-/// Первый id пункта меню трея под пресет (M7, «быстрое переключение из
-/// трея» — ROADMAP.md). `WM_COMMAND` несёт id только в младшем слове
-/// `wParam` (Win32-соглашение, `tray.rs::wndproc` берёт `wparam.0 & 0xffff`)
-/// — 16 бит, поэтому пункт кодирует не сам `Uuid` пресета, а его индекс в
-/// списке на момент последней пересборки меню; обратное соответствие —
-/// `preset_ids` ниже.
-const MENU_PRESET_BASE: u32 = 100;
-/// Пункт «задать величину зазора»: открывает панель с полем ввода поверх
-/// экрана. Значение вписывается числом или крутится колесом мыши — списком
-/// готовых процентов пользователь пользоваться отказался.
+/// Метка окна меню трея (`tauri.conf.json`).
+const TRAY_MENU_LABEL: &str = "traymenu";
+
+/// Где меню должно появиться и ждёт ли оно показа.
 ///
-/// Номер с запасом от `MENU_PRESET_BASE`: пункты пресетов растут вверх от
-/// 100 по числу пресетов, и пересечение диапазонов означало бы, что клик по
-/// зазору применяет пресет.
-const MENU_SNAP_GAP_OPEN: u32 = 1000;
-/// Пункт-галочка «отступ и для обычных окон» в том же подменю.
-const MENU_SNAP_GAP_ALL: u32 = 1100;
-
-/// Собрать пункты меню трея из текущего списка пресетов (M7, «быстрое
-/// переключение из трея» — ROADMAP.md; SPEC.md §12: «пресеты (подменю)») —
-/// постоянные пункты + вложенное подменю «Пресеты» (пусто — не добавляется).
-/// Возвращает и сами пункты, и id-список пресетов в том же порядке, что и
-/// пункты подменю: `preset_ids[i]` — это пресет пункта с
-/// `id == MENU_PRESET_BASE + i` (см. `MENU_PRESET_BASE`).
-/// Подписи пунктов — английские, единственный язык нативного слоя
-/// (`crates/resticker/src/i18n.rs`, доккомент модуля).
-fn build_tray_menu(
-    presets: &[(Uuid, String)],
-    snap_gap_pct: u8,
-    snap_gap_all_windows: bool,
-) -> (Vec<MenuItem>, Vec<Uuid>) {
-    // Текущее значение вынесено в ЗАГОЛОВОК подменю, а не только в галочку
-    // пункта: процент можно вписать руками в настройках, и произвольное
-    // число (17%) не совпадёт ни с одним пунктом списка — без заголовка
-    // подменю выглядело бы так, будто отступ выключен.
-    let snap_gap_title = if snap_gap_pct == 0 {
-        i18n::tray_snap_gap_submenu().to_string()
-    } else {
-        format!("{} ({snap_gap_pct}%)", i18n::tray_snap_gap_submenu())
-    };
-    let mut items = vec![
-        MenuItem::new(MENU_OPEN_SETTINGS, i18n::tray_open_settings()),
-        tray::separator(),
-        MenuItem::new(MENU_EDIT_MODE, i18n::tray_edit_mode()),
-        MenuItem::new(MENU_TOGGLE_VISIBLE, i18n::tray_toggle_visible()),
-        MenuItem::submenu(snap_gap_title, snap_gap_items(snap_gap_all_windows)),
-    ];
-    let ids: Vec<Uuid> = presets.iter().map(|(id, _)| *id).collect();
-    if !ids.is_empty() {
-        let children = presets
-            .iter()
-            .enumerate()
-            .map(|(i, (_, name))| MenuItem::new(MENU_PRESET_BASE + i as u32, name.clone()))
-            .collect();
-        items.push(tray::separator());
-        items.push(MenuItem::submenu(i18n::tray_presets_submenu(), children));
-    }
-    items.push(tray::separator());
-    items.push(MenuItem::new(MENU_EXIT, i18n::tray_exit()));
-    (items, ids)
+/// Точка приходит из потока трея, а размер — из webview уже после отрисовки
+/// (число пресетов меняет высоту). Показать окно раньше, чем известны оба,
+/// значит на мгновение показать пустую дыру в экране у курсора.
+#[derive(Default)]
+struct TrayMenuState {
+    /// Экранная точка клика, физические пиксели.
+    origin: Mutex<Option<(i32, i32)>>,
+    /// `true` — меню просили открыть и оно ждёт размера от webview.
+    pending: std::sync::atomic::AtomicBool,
 }
 
-/// Пункты подменю «Snap gap»: открыть виджет с числом и переключить область
-/// действия.
+/// Попросить окно меню пересобраться под текущее состояние и показаться.
 ///
-/// Раньше здесь был список готовых значений (`Off`, `5%`, `10%`, …), и
-/// пользователь пожаловался на него прямо: «мне не нравится, что я не могу
-/// сам вписать число». Список ушёл целиком — вписать произвольный процент
-/// пунктами `HMENU` невозможно в принципе (Windows не кладёт в меню поле
-/// ввода), поэтому величину задаёт панель поверх экрана, а меню её только
-/// открывает. Само значение видно в ЗАГОЛОВКЕ подменю.
+/// Само показывает не здесь: сначала webview перечитывает конфиг и сообщает
+/// свой размер ([`tray_menu_ready`]).
+fn show_tray_menu<R: tauri::Runtime>(app: &impl tauri::Manager<R>, x: i32, y: i32) {
+    let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) else {
+        return;
+    };
+    {
+        let state = app.state::<TrayMenuState>();
+        *state.origin.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y));
+        state
+            .pending
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    // Открытое меню по повторному клику закрывается — так ведёт себя и
+    // системное, и любая кнопка-переключатель программы.
+    if w.is_visible().unwrap_or(false) {
+        let _ = w.hide();
+        app.state::<TrayMenuState>()
+            .pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        return;
+    }
+    // `emit`, а не `emit_to`: у окна настроек событие «показались» ходит
+    // именно так и доходит до его `listen` (main.js). Адресный вариант с
+    // меткой окна тихо не доезжал до webview — меню получало размер при
+    // загрузке страницы и больше ни одного события.
+    let _ = w.emit("tray-menu-shown", ());
+    tracing::debug!(x, y, "меню трея: запрошен показ");
+
+    // Страховка на случай, если webview промолчит (страница ещё грузится,
+    // скрипт упал): через четверть секунды показываем меню с тем размером,
+    // который оно сообщило в прошлый раз. Иначе правый клик по иконке
+    // выглядел бы как «ничего не произошло» — ровно то, чего мы избегаем.
+    let app_for_fallback = app.app_handle().clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let state = app_for_fallback.state::<TrayMenuState>();
+        if !state
+            .pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        tracing::warn!("меню трея: webview не ответил, показываем прежним размером");
+        let Some(w) = app_for_fallback.get_webview_window(TRAY_MENU_LABEL) else {
+            return;
+        };
+        let size = w.outer_size().unwrap_or(tauri::PhysicalSize::new(232, 240));
+        let origin = *state.origin.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((x, y)) = origin {
+            let (px, py) = place_tray_menu(&w, x, y, size.width as i32, size.height as i32);
+            let _ = w.set_position(tauri::PhysicalPosition::new(px, py));
+        }
+        let _ = w.show();
+        let _ = w.set_focus();
+    });
+}
+
+/// Webview отрисовал меню и сообщил его размер: ставим окно у курсора и
+/// показываем.
 ///
-/// Галочка области действия помечается точкой: `MenuItem` не поддерживает
-/// `MF_CHECKED` — меню рисуется владельцем (`MF_OWNERDRAW`, см. `tray.rs`),
-/// и состояние пункта до отрисовки не доезжает.
-fn snap_gap_items(all_windows: bool) -> Vec<MenuItem> {
-    vec![
-        MenuItem::new(MENU_SNAP_GAP_OPEN, i18n::tray_snap_gap_set()),
-        tray::separator(),
-        MenuItem::new(
-            MENU_SNAP_GAP_ALL,
-            if all_windows {
-                format!("• {}", i18n::tray_snap_gap_all_windows())
-            } else {
-                format!("   {}", i18n::tray_snap_gap_all_windows())
-            },
-        ),
-    ]
+/// Размер приходит в логических пикселях (CSS), позиция — в физических:
+/// первое масштабирует Tauri сам, второе — экранная точка клика.
+#[tauri::command]
+fn tray_menu_ready(width: f64, height: f64, app: tauri::AppHandle) {
+    let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) else {
+        return;
+    };
+    let _ = w.set_size(tauri::LogicalSize::new(width, height));
+    let state = app.state::<TrayMenuState>();
+    // Первый доклад приходит при загрузке страницы, когда меню никто не
+    // просил: он только задаёт размер.
+    if !state
+        .pending
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let Some((x, y)) = *state.origin.lock().unwrap_or_else(|e| e.into_inner()) else {
+        return;
+    };
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let (pw, ph) = (
+        (width * scale).round() as i32,
+        (height * scale).round() as i32,
+    );
+    tracing::debug!(width, height, "меню трея: webview прислал размер");
+    let (px, py) = place_tray_menu(&w, x, y, pw, ph);
+    let _ = w.set_position(tauri::PhysicalPosition::new(px, py));
+    let _ = w.show();
+    let _ = w.set_focus();
+    watch_focus_loss(&app, &w);
+}
+
+/// Закрывать меню, как только фокус ушёл на другое окно.
+///
+/// Своим наблюдателем, а не событием окна: `WindowEvent::Focused` для этого
+/// окна не приходит вовсе (замер 2026-09-17 — в обработчик падали только
+/// `Moved`/`Resized`, а меню оставалось висеть на экране после клика мимо
+/// него). Спросить у Windows, какое окно сейчас впереди, можно всегда.
+///
+/// Поток живёт ровно пока открыто меню: опрос вдесятеро реже кадра, и по
+/// первому же чужому окну впереди он заканчивается вместе с меню.
+fn watch_focus_loss<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    window: &tauri::WebviewWindow<R>,
+) {
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let menu_hwnd = hwnd.0 as isize;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // Небольшая фора: между `show` и реальным приходом фокуса Windows
+        // успевает подержать впереди прежнее окно, и наблюдатель закрыл бы
+        // меню в тот же миг, когда его открыли.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        loop {
+            let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) else {
+                return;
+            };
+            if !w.is_visible().unwrap_or(false) {
+                return;
+            }
+            if rst_win32::window_pick::foreground_window() != menu_hwnd {
+                let _ = w.hide();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+    });
+}
+
+/// Левый верхний угол меню размера `w`×`h` (физические пиксели) для клика в
+/// точке `x`,`y`.
+///
+/// Меню раскрывается ВВЕРХ И ВЛЕВО от курсора: иконка трея живёт в правом
+/// нижнем углу, и любое другое направление упёрлось бы в край экрана. Если
+/// монитор известен, результат прижимается к его границам — на верхнем
+/// мониторе вертикальной пары меню иначе уезжало бы за верхний край.
+fn place_tray_menu<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> (i32, i32) {
+    /// Зазор между меню и курсором/краем экрана, физические пиксели.
+    const GAP: i32 = 6;
+    let (mut px, mut py) = (x - w - GAP, y - h - GAP);
+    if let Ok(Some(monitor)) = window.monitor_from_point(f64::from(x), f64::from(y)) {
+        let pos = monitor.position();
+        let size = monitor.size();
+        let (min_x, min_y) = (pos.x + GAP, pos.y + GAP);
+        let max_x = pos.x + size.width as i32 - w - GAP;
+        let max_y = pos.y + size.height as i32 - h - GAP;
+        px = px.clamp(min_x.min(max_x), max_x.max(min_x));
+        py = py.clamp(min_y.min(max_y), max_y.max(min_y));
+    }
+    (px, py)
+}
+
+/// Спрятать меню трея: клик по пункту, `Esc` или потеря фокуса.
+#[tauri::command]
+fn hide_tray_menu(app: tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) {
+        let _ = w.hide();
+    }
+}
+
+/// Пункт «Открыть настройки».
+#[tauri::command]
+fn open_settings_window(app: tauri::AppHandle) {
+    show_settings_window(&app);
+}
+
+/// Пункт «Режим редактирования» — дубль глобального хоткея на случай, когда
+/// его перехватывает чужая программа.
+#[tauri::command]
+fn tray_toggle_edit_mode(overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::ToggleEditMode);
+}
+
+/// Пункт «Показать/скрыть все стикеры».
+#[tauri::command]
+fn tray_toggle_visible(overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::ToggleAllStickers);
+}
+
+/// Пункт «Зазор в снап-зоне»: панель с полем ввода поверх экрана.
+#[tauri::command]
+fn tray_open_gap_panel(overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::OpenGapPanel);
+}
+
+/// Пункт-переключатель «Все окна, не только закреплённые».
+///
+/// Без значения в аргументе: текущее состояние знает координатор (это его
+/// `cfg`), и вторая копия флага здесь была бы вторым источником правды.
+#[tauri::command]
+fn tray_toggle_snap_gap_all(overlay: tauri::State<OverlayHandle>) {
+    overlay.send(OverlayCommand::ToggleSnapGapAllWindows);
+}
+
+/// Пункт «Выход».
+#[tauri::command]
+fn tray_exit(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 /// Добавить стикер по пути, выбранному в диалоге настроек (M1).
@@ -754,23 +886,7 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "не удалось синхронизировать автозапуск");
     }
 
-    let initial_presets: Vec<(Uuid, String)> =
-        cfg.presets.iter().map(|p| (p.id, p.name.clone())).collect();
-    let (initial_menu, initial_preset_ids) = build_tray_menu(
-        &initial_presets,
-        cfg.settings.snap_shrink_pct,
-        cfg.settings.snap_shrink_all_windows,
-    );
-    // Меню трея рисуем сами и той же гарнитурой, что оверлей (запрос
-    // пользователя 2026-08-23 — «сделай менюшку в трее в стилистику
-    // приложения»): GDI умеет только зарегистрированные шрифты.
-    rst_win32::tray::register_menu_font(rst_render::FONT_BYTES, rst_render::FONT_FAMILY);
-    let (tray_icon, tray_rx) =
-        TrayIcon::new("resticker", initial_menu).context("инициализация иконки трея")?;
-    // Индекс пункта меню → id пресета (см. `MENU_PRESET_BASE`) — общий между
-    // потоком трея (читает при клике) и потоком координатора (пишет при
-    // `CoordinatorRequest::TrayMenuChanged`).
-    let preset_ids = Arc::new(Mutex::new(initial_preset_ids));
+    let (tray_icon, tray_rx) = TrayIcon::new("resticker").context("инициализация иконки трея")?;
 
     let silent_start = cfg.settings.silent_start;
     // Для окна настроек (`get_config`) — читает диск напрямую, не через
@@ -787,6 +903,7 @@ fn main() -> anyhow::Result<()> {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(tray_icon)
+        .manage(TrayMenuState::default())
         .manage(overlay_handle)
         .manage(cfg_path_for_settings)
         .invoke_handler(tauri::generate_handler![
@@ -811,6 +928,14 @@ fn main() -> anyhow::Result<()> {
             add_denylist_rule,
             remove_denylist_rule,
             list_open_processes,
+            tray_menu_ready,
+            hide_tray_menu,
+            open_settings_window,
+            tray_toggle_edit_mode,
+            tray_toggle_visible,
+            tray_open_gap_panel,
+            tray_toggle_snap_gap_all,
+            tray_exit,
         ])
         .setup(move |app| {
             // Прошлый запуск завершился паникой — сказать об этом человеку.
@@ -834,6 +959,15 @@ fn main() -> anyhow::Result<()> {
             });
 
             #[cfg(windows)]
+            // Меню трея — то же безрамочное акриловое окно, что настройки:
+            // системных скруглений у него нет, DWM их и рисует.
+            if let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) {
+                disable_browser_accelerators(&w);
+                if let Ok(hwnd) = w.hwnd() {
+                    rst_win32::dwm::round_window_corners(hwnd.0 as isize);
+                }
+            }
+
             if let Some(w) = app.get_webview_window("settings") {
                 disable_browser_accelerators(&w);
                 // Безрамочное окно Windows не скругляет сама — акриловая
@@ -849,62 +983,17 @@ fn main() -> anyhow::Result<()> {
             }
 
             let handle = app.handle().clone();
-            let preset_ids_for_tray = Arc::clone(&preset_ids);
             std::thread::spawn(move || {
                 for event in tray_rx {
                     match event {
-                        TrayEvent::MenuItem(MENU_OPEN_SETTINGS) | TrayEvent::Activate => {
-                            show_settings_window(&handle);
+                        // Левый клик по иконке — сразу настройки, как и было.
+                        TrayEvent::Activate => show_settings_window(&handle),
+                        // Правый клик — своё окно меню у курсора. Пункты
+                        // больше не приходят сюда номерами: их нажимает
+                        // webview и зовёт обычные команды Tauri.
+                        TrayEvent::ContextMenu { x, y } => {
+                            show_tray_menu(&handle, x, y);
                         }
-                        TrayEvent::MenuItem(MENU_EDIT_MODE) => {
-                            handle
-                                .state::<OverlayHandle>()
-                                .send(OverlayCommand::ToggleEditMode);
-                        }
-                        TrayEvent::MenuItem(MENU_TOGGLE_VISIBLE) => {
-                            handle
-                                .state::<OverlayHandle>()
-                                .send(OverlayCommand::ToggleAllStickers);
-                        }
-                        TrayEvent::MenuItem(MENU_EXIT) => handle.exit(0),
-                        // M7: клик по пункту пресета в меню трея — id несёт
-                        // только индекс в списке на момент последней
-                        // пересборки меню (`build_tray_menu`), сам `Uuid`
-                        // ищем в общем с координатор-потоком `preset_ids`.
-                        // Область действия отступа — галочка без значения,
-                        // поэтому и без диапазона: сравнение точное, и стоять
-                        // оно обязано выше обеих «>=»-веток ниже.
-                        TrayEvent::MenuItem(MENU_SNAP_GAP_ALL) => {
-                            // Переключатель без значения: текущее состояние
-                            // знает координатор (это его `cfg`), и держать
-                            // здесь вторую копию флага значило бы завести
-                            // второй источник правды ради одной галочки.
-                            handle
-                                .state::<OverlayHandle>()
-                                .send(OverlayCommand::ToggleSnapGapAllWindows);
-                        }
-                        // Величина зазора: панель поверх экрана. Ветка стоит
-                        // ВЫШЕ пресетов — их условие `id >= MENU_PRESET_BASE`
-                        // накрывает и этот номер тоже.
-                        TrayEvent::MenuItem(MENU_SNAP_GAP_OPEN) => {
-                            handle
-                                .state::<OverlayHandle>()
-                                .send(OverlayCommand::OpenGapPanel);
-                        }
-                        TrayEvent::MenuItem(id) if id >= MENU_PRESET_BASE => {
-                            let target = {
-                                let ids = preset_ids_for_tray
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                ids.get((id - MENU_PRESET_BASE) as usize).copied()
-                            };
-                            if let Some(preset_id) = target {
-                                handle
-                                    .state::<OverlayHandle>()
-                                    .send(OverlayCommand::ApplyPreset(preset_id));
-                            }
-                        }
-                        TrayEvent::MenuItem(_) => {}
                     }
                 }
             });
@@ -913,7 +1002,6 @@ fn main() -> anyhow::Result<()> {
             // раздел 12): окна живут на главном потоке, оверлей-поток их
             // трогать не может. Обработка — та же, что у пункта трея.
             let coordinator_handle = app.handle().clone();
-            let preset_ids_for_coordinator = Arc::clone(&preset_ids);
             std::thread::spawn(move || {
                 for request in coordinator_rx {
                     match request {
@@ -939,24 +1027,6 @@ fn main() -> anyhow::Result<()> {
                                 tracing::warn!(error = %e, "не удалось показать баллон-уведомление трея");
                             }
                         }
-                        // M7: список пресетов изменился — пересобираем меню
-                        // трея целиком (`TrayIcon::set_menu`) и обновляем
-                        // общий с потоком трея id→Uuid список.
-                        CoordinatorRequest::TrayMenuChanged {
-                            presets,
-                            snap_shrink_pct,
-                            snap_shrink_all_windows,
-                        } => {
-                            let (items, ids) = build_tray_menu(
-                                &presets,
-                                snap_shrink_pct,
-                                snap_shrink_all_windows,
-                            );
-                            *preset_ids_for_coordinator
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = ids;
-                            coordinator_handle.state::<TrayIcon>().set_menu(items);
-                        }
                     }
                 }
             });
@@ -964,6 +1034,18 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // Меню трея закрывается, как только фокус ушёл: меню, пережившее
+            // клик мимо себя, и есть то, чем раздражало системное. Слушаем
+            // здесь, а не в webview: событие фокуса до страницы не доходило
+            // (замер 2026-09-17 — меню оставалось на экране), а окну оно
+            // приходит всегда.
+            if window.label() == TRAY_MENU_LABEL {
+                if let WindowEvent::Focused(false) = event {
+                    let _ = window.hide();
+                }
+                return;
+            }
+
             // Закрытие окна настроек прячет его, а не завершает процесс —
             // приложение живёт в трее (SPEC.md, раздел 12).
             // Оверлей режима редактирования вырезает в себе прямоугольник

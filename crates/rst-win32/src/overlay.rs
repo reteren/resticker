@@ -2323,6 +2323,9 @@ mod tests {
         assert_eq!(pending, None);
     }
     use super::*;
+    // Замок общий с `hotkey::tests`: комбинация системная, делить её надо
+    // на весь тестовый бинарник, а не на модуль.
+    use crate::hotkey::tests::hotkey_guard;
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
@@ -2399,6 +2402,7 @@ mod tests {
 
     #[test]
     fn create_then_drop_destroys_window() {
+        let _guard = hotkey_guard();
         let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
             test_bounds(),
             vec![(EDIT_HOTKEY_ID, test_hotkey())],
@@ -2490,6 +2494,7 @@ mod tests {
 
     #[test]
     fn input_policy_interactive_clears_transparency_and_noactivate() {
+        let _guard = hotkey_guard();
         let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
             test_bounds(),
             vec![(EDIT_HOTKEY_ID, test_hotkey())],
@@ -2513,6 +2518,7 @@ mod tests {
 
     #[test]
     fn input_policy_transparent_restores_both_bits() {
+        let _guard = hotkey_guard();
         let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
             test_bounds(),
             vec![(EDIT_HOTKEY_ID, test_hotkey())],
@@ -2531,6 +2537,7 @@ mod tests {
 
     #[test]
     fn input_policy_hit_rects_keeps_noactivate() {
+        let _guard = hotkey_guard();
         // Попиксельный режим снимает прозрачность (иначе до WM_NCHITTEST
         // дело не дойдёт), но НЕ даёт окну фокус: клик по кнопке куска не
         // должен уводить фокус из окна, в котором человек печатает.
@@ -2551,6 +2558,7 @@ mod tests {
 
     #[test]
     fn input_policy_hover_target_matches_old_hover_click_target() {
+        let _guard = hotkey_guard();
         // Полоса перемотки обязана вести себя ровно как раньше: снята только
         // прозрачность, фокус окно не получает.
         let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
@@ -2566,6 +2574,7 @@ mod tests {
 
     #[test]
     fn input_policy_empty_hit_rects_means_transparent() {
+        let _guard = hotkey_guard();
         // `HitRects(vec![])` со снятой прозрачностью — окно, которое не
         // прозрачно, но и не ловит ничего. Примитив обязан развернуть такой
         // вход в прозрачность сам, не надеясь на вызывающего.
@@ -2587,6 +2596,7 @@ mod tests {
 
     #[test]
     fn set_click_through_toggles_exstyle_bits() {
+        let _guard = hotkey_guard();
         let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
             test_bounds(),
             vec![(EDIT_HOTKEY_ID, test_hotkey())],
@@ -2621,6 +2631,7 @@ mod tests {
 
     #[test]
     fn set_capture_affinity_round_trips_and_verifies() {
+        let _guard = hotkey_guard();
         let (overlay, _events) = OverlayWindow::create_on_monitor_with_hotkeys(
             test_bounds(),
             vec![(EDIT_HOTKEY_ID, test_hotkey())],
@@ -2712,6 +2723,7 @@ mod tests {
     /// окна — `WndState` собирается вручную).
     #[test]
     fn install_hotkeys_isolates_conflicts_and_updates_owned_set() {
+        let _guard = hotkey_guard();
         let state = WndState {
             capture: MouseCapture::new(HWND(std::ptr::null_mut())),
             hit_rects: Vec::new(),
@@ -2765,6 +2777,7 @@ mod tests {
     /// тестов не должны пересекаться.
     #[test]
     fn reload_hotkeys_frees_old_combo_and_takes_new() {
+        let _guard = hotkey_guard();
         let old = HotkeyCombo::parse("Ctrl+Alt+Shift+F13").expect("валидная комбинация");
         let fresh = HotkeyCombo::parse("Ctrl+Alt+Shift+F14").expect("валидная комбинация");
         let (overlay, events) = OverlayWindow::create_on_monitor_with_hotkeys(
@@ -2813,6 +2826,7 @@ mod tests {
 
     #[test]
     fn second_window_with_same_hotkey_reports_conflict() {
+        let _guard = hotkey_guard();
         // Экзотическая комбинация — не конфликтует с реальными приложениями
         // на машине разработчика/CI (F22 не используется другими тестами).
         let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F22").expect("валидная комбинация");
@@ -2843,6 +2857,7 @@ mod tests {
 
     #[test]
     fn window_without_hotkey_does_not_conflict() {
+        let _guard = hotkey_guard();
         // M3: глобальный хоткей — ровно один на процесс (docs/M3_PREP_NOTES.md,
         // раздел 3.3). Первое окно регистрирует комбинацию, второе создаётся
         // с `None` — без регистрации и без события HotkeyConflict.
@@ -2865,6 +2880,7 @@ mod tests {
 
     #[test]
     fn second_window_with_same_toggle_all_hotkey_reports_conflict() {
+        let _guard = hotkey_guard();
         // Экзотическая комбинация — не конфликтует с реальными приложениями
         // и с другими тестами (F20; F21/F22/F23/F24 заняты соседними тестами).
         let toggle = HotkeyCombo::parse("Ctrl+Alt+Shift+F20").expect("валидная комбинация");
@@ -2899,6 +2915,7 @@ mod tests {
 
     #[test]
     fn second_window_with_same_mute_all_hotkey_reports_conflict() {
+        let _guard = hotkey_guard();
         // Тот же паттерн, что и toggle_all выше, для третьего хоткея (M5d).
         // Экзотическая комбинация — не конфликтует с реальными приложениями
         // и с другими тестами (F18; F19/F20/F21/F22/F23/F24 заняты соседними
@@ -2927,6 +2944,7 @@ mod tests {
 
     #[test]
     fn second_window_with_same_pin_focused_hotkey_reports_conflict() {
+        let _guard = hotkey_guard();
         // Тот же паттерн, что и для трёх существующих хоткеев, для четвёртого
         // (редизайн пинов). Экзотическая комбинация — не конфликтует с
         // реальными приложениями и с другими тестами (F17; F18–F24 заняты

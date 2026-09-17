@@ -2847,23 +2847,6 @@ pub enum CoordinatorRequest {
     /// уходили только в лог (`HotkeyConflict`, `PinAccessDenied`) — SPEC.md
     /// требует показать их пользователю, не только записать в файл лога.
     ShowNotification { title: String, body: String },
-    /// Меню трея пора пересобрать. Main.rs строит его целиком заново
-    /// (`TrayIcon::set_menu` другого API не даёт), поэтому запрос несёт всё
-    /// изменчивое содержимое сразу, а не дельту.
-    ///
-    /// Поводов два: изменился список пресетов (сохранение/переименование/
-    /// удаление/импорт — не `ApplyPreset`, он сам список не трогает) и
-    /// изменился отступ снап-зоны (галочка в подменю). Разделять их на две
-    /// команды нечем: обе перестраивают одно и то же меню и обе обязаны
-    /// принести актуальным ВТОРОЕ поле тоже.
-    ///
-    /// Пресеты приходят как `(id, name)`, не полным `Preset`: имя —
-    /// единственное, что нужно пункту меню.
-    TrayMenuChanged {
-        presets: Vec<(Uuid, String)>,
-        snap_shrink_pct: u8,
-        snap_shrink_all_windows: bool,
-    },
 }
 
 /// Сообщение объединённого канала координатора: команда от Tauri, событие от
@@ -5122,7 +5105,6 @@ fn run(
                         cfg.settings.snap_shrink_all_windows,
                     )
                 {
-                    notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
                     enforce_pinned_geometry(
                         &mut edit,
                         &window_pins,
@@ -5390,7 +5372,6 @@ fn run(
                     if let Err(e) = config::save(&cfg, &config_path) {
                         tracing::warn!(error = %e, "не удалось сохранить область действия отступа");
                     }
-                    notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
                     // Снятая галочка ничего не возвращает на место: окна
                     // остаются там, где стоят. Вернуть их в исходные зоны
                     // значило бы двигать чужие окна на ВЫКЛЮЧЕНИИ функции —
@@ -5410,7 +5391,6 @@ fn run(
                 if let Err(e) = config::save(&cfg, &config_path) {
                     tracing::warn!(error = %e, "не удалось сохранить config.json после сохранения пресета");
                 }
-                notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
             }
             OverlayMessage::Command(OverlayCommand::ApplyPreset(id)) => {
                 match presets::apply_preset(&mut cfg, id) {
@@ -5453,7 +5433,6 @@ fn run(
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить config.json после переименования пресета");
                         }
-                        notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
                     }
                     Err(e) => {
                         tracing::warn!(preset = %id, error = %e, "не удалось переименовать пресет")
@@ -5466,7 +5445,6 @@ fn run(
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить config.json после удаления пресета");
                         }
-                        notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
                     }
                     Err(e) => tracing::warn!(preset = %id, error = %e, "не удалось удалить пресет"),
                 }
@@ -5483,7 +5461,6 @@ fn run(
                         if let Err(e) = config::save(&cfg, &config_path) {
                             tracing::warn!(error = %e, "не удалось сохранить config.json после импорта пресета");
                         }
-                        notify_tray_menu_changed(&cfg, &edit.coordinator_tx);
                     }
                     Err(e) => {
                         tracing::warn!(path = %path.display(), error = %e, "не удалось импортировать пресет");
@@ -12070,7 +12047,6 @@ fn apply_snap_gap(
     }
     // Величина видна в заголовке подменю трея — без пересборки там осталось
     // бы прежнее число.
-    notify_tray_menu_changed(cfg, &edit.coordinator_tx);
     enforce_pinned_geometry(
         edit,
         window_pins,
@@ -14406,7 +14382,6 @@ fn handle_preset_picker_up(
             tracing::warn!(preset = %id, error = %e, "не удалось удалить пресет из панели");
         }
         save_after_preset_change(cfg, config_path, "удаления пресета из панели");
-        notify_tray_menu_changed(cfg, &edit.coordinator_tx);
         rebuild_preset_picker(edit, cfg, monitor_geometry);
         return true;
     }
@@ -14427,7 +14402,6 @@ fn handle_preset_picker_up(
         let preset = presets::save_preset(cfg, name);
         cfg.presets.push(preset);
         save_after_preset_change(cfg, config_path, "сохранения пресета из панели");
-        notify_tray_menu_changed(cfg, &edit.coordinator_tx);
         if let Some(state) = &mut edit.preset_picker {
             state.name_draft.clear();
         }
@@ -14443,7 +14417,6 @@ fn handle_preset_picker_up(
                 Ok(preset) => {
                     tracing::info!(preset = %preset.id, "пресет импортирован из панели");
                     save_after_preset_change(cfg, config_path, "импорта пресета из панели");
-                    notify_tray_menu_changed(cfg, &edit.coordinator_tx);
                 }
                 Err(e) => {
                     tracing::warn!(?path, error = %e, "не удалось импортировать пресет из панели");
@@ -18901,23 +18874,6 @@ fn placement_to_physical_rect(
     let x = ((placement.cx - placement.w / 2.0) * scale).round() as i32 + bounds.bounds_px.x;
     let y = ((placement.cy - placement.h / 2.0) * scale).round() as i32 + bounds.bounds_px.y;
     (x, y, w, h)
-}
-
-/// Попросить main.rs пересобрать меню трея из текущего `cfg`
-/// ([`CoordinatorRequest::TrayMenuChanged`]).
-///
-/// Вызывается после успешных `SavePreset`/`RenamePreset`/`DeletePreset`/
-/// `ImportPreset` (`ApplyPreset` сам список не меняет, поэтому его не
-/// трогает) и после смены отступа снап-зоны. Снимок собирается здесь целиком
-/// — вызывающему не приходится помнить, что в меню есть второе изменчивое
-/// поле помимо его собственного.
-fn notify_tray_menu_changed(cfg: &Config, coordinator_tx: &Sender<CoordinatorRequest>) {
-    let presets = cfg.presets.iter().map(|p| (p.id, p.name.clone())).collect();
-    let _ = coordinator_tx.send(CoordinatorRequest::TrayMenuChanged {
-        presets,
-        snap_shrink_pct: cfg.settings.snap_shrink_pct,
-        snap_shrink_all_windows: cfg.settings.snap_shrink_all_windows,
-    });
 }
 
 /// Добавить стикер из файла на диске. `pasted` — источник

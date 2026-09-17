@@ -17,6 +17,10 @@ const dir = __dirname;
 const i18nSrc = fs.readFileSync(path.join(dir, 'i18n.js'), 'utf8');
 const mainSrc = fs.readFileSync(path.join(dir, 'main.js'), 'utf8');
 const htmlSrc = fs.readFileSync(path.join(dir, 'index.html'), 'utf8');
+// Меню трея — вторая страница того же словаря: его ключи используются там,
+// и без этих двух файлов проверка считала бы их забытыми.
+const trayHtmlSrc = fs.readFileSync(path.join(dir, 'traymenu.html'), 'utf8');
+const trayJsSrc = fs.readFileSync(path.join(dir, 'traymenu.js'), 'utf8');
 
 // Загружаем таблицу реальным выполнением i18n.js в изолированном контексте —
 // надёжнее, чем парсить объектный литерал регэкспом.
@@ -35,8 +39,10 @@ assert.deepStrictEqual(empty, [], `пустые строки: ${empty.join(', ')
 
 // Ключи, реально используемые в коде — t('key' / t("key" / data-i18n="key".
 const usedKeys = new Set();
-for (const m of mainSrc.matchAll(/\bt\(\s*['"]([\w.]+)['"]/g)) usedKeys.add(m[1]);
-for (const m of htmlSrc.matchAll(/data-i18n(?:-\w+)?="([\w.]+)"/g)) usedKeys.add(m[1]);
+const SRC_JS = mainSrc + trayJsSrc;
+const SRC_HTML = htmlSrc + trayHtmlSrc;
+for (const m of SRC_JS.matchAll(/\bt\(\s*['"]([\w.]+)['"]/g)) usedKeys.add(m[1]);
+for (const m of SRC_HTML.matchAll(/data-i18n(?:-\w+)?="([\w.]+)"/g)) usedKeys.add(m[1]);
 
 assert.ok(usedKeys.size > 30, `подозрительно мало найденных ключей: ${usedKeys.size}`);
 

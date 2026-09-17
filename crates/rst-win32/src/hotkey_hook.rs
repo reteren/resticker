@@ -125,22 +125,58 @@ fn key_down(vk: u16) -> bool {
     (unsafe { GetAsyncKeyState(i32::from(vk)) } as u16 & 0x8000) != 0
 }
 
+/// Какие модификаторы зажаты в момент нажатия.
+///
+/// Отдельным типом, а не четырьмя `bool` подряд в аргументах: сравнение
+/// точное, а перепутанные местами `alt` и `shift` в вызове компилятор бы не
+/// поймал.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldModifiers {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    win: bool,
+}
+
+impl HeldModifiers {
+    /// Снимок ФИЗИЧЕСКОГО состояния клавиатуры.
+    fn current() -> Self {
+        Self {
+            ctrl: key_down(VK_CONTROL.0),
+            alt: key_down(VK_MENU.0),
+            shift: key_down(VK_SHIFT.0),
+            win: key_down(VK_LWIN.0) || key_down(VK_RWIN.0),
+        }
+    }
+}
+
 /// Совпадает ли нажатие `vk` при текущих модификаторах с одной из
 /// комбинаций набора; возвращает её id.
+fn match_combo(combos: &[(i32, HotkeyCombo)], vk: u32) -> Option<i32> {
+    match_held(combos, vk, HeldModifiers::current())
+}
+
+/// Чистое ядро сравнения: те же правила, но состояние клавиатуры приходит
+/// аргументом.
 ///
 /// Модификаторы сравниваются ТОЧНО, как это делает `RegisterHotKey`: у
 /// комбинации без модификаторов ни один не должен быть зажат, иначе
 /// `Ctrl+Space` срабатывал бы как голый `Space`. Без этого медиа-клавиши
 /// (пробел, PgUp, PgDn) отбирали бы у системы половину сочетаний.
-fn match_combo(combos: &[(i32, HotkeyCombo)], vk: u32) -> Option<i32> {
-    let ctrl = key_down(VK_CONTROL.0);
-    let alt = key_down(VK_MENU.0);
-    let shift = key_down(VK_SHIFT.0);
-    let win = key_down(VK_LWIN.0) || key_down(VK_RWIN.0);
+///
+/// Разделение появилось из-за плавающего теста: он утверждал «ни один
+/// модификатор не зажат», читая живую клавиатуру, и падал, стоило человеку
+/// печатать в момент прогона. Состояние, которое тест не контролирует,
+/// проверять нельзя — теперь оно задаётся явно.
+fn match_held(combos: &[(i32, HotkeyCombo)], vk: u32, held: HeldModifiers) -> Option<i32> {
     combos
         .iter()
         .find(|(_, c)| {
-            c.vk == vk && c.ctrl == ctrl && c.alt == alt && c.shift == shift && c.win == win
+            c.vk == vk
+                && c.ctrl == held.ctrl
+                && c.alt == held.alt
+                && c.shift == held.shift
+                && c.win == held.win
         })
         .map(|(id, _)| *id)
 }
@@ -203,30 +239,69 @@ mod tests {
         }
     }
 
+    /// Зажатые модификаторы для чистого сравнения.
+    fn held(ctrl: bool, alt: bool, shift: bool, win: bool) -> HeldModifiers {
+        HeldModifiers {
+            ctrl,
+            alt,
+            shift,
+            win,
+        }
+    }
+
+    const NOTHING_HELD: HeldModifiers = HeldModifiers {
+        ctrl: false,
+        alt: false,
+        shift: false,
+        win: false,
+    };
+
     #[test]
     fn empty_set_never_matches() {
-        assert_eq!(match_combo(&[], 'M' as u32), None);
+        assert_eq!(match_held(&[], 'M' as u32, NOTHING_HELD), None);
     }
 
     #[test]
     fn a_combo_with_modifiers_needs_them_all() {
-        // Проверяется чистая часть сравнения: физическое состояние
-        // модификаторов в тесте не подделать, поэтому `match_combo` со
-        // «свободной» клавиатурой обязан отвергать комбинацию С
-        // модификаторами — ровно это и означает точное сравнение.
+        // Точное сравнение: комбинация ловится ровно при своих модификаторах
+        // и ни при каких других. Раньше проверялась только отрицательная
+        // половина — положительную было не на чем показать, потому что
+        // состояние читалось с живой клавиатуры.
         let set = [(3, combo(true, true, false, false, 'M' as u32))];
-        assert_eq!(match_combo(&set, 'M' as u32), None);
+        assert_eq!(
+            match_held(&set, 'M' as u32, held(true, true, false, false)),
+            Some(3)
+        );
+        assert_eq!(match_held(&set, 'M' as u32, NOTHING_HELD), None);
+        // Лишний зажатый модификатор — уже другая комбинация.
+        assert_eq!(
+            match_held(&set, 'M' as u32, held(true, true, true, false)),
+            None
+        );
+        // Не хватает одного — тоже мимо.
+        assert_eq!(
+            match_held(&set, 'M' as u32, held(true, false, false, false)),
+            None
+        );
     }
 
     #[test]
-    fn a_bare_key_matches_when_no_modifier_is_held() {
-        // Обратная сторона того же правила: голая клавиша срабатывает
-        // именно потому, что ни один модификатор не зажат. Тест бежит без
-        // клавиатуры в руках, так что это состояние и есть текущее.
+    fn a_bare_key_matches_only_with_no_modifier_held() {
+        // Обратная сторона того же правила: голая клавиша срабатывает именно
+        // потому, что ни один модификатор не зажат — иначе `Ctrl+PgUp`
+        // сработал бы как голый `PgUp`.
         let set = [(5, combo(false, false, false, false, 0x21))]; // VK_PRIOR
-        assert_eq!(match_combo(&set, 0x21), Some(5));
+        assert_eq!(match_held(&set, 0x21, NOTHING_HELD), Some(5));
+        assert_eq!(
+            match_held(&set, 0x21, held(true, false, false, false)),
+            None
+        );
+        assert_eq!(
+            match_held(&set, 0x21, held(false, false, false, true)),
+            None
+        );
         // Чужая клавиша тем же набором не ловится.
-        assert_eq!(match_combo(&set, 0x22), None);
+        assert_eq!(match_held(&set, 0x22, NOTHING_HELD), None);
     }
 
     #[test]

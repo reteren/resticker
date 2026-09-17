@@ -126,6 +126,15 @@ const STRINGS = {
   'control.hintRequired':
     '"Edit mode" is required (cannot be cleared). The others are optional.',
 
+  // --- Меню трея (собственное окно, а не меню Windows) ---
+  'tray.settings': 'Open settings',
+  'tray.editMode': 'Edit mode',
+  'tray.toggleVisible': 'Show/hide all stickers',
+  'tray.snapGap': 'Snap gap',
+  'tray.snapGapAll': 'All windows, not just pinned',
+  'tray.presets': 'Presets',
+  'tray.exit': 'Exit',
+
   'general.startupLabel': 'Startup',
   'general.autostart': 'Launch with Windows',
   'general.silentStart': 'Silent start (don’t open settings)',

@@ -404,8 +404,24 @@ pub fn group_open_combos(hotkeys: &Hotkeys) -> Vec<(i32, HotkeyCombo)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Замок на тесты, которые регистрируют НАСТОЯЩИЕ системные хоткеи.
+    ///
+    /// Тесты крейта живут в одном бинарнике и бегут параллельно, а
+    /// `RegisterHotKey` действует на всю систему: два теста, одновременно
+    /// взявшие одну комбинацию, получают ложный конфликт — и падает тот, кто
+    /// конфликта не ждал. Комбинации в тестах местами совпадают намеренно
+    /// (F17-F20 переиспользуются), поэтому дешевле развести такие тесты во
+    /// времени, чем раздавать каждому свою клавишу из двенадцати доступных.
+    ///
+    /// Отравленный замок берётся как обычный: упавший тест уже сообщил о
+    /// себе, и превращать это во вторую лавину падений незачем.
+    pub(crate) fn hotkey_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn parse_valid_combos() {
@@ -479,6 +495,7 @@ mod tests {
 
     #[test]
     fn register_conflict_then_reregister_after_drop() {
+        let _guard = hotkey_guard();
         // Экзотическая комбинация, чтобы исключить конфликт с реально
         // работающими приложениями на машине разработчика/CI.
         let combo = HotkeyCombo::parse("Ctrl+Alt+Shift+F24").expect("валидная комбинация");
@@ -530,6 +547,7 @@ mod tests {
 
     #[test]
     fn batch_registration_isolates_conflicts_and_registers_the_rest() {
+        let _guard = hotkey_guard();
         // Один занятый хоткей не должен утянуть за собой остальные: в
         // пакете из трёх комбинаций одна конфликтует, две регистрируются.
         let occupied = HotkeyCombo::parse("Ctrl+Alt+Shift+F20").expect("валидная комбинация");
@@ -562,6 +580,7 @@ mod tests {
 
     #[test]
     fn batch_registration_with_all_conflicts_still_succeeds() {
+        let _guard = hotkey_guard();
         // Крайний случай цифровых хоткеев: Ctrl+Shift+цифра занята во
         // многих приложениях, и теоретически не зарегистрироваться могут
         // ВСЕ девять сразу. Пакет обязан пережить и это — без ошибки.
@@ -578,6 +597,7 @@ mod tests {
 
     #[test]
     fn batch_registration_propagates_non_conflict_errors() {
+        let _guard = hotkey_guard();
         // id вне диапазона 0x0000..=0xBFFF — программистская ошибка: она не
         // должна прятаться в списке конфликтов, пользователь тут ни при чём
         // и предупреждать его нечем.

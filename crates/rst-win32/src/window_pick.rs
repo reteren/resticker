@@ -15,7 +15,7 @@
 //! (M4_PREP_NOTES §2.1).
 
 use windows::Win32::Foundation::POINT;
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow};
 
 use crate::error::Win32Error;
 use crate::window_enum::{WindowInfo, WindowRect};
@@ -33,6 +33,17 @@ pub fn cursor_position() -> Result<ScreenPoint, Win32Error> {
     // SAFETY: pt — валидный out-буфер под POINT.
     unsafe { GetCursorPos(&mut pt) }?;
     Ok(ScreenPoint { x: pt.x, y: pt.y })
+}
+
+/// Хэндл окна, которое сейчас впереди (`GetForegroundWindow`), числом.
+///
+/// Числом, а не `HWND`: вызывающий — не Win32-слой, ему это значение нужно
+/// только чтобы сравнить со своим окном («фокус всё ещё у меня?»).
+/// `0` — впереди нет ничего (система переключает окна).
+pub fn foreground_window() -> isize {
+    // SAFETY: GetForegroundWindow — чтение состояния рабочего стола, без
+    // владения и без побочных эффектов.
+    unsafe { GetForegroundWindow() }.0 as isize
 }
 
 /// Верхнее по z-order окно из `snapshot`, чей прямоугольник содержит
