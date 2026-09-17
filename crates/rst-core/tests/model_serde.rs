@@ -373,7 +373,7 @@ fn first_group_takes_number_one() {
 #[test]
 fn new_group_fills_the_hole_left_by_a_deleted_one() {
     // Удалили группу 2 — следующая новая обязана занять именно двойку,
-    // иначе Ctrl+Shift+2 перестал бы открывать хоть что-нибудь, пока
+    // иначе Ctrl+Alt+2 перестал бы открывать хоть что-нибудь, пока
     // номера уползают вверх.
     let existing = vec![group(1), group(3)];
     assert_eq!(WindowGroup::next_number(&existing), Some(2));
@@ -432,13 +432,13 @@ fn member_without_a_saved_place_reads_back_as_none() {
 #[test]
 fn group_hotkey_defaults_are_exactly_the_spec_combos() {
     let h = Hotkeys::default();
-    assert_eq!(h.edit_groups_menu.as_deref(), Some("Ctrl+Shift+G"));
+    assert_eq!(h.edit_groups_menu.as_deref(), Some("Ctrl+Alt+G"));
     assert_eq!(h.delete_open_group.as_deref(), Some("Ctrl+Alt+Shift+G"));
     for n in 1..=9 {
         assert_eq!(
             h.open_group(n),
-            Some(format!("Ctrl+Shift+{n}").as_str()),
-            "группа {n} открывается по Ctrl+Shift+{n}"
+            Some(format!("Ctrl+Alt+{n}").as_str()),
+            "группа {n} открывается по Ctrl+Alt+{n}"
         );
     }
 }
@@ -456,15 +456,12 @@ fn old_config_without_t5_fields_gains_group_hotkey_defaults() {
     .unwrap();
 
     assert_eq!(cfg.hotkeys.edit_mode.as_deref(), Some("Ctrl+Alt+S"));
-    assert_eq!(
-        cfg.hotkeys.edit_groups_menu.as_deref(),
-        Some("Ctrl+Shift+G")
-    );
+    assert_eq!(cfg.hotkeys.edit_groups_menu.as_deref(), Some("Ctrl+Alt+G"));
     assert_eq!(
         cfg.hotkeys.delete_open_group.as_deref(),
         Some("Ctrl+Alt+Shift+G")
     );
-    let expected: Vec<Option<String>> = (1..=9).map(|n| Some(format!("Ctrl+Shift+{n}"))).collect();
+    let expected: Vec<Option<String>> = (1..=9).map(|n| Some(format!("Ctrl+Alt+{n}"))).collect();
     assert_eq!(cfg.hotkeys.open_group_by_number, expected);
 }
 
@@ -477,10 +474,7 @@ fn fixture_v1_gains_group_hotkey_defaults() {
         cfg.hotkeys.toggle_all_stickers.as_deref(),
         Some("Ctrl+Alt+H")
     );
-    assert_eq!(
-        cfg.hotkeys.edit_groups_menu.as_deref(),
-        Some("Ctrl+Shift+G")
-    );
+    assert_eq!(cfg.hotkeys.edit_groups_menu.as_deref(), Some("Ctrl+Alt+G"));
     assert_eq!(cfg.hotkeys.open_group_by_number.len(), 9);
 }
 
@@ -495,14 +489,14 @@ fn open_group_by_number_roundtrips_with_nulls() {
     assert_eq!(
         v["open_group_by_number"],
         json!([
-            "Ctrl+Shift+1",
-            "Ctrl+Shift+2",
+            "Ctrl+Alt+1",
+            "Ctrl+Alt+2",
             null,
-            "Ctrl+Shift+4",
-            "Ctrl+Shift+5",
-            "Ctrl+Shift+6",
-            "Ctrl+Shift+7",
-            "Ctrl+Shift+8",
+            "Ctrl+Alt+4",
+            "Ctrl+Alt+5",
+            "Ctrl+Alt+6",
+            "Ctrl+Alt+7",
+            "Ctrl+Alt+8",
             null
         ])
     );
@@ -513,8 +507,8 @@ fn open_group_by_number_roundtrips_with_nulls() {
 #[test]
 fn open_group_accessor_rejects_out_of_range_and_short_vecs() {
     let h = Hotkeys::default();
-    assert_eq!(h.open_group(1), Some("Ctrl+Shift+1"));
-    assert_eq!(h.open_group(9), Some("Ctrl+Shift+9"));
+    assert_eq!(h.open_group(1), Some("Ctrl+Alt+1"));
+    assert_eq!(h.open_group(9), Some("Ctrl+Alt+9"));
     assert_eq!(h.open_group(0), None, "номера групп начинаются с 1");
     assert_eq!(h.open_group(10), None, "номеров больше девяти нет");
 
@@ -522,6 +516,6 @@ fn open_group_accessor_rejects_out_of_range_and_short_vecs() {
     // конфигурации: настройки могут сохранить частичный список.
     let mut short = Hotkeys::default();
     short.open_group_by_number.truncate(3);
-    assert_eq!(short.open_group(3), Some("Ctrl+Shift+3"));
+    assert_eq!(short.open_group(3), Some("Ctrl+Alt+3"));
     assert_eq!(short.open_group(4), None);
 }

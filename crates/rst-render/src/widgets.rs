@@ -1582,6 +1582,15 @@ impl Widget for ScrollBar {
 /// Текст в буфере — всегда ASCII-цифры, поэтому позиция каретки считается
 /// и в символах, и в байтах. Пока поле не в фокусе, текст зеркалит
 /// `value` (синхронизация с ползунком — [`NumericField::set_value`]).
+/// Сколько DIP протяжки приходится на один шаг значения.
+///
+/// Шесть — из простого соображения: поле высотой в строку, и протяжка на его
+/// высоту должна менять число заметно, но не швырять его от края до края.
+const DRAG_STEP_DIP: f64 = 6.0;
+/// Мёртвая зона протяжки, DIP: клик с дрожанием руки обязан оставаться
+/// кликом (курсор в текст), а не превращаться в смену значения.
+const DRAG_DEAD_ZONE_DIP: f64 = 3.0;
+
 pub struct NumericField {
     id: WidgetId,
     bounds: Box2D,
@@ -1602,6 +1611,12 @@ pub struct NumericField {
     original: String,
     submitted: Option<u32>,
     cancelled: bool,
+    /// Протяжка с зажатой ЛКМ: точка нажатия и значение на её начало.
+    /// `None` — кнопка не удерживается.
+    drag: Option<((f64, f64), u32)>,
+    /// Протяжка уже сдвинула значение: такой жест не считается кликом и не
+    /// ставит каретку под курсор.
+    dragged: bool,
 }
 
 impl NumericField {
@@ -1642,6 +1657,8 @@ impl NumericField {
             focus_phase: Phase::new(theme::HOVER_MS),
             submitted: None,
             cancelled: false,
+            drag: None,
+            dragged: false,
         }
     }
 
@@ -1699,47 +1716,54 @@ impl NumericField {
 
     /// Изменить значение прокруткой колеса мыши на `notches * step`.
     ///
-    /// # Поведение в фокусе (режим ручного текстового ввода)
-    ///
-    /// Если поле находится в фокусе (`self.focused == true`), прокрутка
-    /// колеса мыши **полностью игнорируется** (возвращает `false`), оставляя
-    /// редактируемый текст `self.text`, каретку `self.caret` и значение
-    /// `self.value` нетронутыми.
-    ///
-    /// **Почему именно так (обоснование):**
-    /// 1. **Защита от случайной потери данных**: когда пользователь набирает
-    ///    число с клавиатуры (например, стёр старое значение и набрал первую
-    ///    цифру "2" из желаемого "25", либо очистил поле до пустой строки),
-    ///    случайное касание тачпада или колеса мыши не должно затирать
-    ///    незавершённый ввод и превращать "2" в "3" или перезаписывать буфер.
-    /// 2. **Разделение режимов взаимодействия**: наведение курсора и вращение
-    ///    колеса — это быстрый жест инкремента без клика (hover adjustment);
-    ///    клик и фокус — переход в режим точного посимвольного набора, где
-    ///    хозяином ввода является исключительно клавиатура.
-    /// 3. **Отсутствие неоднозначности парсинга**: промежуточный буфер может
-    ///    быть пустым или временно содержать недопустимое число — попытка
-    ///    применить дельту к неполному тексту привела бы либо к непредсказуемому
-    ///    скачку значения, либо к сбросу каретки.
-    ///
-    /// Чтобы изменить значение колесом, достаточно либо крутить его без клика
-    /// (поле вне фокуса), либо завершить ввод нажатием `Enter`/`Esc`/кликом вне поля.
+    /// Работает и в фокусе (запрос пользователя 2026-09-17: «чтобы работал
+    /// зажатие ЛКМ и скролл»). Раньше прокрутка в фокусе игнорировалась —
+    /// берегли незавершённый набор, — но на практике выходило иначе: клик по
+    /// полю и есть первое, что делает человек, и после него колесо мёртвое.
+    /// Потери набранного нет: перед шагом набранный текст ПРИНИМАЕТСЯ, как
+    /// по `Enter`, и шаг считается уже от него. Пустой текст в фокусе — это
+    /// «ничего не набрано», отсчёт идёт от прежнего значения.
     pub fn mouse_wheel(&mut self, notches: i32) -> bool {
-        if self.focused || notches == 0 {
+        if notches == 0 {
             return false;
         }
+        let base = if self.focused {
+            self.text
+                .parse::<u32>()
+                .unwrap_or(self.value)
+                .clamp(self.min, self.max)
+        } else {
+            self.value
+        };
         let delta = (notches as i64).saturating_mul(self.step as i64);
-        let new_value = (self.value as i64)
+        let new_value = (base as i64)
             .saturating_add(delta)
             .clamp(self.min as i64, self.max as i64) as u32;
-        if new_value == self.value {
+        if new_value == self.value && !self.focused {
             return false;
         }
-        self.value = new_value;
-        self.text = new_value.to_string();
+        self.set_committed(new_value);
+        true
+    }
+
+    /// Принять набранное значение так же, как по `Enter`: привести к
+    /// диапазону, снять фокус и отметить его как поданное
+    /// ([`NumericField::take_submitted`]).
+    ///
+    /// Нужен кнопке подтверждения панели: она закрывает окно, и набранный,
+    /// но не принятый текст иначе просто пропадал бы (репорт пользователя
+    /// 2026-09-17 — «ввожу число, жму Close, ничего не происходит»).
+    pub fn commit(&mut self) {
+        self.submit();
+    }
+
+    /// Записать принятое значение и синхронизировать с ним текст и каретку.
+    fn set_committed(&mut self, value: u32) {
+        self.value = value;
+        self.text = value.to_string();
         self.caret = self.text.len();
         self.original.clone_from(&self.text);
-        self.submitted = Some(new_value);
-        true
+        self.submitted = Some(value);
     }
 
     /// Установить значение извне (синхронизация с ползунком). В фокусе
@@ -1895,9 +1919,20 @@ impl Widget for NumericField {
         self.focused
     }
 
+    /// Уход фокуса ПРИНИМАЕТ набранное, а не отменяет его.
+    ///
+    /// Раньше здесь была отмена, и из-за неё набранное число пропадало ровно
+    /// в тот момент, когда пользователь тянулся к кнопке подтверждения:
+    /// нажатие на кнопку сначала снимает фокус с поля, и текст откатывался к
+    /// прежнему значению ДО того, как кнопка успевала его прочитать (репорт
+    /// пользователя 2026-09-17 — «ввожу число, жму Close, ничего не
+    /// происходит»; замер подтвердил: значение оставалось прежним).
+    ///
+    /// Отказаться от набранного по-прежнему можно `Esc` — это явный жест
+    /// отмены, в отличие от «щёлкнул мимо».
     fn on_blur(&mut self) {
         if self.focused {
-            self.cancel();
+            self.submit();
         }
     }
 
@@ -1911,6 +1946,12 @@ impl Widget for NumericField {
                 if !self.hit_test(pos) {
                     return false;
                 }
+                // Нажатие ещё не решает, клик это или протяжка: решит первое
+                // движение. Значение на начало жеста запоминаем здесь, чтобы
+                // протяжка считалась от него, а не накапливала ошибку шаг за
+                // шагом.
+                self.drag = Some((pos, self.value));
+                self.dragged = false;
                 if !self.focused {
                     self.focused = true;
                     self.focus_phase.set_target(true);
@@ -1925,7 +1966,43 @@ impl Widget for NumericField {
                 }
                 self.mouse_wheel(notches)
             }
-            PointerEvent::Move { .. } | PointerEvent::Up { .. } => false,
+            // Протяжка с зажатой ЛКМ (запрос пользователя 2026-09-17): вверх
+            // больше, вниз меньше — как у любого числового «скраббера».
+            // Курсор при этом может уйти за пределы поля: жест ведёт захват
+            // мыши, и обрывать его на краю значило бы требовать ювелирной
+            // точности ради двух процентов.
+            PointerEvent::Move { pos } => {
+                let Some((start, base)) = self.drag else {
+                    return false;
+                };
+                let dy = start.1 - pos.1;
+                if !self.dragged && dy.abs() < DRAG_DEAD_ZONE_DIP {
+                    return false;
+                }
+                let steps = (dy / DRAG_STEP_DIP).trunc() as i64;
+                let new_value = (base as i64)
+                    .saturating_add(steps.saturating_mul(self.step as i64))
+                    .clamp(self.min as i64, self.max as i64) as u32;
+                self.dragged = true;
+                if new_value == self.value {
+                    return false;
+                }
+                self.set_committed(new_value);
+                true
+            }
+            PointerEvent::Up { .. } => {
+                let dragged = self.dragged;
+                self.drag = None;
+                self.dragged = false;
+                // Протяжка — законченный жест: поле не остаётся в наборе,
+                // иначе следующее колесо считалось бы от текста, а каретка
+                // мигала бы посреди только что выставленного числа.
+                if dragged && self.focused {
+                    self.focused = false;
+                    self.focus_phase.set_target(false);
+                }
+                dragged
+            }
         }
     }
 
@@ -3792,16 +3869,21 @@ mod tests {
         assert_eq!(f.take_submitted(), Some(50));
     }
 
+    /// Уход фокуса ПРИНИМАЕТ набранное (2026-09-17). Прежнее поведение —
+    /// откат — съедало число ровно в тот момент, когда пользователь тянулся
+    /// к кнопке подтверждения: нажатие на неё сперва снимает фокус с поля.
+    /// Отмена осталась за `Esc`, и она проверяется соседним тестом.
     #[test]
-    fn field_blur_reverts_like_escape() {
+    fn field_blur_accepts_the_typed_text() {
         let mut f = field(50);
         f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
         f.key_event(Key::Digit(9));
         f.on_blur();
         assert!(!f.has_focus());
-        f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) });
-        f.key_event(Key::Enter);
-        assert_eq!(f.take_submitted(), Some(50));
+        // «50» с добавленной девяткой в позиции каретки — 509, срезано
+        // потолком поля.
+        assert_eq!(f.take_submitted(), Some(f.value()));
+        assert_eq!(f.value(), 100, "значение принято и приведено к диапазону");
     }
 
     #[test]
@@ -3905,26 +3987,65 @@ mod tests {
         assert_eq!(f.take_submitted(), Some(60));
     }
 
+    /// Колесо работает и в фокусе, отсчитывая шаг ОТ НАБРАННОГО (запрос
+    /// пользователя 2026-09-17). Раньше оно в фокусе игнорировалось, и это
+    /// выглядело как сломанный виджет: клик по полю — первое, что делает
+    /// человек, а после него колесо было мёртвым.
     #[test]
-    fn field_wheel_ignored_when_focused_to_preserve_manual_input() {
+    fn field_wheel_in_focus_steps_from_the_typed_text() {
         let mut f = field(50);
-        // Входим в режим редактирования (фокус).
         assert!(f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) }));
         assert!(f.has_focus());
-        // Пользователь стёр цифру и набрал '7'.
+        // Пользователь стёр цифру и набрал '7': в поле «57».
         f.key_event(Key::Backspace);
         f.key_event(Key::Digit(7));
-        // Колесо не должно затирать введённые символы или менять значение.
-        assert!(!f.pointer_event(PointerEvent::Wheel {
+        assert!(f.pointer_event(PointerEvent::Wheel {
             pos: (100.0, 50.0),
             notches: 1,
         }));
-        assert_eq!(f.value(), 50, "значение поля не изменилось");
-        assert_eq!(f.take_submitted(), None, "никакого submit не произошло");
-        assert!(f.has_focus(), "фокус остался у поля");
-        // Завершаем ввод по Enter — применяется то, что набрал пользователь ("57" -> 57).
-        f.key_event(Key::Enter);
-        assert_eq!(f.take_submitted(), Some(57));
+        assert_eq!(f.value(), 58, "шаг считается от набранного 57, а не от 50");
+        assert_eq!(f.take_submitted(), Some(58));
+    }
+
+    /// Протяжка с зажатой ЛКМ меняет значение, а короткий клик — нет:
+    /// дрожание руки обязано оставаться кликом в текст.
+    #[test]
+    fn field_drag_changes_value_and_a_click_does_not() {
+        let mut f = field(50);
+        assert!(f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) }));
+        // Внутри мёртвой зоны — ещё клик.
+        assert!(!f.pointer_event(PointerEvent::Move { pos: (100.0, 48.0) }));
+        assert_eq!(f.value(), 50);
+        // Выше на 18 DIP — три шага вверх (6 DIP на шаг).
+        assert!(f.pointer_event(PointerEvent::Move { pos: (100.0, 32.0) }));
+        assert_eq!(f.value(), 53);
+        // Обратно вниз: отсчёт от значения на начало жеста, без накопления.
+        assert!(f.pointer_event(PointerEvent::Move { pos: (100.0, 62.0) }));
+        assert_eq!(f.value(), 48);
+        assert!(f.pointer_event(PointerEvent::Up { pos: (100.0, 62.0) }));
+        assert!(!f.has_focus(), "протяжка — законченный жест, не набор");
+
+        // Короткий клик значение не трогает и оставляет поле в наборе.
+        let mut g = field(50);
+        assert!(g.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) }));
+        assert!(!g.pointer_event(PointerEvent::Up { pos: (100.0, 50.0) }));
+        assert_eq!(g.value(), 50);
+        assert!(g.has_focus());
+    }
+
+    /// `commit` принимает набранное так же, как `Enter`: этим кнопка
+    /// подтверждения панели спасает число, введённое без `Enter`.
+    #[test]
+    fn field_commit_accepts_the_typed_text() {
+        let mut f = field(50);
+        assert!(f.pointer_event(PointerEvent::Down { pos: (100.0, 50.0) }));
+        f.key_event(Key::Backspace);
+        f.key_event(Key::Backspace);
+        f.key_event(Key::Digit(2));
+        f.key_event(Key::Digit(5));
+        f.commit();
+        assert_eq!(f.value(), 25);
+        assert_eq!(f.take_submitted(), Some(25));
         assert!(!f.has_focus());
     }
 
@@ -4121,29 +4242,28 @@ mod tests {
         );
     }
 
+    /// Клик по фону панели снимает фокус и ПРИНИМАЕТ набранное — как и любой
+    /// другой уход фокуса (см. `field_blur_accepts_the_typed_text`).
     #[test]
-    fn panel_blur_on_frame_click_reverts_field() {
+    fn panel_blur_on_frame_click_accepts_field() {
         let mut p = Panel::new(0, rect(100.0, 100.0, 200.0, 100.0));
         p.add_widget(NumericField::opacity(ID_FIELD, 100.0, 100.0, 48.0));
         p.pointer_event(PointerEvent::Down {
             pos: (100.0, 100.0),
         });
+        // «100» без двух последних цифр — «1».
         p.key_event(Key::Backspace);
         p.key_event(Key::Backspace);
         p.pointer_event(PointerEvent::Down {
             pos: (195.0, 145.0),
         });
         assert_eq!(p.focused_widget(), None);
-        // Поле отменилось до «100»: повторный фокус + Enter.
-        p.pointer_event(PointerEvent::Down {
-            pos: (100.0, 100.0),
-        });
-        p.key_event(Key::Enter);
         assert_eq!(
             p.widget_mut::<NumericField>(ID_FIELD)
                 .unwrap()
                 .take_submitted(),
-            Some(100)
+            Some(1),
+            "набранное принято уходом фокуса"
         );
     }
 

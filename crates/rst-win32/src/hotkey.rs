@@ -534,7 +534,7 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_accepts_ctrl_shift_digits_one_through_nine() {
-        // Цифровые хоткеи групп: Ctrl+Shift+1..9. VK цифр — 0x30..0x39
+        // Цифровые хоткеи групп: Ctrl+Alt+1..9. VK цифр — 0x30..0x39
         // (верхний ряд, раскладко-независимый), '1' = 0x31.
         for n in 1..=9 {
             let s = format!("Ctrl+Shift+{n}");
@@ -613,7 +613,7 @@ pub(crate) mod tests {
         assert_eq!(combos.len(), 9);
         for (i, (id, combo)) in combos.iter().enumerate() {
             assert_eq!(*id, GROUP_OPEN_HOTKEY_ID_BASE + i as i32);
-            assert_eq!(combo.display_string(), format!("Ctrl+Shift+{}", i + 1));
+            assert_eq!(combo.display_string(), format!("Ctrl+Alt+{}", i + 1));
         }
     }
 
@@ -626,12 +626,12 @@ pub(crate) mod tests {
 
         let combos = group_open_combos(&hotkeys);
         let expect = [
-            (8, "Ctrl+Shift+1"),
-            (9, "Ctrl+Shift+2"),
-            (11, "Ctrl+Shift+4"),
-            (13, "Ctrl+Shift+6"),
-            (14, "Ctrl+Shift+7"),
-            (15, "Ctrl+Shift+8"),
+            (8, "Ctrl+Alt+1"),
+            (9, "Ctrl+Alt+2"),
+            (11, "Ctrl+Alt+4"),
+            (13, "Ctrl+Alt+6"),
+            (14, "Ctrl+Alt+7"),
+            (15, "Ctrl+Alt+8"),
         ];
         assert_eq!(combos.len(), expect.len());
         for ((id, combo), (exp_id, exp_combo)) in combos.iter().zip(expect) {

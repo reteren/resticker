@@ -6615,6 +6615,13 @@ fn run(
                             pct,
                         );
                     }
+                    // `Enter` — это «готово»: панель закрывается сама. Раньше
+                    // она оставалась на экране, и человек, применивший число,
+                    // видел ровно то же окно — будто ничего не случилось
+                    // (репорт пользователя 2026-09-17).
+                    if key == Key::Enter {
+                        close_gap_panel(&mut edit, &monitors_map);
+                    }
                     need_redraw = true;
                 }
             }
@@ -9513,6 +9520,10 @@ fn cursor_panel_tooltip_text(id: WidgetId) -> Option<&'static str> {
         cursor_panel::BTN_LOAD_FILE => Some("Load file"),
         cursor_panel::BTN_ADD_WINDOW => Some("Pin a window"),
         cursor_panel::BTN_PRESETS => Some("Presets"),
+        // Кнопка групп подсказки не имела вовсе (репорт пользователя
+        // 2026-09-17): четыре квадрата ни о чём не говорят, а соседние
+        // кнопки панели все подписаны.
+        cursor_panel::BTN_GROUPS => Some("Window groups"),
         cursor_panel::BTN_TOGGLE_ALL => Some("Show/hide all stickers"),
         cursor_panel::BTN_SETTINGS => Some("Settings"),
         cursor_panel::BTN_EXIT => Some("Leave edit mode"),
@@ -11997,8 +12008,18 @@ fn handle_gap_panel_input(
             let consumed = state.panel.pointer_event(PointerEvent::Up { pos }).consumed;
             let close = state
                 .panel
-                .widget_mut::<Button>(gap_panel::BTN_CLOSE)
+                .widget_mut::<Button>(gap_panel::BTN_CONFIRM)
                 .is_some_and(Button::take_click);
+            if close {
+                // Подтверждение ПРИНИМАЕТ набранное, а не просто закрывает
+                // окно: раньше число, вписанное без `Enter`, оставалось
+                // текстом в поле и пропадало вместе с панелью (репорт
+                // пользователя 2026-09-17 — «ввожу число, жму Close, ничего
+                // не происходит»).
+                if let Some(field) = state.panel.widget_mut::<NumericField>(gap_panel::FIELD_GAP) {
+                    field.commit();
+                }
+            }
             GapPanelInput { consumed, close }
         }
         InputEvent::MouseWheel { notches } => {
@@ -13163,7 +13184,7 @@ fn group_to_close_before_opening(groups: &GroupsState, opening: Uuid) -> Option<
     groups.shown_group().filter(|id| *id != opening)
 }
 
-/// Хоткей `Ctrl+Shift+<номер>`: показать группу или спрятать её.
+/// Хоткей `Ctrl+Alt+<номер>`: показать группу или спрятать её.
 ///
 /// Это ПЕРЕКЛЮЧАТЕЛЬ, а не «открыть». Пользователь описал поведение так:
 /// нажал — вся группа вылетела поверх всего, даже поверх полноэкранной
@@ -22034,7 +22055,7 @@ mod tests {
     #[test]
     fn a_freshly_created_group_becomes_the_open_one_right_away() {
         // Запрос пользователя 2026-08-26: собранная группа обязана сразу
-        // оказаться на экране, а не ждать отдельного `Ctrl+Shift+<номер>`.
+        // оказаться на экране, а не ждать отдельного `Ctrl+Alt+<номер>`.
         // Признак этого — она стала ОТКРЫТОЙ: с неё же начинают
         // запоминаться позиции и на неё целится удаление.
         let (mut groups, mut edit, _w, geometry) = editor_harness(&[1, 2, 3], Some(0));

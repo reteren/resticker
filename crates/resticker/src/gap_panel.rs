@@ -21,12 +21,10 @@ use rst_render::{
 pub const PANEL_ID: WidgetId = 700;
 /// Поле процента.
 pub const FIELD_GAP: WidgetId = 701;
-/// Кнопка закрытия.
-pub const BTN_CLOSE: WidgetId = 702;
+/// Кнопка подтверждения: принимает набранное число и закрывает панель.
+pub const BTN_CONFIRM: WidgetId = 702;
 /// Заголовок.
 const ID_TITLE: WidgetId = 703;
-/// Подсказка под полем.
-const ID_HINT: WidgetId = 704;
 
 /// Ширина панели, DIP. §3 не задаёт ширину — панель по ширине поля и
 /// подсказки.
@@ -38,23 +36,16 @@ const ROW_H: f64 = 28.0;
 /// Ширина поля с числом: три цифры и каретка, не больше — широкое поле под
 /// двузначное число выглядит как ошибка вёрстки.
 const FIELD_W: f64 = 64.0;
-/// Ширина кнопки «Close», DIP: подпись с запасом на `theme::PAD_CTRL_X` (§3).
+/// Ширина кнопки подтверждения, DIP: подпись с запасом на
+/// `theme::PAD_CTRL_X` (§3).
 const BTN_W: f64 = 96.0;
 
 const TITLE_LABEL: &str = "Snap gap";
-const HINT_LABEL: &str = "Scroll to change, click to type";
 
 /// Высота панели, DIP. Считается так же, как ширина строк: заголовок, поле,
 /// подсказка, кнопка — чтобы правка любого отступа не разъезжалась с рамкой.
 pub fn height() -> f64 {
-    2.0 * theme::PAD_PANEL
-        + LINE_HEIGHT
-        + theme::GAP_ROW
-        + ROW_H
-        + theme::GAP_ROW
-        + LINE_HEIGHT
-        + theme::GAP_ROW
-        + ROW_H
+    2.0 * theme::PAD_PANEL + LINE_HEIGHT + theme::GAP_ROW + ROW_H + theme::GAP_ROW + ROW_H
 }
 
 /// Собрать панель. `gap_pct` — текущее значение, 0..=35.
@@ -76,16 +67,14 @@ pub fn build(gap_pct: u8, frame: Box2D) -> Panel {
     field.set_value(u32::from(gap_pct));
     panel.add_widget(field);
 
-    // Подсказка нужна ровно потому, что виджет необычный: квадратик с числом
-    // сам по себе не говорит, что его крутят колесом.
-    let hint_cy = field_cy + ROW_H / 2.0 + theme::GAP_ROW + LINE_HEIGHT / 2.0;
-    let mut hint = Label::new(ID_HINT, left, hint_cy, HINT_LABEL);
-    hint.set_dim(true);
-    panel.add_widget(hint);
-
-    let btn_cy = hint_cy + LINE_HEIGHT / 2.0 + theme::GAP_ROW + ROW_H / 2.0;
+    // Подсказки под полем нет намеренно (репорт пользователя 2026-09-17:
+    // «удали эту надпись, она плохо выглядит»). Она и врала: пока колесо в
+    // фокусе игнорировалось, «Scroll to change» было обещанием, которого
+    // виджет не держал. Теперь крутится и тянется — объяснять это строкой
+    // текста уже незачем.
+    let btn_cy = field_cy + ROW_H / 2.0 + theme::GAP_ROW + ROW_H / 2.0;
     panel.add_widget(Button::new(
-        BTN_CLOSE,
+        BTN_CONFIRM,
         Box2D {
             cx: frame.cx,
             cy: btn_cy,
@@ -93,7 +82,7 @@ pub fn build(gap_pct: u8, frame: Box2D) -> Panel {
             h: ROW_H,
             rotation: 0.0,
         },
-        ButtonContent::Label("Close".to_string()),
+        ButtonContent::Label("Confirm".to_string()),
     ));
 
     panel
@@ -133,8 +122,8 @@ mod tests {
         let f = frame();
         let mut panel = build(5, f);
         let btn = panel
-            .widget_mut::<Button>(BTN_CLOSE)
-            .expect("кнопка закрытия");
+            .widget_mut::<Button>(BTN_CONFIRM)
+            .expect("кнопка подтверждения");
         let b = btn.bounds();
         assert!(
             b.cy + b.h / 2.0 <= f.cy + f.h / 2.0 - theme::PAD_PANEL + 0.5,
