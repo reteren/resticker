@@ -4803,6 +4803,9 @@ fn run(
     // — здесь только оставшееся runtime-состояние планировщика M5a.
     // Последний дедлайн, отправленный планировщику — чтобы не слать
     // одинаковое значение на каждой итерации цикла впустую.
+    let mut fps_limiter = FpsLimiter::new();
+    // Кадр, придержанный ограничителем: рисуем его на следующей итерации.
+    let mut deferred_redraw = false;
     let mut last_anim_deadline: Option<Instant> = None;
     // Прошлое значение «нужен ли секундный тик» — шлём только при смене,
     // чтобы не будить поток-будильник каждым сообщением координатора.
@@ -5014,7 +5017,9 @@ fn run(
         };
         let (msg, leftover) = coalesce_mouse_move(&rx, msg);
         pending = leftover;
-        let mut need_redraw = false;
+        // Кадр, придержанный ограничителем частоты, дорисовывается здесь:
+        // он не выброшен, а отложен.
+        let mut need_redraw = std::mem::take(&mut deferred_redraw);
         // Истёкший баннер снимается на ЛЮБОМ сообщении, а не только на тике
         // анимации, где эта проверка жила раньше. Причина — живой репорт
         // 2026-09-01 («плашка вечная»): тик приходит, только пока
@@ -7547,7 +7552,23 @@ fn run(
         } else {
             Some(now_ui + UI_FRAME)
         };
+        // Ограничитель частоты спрашивается здесь, а не у самой отрисовки:
+        // его дедлайн обязан попасть в общий расчёт ниже, иначе придержанный
+        // кадр ждал бы случайного события.
+        let next_redraw_deadline = if need_redraw {
+            match fps_limiter.allow(cfg.settings.battery_fps_limit, Instant::now()) {
+                Ok(()) => None,
+                Err(deadline) => {
+                    need_redraw = false;
+                    deferred_redraw = true;
+                    Some(deadline)
+                }
+            }
+        } else {
+            None
+        };
         let next_tick_deadline = [
+            next_redraw_deadline,
             next_anim_deadline,
             next_timeline_deadline,
             next_video_deadline,
@@ -7866,6 +7887,7 @@ fn run(
         }
         if need_redraw {
             smoothness.drawn(draw_started.elapsed());
+            fps_limiter.drawn(Instant::now());
         }
     }
     // Гарантированное открепление стикеров-окон при выходе (ROADMAP.md M6,
@@ -14214,6 +14236,85 @@ fn exe_texture_key(exe_path: &Path) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     exe_path.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Ограничитель частоты кадров оверлея (`Settings::battery_fps_limit`).
+///
+/// От сети оверлей рисует по событиям и ничего не ждёт — так он и задуман
+/// (ADR-006). Ограничение включается ТОЛЬКО на батарее: настройка и названа
+/// «battery_fps_limit», и в SPEC §10 стоит рядом со словами «режим экономии
+/// на батарее».
+///
+/// Кадр не выбрасывается, а откладывается: сдержанная перерисовка возвращает
+/// дедлайн, и цикл просыпается к нему сам. Выброшенный кадр означал бы, что
+/// последнее движение мыши или последний кадр видео могут не доехать до
+/// экрана вовсе.
+struct FpsLimiter {
+    /// Когда рисовали в прошлый раз.
+    last_draw: Option<Instant>,
+    /// Что ответил опрос питания и когда: спрашивать систему на каждый кадр
+    /// незачем, состояние меняется раз в часы.
+    power: Option<(Instant, bool)>,
+}
+
+/// Как часто переспрашивать систему о питании.
+const POWER_POLL: Duration = Duration::from_secs(5);
+
+impl FpsLimiter {
+    fn new() -> Self {
+        Self {
+            last_draw: None,
+            power: None,
+        }
+    }
+
+    /// Работаем ли сейчас от батареи (с кэшем на [`POWER_POLL`]).
+    fn on_battery(&mut self, now: Instant) -> bool {
+        if let Some((at, value)) = self.power
+            && now.duration_since(at) < POWER_POLL
+        {
+            return value;
+        }
+        let value = rst_win32::power::on_battery();
+        self.power = Some((now, value));
+        value
+    }
+
+    /// Можно ли рисовать прямо сейчас. `Err(deadline)` — рисовать рано,
+    /// проснуться к этому моменту.
+    fn allow(&mut self, fps_limit: u32, now: Instant) -> Result<(), Instant> {
+        let Some(interval) = frame_interval(fps_limit) else {
+            return Ok(());
+        };
+        if !self.on_battery(now) {
+            return Ok(());
+        }
+        match defer_until(self.last_draw, now, interval) {
+            Some(deadline) => Err(deadline),
+            None => Ok(()),
+        }
+    }
+
+    /// Отметить состоявшуюся отрисовку.
+    fn drawn(&mut self, now: Instant) {
+        self.last_draw = Some(now);
+    }
+}
+
+/// Минимальный промежуток между кадрами для `fps` кадров в секунду.
+///
+/// `None` — ограничивать нечего: ноль кадров в секунду означал бы «не рисовать
+/// никогда», а такого выбора настройка не предлагает (ползунок 5..60).
+fn frame_interval(fps: u32) -> Option<Duration> {
+    (fps > 0).then(|| Duration::from_secs_f64(1.0 / f64::from(fps)))
+}
+
+/// До какого момента нужно подождать, если прошлый кадр был слишком недавно.
+/// `None` — ждать нечего, можно рисовать.
+fn defer_until(last_draw: Option<Instant>, now: Instant, interval: Duration) -> Option<Instant> {
+    let last = last_draw?;
+    let next = last + interval;
+    (next > now).then_some(next)
 }
 
 /// Открыть панель величины зазора на мониторе, где сейчас курсор.
@@ -24931,6 +25032,91 @@ mod tests {
         assert!(
             rects.is_empty(),
             "полностью закрытый сверху окклюдер не должен давать видимую площадь, а закрывающее окно само не окклюдер"
+        );
+    }
+
+    /// Ограничитель частоты: арифметика проверяется отдельно от Win32 —
+    /// питание машины в тесте не подделать, а вот «рано или пора» это чистый
+    /// расчёт.
+    #[test]
+    fn frame_interval_matches_the_requested_rate() {
+        // Сравниваем длительность с допуском, а не побайтово: 1/60 секунды
+        // в double — 16.666667 мс, и точное равенство здесь проверяло бы
+        // округление, а не смысл.
+        let about = |fps: u32, expected_ms: f64| {
+            let got = frame_interval(fps)
+                .expect("ограничение задано")
+                .as_secs_f64()
+                * 1000.0;
+            assert!(
+                (got - expected_ms).abs() < 0.01,
+                "{fps} кадр/с: ожидали ~{expected_ms} мс, получили {got} мс"
+            );
+        };
+        about(60, 16.6667);
+        about(30, 33.3333);
+        about(5, 200.0);
+        assert_eq!(
+            frame_interval(0),
+            None,
+            "ноль кадров в секунду не ограничение"
+        );
+    }
+
+    /// Решение ограничителя целиком, минус обращение к Win32: состояние
+    /// питания подставляется в кэш напрямую. Иначе тест зависел бы от того,
+    /// ноутбук ли это и воткнут ли шнур, — а проверить надо логику.
+    #[test]
+    fn limiter_spaces_out_frames_on_battery() {
+        let start = Instant::now();
+        let mut limiter = FpsLimiter {
+            last_draw: None,
+            power: Some((start, true)),
+        };
+        // Первый кадр не придерживается: рисовать ещё нечего было.
+        assert!(limiter.allow(30, start).is_ok());
+        limiter.drawn(start);
+        // 10 мс спустя при 30 кадрах/с — рано; дедлайн через 1/30 секунды.
+        let early = start + Duration::from_millis(10);
+        let deadline = limiter.allow(30, early).expect_err("кадр обязан подождать");
+        let waited = deadline.duration_since(start).as_secs_f64() * 1000.0;
+        assert!(
+            (waited - 33.33).abs() < 0.1,
+            "ждать до {waited} мс вместо ~33.3"
+        );
+        // После истечения промежутка — можно.
+        assert!(limiter.allow(30, start + Duration::from_millis(40)).is_ok());
+    }
+
+    /// От сети ограничитель не вмешивается вовсе — даже два кадра подряд в
+    /// одну миллисекунду.
+    #[test]
+    fn limiter_does_nothing_on_mains_power() {
+        let start = Instant::now();
+        let mut limiter = FpsLimiter {
+            last_draw: Some(start),
+            power: Some((start, false)),
+        };
+        assert!(limiter.allow(5, start).is_ok());
+        assert!(limiter.allow(5, start + Duration::from_micros(1)).is_ok());
+    }
+
+    #[test]
+    fn defer_until_holds_the_frame_only_while_the_interval_runs() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(100);
+        // Первый кадр не придерживается ничем: рисовать ещё нечего было.
+        assert_eq!(defer_until(None, start, interval), None);
+        // Через 40 мс после прошлого кадра — рано, ждать до 100-й мс.
+        assert_eq!(
+            defer_until(Some(start), start + Duration::from_millis(40), interval),
+            Some(start + interval)
+        );
+        // Ровно на границе и позже — пора.
+        assert_eq!(defer_until(Some(start), start + interval, interval), None);
+        assert_eq!(
+            defer_until(Some(start), start + Duration::from_millis(250), interval),
+            None
         );
     }
 

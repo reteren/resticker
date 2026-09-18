@@ -385,11 +385,14 @@
                 <h2 class="groupTitle" data-i18n="general.performanceLabel">Performance</h2>
 
                 <div class="setting">
-                  <span class="settingLabel" data-i18n="general.fpsLimit">Overlay FPS limit</span>
+                  <span class="settingLabel" data-i18n="general.fpsLimit">Overlay FPS limit on battery</span>
                   <div class="settingControl">
                     <input type="range" class="slider" id="battery-fps-limit" min="5" max="60" step="1" />
                     <span class="sliderValue" id="battery-fps-limit-value">30</span>
                   </div>
+                  <p class="hint" data-i18n="general.fpsLimitHint">
+                    Applies only while the machine runs on battery: overlay redraws are spaced out to this rate. On mains power the overlay redraws on events, as always.
+                  </p>
                 </div>
 
                 <div class="setting">

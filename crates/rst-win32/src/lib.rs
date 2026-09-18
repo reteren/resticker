@@ -17,6 +17,7 @@ pub mod hotkey_hook;
 pub mod input;
 pub mod monitors;
 pub mod overlay;
+pub mod power;
 pub mod single_instance;
 pub mod sound;
 pub mod thumb_cache;

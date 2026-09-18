@@ -147,7 +147,9 @@ const STRINGS = {
     'Unstable on some Windows 11 builds — the result is verified after applying; a warning is logged on failure.',
   'general.neverOverlapTaskbar': "Don't overlap the taskbar",
   'general.performanceLabel': 'Performance',
-  'general.fpsLimit': 'Overlay FPS limit',
+  'general.fpsLimit': 'Overlay FPS limit on battery',
+  'general.fpsLimitHint':
+    'Applies only while the machine runs on battery: overlay redraws are spaced out to this rate. On mains power the overlay redraws on events, as always.',
   'general.mitosisMemoryLimit': 'Mitosis memory limit, MB',
   'general.mitosisMemoryLimitHint':
     'A heavier app is refused: mitosis launches a second copy of it.',
