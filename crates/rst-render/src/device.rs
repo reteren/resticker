@@ -65,6 +65,39 @@ fn placement_to_physical(p: &Placement, scale: f32) -> [f32; 4] {
     ]
 }
 
+/// Исходный размер картинки по заголовку файла, без декодирования пикселей.
+/// `None` — формат не распознан или файл не читается.
+pub fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::image_dimensions(path).ok()
+}
+
+/// Вычислить пропорциональные размеры при ограничении `max_size: Option<(u32, u32)>`.
+/// Если `max_size` равен `None`, либо `(max_w, max_h)` равны 0, либо исходные
+/// размеры не превышают предел, возвращает `(orig_w, orig_h)`.
+/// Иначе вычисляет масштаб `scale = min(max_w / orig_w, max_h / orig_h)`
+/// и возвращает пропорционально уменьшенные размеры (минимум 1×1).
+pub fn compute_downscale_dimensions(
+    orig_w: u32,
+    orig_h: u32,
+    max_size: Option<(u32, u32)>,
+) -> (u32, u32) {
+    let Some((max_w, max_h)) = max_size else {
+        return (orig_w, orig_h);
+    };
+    if orig_w == 0 || orig_h == 0 || max_w == 0 || max_h == 0 {
+        return (orig_w, orig_h);
+    }
+    if orig_w <= max_w && orig_h <= max_h {
+        return (orig_w, orig_h);
+    }
+    let scale_w = max_w as f64 / orig_w as f64;
+    let scale_h = max_h as f64 / orig_h as f64;
+    let scale = scale_w.min(scale_h);
+    let new_w = (orig_w as f64 * scale).round().max(1.0) as u32;
+    let new_h = (orig_h as f64 * scale).round().max(1.0) as u32;
+    (new_w, new_h)
+}
+
 /// D3D11-устройство процесса: один экземпляр на процесс, любое число
 /// [`WindowTarget`] на его базе.
 ///
@@ -344,15 +377,36 @@ impl Device {
     }
 
     /// Загрузить изображение из файла (PNG/JPEG/WebP/BMP) в GPU-текстуру
-    /// с мипмапами. Даунскейл >4096 и кэш — зона rst-media, не этого крейта.
+    /// с мипмапами. Эквивалентно [`Self::load_image_with_max_size`] с `max_size: None`.
     pub fn load_image(&self, path: &Path) -> Result<Texture, RenderError> {
+        self.load_image_with_max_size(path, None)
+    }
+
+    /// Загрузить изображение из файла в GPU-текстуру с мипмапами и опциональным
+    /// ограничением максимального размера (`max_size: Option<(max_w, max_h)>`).
+    ///
+    /// Если задан предел и размеры изображения превышают его, изображение
+    /// пропорционально уменьшается с помощью [`image::imageops::FilterType::Triangle`].
+    /// `None` сохраняет исходный размер. Пиксели передаются в GPU без избыточного
+    /// клонирования буфера через [`Self::create_texture_from_rgba_owned`].
+    pub fn load_image_with_max_size(
+        &self,
+        path: &Path,
+        max_size: Option<(u32, u32)>,
+    ) -> Result<Texture, RenderError> {
         let img = image::open(path).map_err(|source| RenderError::ImageDecode {
             path: path.display().to_string(),
             source,
         })?;
-        let rgba = img.to_rgba8();
+        let (orig_w, orig_h) = (img.width(), img.height());
+        let (target_w, target_h) = compute_downscale_dimensions(orig_w, orig_h, max_size);
+        let rgba = if target_w != orig_w || target_h != orig_h {
+            image::imageops::resize(&img, target_w, target_h, image::imageops::FilterType::Triangle)
+        } else {
+            img.to_rgba8()
+        };
         let (w, h) = rgba.dimensions();
-        self.create_texture_from_rgba(&rgba, w, h)
+        self.create_texture_from_rgba_owned(rgba.into_raw(), w, h)
     }
 
     /// Загрузить RGBA-пиксели (straight alpha) в GPU-текстуру с мипмапами.
@@ -367,6 +421,18 @@ impl Device {
         Texture::from_rgba(&self.device, &self.context, data, width, height)
     }
 
+    /// Загрузить RGBA-пиксели (straight alpha) в GPU-текстуру с мипмапами,
+    /// принимая буфер во владение. Premultiply выполняется in-place без
+    /// дополнительного клонирования буфера.
+    pub fn create_texture_from_rgba_owned(
+        &self,
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> Result<Texture, RenderError> {
+        Texture::from_rgba_owned(&self.device, &self.context, data, width, height)
+    }
+
     /// Собрать текстурный атлас анимации (M5a, docs/M5A_ANIMATION_DESIGN.md
     /// §3): все кадры заливаются в одну текстуру-грид, каждый кадр
     /// рисуется через `Sprite::with_uv` с его UV-подпрямоугольником — смена
@@ -374,7 +440,8 @@ impl Device {
     /// одинакового размера `frame_w × frame_h`; раскладка грид
     /// (`columns = ceil(sqrt(n))`), размер атласа явно проверяется против
     /// лимита D3D11 feature level 11 (16384 px) — драйверу непроверенный
-    /// размер не передаётся.
+    /// размер не передаётся. Буфер атласа передаётся в GPU с in-place premultiply
+    /// без промежуточного дублирования в памяти.
     pub fn create_texture_atlas(
         &self,
         frames: &[(Vec<u8>, Duration)],
@@ -430,10 +497,10 @@ impl Device {
 
         // Атлас одно-миповый: автогенерация мипмапов усреднила бы соседние
         // кадры в нижних мипах (цвет ячейки «протёк» бы в соседнюю).
-        let texture = Texture::from_rgba_atlas(
+        let texture = Texture::from_rgba_atlas_owned(
             &self.device,
             &self.context,
-            &combined,
+            combined,
             layout.atlas_w,
             layout.atlas_h,
         )?;
@@ -452,6 +519,79 @@ impl Device {
             .collect();
 
         Ok(TextureAtlas { texture, frames })
+    }
+
+    /// Как [`Self::create_texture_atlas`], но принимает кадры во владение (`Vec<(Vec<u8>, Duration)>`).
+    /// Буфер каждого кадра освобождается сразу после копирования в общий буфер атласа `combined`,
+    /// а `combined` передаётся в GPU-текстуру с in-place premultiply без повторного клонирования.
+    /// Пиковый расход памяти на CPU снижается до ≈ 1× размера атласа вместо 2×-3×.
+    pub fn create_texture_atlas_owned(
+        &self,
+        mut frames: Vec<(Vec<u8>, Duration)>,
+        frame_w: u32,
+        frame_h: u32,
+    ) -> Result<TextureAtlas, RenderError> {
+        if frames.is_empty() {
+            return Err(RenderError::InvalidTextureData(
+                "пустой список кадров атласа".to_string(),
+            ));
+        }
+        for (i, (data, _)) in frames.iter().enumerate() {
+            if let Err(e) = crate::texture::validate_texture_data(frame_w, frame_h, data.len()) {
+                return Err(RenderError::InvalidTextureData(format!("кадр {i}: {e}")));
+            }
+        }
+
+        let layout = crate::atlas::grid_layout(frames.len(), frame_w, frame_h);
+        if layout.atlas_w > 16384 || layout.atlas_h > 16384 {
+            return Err(RenderError::InvalidTextureData(format!(
+                "атлас {}×{} px превышает лимит D3D11 feature level 11 (16384 px): \
+                 {} кадров по {}×{} px",
+                layout.atlas_w,
+                layout.atlas_h,
+                frames.len(),
+                frame_w,
+                frame_h
+            )));
+        }
+
+        let row_bytes = frame_w as usize * 4;
+        let mut combined = vec![0u8; layout.atlas_w as usize * layout.atlas_h as usize * 4];
+        let num_frames = frames.len();
+        let mut atlas_frames = Vec::with_capacity(num_frames);
+
+        for (i, (data, delay)) in frames.drain(..).enumerate() {
+            let col = (i % layout.columns as usize) as u32;
+            let row = (i / layout.columns as usize) as u32;
+            let dst_x = col * frame_w;
+            let dst_y = row * frame_h;
+            for y in 0..frame_h {
+                let src_off = y as usize * row_bytes;
+                let dst_off = ((dst_y + y) as usize * layout.atlas_w as usize + dst_x as usize) * 4;
+                combined[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&data[src_off..src_off + row_bytes]);
+            }
+            // `data` освобождается сразу по завершении итерации!
+            let (uv_offset, uv_scale) = crate::atlas::frame_uvs(i, &layout);
+            atlas_frames.push(AtlasFrame {
+                uv_offset,
+                uv_scale,
+                delay,
+            });
+        }
+
+        let texture = Texture::from_rgba_atlas_owned(
+            &self.device,
+            &self.context,
+            combined,
+            layout.atlas_w,
+            layout.atlas_h,
+        )?;
+
+        Ok(TextureAtlas {
+            texture,
+            frames: atlas_frames,
+        })
     }
 
     /// Создать текстуру для потоковой анимации (ROADMAP.md M5a, «потоковый
@@ -473,6 +613,17 @@ impl Device {
         Texture::from_rgba_atlas(&self.device, &self.context, rgba, width, height)
     }
 
+    /// Как [`Self::create_streaming_animation_frame`], но принимает буфер кадра во владение
+    /// без промежуточного копирования.
+    pub fn create_streaming_animation_frame_owned(
+        &self,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> Result<Texture, RenderError> {
+        Texture::from_rgba_atlas_owned(&self.device, &self.context, rgba, width, height)
+    }
+
     /// Обновить текстуру потоковой анимации новым декодированным кадром —
     /// тот же размер, что при создании [`Self::create_streaming_animation_frame`].
     pub fn update_streaming_animation_frame(
@@ -481,6 +632,16 @@ impl Device {
         rgba: &[u8],
     ) -> Result<(), RenderError> {
         texture.update_rgba(&self.context, rgba)
+    }
+
+    /// Как [`Self::update_streaming_animation_frame`], но принимает буфер кадра во владение,
+    /// выполняя premultiply in-place без промежуточного клонирования.
+    pub fn update_streaming_animation_frame_owned(
+        &self,
+        texture: &Texture,
+        rgba: Vec<u8>,
+    ) -> Result<(), RenderError> {
+        texture.update_rgba_owned(&self.context, rgba)
     }
 
     /// Создать три R8-плоскости видеокадра непрозрачного видео (M5b,
@@ -1684,6 +1845,58 @@ mod gpu_tests {
                 "кадр 1 должен быть синим в ({x},{y})"
             );
         }
+
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    #[test]
+    #[ignore = "требует GPU и дисплей; запуск вручную: cargo test -p rst-render --lib -- --ignored"]
+    fn create_texture_atlas_owned_matches_borrowed_atlas() {
+        let hwnd = unsafe {
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("Static"),
+                w!("rst-render atlas owned test"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap()
+        };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        let device = Device::new().expect("устройство создаётся на GPU");
+        let solid = |rgb: [u8; 3]| [rgb[0], rgb[1], rgb[2], 255].repeat(8 * 8);
+        let red = solid([255, 0, 0]);
+        let blue = solid([0, 0, 255]);
+        let delay1 = Duration::from_millis(120);
+        let delay2 = Duration::from_millis(240);
+
+        let frames_borrowed = vec![(red.clone(), delay1), (blue.clone(), delay2)];
+        let atlas_borrowed = device
+            .create_texture_atlas(&frames_borrowed, 8, 8)
+            .expect("create_texture_atlas succeeds");
+
+        let frames_owned = vec![(red, delay1), (blue, delay2)];
+        let atlas_owned = device
+            .create_texture_atlas_owned(frames_owned, 8, 8)
+            .expect("create_texture_atlas_owned succeeds");
+
+        assert_eq!(atlas_borrowed.frames.len(), atlas_owned.frames.len());
+        for (f_b, f_o) in atlas_borrowed.frames.iter().zip(atlas_owned.frames.iter()) {
+            assert_eq!(f_b.uv_offset, f_o.uv_offset);
+            assert_eq!(f_b.uv_scale, f_o.uv_scale);
+            assert_eq!(f_b.delay, f_o.delay);
+        }
+        assert_eq!(atlas_borrowed.texture.width(), atlas_owned.texture.width());
+        assert_eq!(atlas_borrowed.texture.height(), atlas_owned.texture.height());
 
         unsafe { DestroyWindow(hwnd) }.unwrap();
     }

@@ -14,4 +14,7 @@ mod error;
 mod mixer;
 
 pub use error::AudioError;
-pub use mixer::{AudioMixer, AudioSource, mix_frame};
+pub use mixer::{
+    AudioMixer, AudioSource, DEFAULT_IDLE_TIMEOUT, IdleDetector, StreamAction,
+    StreamPlaybackState, mix_frame,
+};

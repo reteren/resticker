@@ -3,8 +3,9 @@
 //! Живёт на собственном потоке со своим циклом сообщений (тот же паттерн,
 //! что у [`crate::overlay::OverlayWindow`]/[`crate::tray::TrayIcon`]):
 //! `start()` возвращает `(Self, Receiver<WindowEvent>)`, `Drop` останавливает
-//! поток. Разовое перечисление — [`crate::window_enum::enumerate`]; здесь —
-//! только дифф на WinEvent-хуках между полными перечислениями.
+//! поток. Разовое полное перечисление — [`crate::window_enum::enumerate`];
+//! здесь — инкрементальные дельты WinEvent-хуков с дешёвым z-order-проходом
+//! и fallback на полный снимок при расхождении множества окон.
 //!
 //! Fast path (ADR-005): пока [`WindowTracker::set_mask_needed`] не вызван с
 //! `true`, хуки не ставятся вовсе, поток крутит пустой pump практически без
@@ -25,13 +26,13 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-    EVENT_SYSTEM_MOVESIZEEND, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HWND_MESSAGE,
-    IsWindow, KillTimer, MSG, OBJID_WINDOW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetTimer, SetWindowLongPtrW, TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_APP, WM_CLOSE,
-    WM_DESTROY, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_POPUP,
-    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
+    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, GWLP_USERDATA, GetMessageW,
+    GetWindowLongPtrW, HWND_MESSAGE, IsWindow, KillTimer, MSG, OBJID_WINDOW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, TranslateMessage,
+    WINEVENT_OUTOFCONTEXT, WM_APP, WM_CLOSE, WM_DESTROY, WM_TIMER, WM_WTSSESSION_CHANGE,
+    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use windows::core::{PCWSTR, w};
 
@@ -140,17 +141,25 @@ impl Drop for WindowTracker {
 }
 
 /// Отложенные изменения кэша, накопленные между дебаунс-циклами
-/// (M4_WINDOW_TRACKER_DESIGN.md §2, §4). `needs_full` перекрывает всё
-/// остальное: полное перечисление даёт свежий z-order и не нуждается в
-/// применении инкрементальных дельт поверх него.
+/// (M4_WINDOW_TRACKER_DESIGN.md §2, §4). Расхождение множества hwnd
+/// обнаруживается быстрым проходом и переводит flush в полное перечисление.
 #[derive(Default)]
 struct Pending {
-    needs_full: bool,
     destroyed: HashSet<usize>,
     /// `hwnd → iconic`; последняя запись в пределах одного окна дебаунса
     /// побеждает (быстрый minimize+restore схлопывается в no-op).
     minimized: HashMap<usize, bool>,
     location_changed: HashSet<usize>,
+    /// Окна, для которых смена переднего плана потребовала перечитать все
+    /// данные одного окна; z-order после этого сливается дешёвым проходом.
+    foreground: HashSet<usize>,
+    /// Последнее состояние видимости в пределах одного дебаунса.
+    visibility: HashMap<usize, bool>,
+    /// Заголовок/класс изменились, но состав кэша не обязан меняться.
+    name_changed: HashSet<usize>,
+    /// После DESTROY/SHOW/HIDE/FOREGROUND/REORDER нужно обновить сырые
+    /// индексы z-order, иначе снимок не равен полному перечислению.
+    refresh_z_order: bool,
 }
 
 /// Состояние, живущее на потоке трекера между сообщениями (GWLP_USERDATA —
@@ -160,6 +169,8 @@ struct Pending {
 struct WndState {
     tx: Sender<WindowEvent>,
     cache: Vec<WindowInfo>,
+    /// PID → exe, общий для полных перечислений и точечного обновления окна.
+    process_cache: HashMap<u32, std::path::PathBuf>,
     mask_needed: bool,
     hooks: Vec<HWINEVENTHOOK>,
     timer_running: bool,
@@ -169,6 +180,8 @@ struct WndState {
     /// полный ребилд на `WTS_SESSION_UNLOCK`.
     frozen: bool,
     pending: Pending,
+    full_rebuilds: u64,
+    incremental_rebuilds: u64,
 }
 
 thread_local! {
@@ -197,11 +210,14 @@ fn run_message_loop(tx: Sender<WindowEvent>, ready_tx: Sender<ReadyResult>) {
     let state = Box::new(WndState {
         tx,
         cache: Vec::new(),
+        process_cache: HashMap::new(),
         mask_needed: false,
         hooks: Vec::new(),
         timer_running: false,
         frozen: false,
         pending: Pending::default(),
+        full_rebuilds: 0,
+        incremental_rebuilds: 0,
     });
     // SAFETY: hwnd только что создано этим потоком; GWLP_USERDATA хранит
     // единственный владеющий указатель, освобождаемый после выхода из pump.
@@ -307,11 +323,10 @@ fn create_window() -> Result<HWND, Win32Error> {
 
 /// Установить все диапазоны хуков (M4_WINDOW_TRACKER_DESIGN.md §3, с
 /// правкой по `FOREGROUND` — см. коммент у самого диапазона ниже): диапазон
-/// `DESTROY..LOCATIONCHANGE` захватывает и `SHOW`/`HIDE` (соседние коды) —
-/// колбэк фильтрует по точному `event`, лишние коды в диапазоне просто
-/// падают в `_ => {}`; `MINIMIZESTART..MINIMIZEEND` и `FOREGROUND` —
-/// отдельные узкие диапазоны (коды не соседствуют ни с первым, ни друг с
-/// другом). Без `WINEVENT_SKIPOWNPROCESS`
+/// `DESTROY..LOCATIONCHANGE` захватывает и `SHOW`/`HIDE`/`REORDER` (соседние
+/// коды) — колбэк фильтрует по точному `event`, лишние коды в диапазоне просто
+/// падают в `_ => {}`; `NAMECHANGE`, `MINIMIZESTART..MINIMIZEEND` и
+/// `FOREGROUND` — отдельные узкие диапазоны. Без `WINEVENT_SKIPOWNPROCESS`
 /// намеренно: собственные оверлеи и так никогда не попадают в кэш
 /// (`is_real_window` отбраковывает их по `WS_EX_NOACTIVATE`), поэтому их
 /// `LOCATIONCHANGE` просто не проходит проверку «hwnd в кэше» в колбэке —
@@ -326,6 +341,7 @@ fn install_hooks(state: &mut WndState) {
     let flags = WINEVENT_OUTOFCONTEXT;
     for (min, max) in [
         (EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE),
+        (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         // Узкий диапазон на одно событие (M4_WINDOW_TRACKER_DESIGN.md §3,
         // пересмотрено — живой репорт пользователя: переключение фокуса
@@ -352,9 +368,9 @@ fn install_hooks(state: &mut WndState) {
         // сам доставит колбэк в очередь ЭТОГО потока, ADR-005).
         let hook = unsafe { SetWinEventHook(min, max, None, Some(win_event_proc), 0, 0, flags) };
         if hook.0.is_null() {
-            // Половинчатая установка хуже отсутствия: первый диапазон несёт
-            // SHOW/HIDE — единственный источник полных перечислений — его
-            // потеря при живом втором навсегда «замораживает» кэш молча.
+            // Половинчатая установка хуже отсутствия: потеря любого
+            // диапазона оставит часть дельт без доставки и может устарить
+            // кэш молча.
             // Честная деградация — снести уже поставленные и остаться без
             // хуков вовсе (эквивалент fast path, без эмиссии), а не жить в
             // полуработающем состоянии (M4_WINDOW_TRACKER_REVIEW.md, пункт
@@ -429,12 +445,86 @@ fn apply_location(cache: &mut [WindowInfo], hwnd: usize, rect: WindowRect) -> bo
     }
 }
 
-/// Полное перечисление, заменяющее кэш целиком (SHOW/HIDE/force/unlock).
-/// Возвращает копию нового кэша для эмиссии — вызывающему не нужно клонировать
-/// отдельно.
-fn rebuild_from_enum(cache: &mut Vec<WindowInfo>) -> Vec<WindowInfo> {
-    *cache = window_enum::enumerate();
-    cache.clone()
+/// Полное перечисление, заменяющее кэш целиком (первичный снимок, fallback,
+/// разблокировка). Одновременно наполняет/чистит PID-кэш и считает дорогие
+/// перестроения для debug-лога.
+fn rebuild_from_enum(state: &mut WndState) -> Vec<WindowInfo> {
+    // Полный перебор случается, когда появилось незнакомое окно — в том числе
+    // у процесса, которому Windows отдала PID недавно умершего. Старый путь exe
+    // для такого PID был бы чужим, поэтому кэш здесь начинается заново: он
+    // экономит `OpenProcess` на окнах одного процесса внутри перебора и между
+    // инкрементальными обновлениями, а полные переборы теперь редки.
+    state.process_cache.clear();
+    state.cache = window_enum::enumerate_with_process_cache(&mut state.process_cache);
+    prune_process_cache(&state.cache, &mut state.process_cache);
+    state.full_rebuilds = state.full_rebuilds.saturating_add(1);
+    tracing::debug!(
+        full_rebuilds = state.full_rebuilds,
+        incremental_rebuilds = state.incremental_rebuilds,
+        windows = state.cache.len(),
+        "полное перестроение трекера окон"
+    );
+    state.cache.clone()
+}
+
+/// Выкинуть пути процессов, для которых в актуальном снимке больше нет окон.
+fn prune_process_cache(cache: &[WindowInfo], process_cache: &mut HashMap<u32, std::path::PathBuf>) {
+    let live_pids: HashSet<u32> = cache.iter().map(|window| window.pid).collect();
+    process_cache.retain(|pid, _| live_pids.contains(pid));
+}
+
+/// Перечитать полные данные одного уже известного окна. Неизвестный hwnd не
+/// добавляется быстрым путём: следующий z-order-проход обнаружит расхождение
+/// и отправит выполнение в `rebuild_from_enum`.
+fn refresh_known_window(
+    cache: &mut [WindowInfo],
+    hwnd: usize,
+    process_cache: &mut HashMap<u32, std::path::PathBuf>,
+) -> bool {
+    let Some(existing) = cache.iter().find(|window| window.hwnd == hwnd) else {
+        return true;
+    };
+    let z_order = existing.z_order;
+    let Some(mut fresh) = window_enum::collect_window_with_process_cache(
+        hwnd_from_usize(hwnd),
+        z_order,
+        process_cache,
+    ) else {
+        return false;
+    };
+    fresh.z_order = z_order;
+    let Some(slot) = cache.iter_mut().find(|window| window.hwnd == hwnd) else {
+        return false;
+    };
+    *slot = fresh;
+    true
+}
+
+/// Слить дешёвый проход `(hwnd, raw z_order)` с полными данными кэша.
+/// `None` означает неизвестное/пропавшее/дублированное окно и требует полного
+/// перечисления. При успехе результат имеет тот же порядок и z_order, что и
+/// `window_enum::enumerate()` при том же состоянии рабочего стола.
+fn merge_z_order(cache: &[WindowInfo], order: &[(usize, u32)]) -> Option<Vec<WindowInfo>> {
+    if cache.len() != order.len() {
+        return None;
+    }
+    let by_hwnd: HashMap<usize, &WindowInfo> =
+        cache.iter().map(|window| (window.hwnd, window)).collect();
+    if by_hwnd.len() != cache.len() {
+        return None;
+    }
+    let mut seen = HashSet::with_capacity(order.len());
+    let mut merged = Vec::with_capacity(order.len());
+    for &(hwnd, z_order) in order {
+        let source = by_hwnd.get(&hwnd)?;
+        if !seen.insert(hwnd) {
+            return None;
+        }
+        let mut window = (*source).clone();
+        window.z_order = z_order;
+        merged.push(window);
+    }
+    (merged.len() == cache.len()).then_some(merged)
 }
 
 /// Одна разрешённая операция над кэшом после снятия приоритетов между
@@ -458,9 +548,7 @@ enum ResolvedOp {
 /// освежать rect или iconic-флаг), минимизация — важнее отдельного
 /// `LOCATIONCHANGE` того же `hwnd` (уже покрыта через `refresh_rect`).
 /// Чистая функция — тестируется без кэша и без Win32
-/// (M4_WINDOW_TRACKER_REVIEW.md, пункт 2.3). Вызывается только когда
-/// `pending.needs_full == false` — полное перечисление решает целиком, эта
-/// функция для него не нужна.
+/// (M4_WINDOW_TRACKER_REVIEW.md, пункт 2.3).
 fn resolve_pending(pending: &Pending) -> Vec<ResolvedOp> {
     let mut ops = Vec::with_capacity(
         pending.destroyed.len() + pending.minimized.len() + pending.location_changed.len(),
@@ -487,13 +575,12 @@ fn resolve_pending(pending: &Pending) -> Vec<ResolvedOp> {
     ops
 }
 
-/// Применить накопленные изменения и отправить свежий снимок. Вызывается из
-/// `WM_TIMER` (обычный дебаунс) и из мест, требующих немедленного полного
-/// перечисления (`set_mask_needed(true)`, разблокировка сессии).
+/// Применить накопленные изменения и отправить свежий снимок. Быстрый путь
+/// обновляет только изменившиеся данные и z-order; если множество реальных
+/// hwnd разошлось с кэшем, выполняется полное перечисление.
 fn flush_pending(state: &mut WndState) {
-    let snapshot = if state.pending.needs_full {
-        rebuild_from_enum(&mut state.cache)
-    } else {
+    let mut needs_full = false;
+    if !needs_full {
         for op in resolve_pending(&state.pending) {
             match op {
                 ResolvedOp::Destroy(hwnd) => {
@@ -514,6 +601,51 @@ fn flush_pending(state: &mut WndState) {
                 }
             }
         }
+        for (&hwnd, &visible) in &state.pending.visibility {
+            if visible {
+                if !refresh_known_window(&mut state.cache, hwnd, &mut state.process_cache) {
+                    needs_full = true;
+                    break;
+                }
+            } else {
+                apply_destroy(&mut state.cache, hwnd);
+            }
+        }
+        if !needs_full {
+            for &hwnd in &state.pending.name_changed {
+                if !refresh_known_window(&mut state.cache, hwnd, &mut state.process_cache) {
+                    needs_full = true;
+                    break;
+                }
+            }
+        }
+        if !needs_full {
+            for &hwnd in &state.pending.foreground {
+                if !refresh_known_window(&mut state.cache, hwnd, &mut state.process_cache) {
+                    needs_full = true;
+                    break;
+                }
+            }
+        }
+        if !needs_full && state.pending.refresh_z_order {
+            let order = window_enum::enumerate_real_window_order();
+            match order.and_then(|order| merge_z_order(&state.cache, &order)) {
+                Some(merged) => state.cache = merged,
+                None => needs_full = true,
+            }
+        }
+    }
+    let snapshot = if needs_full {
+        rebuild_from_enum(state)
+    } else {
+        prune_process_cache(&state.cache, &mut state.process_cache);
+        state.incremental_rebuilds = state.incremental_rebuilds.saturating_add(1);
+        tracing::debug!(
+            full_rebuilds = state.full_rebuilds,
+            incremental_rebuilds = state.incremental_rebuilds,
+            windows = state.cache.len(),
+            "инкрементальное перестроение трекера окон"
+        );
         state.cache.clone()
     };
     state.pending = Pending::default();
@@ -539,29 +671,35 @@ fn refresh_rect_or_destroy(cache: &mut Vec<WindowInfo>, hwnd: usize) {
 /// без окон и без колбэка (M4_WINDOW_TRACKER_REVIEW.md, пункт 2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingOp {
-    NeedsFull,
     Destroyed,
     Minimized(bool),
     LocationChanged,
+    Foreground,
+    Reordered,
+    Visibility(bool),
+    NameChanged,
 }
 
 /// Классифицировать событие хука (M4_PREP_NOTES §3.2, таблица хуков):
 /// `None` — событие не интересно (лишний код диапазона `SetWinEventHook`
-/// или `LOCATIONCHANGE` окна вне кэша) — колбэк ничего не копит и не
-/// заводит таймер. `in_cache` учитывается только для `LOCATIONCHANGE`:
+/// или `NAMECHANGE` окна вне кэша) — колбэк ничего не копит и не заводит
+/// таймер. `in_cache` учитывается только для `LOCATIONCHANGE` и `NAMECHANGE`:
 /// иначе любая всплывающая подсказка/дропдаун вне кэша будила бы дебаунс
-/// впустую.
+/// впустую. FOREGROUND/SHOW/HIDE остаются быстрыми даже для неизвестного
+/// hwnd: дешёвый проход сам обнаружит расхождение множества и включит full.
 fn classify_event(event: u32, in_cache: bool) -> Option<PendingOp> {
     match event {
-        EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_SYSTEM_FOREGROUND => {
-            Some(PendingOp::NeedsFull)
-        }
+        EVENT_OBJECT_SHOW => Some(PendingOp::Visibility(true)),
+        EVENT_OBJECT_HIDE => Some(PendingOp::Visibility(false)),
         EVENT_OBJECT_DESTROY => Some(PendingOp::Destroyed),
         EVENT_SYSTEM_MINIMIZESTART => Some(PendingOp::Minimized(true)),
         EVENT_SYSTEM_MINIMIZEEND => Some(PendingOp::Minimized(false)),
         EVENT_OBJECT_LOCATIONCHANGE | EVENT_SYSTEM_MOVESIZEEND if in_cache => {
             Some(PendingOp::LocationChanged)
         }
+        EVENT_SYSTEM_FOREGROUND => Some(PendingOp::Foreground),
+        EVENT_OBJECT_REORDER => Some(PendingOp::Reordered),
+        EVENT_OBJECT_NAMECHANGE if in_cache => Some(PendingOp::NameChanged),
         _ => None,
     }
 }
@@ -608,15 +746,32 @@ unsafe extern "system" fn win_event_proc(
         return;
     };
     match op {
-        PendingOp::NeedsFull => state.pending.needs_full = true,
         PendingOp::Destroyed => {
             state.pending.destroyed.insert(target);
+            state.pending.refresh_z_order = true;
         }
         PendingOp::Minimized(iconic) => {
             state.pending.minimized.insert(target, iconic);
+            // Развёрнутое без фокуса окно (фоновое восстановление, показ
+            // группы) меняет порядок, не присылая FOREGROUND.
+            state.pending.refresh_z_order = true;
         }
         PendingOp::LocationChanged => {
             state.pending.location_changed.insert(target);
+        }
+        PendingOp::Foreground => {
+            state.pending.foreground.insert(target);
+            state.pending.refresh_z_order = true;
+        }
+        PendingOp::Reordered => {
+            state.pending.refresh_z_order = true;
+        }
+        PendingOp::Visibility(visible) => {
+            state.pending.visibility.insert(target, visible);
+            state.pending.refresh_z_order = true;
+        }
+        PendingOp::NameChanged => {
+            state.pending.name_changed.insert(target);
         }
     }
 
@@ -670,7 +825,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // `state.mask_needed`, M4_WINDOW_TRACKER_REVIEW.md,
                         // пункт 2.5).
                         if !state.frozen {
-                            let snapshot = rebuild_from_enum(&mut state.cache);
+                            let snapshot = rebuild_from_enum(state);
                             let _ = state.tx.send(WindowEvent::Changed(snapshot));
                         }
                     } else {
@@ -678,6 +833,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         kill_debounce_timer(hwnd, state);
                         state.pending = Pending::default();
                         state.cache.clear();
+                        state.process_cache.clear();
                     }
                 }
             }
@@ -713,7 +869,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     } else {
                         state.frozen = false;
                         if state.mask_needed {
-                            let snapshot = rebuild_from_enum(&mut state.cache);
+                            let snapshot = rebuild_from_enum(state);
                             let _ = state.tx.send(WindowEvent::Changed(snapshot));
                         }
                     }
@@ -839,20 +995,19 @@ mod tests {
     }
 
     #[test]
-    fn classify_event_show_and_hide_need_full() {
+    fn classify_event_show_and_hide_use_incremental_visibility() {
         assert_eq!(
             classify_event(EVENT_OBJECT_SHOW, false),
-            Some(PendingOp::NeedsFull)
+            Some(PendingOp::Visibility(true))
         );
         assert_eq!(
             classify_event(EVENT_OBJECT_HIDE, false),
-            Some(PendingOp::NeedsFull)
+            Some(PendingOp::Visibility(false))
         );
-        // in_cache не важен для SHOW/HIDE — источник полных перечислений
-        // не фильтруется членством (M4_WINDOW_TRACKER_DESIGN.md §3).
+        // in_cache не важен: быстрый проход сам обнаружит новое реальное окно.
         assert_eq!(
             classify_event(EVENT_OBJECT_SHOW, true),
-            Some(PendingOp::NeedsFull)
+            Some(PendingOp::Visibility(true))
         );
     }
 
@@ -890,23 +1045,80 @@ mod tests {
         assert_eq!(classify_event(0, true), None);
     }
 
-    /// Регрессия на живой репорт пользователя: переключение фокуса без
-    /// движения/показа/скрытия окна раньше не будило пересчёт маски вовсе —
-    /// `EVENT_SYSTEM_FOREGROUND` не был в таблице хуков. Теперь окклюдер
-    /// вычитает окна выше по z-order (`occluder_rects_for`), так что смена
-    /// переднего плана меняет фактическую видимую площадь и обязана
-    /// триггерить полное перечисление, как `SHOW`/`HIDE`.
+    /// Смена фокуса будит быстрый z-order-путь; полное перечисление нужно
+    /// только если проход обнаружит неизвестное реальное окно.
     #[test]
-    fn classify_event_foreground_needs_full() {
+    fn classify_event_foreground_is_incremental() {
         assert_eq!(
             classify_event(EVENT_SYSTEM_FOREGROUND, false),
-            Some(PendingOp::NeedsFull)
+            Some(PendingOp::Foreground)
         );
-        // in_cache не важен — тот же принцип, что у SHOW/HIDE.
         assert_eq!(
             classify_event(EVENT_SYSTEM_FOREGROUND, true),
-            Some(PendingOp::NeedsFull)
+            Some(PendingOp::Foreground)
         );
+    }
+
+    #[test]
+    fn classify_event_reorder_is_incremental() {
+        assert_eq!(
+            classify_event(EVENT_OBJECT_REORDER, false),
+            Some(PendingOp::Reordered)
+        );
+    }
+
+    #[test]
+    fn classify_event_name_change_requires_known_window() {
+        assert_eq!(
+            classify_event(EVENT_OBJECT_NAMECHANGE, true),
+            Some(PendingOp::NameChanged)
+        );
+        assert_eq!(classify_event(EVENT_OBJECT_NAMECHANGE, false), None);
+    }
+
+    #[test]
+    fn merge_z_order_matches_full_snapshot_data() {
+        let mut first = info(1, false);
+        first.title = "first".to_string();
+        first.rect = WindowRect {
+            x: 10,
+            y: 20,
+            w: 30,
+            h: 40,
+        };
+        let mut second = info(2, true);
+        second.title = "second".to_string();
+        second.pid = 42;
+        let cache = vec![first.clone(), second.clone()];
+
+        let merged = merge_z_order(&cache, &[(2, 0), (1, 7)]).expect("known order");
+        let mut expected_second = second;
+        expected_second.z_order = 0;
+        let mut expected_first = first;
+        expected_first.z_order = 7;
+        assert_eq!(merged, vec![expected_second, expected_first]);
+    }
+
+    #[test]
+    fn merge_z_order_falls_back_for_unknown_or_missing_window() {
+        let cache = vec![info(1, false), info(2, false)];
+        assert!(merge_z_order(&cache, &[(1, 0), (3, 1)]).is_none());
+        assert!(merge_z_order(&cache, &[(1, 0)]).is_none());
+        assert!(merge_z_order(&cache, &[(1, 0), (1, 1)]).is_none());
+    }
+
+    #[test]
+    fn process_cache_prunes_pids_without_windows() {
+        let mut cache = HashMap::from([
+            (7, std::path::PathBuf::from("live.exe")),
+            (8, std::path::PathBuf::from("gone.exe")),
+        ]);
+        let mut windows = vec![info(1, false)];
+        windows[0].pid = 7;
+        prune_process_cache(&windows, &mut cache);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&7), Some(&std::path::PathBuf::from("live.exe")));
+        assert!(!cache.contains_key(&8));
     }
 
     #[test]

@@ -41,6 +41,13 @@ impl Texture {
         self.height
     }
 
+    /// Идентичность GPU-ресурса: одинакова у клонов одной текстуры и
+    /// различна у разных. Нужна, чтобы заметить подмену текстуры спрайта
+    /// (перезагрузка медиа) при тех же UV и размещении.
+    pub fn identity(&self) -> usize {
+        windows::core::Interface::as_raw(&self.srv) as usize
+    }
+
     /// Обернуть ЧУЖУЮ текстуру и уже созданный на неё SRV.
     ///
     /// Нужно для живого куска окна: кадр приходит текстурой от
@@ -94,6 +101,18 @@ impl Texture {
         Self::from_rgba_inner(device, context, data, width, height, true)
     }
 
+    /// Как [`Self::from_rgba`], но принимает `Vec<u8>` во владение —
+    /// premultiply выполняется in-place без дополнительного клонирования буфера.
+    pub(crate) fn from_rgba_owned(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RenderError> {
+        Self::from_rgba_inner_owned(device, context, data, width, height, true)
+    }
+
     /// Как [`Self::from_rgba`], но БЕЗ мипмапов — для текстурных атласов
     /// анимации (M5a): автогенерация усреднила бы соседние кадры в нижних
     /// мипах (цвет ячейки «протёк» бы в соседнюю), поэтому атлас всегда
@@ -108,6 +127,19 @@ impl Texture {
         Self::from_rgba_inner(device, context, data, width, height, false)
     }
 
+    /// Как [`Self::from_rgba_atlas`], но принимает буфер атласа во владение —
+    /// premultiply выполняется in-place над буфером `combined`, исключая повторную
+    /// аллокацию полного размера атласа.
+    pub(crate) fn from_rgba_atlas_owned(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RenderError> {
+        Self::from_rgba_inner_owned(device, context, data, width, height, false)
+    }
+
     fn from_rgba_inner(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -117,7 +149,18 @@ impl Texture {
         with_mips: bool,
     ) -> Result<Self, RenderError> {
         validate_texture_data(width, height, data.len())?;
-        let mut data = data.to_vec();
+        Self::from_rgba_inner_owned(device, context, data.to_vec(), width, height, with_mips)
+    }
+
+    fn from_rgba_inner_owned(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        mut data: Vec<u8>,
+        width: u32,
+        height: u32,
+        with_mips: bool,
+    ) -> Result<Self, RenderError> {
+        validate_texture_data(width, height, data.len())?;
         premultiply_rgba(&mut data);
 
         // Проверяем поддержку автогенерации мипмапов форматом.
@@ -197,7 +240,17 @@ impl Texture {
         data: &[u8],
     ) -> Result<(), RenderError> {
         validate_texture_data(self.width, self.height, data.len())?;
-        let mut data = data.to_vec();
+        self.update_rgba_owned(context, data.to_vec())
+    }
+
+    /// Как [`Self::update_rgba`], но принимает `Vec<u8>` во владение —
+    /// premultiply выполняется in-place.
+    pub(crate) fn update_rgba_owned(
+        &self,
+        context: &ID3D11DeviceContext,
+        mut data: Vec<u8>,
+    ) -> Result<(), RenderError> {
+        validate_texture_data(self.width, self.height, data.len())?;
         premultiply_rgba(&mut data);
         // SAFETY: `self._texture` — валидный ID3D11Resource устройства
         // контекста; `data` живёт до конца вызова; UpdateSubresource

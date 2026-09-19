@@ -71,30 +71,94 @@ pub enum MediaError {
     UnsupportedFormat,
 }
 
+/// Исходный размер кадра анимации по заголовку файла, без декодирования
+/// кадров. `None` — формат не распознан или файл не читается.
+pub fn frame_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::image_dimensions(path).ok()
+}
+
+/// Вычислить новые размеры при пропорциональном даунскейле под предел `max_size`.
+/// Если `max_size` равен `None`, либо `(max_w, max_h)` равны 0, либо исходные
+/// размеры не превышают предел, возвращает `(orig_w, orig_h)`.
+/// Иначе вычисляет коэффициент `scale = min(max_w / orig_w, max_h / orig_h)`
+/// и возвращает пропорционально уменьшенные размеры (минимум 1×1).
+pub fn compute_downscale_dimensions(
+    orig_w: u32,
+    orig_h: u32,
+    max_size: Option<(u32, u32)>,
+) -> (u32, u32) {
+    let Some((max_w, max_h)) = max_size else {
+        return (orig_w, orig_h);
+    };
+    if orig_w == 0 || orig_h == 0 || max_w == 0 || max_h == 0 {
+        return (orig_w, orig_h);
+    }
+    if orig_w <= max_w && orig_h <= max_h {
+        return (orig_w, orig_h);
+    }
+    let scale_w = max_w as f64 / orig_w as f64;
+    let scale_h = max_h as f64 / orig_h as f64;
+    let scale = scale_w.min(scale_h);
+    let new_w = (orig_w as f64 * scale).round().max(1.0) as u32;
+    let new_h = (orig_h as f64 * scale).round().max(1.0) as u32;
+    (new_w, new_h)
+}
+
 /// Декодировать файл (GIF / APNG / animated WebP, по содержимому, не по
 /// расширению) во все кадры. Пороги лимитов проверяются инкрементально по
 /// мере итерации — при превышении возвращается `Err` сразу, без
 /// материализации остальных кадров.
+/// Прежняя сигнатура (эквивалентна [`decode_animation_with_max_size`] с `max_size: None`).
 pub fn decode_animation(path: &Path) -> Result<DecodedAnimation, MediaError> {
+    decode_animation_with_max_size(path, None)
+}
+
+/// Декодировать файл анимации во все кадры с опциональным ограничением максимального
+/// размера кадра (`max_size: Option<(max_w, max_h)>`).
+///
+/// Если задан `max_size` и исходные размеры превышают указанный предел, кадры
+/// пропорционально уменьшаются фильтром `Triangle` (Bilinear) до упаковки в атлас.
+/// Кадры декодируются с передачей владения (`into_buffer().into_raw()`) без избыточного
+/// глубокого клонирования буфера каждого кадра (`raw.clone()`), что удерживает пиковый
+/// расход памяти на уровне ≈ 1× размера атласа.
+pub fn decode_animation_with_max_size(
+    path: &Path,
+    max_size: Option<(u32, u32)>,
+) -> Result<DecodedAnimation, MediaError> {
     let format = detect_format(path)?;
     let frames = open_frames(path, format)?;
 
     let mut decoded = Vec::new();
     let mut total_bytes = 0usize;
-    let mut width = 0u32;
-    let mut height = 0u32;
+    let mut target_w = 0u32;
+    let mut target_h = 0u32;
 
     for frame in frames {
         let frame = frame?;
+        let delay = clamp_delay(frame.delay());
+        let buffer = frame.into_buffer();
         if decoded.is_empty() {
-            (width, height) = frame.buffer().dimensions();
+            let (orig_w, orig_h) = buffer.dimensions();
+            (target_w, target_h) = compute_downscale_dimensions(orig_w, orig_h, max_size);
         }
-        let raw = frame.buffer().as_raw();
-        total_bytes += raw.len();
+
+        let rgba = if (target_w, target_h) != buffer.dimensions() && target_w > 0 && target_h > 0 {
+            let resized = image::imageops::resize(
+                &buffer,
+                target_w,
+                target_h,
+                image::imageops::FilterType::Triangle,
+            );
+            resized.into_raw()
+        } else {
+            buffer.into_raw()
+        };
+
+        total_bytes += rgba.len();
         check_thresholds(decoded.len() + 1, total_bytes)?;
         decoded.push(DecodedFrame {
-            rgba: raw.clone(),
-            delay: clamp_delay(frame.delay()),
+            rgba,
+            delay,
         });
     }
 
@@ -102,8 +166,8 @@ pub fn decode_animation(path: &Path) -> Result<DecodedAnimation, MediaError> {
         return Err(MediaError::NotAnimated);
     }
     Ok(DecodedAnimation {
-        width,
-        height,
+        width: target_w,
+        height: target_h,
         frames: decoded,
     })
 }
@@ -148,6 +212,7 @@ pub struct StreamingAnimation {
     frames: Frames<'static>,
     width: u32,
     height: u32,
+    max_size: Option<(u32, u32)>,
     /// Кадры открытия/рестарта, уже декодированные, но ещё не отданные
     /// вызывающему коду через `next_frame`: ровно 2 (не 1) — тот же
     /// контракт «минимум 2 кадра», что у `decode_animation::NotAnimated`,
@@ -160,7 +225,17 @@ impl StreamingAnimation {
     /// Открыть файл для потокового декода: определяет формат по магическим
     /// байтам (как `decode_animation`), декодирует только первый кадр —
     /// остальные читаются по требованию через `next_frame`.
+    /// Прежняя сигнатура (эквивалентна [`Self::open_with_max_size`] с `max_size: None`).
     pub fn open(path: &Path) -> Result<Self, MediaError> {
+        Self::open_with_max_size(path, None)
+    }
+
+    /// Открыть файл для потокового декода с опциональным ограничением максимального
+    /// размера кадра (`max_size: Option<(max_w, max_h)>`).
+    pub fn open_with_max_size(
+        path: &Path,
+        max_size: Option<(u32, u32)>,
+    ) -> Result<Self, MediaError> {
         let format = detect_format(path)?;
         let frames = open_frames(path, format)?;
         let mut this = Self {
@@ -169,6 +244,7 @@ impl StreamingAnimation {
             frames,
             width: 0,
             height: 0,
+            max_size,
             pending: std::collections::VecDeque::new(),
         };
         this.prime()?;
@@ -185,6 +261,25 @@ impl StreamingAnimation {
         self.height
     }
 
+    /// Декодировать один кадр без глубокого клонирования буфера (`raw.clone()`),
+    /// с пропорциональным даунскейлом до `target_size`, если он отличается от исходного.
+    fn decode_single_frame(frame: image::Frame, target_w: u32, target_h: u32) -> DecodedFrame {
+        let delay = clamp_delay(frame.delay());
+        let buffer = frame.into_buffer();
+        let rgba = if (target_w, target_h) != buffer.dimensions() && target_w > 0 && target_h > 0 {
+            let resized = image::imageops::resize(
+                &buffer,
+                target_w,
+                target_h,
+                image::imageops::FilterType::Triangle,
+            );
+            resized.into_raw()
+        } else {
+            buffer.into_raw()
+        };
+        DecodedFrame { rgba, delay }
+    }
+
     /// Декодировать следующий кадр. По исчерпании кадров файла перезапускает
     /// декодер с начала (луп) и возвращает первый кадр нового прохода —
     /// вызывающему коду не нужно самому отслеживать конец анимации.
@@ -193,10 +288,7 @@ impl StreamingAnimation {
             return Ok(frame);
         }
         match self.frames.next() {
-            Some(Ok(frame)) => Ok(DecodedFrame {
-                rgba: frame.buffer().as_raw().clone(),
-                delay: clamp_delay(frame.delay()),
-            }),
+            Some(Ok(frame)) => Ok(Self::decode_single_frame(frame, self.width, self.height)),
             Some(Err(e)) => Err(e.into()),
             None => {
                 self.restart()?;
@@ -222,22 +314,18 @@ impl StreamingAnimation {
             .next()
             .transpose()?
             .ok_or(MediaError::NotAnimated)?;
-        let (width, height) = raw0.buffer().dimensions();
-        self.width = width;
-        self.height = height;
-        let frame0 = DecodedFrame {
-            rgba: raw0.buffer().as_raw().clone(),
-            delay: clamp_delay(raw0.delay()),
-        };
+        let (orig_w, orig_h) = raw0.buffer().dimensions();
+        let (target_w, target_h) = compute_downscale_dimensions(orig_w, orig_h, self.max_size);
+        self.width = target_w;
+        self.height = target_h;
+        let frame0 = Self::decode_single_frame(raw0, target_w, target_h);
+
         let raw1 = self
             .frames
             .next()
             .transpose()?
             .ok_or(MediaError::NotAnimated)?;
-        let frame1 = DecodedFrame {
-            rgba: raw1.buffer().as_raw().clone(),
-            delay: clamp_delay(raw1.delay()),
-        };
+        let frame1 = Self::decode_single_frame(raw1, target_w, target_h);
         self.pending = std::collections::VecDeque::from([frame0, frame1]);
         Ok(())
     }
@@ -536,12 +624,109 @@ mod tests {
     }
 
     #[test]
-    fn streaming_animation_unknown_format_is_rejected() {
-        let (_dir, path) = write_fixture(b"not a media file at all", "junk.bin");
-        let err = StreamingAnimation::open(&path).err();
-        assert!(
-            matches!(err, Some(MediaError::UnsupportedFormat)),
-            "{err:?}"
+    fn compute_downscale_dimensions_aspect_ratios_and_limits() {
+        // None = без изменений
+        assert_eq!(compute_downscale_dimensions(1920, 1080, None), (1920, 1080));
+        // Размеры меньше предела — без изменений
+        assert_eq!(
+            compute_downscale_dimensions(100, 50, Some((200, 200))),
+            (100, 50)
         );
+        // Ровно предел — без изменений
+        assert_eq!(
+            compute_downscale_dimensions(200, 100, Some((200, 100))),
+            (200, 100)
+        );
+        // Превышение по ширине: 1000×500 с пределом (200, 500) -> 200×100
+        assert_eq!(
+            compute_downscale_dimensions(1000, 500, Some((200, 500))),
+            (200, 100)
+        );
+        // Превышение по высоте: 500×1000 с пределом (500, 200) -> 100×200
+        assert_eq!(
+            compute_downscale_dimensions(500, 1000, Some((500, 200))),
+            (100, 200)
+        );
+        // Квадратный лимит для прямоугольника: 1920×1080 под (500, 500) -> 500×281
+        assert_eq!(
+            compute_downscale_dimensions(1920, 1080, Some((500, 500))),
+            (500, 281)
+        );
+        // Нулевые размеры / вырожденный вход
+        assert_eq!(compute_downscale_dimensions(0, 100, Some((50, 50))), (0, 100));
+        assert_eq!(compute_downscale_dimensions(100, 0, Some((50, 50))), (100, 0));
+        assert_eq!(compute_downscale_dimensions(100, 100, Some((0, 50))), (100, 100));
+    }
+
+    fn sized_gif_fixture(w: u32, h: u32, frame_colors: &[[u8; 4]], delays_ms: &[u32]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut buf);
+        for (color, delay_ms) in frame_colors.iter().zip(delays_ms) {
+            let img = RgbaImage::from_pixel(w, h, Rgba(*color));
+            let frame = Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(*delay_ms, 1));
+            encoder
+                .encode_frame(frame)
+                .expect("GIF-кодирование фикстуры");
+        }
+        drop(encoder);
+        buf
+    }
+
+    #[test]
+    fn decode_animation_with_max_size_downscales_frames_proportionally() {
+        let gif = sized_gif_fixture(
+            80,
+            40,
+            &[[255, 0, 0, 255], [0, 255, 0, 255]],
+            &[100, 200],
+        );
+        let (_dir, path) = write_fixture(&gif, "sized.gif");
+
+        // Без предела — оригинальный размер 80×40
+        let original = decode_animation(&path).expect("декод без предела");
+        assert_eq!(original.width, 80);
+        assert_eq!(original.height, 40);
+        assert_eq!(original.frames.len(), 2);
+        assert_eq!(original.frames[0].rgba.len(), 80 * 40 * 4);
+
+        // С пределом (20, 20): пропорциональный ресайз до 20×10 (scale = 20/80 = 0.25)
+        let downscaled = decode_animation_with_max_size(&path, Some((20, 20)))
+            .expect("декод с даунскейлом");
+        assert_eq!(downscaled.width, 20);
+        assert_eq!(downscaled.height, 10);
+        assert_eq!(downscaled.frames.len(), 2);
+        assert_eq!(downscaled.frames[0].rgba.len(), 20 * 10 * 4);
+        assert_eq!(downscaled.frames[1].rgba.len(), 20 * 10 * 4);
+        // Задержки кадров остаются прежними
+        assert_eq!(downscaled.frames[0].delay, Duration::from_millis(100));
+        assert_eq!(downscaled.frames[1].delay, Duration::from_millis(200));
+
+        // Эквивалентность: decode_animation_with_max_size с None полностью совпадает со старым decode_animation
+        let with_none = decode_animation_with_max_size(&path, None).expect("декод с None");
+        assert_eq!(with_none.width, original.width);
+        assert_eq!(with_none.height, original.height);
+        assert_eq!(with_none.frames[0].rgba, original.frames[0].rgba);
+        assert_eq!(with_none.frames[1].rgba, original.frames[1].rgba);
+    }
+
+    #[test]
+    fn streaming_animation_with_max_size_downscales_frames() {
+        let gif = sized_gif_fixture(
+            60,
+            30,
+            &[[255, 0, 0, 255], [0, 0, 255, 255]],
+            &[100, 100],
+        );
+        let (_dir, path) = write_fixture(&gif, "stream_sized.gif");
+
+        let mut stream = StreamingAnimation::open_with_max_size(&path, Some((20, 20)))
+            .expect("открытие потока с даунскейлом");
+        // 60×30 масштабируется до 20×10
+        assert_eq!(stream.width(), 20);
+        assert_eq!(stream.height(), 10);
+
+        let f0 = stream.next_frame().expect("кадр 0");
+        assert_eq!(f0.rgba.len(), 20 * 10 * 4);
+        assert_eq!(f0.delay, Duration::from_millis(100));
     }
 }

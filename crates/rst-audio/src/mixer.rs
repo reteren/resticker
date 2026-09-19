@@ -102,6 +102,167 @@ pub fn mix_frame(
     }
 }
 
+/// Порог тишины по умолчанию (~1.5 секунды), после которого поток вывода
+/// переводится в режим паузы (cpal stream.pause()) для экономии CPU и питания.
+pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Состояние воспроизведения аудио-потока.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPlaybackState {
+    Playing,
+    Paused,
+}
+
+/// Действие, которое необходимо применить к потоку cpal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAction {
+    None,
+    Play,
+    Pause,
+}
+
+/// Чистая логика отслеживания активности аудио-потока и управления паузой/воспроизведением.
+///
+/// Не зависит от cpal и аудио-устройств — полностью покрывается юнит-тестами.
+/// Реализует гистерезис:
+/// - Переход в `Paused` только после непрерывной тишины длительностью не менее `threshold_frames`.
+/// - Переход в `Playing` немедленно при появлении данных у любого источника.
+/// - Исключает частое переключение (chatter) и потерю первых сэмплов.
+#[derive(Debug)]
+pub struct IdleDetector {
+    state: StreamPlaybackState,
+    silence_frames: u64,
+    threshold_frames: u64,
+}
+
+impl IdleDetector {
+    /// Создаёт детектор с заданным порогом тишины в аудио-фреймах.
+    pub fn new(threshold_frames: u64) -> Self {
+        Self {
+            state: StreamPlaybackState::Playing,
+            silence_frames: 0,
+            threshold_frames,
+        }
+    }
+
+    /// Текущее состояние воспроизведения.
+    pub fn state(&self) -> StreamPlaybackState {
+        self.state
+    }
+
+    /// Число непрерывных фреймов тишины.
+    pub fn silence_frames(&self) -> u64 {
+        self.silence_frames
+    }
+
+    /// Порог тишины в фреймах.
+    pub fn threshold_frames(&self) -> u64 {
+        self.threshold_frames
+    }
+
+    /// Обработка результата рендера одного буфера.
+    ///
+    /// `has_data` — содержал ли буфер реальные сэмплы из очередей источников.
+    /// `frames` — количество фреймов в буфере.
+    pub fn on_render(&mut self, has_data: bool, frames: u64) -> StreamAction {
+        if has_data {
+            self.silence_frames = 0;
+            if self.state == StreamPlaybackState::Paused {
+                self.state = StreamPlaybackState::Playing;
+                return StreamAction::Play;
+            }
+            StreamAction::None
+        } else {
+            if self.state == StreamPlaybackState::Playing {
+                self.silence_frames = self.silence_frames.saturating_add(frames);
+                if self.silence_frames >= self.threshold_frames {
+                    self.state = StreamPlaybackState::Paused;
+                    return StreamAction::Pause;
+                }
+            }
+            StreamAction::None
+        }
+    }
+
+    /// Обработка поступления новых данных в любой источник.
+    pub fn on_data_available(&mut self) -> StreamAction {
+        self.silence_frames = 0;
+        if self.state == StreamPlaybackState::Paused {
+            self.state = StreamPlaybackState::Playing;
+            StreamAction::Play
+        } else {
+            StreamAction::None
+        }
+    }
+}
+
+/// Интерфейс управления аудио-потоком из микшера.
+pub(crate) trait StreamControl: Send + Sync {
+    /// Уведомление о рендере буфера (вызывается из audio callback).
+    fn on_render(&self, has_data: bool, frames: u64);
+    /// Возобновление потока при появлении данных (вызывается из push_samples).
+    fn resume(&self);
+}
+
+/// Контроллер потока cpal: связывает IdleDetector со слабым указателем на cpal::Stream.
+struct CpalStreamController {
+    detector: Mutex<IdleDetector>,
+    weak_stream: std::sync::Weak<Stream>,
+    is_paused: Arc<AtomicBool>,
+}
+
+impl CpalStreamController {
+    fn new(
+        weak_stream: std::sync::Weak<Stream>,
+        threshold_frames: u64,
+        is_paused: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            detector: Mutex::new(IdleDetector::new(threshold_frames)),
+            weak_stream,
+            is_paused,
+        }
+    }
+}
+
+impl StreamControl for CpalStreamController {
+    fn on_render(&self, has_data: bool, frames: u64) {
+        let mut det = lock(&self.detector);
+        let action = det.on_render(has_data, frames);
+        match action {
+            StreamAction::Pause => {
+                self.is_paused.store(true, Ordering::Relaxed);
+                if let Some(stream) = self.weak_stream.upgrade() {
+                    if let Err(e) = stream.pause() {
+                        tracing::warn!(error = %e, "не удалось приостановить cpal поток");
+                    }
+                }
+            }
+            StreamAction::Play => {
+                self.is_paused.store(false, Ordering::Relaxed);
+                if let Some(stream) = self.weak_stream.upgrade() {
+                    if let Err(e) = stream.play() {
+                        tracing::warn!(error = %e, "не удалось возобновить cpal поток");
+                    }
+                }
+            }
+            StreamAction::None => {}
+        }
+    }
+
+    fn resume(&self) {
+        let mut det = lock(&self.detector);
+        if det.on_data_available() == StreamAction::Play {
+            self.is_paused.store(false, Ordering::Relaxed);
+            if let Some(stream) = self.weak_stream.upgrade() {
+                if let Err(e) = stream.play() {
+                    tracing::warn!(error = %e, "не удалось возобновить cpal поток");
+                }
+            }
+        }
+    }
+}
+
 /// Чистая логика микшера: очередь источников, глобальная громкость/mute.
 /// Не знает про cpal — тестируется юнитами напрямую.
 struct MixerCore {
@@ -109,6 +270,9 @@ struct MixerCore {
     /// Биты f32 глобальной громкости (0.0..=1.0).
     global_volume: AtomicU32,
     muted: AtomicBool,
+    channels: AtomicU32,
+    controller: Mutex<Option<Arc<dyn StreamControl>>>,
+    is_stream_paused: Arc<AtomicBool>,
 }
 
 /// Состояние одного источника: очередь сэмплов + громкость.
@@ -126,6 +290,36 @@ impl MixerCore {
             sources: Mutex::new(HashMap::new()),
             global_volume: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
+            channels: AtomicU32::new(2),
+            controller: Mutex::new(None),
+            is_stream_paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn set_channels(&self, channels: u16) {
+        self.channels.store(channels.max(1) as u32, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn set_controller(&self, controller: Arc<dyn StreamControl>) {
+        *lock(&self.controller) = Some(controller);
+    }
+
+    #[cfg(not(test))]
+    fn set_controller(&self, controller: Arc<dyn StreamControl>) {
+        *lock(&self.controller) = Some(controller);
+    }
+
+    fn on_data_pushed(&self) {
+        // Без предварительной проверки `is_stream_paused`: флаг выставляет
+        // колбэк, и push, пришедший между решением «уснуть» и записью флага,
+        // оставил бы сэмплы в очереди остановленного потока. Решение
+        // «проснуться» принимается под тем же мьютексом детектора, что и
+        // «уснуть», и он же сбрасывает счётчик тишины — поэтому колбэк,
+        // посчитавший тишину до этого push, уснуть уже не успеет.
+        let ctrl = lock(&self.controller).clone();
+        if let Some(ctrl) = ctrl {
+            ctrl.resume();
         }
     }
 
@@ -151,7 +345,8 @@ impl MixerCore {
     /// устройства). Вызывается аудио-потоком в реальном времени — без
     /// аллокаций и блокировок длиннее микросекунд: один короткий мьютекс
     /// на мапу и по одному на очередь.
-    fn mix_into(&self, out: &mut [f32]) {
+    /// Возвращает `true`, если хотя бы один источник предоставил сэмплы.
+    fn mix_into(&self, out: &mut [f32]) -> bool {
         let muted = self.muted.load(Ordering::Relaxed);
         let global = f32::from_bits(self.global_volume.load(Ordering::Relaxed));
         let global = if muted || !global.is_finite() {
@@ -160,34 +355,52 @@ impl MixerCore {
             global.clamp(0.0, 1.0)
         };
         out.fill(0.0);
-        let sources = lock(&self.sources);
-        if sources.is_empty() {
-            return;
-        }
-        for state in sources.values() {
-            if state.dropped.load(Ordering::Relaxed) {
-                continue;
-            }
-            let volume = f32::from_bits(state.volume.load(Ordering::Relaxed));
-            let mut queue = lock(&state.queue);
-            if queue.is_empty() {
-                continue;
-            }
-            let samples = queue.make_contiguous();
-            let n = samples.len().min(out.len());
-            let v = volume * global;
-            if v > 0.0 {
-                for (dst, &s) in out.iter_mut().zip(samples[..n].iter()) {
-                    *dst += s * v;
+        let channels = self.channels.load(Ordering::Relaxed).max(1) as usize;
+        let frames = (out.len() / channels) as u64;
+
+        let (any_samples, controller) = {
+            let sources = lock(&self.sources);
+            if sources.is_empty() {
+                (false, lock(&self.controller).clone())
+            } else {
+                let mut any_samples = false;
+                for state in sources.values() {
+                    if state.dropped.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let volume = f32::from_bits(state.volume.load(Ordering::Relaxed));
+                    let mut queue = lock(&state.queue);
+                    if queue.is_empty() {
+                        continue;
+                    }
+                    let samples = queue.make_contiguous();
+                    let n = samples.len().min(out.len());
+                    let v = volume * global;
+                    if v > 0.0 {
+                        for (dst, &s) in out.iter_mut().zip(samples[..n].iter()) {
+                            *dst += s * v;
+                        }
+                    }
+                    // Потребляем всегда, даже при mute/нулевой громкости: молчание
+                    // тоже «проигрывается», иначе после unmute зазвучали бы
+                    // устаревшие сэмплы вразнобой с видео.
+                    queue.drain(..n);
+                    if n > 0 {
+                        any_samples = true;
+                    }
                 }
-            } // Потребляем всегда, даже при mute/нулевой громкости: молчание
-            // тоже «проигрывается», иначе после unmute зазвучали бы
-            // устаревшие сэмплы вразнобой с видео.
-            queue.drain(..n);
+                for v in out.iter_mut() {
+                    *v = v.clamp(-1.0, 1.0);
+                }
+                (any_samples, lock(&self.controller).clone())
+            }
+        };
+
+        if let Some(ctrl) = controller {
+            ctrl.on_render(any_samples, frames);
         }
-        for v in out.iter_mut() {
-            *v = v.clamp(-1.0, 1.0);
-        }
+
+        any_samples
     }
 
     fn set_global_volume(&self, volume: f32) {
@@ -207,13 +420,14 @@ impl MixerCore {
 /// Микшер с живым выходным потоком cpal: один на весь процесс.
 ///
 /// Открывает устройство вывода по умолчанию и поток в `new()` — поток
-/// играет тишину, пока источников нет. Источники создаются `add_source`
-/// (id берётся у координатора — тот же `Uuid`, что у стикера) и живут,
-/// пока жив `AudioSource`-хендл или пока не вызван `remove_source`.
+/// автоматически встаёт на паузу (stream.pause()) при отсутствии звука
+/// дольше ~1.5 с и возобновляется (stream.play()) при поступлении сэмплов.
+/// Источники создаются `add_source` (id берётся у координатора — тот же `Uuid`,
+/// что у стикера) и живут, пока жив `AudioSource`-хендл или пока не вызван `remove_source`.
 pub struct AudioMixer {
     core: Arc<MixerCore>,
     /// Удерживается только ради Drop: закрытие потока останавливает звук.
-    _stream: Stream,
+    _stream: Arc<Stream>,
     _device: cpal::Device,
     sample_rate: u32,
     channels: u16,
@@ -248,6 +462,7 @@ impl AudioMixer {
         };
 
         let core = Arc::new(MixerCore::new());
+        core.set_channels(stream_config.channels);
         let callback_core = Arc::clone(&core);
         let stream = device
             .build_output_stream_raw(
@@ -262,6 +477,18 @@ impl AudioMixer {
                 None,
             )?;
         stream.play()?;
+
+        let stream = Arc::new(stream);
+        let threshold_frames = (stream_config.sample_rate as u64
+            * DEFAULT_IDLE_TIMEOUT.as_millis() as u64)
+            / 1000;
+        let controller = Arc::new(CpalStreamController::new(
+            Arc::downgrade(&stream),
+            threshold_frames,
+            Arc::clone(&core.is_stream_paused),
+        ));
+        core.set_controller(controller);
+
         // Формат устройства уходит в декодер видео как цель ресемплинга
         // (`VideoSource::open_with_audio_target`), и неправдоподобные
         // значения там превращаются в отказ инициализировать звук — а
@@ -280,6 +507,11 @@ impl AudioMixer {
             _stream: stream,
             _device: device,
         })
+    }
+
+    /// Находится ли поток вывода устройства в режиме паузы (покой без звука).
+    pub fn is_stream_paused(&self) -> bool {
+        self.core.is_stream_paused.load(Ordering::Relaxed)
     }
 
     /// Регистрирует новый источник звука с уникальным `id` (id стикера).
@@ -385,6 +617,9 @@ impl AudioSource {
         let space = MAX_BUFFERED_SAMPLES.saturating_sub(queue.len());
         let chunk = &samples[samples.len().saturating_sub(space)..];
         queue.extend(chunk.iter().copied());
+        drop(queue);
+
+        self.core.on_data_pushed();
     }
 
     /// Громкость этого источника: `0.0..=1.0`, вне диапазона обрезается,
@@ -628,5 +863,200 @@ mod tests {
             std::thread::sleep(Duration::from_millis(60));
         }
         std::thread::sleep(Duration::from_millis(300));
+    }
+
+    #[test]
+    fn push_between_silent_mix_and_decision_prevents_pause() {
+        // Колбэк смешал пустой буфер почти на пороге тишины, в этот момент
+        // пришёл push — решение колбэка, принятое после, не должно усыпить поток.
+        let mut det = IdleDetector::new(1000);
+        assert_eq!(det.on_render(false, 990), StreamAction::None);
+        assert_eq!(det.on_data_available(), StreamAction::None);
+        assert_eq!(det.on_render(false, 10), StreamAction::None);
+        assert_eq!(det.state(), StreamPlaybackState::Playing);
+    }
+
+    #[test]
+    fn push_after_pause_decision_wakes_stream() {
+        let mut det = IdleDetector::new(100);
+        assert_eq!(det.on_render(false, 100), StreamAction::Pause);
+        assert_eq!(det.on_data_available(), StreamAction::Play);
+        assert_eq!(det.state(), StreamPlaybackState::Playing);
+    }
+
+    #[test]
+    fn idle_detector_starts_playing_with_zero_silence() {
+        let det = IdleDetector::new(1000);
+        assert_eq!(det.state(), StreamPlaybackState::Playing);
+        assert_eq!(det.silence_frames(), 0);
+        assert_eq!(det.threshold_frames(), 1000);
+    }
+
+    #[test]
+    fn idle_detector_hysteresis_and_pause_threshold() {
+        let mut det = IdleDetector::new(1000);
+
+        // Накопление тишины ниже порога: состояние остаётся Playing, действий нет
+        assert_eq!(det.on_render(false, 300), StreamAction::None);
+        assert_eq!(det.state(), StreamPlaybackState::Playing);
+        assert_eq!(det.silence_frames(), 300);
+
+        assert_eq!(det.on_render(false, 699), StreamAction::None);
+        assert_eq!(det.state(), StreamPlaybackState::Playing);
+        assert_eq!(det.silence_frames(), 999);
+
+        // Достижение порога: переход в Paused и возврат действия Pause
+        assert_eq!(det.on_render(false, 1), StreamAction::Pause);
+        assert_eq!(det.state(), StreamPlaybackState::Paused);
+        assert_eq!(det.silence_frames(), 1000);
+
+        // Продолжение тишины на паузе: повторных действий нет, состояние остаётся Paused
+        assert_eq!(det.on_render(false, 500), StreamAction::None);
+        assert_eq!(det.state(), StreamPlaybackState::Paused);
+    }
+
+    #[test]
+    fn idle_detector_resets_silence_on_active_data() {
+        let mut det = IdleDetector::new(1000);
+        assert_eq!(det.on_render(false, 800), StreamAction::None);
+        assert_eq!(det.silence_frames(), 800);
+
+        // Появление реального звука сбрасывает счётчик тишины
+        assert_eq!(det.on_render(true, 100), StreamAction::None);
+        assert_eq!(det.silence_frames(), 0);
+        assert_eq!(det.state(), StreamPlaybackState::Playing);
+
+        // После сброса нужно снова накопить полный порог для паузы
+        assert_eq!(det.on_render(false, 800), StreamAction::None);
+        assert_eq!(det.silence_frames(), 800);
+        assert_eq!(det.state(), StreamPlaybackState::Playing);
+    }
+
+    #[test]
+    fn idle_detector_resumes_when_data_becomes_available() {
+        let mut det = IdleDetector::new(500);
+        // Загоняем в паузу
+        assert_eq!(det.on_render(false, 500), StreamAction::Pause);
+        assert_eq!(det.state(), StreamPlaybackState::Paused);
+
+        // Поступление данных в очередь источника будит поток
+        assert_eq!(det.on_data_available(), StreamAction::Play);
+        assert_eq!(det.state(), StreamPlaybackState::Playing);
+        assert_eq!(det.silence_frames(), 0);
+
+        // Повторный вызов во время Playing не шлёт лишний Play
+        assert_eq!(det.on_data_available(), StreamAction::None);
+        assert_eq!(det.state(), StreamPlaybackState::Playing);
+    }
+
+    #[test]
+    fn core_mix_into_reports_has_data_accurately() {
+        let core = Arc::new(MixerCore::new());
+        let mut out = [0.0f32; 8];
+
+        // Без источников — has_data == false
+        assert!(!core.mix_into(&mut out));
+
+        // С пустым источником — has_data == false
+        let id = Uuid::new_v4();
+        let state = core.register_source(id);
+        assert!(!core.mix_into(&mut out));
+
+        // С сэмплами — has_data == true
+        lock(&state.queue).extend([0.5f32; 4]);
+        assert!(core.mix_into(&mut out));
+
+        // Снова пусто — has_data == false
+        assert!(!core.mix_into(&mut out));
+
+        // Mute: сэмплы всё равно потребляются (для синхронизации темпа видео), has_data == true
+        core.set_muted(true);
+        lock(&state.queue).extend([0.5f32; 4]);
+        assert!(core.mix_into(&mut out));
+        assert_eq!(out, [0.0; 8], "выход занулён из-за mute");
+    }
+
+    struct MockStreamController {
+        detector: Mutex<IdleDetector>,
+        is_paused: Arc<AtomicBool>,
+        play_count: AtomicU32,
+        pause_count: AtomicU32,
+    }
+
+    impl StreamControl for MockStreamController {
+        fn on_render(&self, has_data: bool, frames: u64) {
+            let mut det = lock(&self.detector);
+            match det.on_render(has_data, frames) {
+                StreamAction::Pause => {
+                    self.is_paused.store(true, Ordering::Relaxed);
+                    self.pause_count.fetch_add(1, Ordering::Relaxed);
+                }
+                StreamAction::Play => {
+                    self.is_paused.store(false, Ordering::Relaxed);
+                    self.play_count.fetch_add(1, Ordering::Relaxed);
+                }
+                StreamAction::None => {}
+            }
+        }
+
+        fn resume(&self) {
+            let mut det = lock(&self.detector);
+            if det.on_data_available() == StreamAction::Play {
+                self.is_paused.store(false, Ordering::Relaxed);
+                self.play_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn core_with_mock_controller_pauses_and_resumes_cleanly() {
+        let core = Arc::new(MixerCore::new());
+        core.set_channels(2); // stereo: 8 samples = 4 frames
+        let mock = Arc::new(MockStreamController {
+            detector: Mutex::new(IdleDetector::new(500)), // порог 500 фреймов
+            is_paused: Arc::clone(&core.is_stream_paused),
+            play_count: AtomicU32::new(0),
+            pause_count: AtomicU32::new(0),
+        });
+        core.set_controller(Arc::clone(&mock) as Arc<dyn StreamControl>);
+
+        let mut out = [0.0f32; 200]; // 100 фреймов стерео
+        // 4 прохода по 100 фреймов = 400 фреймов тишины (< 500)
+        for _ in 0..4 {
+            core.mix_into(&mut out);
+            assert_eq!(mock.pause_count.load(Ordering::Relaxed), 0);
+            assert!(!core.is_stream_paused.load(Ordering::Relaxed));
+        }
+
+        // 5-й проход: 500 фреймов тишины -> пауза!
+        core.mix_into(&mut out);
+        assert_eq!(mock.pause_count.load(Ordering::Relaxed), 1);
+        assert!(core.is_stream_paused.load(Ordering::Relaxed));
+
+        // Дальнейшие вызовы на паузе не спамят Pause
+        core.mix_into(&mut out);
+        assert_eq!(mock.pause_count.load(Ordering::Relaxed), 1);
+
+        // Поступление данных в источник: AudioSource::push_samples будит поток
+        let id = Uuid::new_v4();
+        let state = core.register_source(id);
+        let source = AudioSource {
+            id,
+            state: Arc::clone(&state),
+            core: Arc::clone(&core),
+        };
+
+        source.push_samples(&[0.3f32; 16]);
+        assert_eq!(mock.play_count.load(Ordering::Relaxed), 1);
+        assert!(!core.is_stream_paused.load(Ordering::Relaxed));
+
+        // Повторный push_samples во время работы не вызывает лишний play
+        source.push_samples(&[0.4f32; 16]);
+        assert_eq!(mock.play_count.load(Ordering::Relaxed), 1);
+
+        // Вызов mix_into потребляет данные и сбрасывает тишину
+        assert!(core.mix_into(&mut out));
+        assert_eq!(lock(&mock.detector).silence_frames(), 0);
+        assert_eq!(mock.pause_count.load(Ordering::Relaxed), 1);
     }
 }

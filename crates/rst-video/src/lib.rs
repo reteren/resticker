@@ -52,6 +52,7 @@ mod error;
 mod format;
 mod hwaccel;
 mod pipeline;
+mod runtime;
 mod timer_res;
 
 pub use error::VideoError;
@@ -474,6 +475,12 @@ impl VideoSource {
     pub fn duration(&self) -> Option<Duration> {
         self.info.duration
     }
+}
+
+/// Количество активных запросов на повышенное разрешение таймера (1 мс).
+/// В покое (все видео на паузе/остановлены) должно быть 0.
+pub fn active_timer_resolution_holders() -> usize {
+    crate::timer_res::TimerResolution::active_holders()
 }
 
 impl Drop for VideoSource {

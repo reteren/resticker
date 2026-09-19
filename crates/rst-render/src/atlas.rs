@@ -167,4 +167,86 @@ mod tests {
         let g = grid_layout(1, 8, 8);
         assert_eq!(frame_uvs(0, &g), ([0.0625, 0.0625], [0.875, 0.875]));
     }
+
+    #[test]
+    fn compute_downscale_dimensions_preserves_aspect_ratio_and_none() {
+        use crate::device::compute_downscale_dimensions;
+
+        // max_size = None сохраняет исходные размеры в точности (эквивалентность старому пути)
+        assert_eq!(compute_downscale_dimensions(1920, 1080, None), (1920, 1080));
+        assert_eq!(compute_downscale_dimensions(800, 600, None), (800, 600));
+
+        // Размеры меньше лимита не увеличиваются (no upscale)
+        assert_eq!(
+            compute_downscale_dimensions(200, 100, Some((400, 400))),
+            (200, 100)
+        );
+
+        // Пропорциональный даунскейл: ограничение по ширине
+        assert_eq!(
+            compute_downscale_dimensions(1920, 1080, Some((960, 960))),
+            (960, 540)
+        );
+
+        // Пропорциональный даунскейл: ограничение по высоте
+        assert_eq!(
+            compute_downscale_dimensions(1000, 2000, Some((800, 500))),
+            (250, 500)
+        );
+
+        // Граничные случаи: нулевые размеры
+        assert_eq!(compute_downscale_dimensions(0, 100, Some((50, 50))), (0, 100));
+        assert_eq!(compute_downscale_dimensions(100, 100, Some((0, 50))), (100, 100));
+    }
+
+    #[test]
+    fn atlas_layout_and_uvs_after_downscale() {
+        use crate::device::compute_downscale_dimensions;
+
+        let orig_w = 1200;
+        let orig_h = 800;
+        let frame_count = 4;
+
+        // Исходная раскладка без даунскейла (None)
+        let (none_w, none_h) = compute_downscale_dimensions(orig_w, orig_h, None);
+        let layout_orig = grid_layout(frame_count, none_w, none_h);
+        assert_eq!(layout_orig.columns, 2);
+        assert_eq!(layout_orig.rows, 2);
+        assert_eq!(layout_orig.atlas_w, 2400);
+        assert_eq!(layout_orig.atlas_h, 1600);
+
+        // Раскладка с даунскейлом max_size = (300, 300) -> 300x200
+        let (down_w, down_h) = compute_downscale_dimensions(orig_w, orig_h, Some((300, 300)));
+        assert_eq!((down_w, down_h), (300, 200));
+
+        let layout_down = grid_layout(frame_count, down_w, down_h);
+        assert_eq!(layout_down.columns, 2);
+        assert_eq!(layout_down.rows, 2);
+        assert_eq!(layout_down.atlas_w, 600);
+        assert_eq!(layout_down.atlas_h, 400);
+
+        // Проверка UV-координат всех кадров: сетка ячеек остаётся согласованной,
+        // а inset_u / inset_v корректно масштабируются под новый размер атласа
+        for i in 0..frame_count {
+            let (uv_off, uv_scale) = frame_uvs(i, &layout_down);
+            // Ячейки в диапазоне [0, 1]
+            assert!(uv_off[0] >= 0.0 && uv_off[0] < 1.0);
+            assert!(uv_off[1] >= 0.0 && uv_off[1] < 1.0);
+            assert!(uv_off[0] + uv_scale[0] <= 1.0);
+            assert!(uv_off[1] + uv_scale[1] <= 1.0);
+
+            // Ожидаемый инсет для 600x400: 0.5/600 и 0.5/400
+            let expected_cell_w = 0.5f32; // 1 / 2 columns
+            let expected_cell_h = 0.5f32; // 1 / 2 rows
+            let expected_inset_u = 0.5f32 / 600.0;
+            let expected_inset_v = 0.5f32 / 400.0;
+
+            let col = (i % 2) as f32;
+            let row = (i / 2) as f32;
+            assert_eq!(uv_off[0], col * expected_cell_w + expected_inset_u);
+            assert_eq!(uv_off[1], row * expected_cell_h + expected_inset_v);
+            assert_eq!(uv_scale[0], expected_cell_w - 2.0 * expected_inset_u);
+            assert_eq!(uv_scale[1], expected_cell_h - 2.0 * expected_inset_v);
+        }
+    }
 }

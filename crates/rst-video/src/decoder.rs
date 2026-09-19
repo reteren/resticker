@@ -3,7 +3,7 @@
 //! координатора (docs/M5B_VIDEO_DESIGN.md §2).
 //!
 //! Контракты потока:
-//! - **Пауза** — не тянет пакеты вообще (`recv_timeout` вместо чтения файла),
+//! - **Пауза** — не тянет пакеты вообще (блокирующий `recv` вместо чтения файла),
 //!   CPU в простое нулевой; любое сообщение из канала при этом ОБРАБАТЫВАЕТСЯ
 //!   (не выбрасывается — иначе Play/Seek/Shutdown, пришедшие на паузе,
 //!   терялись бы и поток не выходил из паузы никогда).
@@ -36,8 +36,6 @@ pub(crate) const AUDIO_QUEUE_CAPACITY: usize = 32;
 /// Срез сна пайсинга: команды (пауза/перемотка/завершение) доезжают с
 /// задержкой ≤ 100 мс.
 const PACE_SLICE: Duration = Duration::from_millis(100);
-/// Период проверки команд на паузе.
-const PAUSE_POLL: Duration = Duration::from_millis(100);
 
 /// Команда декодер-потоку от [`crate::VideoSource`].
 pub(crate) enum Control {
@@ -115,11 +113,6 @@ pub(crate) fn decoder_thread(
     audio_target: crate::pipeline::AudioTarget,
     hw_device: Option<ID3D11Device>,
 ) {
-    // Пока живёт этот поток, процесс держит миллисекундное разрешение
-    // таймера: пауза до `pts` кадра иначе округляется до ~15.6 мс и видео
-    // идёт рывками (см. `crate::timer_res`).
-    let _timer = crate::timer_res::TimerResolution::acquire();
-
     // Открытие и проверка первого кадра (формат пикселя/размеры) — здесь, в
     // потоке: все FFmpeg-вызовы одного файла живут на одной нити. В hw-режиме
     // устройство передаётся в `Pipeline::open_with_hw` (hw-контексты
@@ -155,6 +148,11 @@ pub(crate) fn decoder_thread(
     let mut pacing = Pacing::default();
     let mut pending_seek: Option<PendingSeek> = None;
     let mut paused = shared.paused.load(Ordering::Relaxed);
+    // Разрешение таймера 1 мс держится только во время активного воспроизведения.
+    // На паузе и при остановке оно отпускается, чтобы не ускорять системный
+    // таймер всей Windows в покое (см. timer_res.rs).
+    let mut timer_res: Option<crate::timer_res::TimerResolution> = None;
+    sync_timer_res(&mut timer_res, paused);
 
     loop {
         // 1. Команды (и только команды — пакеты не читаются).
@@ -162,13 +160,16 @@ pub(crate) fn decoder_thread(
         if drain_commands(&ctl_rx, &mut paused, &mut pending_seek, &shared) {
             break; // Shutdown
         }
-        if was_paused && !paused {
-            // Возобновление с паузы: старый якорь датирован до-паузным
-            // моментом — без сброса все кадры после паузы длительностью P
-            // отдаются мгновенно "вдогонку", видео пропускает P секунд
-            // контента. Найдено независимым ревью: докком `Pacing` обещал
-            // сброс "и возобновления с паузы", код его не делал.
-            pacing.reset();
+        if was_paused != paused {
+            if was_paused && !paused {
+                // Возобновление с паузы: старый якорь датирован до-паузным
+                // моментом — без сброса все кадры после паузы длительностью P
+                // отдаются мгновенно "вдогонку", видео пропускает P секунд
+                // контента. Найдено независимым ревью: докком `Pacing` обещал
+                // сброс "и возобновления с паузы", код его не делал.
+                pacing.reset();
+            }
+            sync_timer_res(&mut timer_res, paused);
         }
 
         // 2. Перемотка — до чтения новых пакетов (безопасная точка: между
@@ -182,22 +183,25 @@ pub(crate) fn decoder_thread(
             pacing.reset();
         }
 
-        // 3. Пауза: не тянем пакеты вообще — ждём команду (нулевой CPU).
-        //    Важно: сообщение из recv_timeout ОБРАБАТЫВАЕТСЯ, а не
+        // 3. Пауза: не тянем пакеты вообще — ждём команду блокирующе (нулевой CPU).
+        //    Важно: сообщение из recv ОБРАБАТЫВАЕТСЯ, а не
         //    выбрасывается (иначе Play/Seek, пришедшие на паузе, терялись бы).
         if paused {
-            match ctl_rx.recv_timeout(PAUSE_POLL) {
+            sync_timer_res(&mut timer_res, true);
+            match ctl_rx.recv() {
                 Ok(cmd) => {
                     let was_paused = paused;
                     if apply_command(cmd, &mut paused, &mut pending_seek, &shared) {
                         break; // Shutdown
                     }
-                    if was_paused && !paused {
-                        pacing.reset();
+                    if was_paused != paused {
+                        if was_paused && !paused {
+                            pacing.reset();
+                        }
+                        sync_timer_res(&mut timer_res, paused);
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(_) => break, // Канал закрыт (VideoSource дропнут) — завершаем поток
             }
             continue;
         }
@@ -210,8 +214,15 @@ pub(crate) fn decoder_thread(
                 // Pause/Seek задерживались бы на весь PACE_SLICE-остаток —
                 // секунды/минуты на файле с аномальным скачком PTS).
                 if let Some(cmd) = pace_to(&mut pacing, frame.pts, &ctl_rx) {
+                    let was_paused = paused;
                     if apply_command(cmd, &mut paused, &mut pending_seek, &shared) {
                         break; // Shutdown
+                    }
+                    if was_paused != paused {
+                        if was_paused && !paused {
+                            pacing.reset();
+                        }
+                        sync_timer_res(&mut timer_res, paused);
                     }
                     // Кадр уже декодирован — не выбрасываем проделанную
                     // работу, отправляем как обычно; если команда была
@@ -240,8 +251,15 @@ pub(crate) fn decoder_thread(
                 // очередь в этом режиме остаётся пустой (док
                 // `VideoSource::try_recv_frame`).
                 if let Some(cmd) = pace_to(&mut pacing, frame.pts, &ctl_rx) {
+                    let was_paused = paused;
                     if apply_command(cmd, &mut paused, &mut pending_seek, &shared) {
                         break; // Shutdown
+                    }
+                    if was_paused != paused {
+                        if was_paused && !paused {
+                            pacing.reset();
+                        }
+                        sync_timer_res(&mut timer_res, paused);
                     }
                 }
                 if hw_frame_tx.try_send(frame).is_ok() {
@@ -317,6 +335,16 @@ fn apply_command(
         Control::Shutdown => return true,
     }
     false
+}
+
+/// Синхронизирует удержание разрешения системного таймера 1 мс:
+/// удерживается только пока видео активно воспроизводится (!paused).
+fn sync_timer_res(timer_res: &mut Option<crate::timer_res::TimerResolution>, paused: bool) {
+    if paused {
+        *timer_res = None;
+    } else if timer_res.is_none() {
+        *timer_res = Some(crate::timer_res::TimerResolution::acquire());
+    }
 }
 
 /// Задержать выдачу кадра до его тайминга: `anchor + pts` — момент показа.

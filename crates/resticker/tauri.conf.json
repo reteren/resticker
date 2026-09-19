@@ -8,47 +8,7 @@
   },
   "app": {
     "withGlobalTauri": true,
-    "windows": [
-      {
-        "label": "settings",
-        "title": "resticker — settings",
-        "width": 900,
-        "height": 600,
-        "visible": false,
-        "center": true,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "shadow": false,
-        "theme": "Dark",
-        "windowEffects": {
-          "effects": [
-            "acrylic"
-          ]
-        }
-      },
-      {
-        "label": "traymenu",
-        "url": "traymenu.html",
-        "title": "resticker menu",
-        "width": 232,
-        "height": 240,
-        "visible": false,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "shadow": false,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "focus": true,
-        "theme": "Dark",
-        "windowEffects": {
-          "effects": [
-            "acrylic"
-          ]
-        }
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

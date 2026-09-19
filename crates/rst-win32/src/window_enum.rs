@@ -331,18 +331,30 @@ pub fn min_window_size(hwnd: usize) -> Option<WindowMinSize> {
 /// Контекст колбэка `EnumWindows`: `raw_index` считает **все** окна из
 /// сырого перечисления (даже отфильтрованные) — так `WindowInfo::z_order`
 /// остаётся монотонным с пропусками, как задокументировано на поле.
-struct EnumCtx {
+struct EnumCtx<'a> {
     out: Vec<WindowInfo>,
     raw_index: u32,
+    process_cache: &'a mut HashMap<u32, PathBuf>,
 }
 
 /// Перечислить все «реальные» top-level окна одним снимком (одноразовое
 /// перечисление; инкрементальный кэш на WinEvent-хуках — отдельный модуль,
 /// M4_PREP_NOTES §3).
 pub fn enumerate() -> Vec<WindowInfo> {
+    let mut process_cache = HashMap::new();
+    enumerate_with_process_cache(&mut process_cache)
+}
+
+/// Полное перечисление с кэшем `pid → exe_path`, принадлежащим вызывающему
+/// потоку. Кэш позволяет не делать `OpenProcess`/`QueryFullProcessImageNameW`
+/// повторно для каждого окна одного процесса при каждом полном снимке.
+pub(crate) fn enumerate_with_process_cache(
+    process_cache: &mut HashMap<u32, PathBuf>,
+) -> Vec<WindowInfo> {
     let mut ctx = EnumCtx {
         out: Vec::new(),
         raw_index: 0,
+        process_cache,
     };
     // SAFETY: `ctx` живёт весь вызов и не разделяется; колбэк — синхронный,
     // на этом же потоке, указатель действует только внутри EnumWindows.
@@ -358,15 +370,57 @@ extern "system" fn enum_windows_proc(hwnd: HWND, data: LPARAM) -> BOOL {
     let ctx = unsafe { &mut *(data.0 as *mut EnumCtx) };
     let z_order = ctx.raw_index;
     ctx.raw_index += 1;
-    if let Some(info) = collect_window(hwnd, z_order) {
+    if let Some(info) = collect_window_with_process_cache(hwnd, z_order, ctx.process_cache) {
         ctx.out.push(info);
     }
     TRUE
 }
 
-/// Собрать [`WindowInfo`] для `hwnd`, если оно проходит фильтр
-/// [`is_real_window`]; иначе `None`.
-fn collect_window(hwnd: HWND, z_order: u32) -> Option<WindowInfo> {
+/// Только дешёвая часть полного перечисления: hwnd реальных окон и их сырой
+/// индекс в z-order. Заголовок, exe, иконка и DWM-границы здесь не читаются.
+/// `None` означает отказ самого `EnumWindows`, поэтому вызывающий должен
+/// считать кэш устаревшим и выполнить полное перечисление.
+pub(crate) fn enumerate_real_window_order() -> Option<Vec<(usize, u32)>> {
+    let mut ctx = OrderCtx {
+        out: Vec::new(),
+        raw_index: 0,
+    };
+    // SAFETY: `ctx` живёт весь вызов и не разделяется; колбэк синхронный,
+    // на этом же потоке, указатель действует только внутри EnumWindows.
+    let ok = unsafe {
+        EnumWindows(
+            Some(enum_real_window_order_proc),
+            LPARAM(&raw mut ctx as isize),
+        )
+    }
+    .is_ok();
+    ok.then_some(ctx.out)
+}
+
+struct OrderCtx {
+    out: Vec<(usize, u32)>,
+    raw_index: u32,
+}
+
+extern "system" fn enum_real_window_order_proc(hwnd: HWND, data: LPARAM) -> BOOL {
+    // SAFETY: `data` — &mut OrderCtx из `enumerate_real_window_order`, живой
+    // на всё время вызова EnumWindows; колбэк синхронный, гонок нет.
+    let ctx = unsafe { &mut *(data.0 as *mut OrderCtx) };
+    let z_order = ctx.raw_index;
+    ctx.raw_index += 1;
+    if is_real_window_handle(hwnd) {
+        ctx.out.push((hwnd.0 as usize, z_order));
+    }
+    TRUE
+}
+
+/// Собрать [`WindowInfo`] для `hwnd` с полными данными, если оно проходит
+/// фильтр [`is_real_window`]; иначе `None`.
+pub(crate) fn collect_window_with_process_cache(
+    hwnd: HWND,
+    z_order: u32,
+    process_cache: &mut HashMap<u32, PathBuf>,
+) -> Option<WindowInfo> {
     let flags = window_flags(hwnd);
     if !is_real_window(&flags) {
         // Диагностика на живой репорт пользователя («список окон в панели
@@ -382,7 +436,7 @@ fn collect_window(hwnd: HWND, z_order: u32) -> Option<WindowInfo> {
         );
         return None;
     }
-    let (pid, exe_path) = process_info(hwnd);
+    let (pid, exe_path) = process_info_cached(hwnd, process_cache);
     let icon = window_icon(&exe_path);
     Some(WindowInfo {
         hwnd: hwnd.0 as usize,
@@ -395,6 +449,13 @@ fn collect_window(hwnd: HWND, z_order: u32) -> Option<WindowInfo> {
         iconic: flags.iconic,
         icon,
     })
+}
+
+/// Тот же фильтр, что в полном `collect_window`, но без дорогих данных окна.
+/// Нужен только для проверки, что быстрый z-order-снимок содержит ровно тот
+/// же набор окон, что и полное перечисление.
+fn is_real_window_handle(hwnd: HWND) -> bool {
+    is_real_window(&window_flags(hwnd))
 }
 
 /// Собрать [`WindowFlags`] Win32-вызовами (ARCHITECTURE.md 3.3, M4_PREP_NOTES §2.2).
@@ -729,21 +790,29 @@ fn window_class(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..len.max(0) as usize])
 }
 
-/// PID окна и путь к его exe. Путь пуст, если `OpenProcess` отказал
-/// (недостаточно прав — например, защищённый процесс) — окно всё равно
-/// перечисляется (M4_PREP_NOTES §2.2).
-fn process_info(hwnd: HWND) -> (u32, PathBuf) {
+/// Вариант `process_info`, переиспользующий путь exe для всех окон одного PID.
+/// Пустой путь тоже кэшируется: повторный отказ UIPI не должен повторять
+/// `OpenProcess` на каждом окне этого процесса.
+fn process_info_cached(hwnd: HWND, process_cache: &mut HashMap<u32, PathBuf>) -> (u32, PathBuf) {
     let mut pid: u32 = 0;
     // SAFETY: hwnd — из EnumWindows; pid — валидный out-параметр.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    process_info_for_pid(pid, process_cache)
+}
+
+fn process_info_for_pid(pid: u32, process_cache: &mut HashMap<u32, PathBuf>) -> (u32, PathBuf) {
     if pid == 0 {
         return (0, PathBuf::new());
+    }
+    if let Some(path) = process_cache.get(&pid) {
+        return (pid, path.clone());
     }
     // SAFETY: pid — только что полученный от системы; хэндл процесса
     // закрывается ниже в любом случае (в т.ч. при ошибке — CloseHandle
     // безопасен для валидного хэндла).
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
     let Ok(process) = process else {
+        process_cache.insert(pid, PathBuf::new());
         return (pid, PathBuf::new());
     };
     let mut buf = [0u16; 1024];
@@ -768,6 +837,7 @@ fn process_info(hwnd: HWND) -> (u32, PathBuf) {
     } else {
         PathBuf::new()
     };
+    process_cache.insert(pid, path.clone());
     (pid, path)
 }
 

@@ -200,3 +200,55 @@ fn loops_back_to_start_at_end_of_stream() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn drop_while_paused_exits_promptly() {
+    let source = VideoSource::open(&fixture()).expect("фикстура открывается");
+    let _ = wait_first_frame(&source, Duration::from_secs(15));
+    source.pause();
+    assert!(source.is_paused());
+    std::thread::sleep(Duration::from_millis(200));
+
+    let start = Instant::now();
+    // Поток блокирующе ждет в recv(); drop обязан разбудить его и завершить join быстро.
+    drop(source);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "drop на паузе должен завершаться быстро, прошло: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn pause_releases_timer_resolution_and_resume_reacquires() {
+    let source = VideoSource::open(&fixture()).expect("фикстура открывается");
+    let _ = wait_first_frame(&source, Duration::from_secs(15));
+
+    let holders_playing = rst_video::active_timer_resolution_holders();
+    assert!(
+        holders_playing >= 1,
+        "при воспроизведении таймер 1 мс должен удерживаться: holders = {holders_playing}"
+    );
+
+    source.pause();
+    assert!(source.is_paused());
+    std::thread::sleep(Duration::from_millis(300));
+
+    let holders_paused = rst_video::active_timer_resolution_holders();
+    assert!(
+        holders_paused < holders_playing,
+        "на паузе число держателей должно уменьшиться: было {holders_playing}, стало {holders_paused}"
+    );
+
+    source.play();
+    assert!(!source.is_paused());
+    let _ = wait_first_frame(&source, Duration::from_secs(15));
+
+    let holders_resumed = rst_video::active_timer_resolution_holders();
+    assert!(
+        holders_resumed > holders_paused,
+        "при возобновлении число держателей должно вырасти: было {holders_paused}, стало {holders_resumed}"
+    );
+
+    drop(source);
+}

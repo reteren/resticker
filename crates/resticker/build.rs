@@ -2,7 +2,18 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Такие аргументы нужны именно финальному `resticker.exe`: build.rs
+/// библиотечного `rst-video` не передаёт link flags зависимому бинарю.
+const FFMPEG_DELAY_LOAD_DLLS: &[&str] = &[
+    "avformat-61.dll",
+    "avcodec-61.dll",
+    "avutil-59.dll",
+    "swresample-5.dll",
+];
+
 fn main() {
+    emit_delay_load_args();
+
     // Должно выполниться до tauri_build::try_build: он сам читает
     // bundle.resources из tauri.conf.json и падает, если glob ничего не
     // находит — resources/ffmpeg-dlls/ должна существовать заранее.
@@ -15,6 +26,24 @@ fn main() {
             .app_manifest(include_str!("resources/resticker.exe.manifest")),
     );
     tauri_build::try_build(attrs).expect("tauri_build failed");
+}
+
+/// До первого вызова FFmpeg Windows не маппит DLL, поэтому обычный старт
+/// приложения не оплачивает память видеопайплайна. delayimp.lib нужен для
+/// обработчика thunk; на остальных toolchain'ах этот MSVC-флаг неприменим.
+fn emit_delay_load_args() {
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        return;
+    }
+    for dll in FFMPEG_DELAY_LOAD_DLLS {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
+    }
+    println!("cargo:rustc-link-lib=dylib=delayimp");
+    // delayimp.lib просит динамический vcruntime.lib, а rustc линкует
+    // vcruntime статически: без этого исключения exe начинает требовать
+    // VCRUNTIME140.dll и не запустится там, где нет VC++ Redistributable
+    // (замер dumpbin 2026-09-19 — до delay-load этого импорта не было).
+    println!("cargo:rustc-link-arg=/NODEFAULTLIB:vcruntime.lib");
 }
 
 /// FFmpeg собран тулчейном MinGW-w64 gcc (docs/M5B_VIDEO_DESIGN.md §1), и

@@ -35,7 +35,7 @@ mod window_highlight;
 mod window_target;
 
 pub use atlas::{AtlasFrame, TextureAtlas};
-pub use device::Device;
+pub use device::{Device, compute_downscale_dimensions, image_dimensions};
 pub use error::RenderError;
 pub use icons::icon_rgba;
 pub use marquee::{

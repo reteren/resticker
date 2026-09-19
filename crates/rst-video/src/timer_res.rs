@@ -21,7 +21,7 @@
 //! на время жизни декодер-потоков и опускается, когда закрылся последний:
 //! в покое программа не должна держать систему в режиме частых прерываний.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 
@@ -30,7 +30,18 @@ use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 const PERIOD_MS: u32 = 1;
 
 /// Сколько живых держателей сейчас (файлов может играть несколько).
-static HOLDERS: AtomicUsize = AtomicUsize::new(0);
+///
+/// Под мьютексом, а не атомиком: счётчик и системный вызов обязаны меняться
+/// вместе. С атомиком закрывающийся декодер мог уменьшить счётчик до нуля,
+/// открывающийся — успеть позвать `timeBeginPeriod`, и только потом первый
+/// позвал бы `timeEndPeriod`, сбросив разрешение из-под играющего видео.
+/// Теперь, когда разрешение берётся на каждом Play и отдаётся на каждой
+/// паузе, такие встречи стали обычным делом.
+static HOLDERS: Mutex<usize> = Mutex::new(0);
+
+fn holders() -> MutexGuard<'static, usize> {
+    HOLDERS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Держатель повышенного разрешения таймера: пока жив хотя бы один,
 /// ожидания в процессе просыпаются с точностью до миллисекунды.
@@ -41,21 +52,28 @@ pub(crate) struct TimerResolution {
 }
 
 impl TimerResolution {
+    /// Количество активных держателей повышенного разрешения таймера.
+    #[allow(dead_code)]
+    pub(crate) fn active_holders() -> usize {
+        *holders()
+    }
+
     /// Поднять разрешение (или присоединиться к уже поднятому).
     pub(crate) fn acquire() -> Self {
-        if HOLDERS.fetch_add(1, Ordering::AcqRel) == 0 {
+        let mut count = holders();
+        if *count == 0 {
             // SAFETY: timeBeginPeriod — потокобезопасный запрос к системе,
             // парный вызов `timeEndPeriod` делается в `Drop`.
             let code = unsafe { timeBeginPeriod(PERIOD_MS) };
             if code != 0 {
                 // Система отказала (экзотика): работаем как раньше, просто
                 // с грубыми ожиданиями — это хуже по плавности, но не
-                // ошибка. Счётчик откатываем, чтобы не «снять» чужой запрос.
-                HOLDERS.fetch_sub(1, Ordering::AcqRel);
+                // ошибка. Счётчик не трогаем, чтобы не «снять» чужой запрос.
                 tracing::warn!(code, "не удалось поднять разрешение таймера");
                 return Self { active: false };
             }
         }
+        *count += 1;
         Self { active: true }
     }
 }
@@ -65,11 +83,31 @@ impl Drop for TimerResolution {
         if !self.active {
             return;
         }
-        if HOLDERS.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let mut count = holders();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
             // SAFETY: парный вызов к принятому `timeBeginPeriod`.
             unsafe {
                 let _ = timeEndPeriod(PERIOD_MS);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timer_resolution_increments_and_decrements_holders() {
+        let before = TimerResolution::active_holders();
+        let t1 = TimerResolution::acquire();
+        assert_eq!(TimerResolution::active_holders(), before + 1);
+        let t2 = TimerResolution::acquire();
+        assert_eq!(TimerResolution::active_holders(), before + 2);
+        drop(t2);
+        assert_eq!(TimerResolution::active_holders(), before + 1);
+        drop(t1);
+        assert_eq!(TimerResolution::active_holders(), before);
     }
 }

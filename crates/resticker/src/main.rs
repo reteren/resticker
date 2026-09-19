@@ -50,9 +50,19 @@ use uuid::Uuid;
 
 use overlay_manager::{CoordinatorRequest, OverlayCommand, OverlayHandle};
 use rst_win32::tray::{TrayEvent, TrayIcon};
+use tauri::window::{Effect, EffectsBuilder};
 
-/// Метка окна меню трея (`tauri.conf.json`).
+/// Метка окна меню трея.
 const TRAY_MENU_LABEL: &str = "traymenu";
+
+/// Создание, повторное открытие и уничтожение окна меню трея идут из разных
+/// потоков (поток трея, таймер простоя). Под этим замком решение «окно ещё
+/// нужно?» и само уничтожение не могут разойтись с открытием.
+static TRAY_MENU_LIFECYCLE: Mutex<()> = Mutex::new(());
+
+/// То же для окна настроек: трей, хоткей координатора и второй экземпляр
+/// могут попросить его одновременно — создаётся ровно одно.
+static SETTINGS_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 /// Где меню должно появиться и ждёт ли оно показа.
 ///
@@ -65,32 +75,106 @@ struct TrayMenuState {
     origin: Mutex<Option<(i32, i32)>>,
     /// `true` — меню просили открыть и оно ждёт размера от webview.
     pending: std::sync::atomic::AtomicBool,
+    /// Счётчик поколения скрытия/открытия: инкрементируется при каждом скрытии/открытии,
+    /// чтобы таймер простоя (60 с) уничтожал окно только если его не трогали.
+    epoch: std::sync::atomic::AtomicU64,
+}
+
+/// Запланировать уничтожение окна меню трея через 60 с простоя.
+///
+/// Если за это время меню открыли снова — поколение `epoch` увеличивается,
+/// и фоновый таймер ничего не делает. Если меню простаивало все 60 с скрытым —
+/// окно уничтожается, освобождая память WebView2.
+fn schedule_tray_menu_idle_cleanup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let state = app.state::<TrayMenuState>();
+    let current_epoch = state.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        let _lifecycle = TRAY_MENU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        let state = app_clone.state::<TrayMenuState>();
+        let untouched = state.epoch.load(std::sync::atomic::Ordering::SeqCst) == current_epoch;
+        let waiting_to_show = state.pending.load(std::sync::atomic::Ordering::Acquire);
+        if untouched && !waiting_to_show {
+            if let Some(w) = app_clone.get_webview_window(TRAY_MENU_LABEL) {
+                if !w.is_visible().unwrap_or(false) {
+                    tracing::info!("меню трея: окно уничтожено по таймеру простоя 60с");
+                    let _ = w.destroy();
+                }
+            }
+        }
+    });
 }
 
 /// Попросить окно меню пересобраться под текущее состояние и показаться.
 ///
-/// Само показывает не здесь: сначала webview перечитывает конфиг и сообщает
-/// свой размер ([`tray_menu_ready`]).
+/// Если окно ещё не создано, создаёт его WebviewWindowBuilder-ом на лету (холодный старт
+/// замеряется в tracing). Само окно показывается после того, как webview сообщит свой
+/// размер ([`tray_menu_ready`]).
 fn show_tray_menu<R: tauri::Runtime>(app: &impl tauri::Manager<R>, x: i32, y: i32) {
-    let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) else {
-        return;
+    let _lifecycle = TRAY_MENU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = app.state::<TrayMenuState>();
+    *state.origin.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y));
+    state
+        .pending
+        .store(true, std::sync::atomic::Ordering::Release);
+    // Инвалидируем любой ожидающий 60с-таймер очистки
+    state.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let w = if let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) {
+        // Открытое меню по повторному клику закрывается — так ведёт себя и
+        // системное, и любая кнопка-переключатель программы.
+        if w.is_visible().unwrap_or(false) {
+            let _ = w.hide();
+            state
+                .pending
+                .store(false, std::sync::atomic::Ordering::Release);
+            schedule_tray_menu_idle_cleanup(app.app_handle());
+            return;
+        }
+        w
+    } else {
+        let t0 = std::time::Instant::now();
+        let effects = EffectsBuilder::new()
+            .effect(Effect::Acrylic)
+            .build();
+        let builder = tauri::WebviewWindowBuilder::new(
+            app,
+            TRAY_MENU_LABEL,
+            tauri::WebviewUrl::App("traymenu.html".into()),
+        )
+        .title("resticker menu")
+        .inner_size(232.0, 240.0)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .theme(Some(tauri::Theme::Dark))
+        .effects(effects)
+        .visible(false);
+
+        match builder.build() {
+            Ok(w) => {
+                let elapsed_ms = t0.elapsed().as_millis();
+                tracing::info!(elapsed_ms, "холодное открытие меню трея");
+                #[cfg(windows)]
+                {
+                    disable_browser_accelerators(&w);
+                    if let Ok(hwnd) = w.hwnd() {
+                        rst_win32::dwm::round_window_corners(hwnd.0 as isize);
+                    }
+                }
+                w
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "не удалось создать окно меню трея");
+                return;
+            }
+        }
     };
-    {
-        let state = app.state::<TrayMenuState>();
-        *state.origin.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y));
-        state
-            .pending
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-    // Открытое меню по повторному клику закрывается — так ведёт себя и
-    // системное, и любая кнопка-переключатель программы.
-    if w.is_visible().unwrap_or(false) {
-        let _ = w.hide();
-        app.state::<TrayMenuState>()
-            .pending
-            .store(false, std::sync::atomic::Ordering::Release);
-        return;
-    }
+
     // `emit`, а не `emit_to`: у окна настроек событие «показались» ходит
     // именно так и доходит до его `listen` (main.js). Адресный вариант с
     // меткой окна тихо не доезжал до webview — меню получало размер при
@@ -99,12 +183,12 @@ fn show_tray_menu<R: tauri::Runtime>(app: &impl tauri::Manager<R>, x: i32, y: i3
     tracing::debug!(x, y, "меню трея: запрошен показ");
 
     // Страховка на случай, если webview промолчит (страница ещё грузится,
-    // скрипт упал): через четверть секунды показываем меню с тем размером,
-    // который оно сообщило в прошлый раз. Иначе правый клик по иконке
+    // скрипт упал): через секунду показываем меню с тем размером,
+    // который оно сообщило в прошлый раз или дефолтным. Иначе правый клик по иконке
     // выглядел бы как «ничего не произошло» — ровно то, чего мы избегаем.
     let app_for_fallback = app.app_handle().clone();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
         let state = app_for_fallback.state::<TrayMenuState>();
         if !state
             .pending
@@ -211,6 +295,7 @@ fn watch_focus_loss<R: tauri::Runtime>(
             }
             if was_ours || fg != opened_over {
                 let _ = w.hide();
+                schedule_tray_menu_idle_cleanup(&app);
                 return;
             }
         }
@@ -251,12 +336,17 @@ fn place_tray_menu<R: tauri::Runtime>(
 fn hide_tray_menu(app: tauri::AppHandle) {
     if let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) {
         let _ = w.hide();
+        schedule_tray_menu_idle_cleanup(&app);
     }
 }
 
 /// Пункт «Открыть настройки».
+///
+/// Асинхронная команда обязательно: окно теперь создаётся по требованию, а
+/// `WebviewWindowBuilder::build` из синхронной команды на Windows зависает
+/// намертво (доккомент `WebviewWindowBuilder::new`, tauri 2.11).
 #[tauri::command]
-fn open_settings_window(app: tauri::AppHandle) {
+async fn open_settings_window(app: tauri::AppHandle) {
     show_settings_window(&app);
 }
 
@@ -317,23 +407,67 @@ fn get_config(config_path: tauri::State<PathBuf>) -> Result<Config, String> {
 
 /// Показать окно настроек: поверх всех окон и в фокусе.
 ///
+/// Если окно ещё не создано, создаёт его WebviewWindowBuilder-ом на лету (холодный старт
+/// замеряется в tracing). Окно уничтожается при закрытии, освобождая рантайм WebView2.
+///
 /// `set_always_on_top` обязателен: оверлей-окна и закреплённые окна живут с
 /// `WS_EX_TOPMOST`, и обычное окно уходит под них — на прозрачном оверлее
 /// это выглядит как «настройки открылись, но не нажимаются» (репорт
 /// пользователя 2026-08-23).
 fn show_settings_window<R: tauri::Runtime>(app: &impl tauri::Manager<R>) {
-    let Some(w) = app.get_webview_window("settings") else {
-        return;
+    let _lifecycle = SETTINGS_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    let w = if let Some(w) = app.get_webview_window("settings") {
+        let _ = w.set_always_on_top(true);
+        let _ = w.show();
+        let _ = w.set_focus();
+        let _ = w.emit("settings-shown", ());
+        report_settings_rect(app, &w);
+        w
+    } else {
+        let t0 = std::time::Instant::now();
+        let effects = EffectsBuilder::new()
+            .effect(Effect::Acrylic)
+            .build();
+        let builder = tauri::WebviewWindowBuilder::new(
+            app,
+            "settings",
+            tauri::WebviewUrl::App("index.html".into()),
+        )
+        .title("resticker — settings")
+        .inner_size(900.0, 600.0)
+        .center()
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .theme(Some(tauri::Theme::Dark))
+        .always_on_top(true)
+        .effects(effects)
+        .visible(false);
+
+        match builder.build() {
+            Ok(w) => {
+                let elapsed_ms = t0.elapsed().as_millis();
+                tracing::info!(elapsed_ms, "холодное открытие окна настроек");
+                #[cfg(windows)]
+                {
+                    disable_browser_accelerators(&w);
+                    if let Ok(hwnd) = w.hwnd() {
+                        rst_win32::dwm::round_window_corners(hwnd.0 as isize);
+                    }
+                }
+                let _ = w.show();
+                let _ = w.set_focus();
+                report_settings_rect(app, &w);
+                w
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "не удалось создать окно настроек");
+                return;
+            }
+        }
     };
-    let _ = w.set_always_on_top(true);
-    let _ = w.show();
-    let _ = w.set_focus();
-    // Вебвью загружает config.json ОДИН раз при создании и живёт дальше
-    // скрытым: без этого события список стикеров в настройках показывал
-    // состояние на момент запуска (репорт пользователя 2026-08-23 —
-    // «No stickers yet» при двух живых стикерах на экране).
-    let _ = w.emit("settings-shown", ());
-    report_settings_rect(app, &w);
+    let _ = w;
 }
 
 /// Сообщить координатору прямоугольник окна настроек (физические пиксели
@@ -599,7 +733,7 @@ fn list_open_processes() -> Vec<(String, String)> {
 /// дойдёт до JavaScript в DOM. Из-за этого пользователь не мог назначить
 /// `Alt+Shift+S` в поле хоткеев — событие просто не долетало до вебвью.
 #[cfg(windows)]
-fn disable_browser_accelerators(window: &tauri::WebviewWindow) {
+fn disable_browser_accelerators<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
     let _ = window.with_webview(|webview| {
         // SAFETY: прямое обращение к COM-интерфейсам WebView2 в соответствии
         // с контрактом WebView2 SDK.
@@ -800,6 +934,16 @@ fn consume_panic_marker(
 }
 
 fn main() -> anyhow::Result<()> {
+    // Ограничиваем рантайм Tokio для Tauri 2 рабочими потоками вместо числа ядер CPU
+    // (обычно 16-32), чтобы устранить 16 простаивающих фоновых потоков.
+    let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("инициализация tokio runtime")?;
+    tauri::async_runtime::set(tokio_rt.handle().clone());
+    let _tokio_rt = tokio_rt;
+
     let log_path = logging::init()?;
     tracing::info!(path = %log_path.display(), "логирование инициализировано");
     let panic_marker_file = panic_marker_path_for_log(&log_path);
@@ -973,26 +1117,6 @@ fn main() -> anyhow::Result<()> {
                 true
             });
 
-            #[cfg(windows)]
-            // Меню трея — то же безрамочное акриловое окно, что настройки:
-            // системных скруглений у него нет, DWM их и рисует.
-            if let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) {
-                disable_browser_accelerators(&w);
-                if let Ok(hwnd) = w.hwnd() {
-                    rst_win32::dwm::round_window_corners(hwnd.0 as isize);
-                }
-            }
-
-            if let Some(w) = app.get_webview_window("settings") {
-                disable_browser_accelerators(&w);
-                // Безрамочное окно Windows не скругляет сама — акриловая
-                // подложка торчала квадратными углами из-под скруглённого
-                // корпуса (жалоба 2026-09-05).
-                if let Ok(hwnd) = w.hwnd() {
-                    rst_win32::dwm::round_window_corners(hwnd.0 as isize);
-                }
-            }
-
             if !silent_start {
                 show_settings_window(app);
             }
@@ -1025,15 +1149,43 @@ fn main() -> anyhow::Result<()> {
                         }
                         // M7: применение пресета оставило часть стикеров
                         // неприменённой (SPEC.md §11) — форвардим списком
-                        // события фронтенду окна настроек; текст диалога —
-                        // ответственность JS (main.js уже слушает
-                        // 'preset-missing-elements').
+                        // события фронтенду окна настроек, если оно открыто;
+                        // если окно закрыто — уведомляем через баллун и баннер,
+                        // чтобы событие не пропало молча.
                         CoordinatorRequest::PresetMissingElements(missing) => {
-                            // Фронтенд (main.js) ждёт объект `{missing: [...]}`,
-                            // не голый массив — `event.payload.missing`.
                             let payload = serde_json::json!({ "missing": missing });
-                            let _ =
-                                coordinator_handle.emit_to("settings", "preset-missing-elements", payload);
+                            // Окно, которое есть, но спрятано или свёрнуто,
+                            // сообщение не покажет — тогда баллун и баннер.
+                            let has_settings = coordinator_handle
+                                .get_webview_window("settings")
+                                .is_some_and(|w| {
+                                    w.is_visible().unwrap_or(false)
+                                        && !w.is_minimized().unwrap_or(false)
+                                });
+                            let delivered = if has_settings {
+                                coordinator_handle
+                                    .emit_to("settings", "preset-missing-elements", payload)
+                                    .is_ok()
+                            } else {
+                                false
+                            };
+                            if !delivered {
+                                let lines = missing
+                                    .iter()
+                                    .map(|(_, path)| format!("• {}", path.display()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let body = format!("Пресет применён частично:\n{lines}");
+                                if let Err(e) = coordinator_handle
+                                    .state::<TrayIcon>()
+                                    .show_balloon("resticker — пресет", &body)
+                                {
+                                    tracing::warn!(error = %e, "не удалось показать баллун трея для недостающих элементов пресета");
+                                }
+                                coordinator_handle
+                                    .state::<OverlayHandle>()
+                                    .send(OverlayCommand::ShowBanner(body));
+                            }
                         }
                         CoordinatorRequest::ShowNotification { title, body } => {
                             if let Err(e) =
@@ -1057,44 +1209,70 @@ fn main() -> anyhow::Result<()> {
             if window.label() == TRAY_MENU_LABEL {
                 if let WindowEvent::Focused(false) = event {
                     let _ = window.hide();
+                    schedule_tray_menu_idle_cleanup(window.app_handle());
                 }
                 return;
             }
 
-            // Закрытие окна настроек прячет его, а не завершает процесс —
-            // приложение живёт в трее (SPEC.md, раздел 12).
+            // Окно настроек: уничтожается при закрытии, освобождая память WebView2.
             // Оверлей режима редактирования вырезает в себе прямоугольник
-            // окна настроек — значит, обязан знать про каждое его движение.
-            if matches!(
-                event,
-                WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::Focused(_)
-            ) {
-                if let Some(w) = window.get_webview_window("settings") {
-                    report_settings_rect(window.app_handle(), &w);
+            // окна настроек — значит, обязан знать про каждое его движение и исчезновение.
+            if window.label() == "settings" {
+                if matches!(
+                    event,
+                    WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::Focused(_)
+                ) {
+                    if let Some(w) = window.get_webview_window("settings") {
+                        report_settings_rect(window.app_handle(), &w);
+                    }
+                }
+                if let WindowEvent::CloseRequested { .. } = event {
+                    let _ = window.set_always_on_top(false);
+                    window
+                        .state::<OverlayHandle>()
+                        .send(OverlayCommand::SettingsWindowRect(None));
+                }
+                if let WindowEvent::Destroyed = event {
+                    window
+                        .state::<OverlayHandle>()
+                        .send(OverlayCommand::SettingsWindowRect(None));
                 }
             }
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                // Снять «поверх всех» вместе со скрытием: флаг нужен только
-                // пока окно открыто, чтобы его не заслоняли оверлей и
-                // закреплённые окна (они topmost). Оставленный включённым,
-                // он держал бы невидимое окно над чужими приложениями.
-                let _ = window.set_always_on_top(false);
-                let _ = window.hide();
-                window
-                    .state::<OverlayHandle>()
-                    .send(OverlayCommand::SettingsWindowRect(None));
-            }
         })
-        .run(tauri::generate_context!())
-        .context("запуск приложения Tauri")?;
+        .build(tauri::generate_context!())
+        .context("запуск приложения Tauri")?
+        .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                if !should_exit_on_request(code) {
+                    api.prevent_exit();
+                }
+            }
+        });
 
     Ok(())
+}
+
+/// Разрешить ли Tauri завершить процесс по `RunEvent::ExitRequested`.
+///
+/// Окна настроек и меню теперь уничтожаются, когда не нужны, и закрытие
+/// последнего из них Tauri по умолчанию считает выходом из программы
+/// (`code == None`). Программа живёт в трее и оверлее, а не в окнах, поэтому
+/// такой выход отменяется; явный выход (`AppHandle::exit`, пункт «Выход»)
+/// приходит с кодом и проходит.
+fn should_exit_on_request(code: Option<i32>) -> bool {
+    code.is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_last_window_does_not_exit_but_explicit_exit_does() {
+        assert!(!should_exit_on_request(None));
+        assert!(should_exit_on_request(Some(0)));
+        assert!(should_exit_on_request(Some(1)));
+    }
 
     /// ROADMAP.md M8 «понятные тексты ошибок вместо кодов»: текст, который
     /// увидит пользователь в окне настроек, не должен содержать сырые
@@ -1262,5 +1440,33 @@ mod tests {
         assert!(shown);
         assert!(!path.exists());
         std::fs::remove_dir_all(dir).expect("убрать временный каталог");
+    }
+
+    #[test]
+    fn tray_menu_state_defaults_and_epoch_increment() {
+        let state = TrayMenuState::default();
+        assert_eq!(state.epoch.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.pending.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(state.origin.lock().unwrap().is_none());
+
+        let next = state.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        assert_eq!(next, 1);
+        assert_eq!(state.epoch.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preset_missing_notification_formats_paths() {
+        let missing = [
+            (Uuid::new_v4(), PathBuf::from(r"C:\stickers\cat.png")),
+            (Uuid::new_v4(), PathBuf::from(r"C:\stickers\dog.gif")),
+        ];
+        let lines = missing
+            .iter()
+            .map(|(_, path)| format!("• {}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!("Пресет применён частично:\n{lines}");
+        assert!(body.contains("cat.png"));
+        assert!(body.contains("dog.gif"));
     }
 }

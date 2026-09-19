@@ -35,6 +35,7 @@ use crate::format::{
     pts_to_duration, rgb_packed_to_yuva420p, swr_out_count,
 };
 use crate::hwaccel::{self, HwDecode};
+use crate::runtime;
 
 /// Целевой формат ресемплера звука: f32, стерео, 48000 Гц (фиксированный,
 /// docs/M5B_VIDEO_DESIGN.md §4 — микшер работает в одном формате и не
@@ -342,7 +343,6 @@ impl Pipeline {
     /// вывода — `AudioTarget::default()`, если вызывающему коду он
     /// неизвестен).
     pub(crate) fn open(path: &Path, audio_target: AudioTarget) -> Result<Self, VideoError> {
-        check_runtime_versions();
         Self::open_inner(path, audio_target, None)
     }
 
@@ -381,6 +381,10 @@ impl Pipeline {
         audio_target: AudioTarget,
         hw_device: Option<&ID3D11Device>,
     ) -> Result<Self, VideoError> {
+        // До первого FFI-вызова проверяем DLL явно: иначе delay-import helper
+        // превратит отсутствие файла в необрабатываемое SEH-исключение.
+        runtime::ensure_loaded(path)?;
+        check_runtime_versions();
         let fmt = FmtCtx::open(path)?;
 
         // --- Видеопоток ---

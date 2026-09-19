@@ -157,6 +157,45 @@ impl Renderer<'_> {
 /// (`WM_CLOSE` + join потока, `OverlayWindow::drop`) раньше, чем
 /// освободится DComp-цепочка, построенная на его HWND
 /// (docs/M3_STEP4_REVIEW.md, пункт 2.3).
+/// Кэшированная маска перекрытия D3D11 для группы окклюдеров (TASK I2).
+#[derive(Clone)]
+struct CachedMask {
+    texture: Texture,
+    hash: u64,
+}
+
+/// Кэш текстур шахматки для скрытых стикеров в режиме редактирования (TASK I2).
+#[derive(Default)]
+struct CheckerboardCache {
+    entries: HashMap<(u32, u32, u32), Texture>,
+}
+
+impl CheckerboardCache {
+    fn get_or_create(
+        &mut self,
+        renderer: &Renderer,
+        cell_px: u32,
+        w_px: u32,
+        h_px: u32,
+    ) -> Result<Texture, RenderError> {
+        let key = (cell_px, w_px, h_px);
+        if let Some(tex) = self.entries.get(&key) {
+            return Ok(tex.clone());
+        }
+        if self.entries.len() > 16 {
+            self.entries.clear();
+        }
+        let rgba = rst_render::checkerboard_tile(cell_px, w_px, h_px);
+        let tex = renderer.create_texture_from_rgba(&rgba, w_px, h_px)?;
+        self.entries.insert(key, tex.clone());
+        Ok(tex)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 struct MonitorState {
     target: WindowTarget,
     overlay: OverlayWindow,
@@ -188,6 +227,12 @@ struct MonitorState {
     /// восстановления, кроме перезапуска процесса (M3_STEP5_6_REVIEW.md,
     /// пункт 2.6). На практике маловероятно — устройство только что создано.
     broken: bool,
+    /// Кэш текстур масок D3D11 по индексу группы окклюдеров (TASK I2).
+    mask_cache: HashMap<usize, CachedMask>,
+    /// Кэш текстур шахматки для скрытых стикеров в режиме редактирования (TASK I2).
+    checkerboard_cache: CheckerboardCache,
+    /// Сигнатура последнего отрисованного кадра для пропуска не изменившихся мониторов (TASK I2).
+    last_frame_hash: Option<u64>,
 }
 
 /// Окно + `WindowTarget` + поток-форвардер событий для одного монитора —
@@ -265,6 +310,9 @@ fn create_monitor_state(
         height,
         scale,
         broken: false,
+        mask_cache: HashMap::new(),
+        checkerboard_cache: CheckerboardCache::default(),
+        last_frame_hash: None,
     })
 }
 
@@ -4620,7 +4668,16 @@ fn run(
     // Номер следующего окна куска: растёт на каждое созданное окно и никогда
     // не повторяется, поэтому событие старого окна нельзя спутать с новым.
     let mut crop_generation: u64 = 0;
-    for sticker in &cfg.stickers {
+    // Скрытые стикеры на старте не грузятся вовсе — их медиа подтянет
+    // `reconcile_sticker_media`, когда стикер покажут или откроют редактор.
+    let mut media_residency = MediaResidency::default();
+    set_max_monitor_scale(
+        monitor_infos
+            .iter()
+            .map(|m| f64::from(m.dpi) / 96.0)
+            .fold(1.0, f64::max),
+    );
+    for sticker in cfg.stickers.iter().filter(|s| s.visible) {
         if let Some((sprite, anim)) = load_sticker_sprite(&device, sticker) {
             sprites.push((sticker.id, sprite));
             animations.insert(sticker.id, anim);
@@ -7294,6 +7351,29 @@ fn run(
         if !videos.is_empty() {
             videos.retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
         }
+        // Медиа ровно тем стикерам, которым оно сейчас нужно (показанным,
+        // и превью скрытым в редакторе) — после всех веток, менявших
+        // видимость, и до решения, какие видео играют.
+        set_max_monitor_scale(
+            monitor_bounds
+                .values()
+                .map(|b| b.scale)
+                .fold(1.0, f64::max),
+        );
+        if reconcile_sticker_media(
+            &device,
+            &cfg,
+            edit.active,
+            edit.gesture.is_some(),
+            Instant::now(),
+            &mut media_residency,
+            &mut sprites,
+            &mut animations,
+            &mut videos,
+            audio_mixer.as_ref(),
+        ) {
+            need_redraw = true;
+        }
         // Синхронизация Config → живые VideoSource/AudioSource (M5b) —
         // единая точка входа вместо разбросанных вызовов source.play()/
         // pause()/audio.set_volume() по местам мутации cfg (тулбар, undo/
@@ -7578,6 +7658,7 @@ fn run(
             next_pin_follow_deadline,
             next_cursor_panel_deadline,
             next_ui_anim_deadline,
+            media_residency.next_release_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -8128,6 +8209,11 @@ fn resync_sprites(
             sprite.transform = sticker.transform;
             continue;
         }
+        // Скрытому стикеру медиа не грузим — превью для редактора или полную
+        // загрузку после показа сделает `reconcile_sticker_media`.
+        if !sticker.visible {
+            continue;
+        }
         // Стикер вернулся (undo удаления) или впервые появился (дублирование,
         // ops::duplicate) — `sprites` не содержит его. Анимация (M5a):
         // `load_sticker_sprite` сама решает статика это или атлас; на
@@ -8172,6 +8258,13 @@ fn sticker_image_path(source: &StickerSource) -> Option<&Path> {
 /// загрузился — например, файл недоступен).
 fn sticker_natural_size(sprites: &[(Uuid, Sprite)], id: Uuid) -> Option<(f64, f64)> {
     let (_, sprite) = sprites.iter().find(|(sid, _)| *sid == id)?;
+    // Текстура могла быть уменьшена под экран при загрузке — натуральный
+    // размер тогда берётся из файла, а не из текстуры.
+    if sprite.video.is_none() {
+        if let Some(record) = downscale_record(id) {
+            return Some((f64::from(record.natural.0), f64::from(record.natural.1)));
+        }
+    }
     let (w, h) = match &sprite.video {
         Some(video) => (video.y.width() as f64, video.y.height() as f64),
         // `sprite.texture` для анимации (M5a) — весь текстурный атлас
@@ -8188,6 +8281,156 @@ fn sticker_natural_size(sprites: &[(Uuid, Sprite)], id: Uuid) -> Option<(f64, f6
         ),
     };
     Some((w, h))
+}
+
+/// Наибольший масштаб DPI среди подключённых мониторов, в тысячных.
+///
+/// Нужен загрузчикам медиа (предел даунскейла), которых зовут из пяти мест с
+/// разными наборами аргументов; координатор обновляет значение раз за
+/// итерацию из `monitor_bounds`, так что горячее подключение и смена DPI
+/// учитываются без правок каждого вызова.
+static MAX_MONITOR_SCALE_MILLI: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1000);
+
+fn set_max_monitor_scale(scale: f64) {
+    if scale.is_finite() && scale > 0.0 {
+        MAX_MONITOR_SCALE_MILLI.store(
+            (scale * 1000.0).round() as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Запас сверх экранного размера стикера при даунскейле: покрывает поворот,
+/// небольшое растягивание и переезд на монитор с большим DPI без перезагрузки.
+const DOWNSCALE_HEADROOM: f64 = 1.5;
+
+/// Во сколько раз экранный размер должен превысить предел, под который
+/// текстуру ужали, чтобы перезагрузить её в большем разрешении.
+const DOWNSCALE_RELOAD_RATIO: f64 = 1.25;
+
+/// Предел размера кадра в пикселях, под который имеет смысл декодировать
+/// медиа стикера: больше экран всё равно не покажет. Замер 2026-09-19: GIF
+/// 720×1280, показанный стикером 289×514 DIP, держал атлас в 6 раз больше
+/// нужного.
+fn sticker_load_limit(sticker: &Sticker) -> Option<(u32, u32)> {
+    let scale = f64::from(MAX_MONITOR_SCALE_MILLI.load(std::sync::atomic::Ordering::Relaxed)) / 1000.0;
+    let w = (sticker.placement.w * scale * DOWNSCALE_HEADROOM).ceil();
+    let h = (sticker.placement.h * scale * DOWNSCALE_HEADROOM).ceil();
+    if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
+        return None;
+    }
+    // Нижняя планка — чтобы крошечный стикер не превращался в кашу пикселей
+    // при первом же растягивании.
+    Some((w.max(64.0) as u32, h.max(64.0) as u32))
+}
+
+/// Текстура стикера загружена уменьшенной: исходный размер (для «сбросить
+/// размер», `sticker_natural_size`) и предел, под который её ужали (для
+/// перезагрузки, когда стикер растянули сильнее, `reconcile_sticker_media`).
+#[derive(Debug, Clone, Copy)]
+struct DownscaleRecord {
+    natural: (u32, u32),
+    limit: (u32, u32),
+}
+
+/// Учёт уменьшенных текстур по стикерам. Глобальный по той же причине, что
+/// `MAX_MONITOR_SCALE_MILLI`: пишут его загрузчики, у которых нет общего
+/// состояния координатора. Трогает его только поток координатора.
+static DOWNSCALED: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, DownscaleRecord>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn downscale_record(id: Uuid) -> Option<DownscaleRecord> {
+    DOWNSCALED.lock().ok()?.get(&id).copied()
+}
+
+/// Запомнить (или забыть), что стикер загружен уменьшенным.
+fn note_downscale(
+    id: Uuid,
+    natural: Option<(u32, u32)>,
+    loaded: (u32, u32),
+    limit: Option<(u32, u32)>,
+) {
+    let Ok(mut map) = DOWNSCALED.lock() else {
+        return;
+    };
+    match (natural, limit) {
+        (Some(natural), Some(limit)) if natural != loaded => {
+            map.insert(id, DownscaleRecord { natural, limit });
+        }
+        _ => {
+            map.remove(&id);
+        }
+    }
+}
+
+/// Стикер растянули заметно сильнее предела, под который ужата его текстура —
+/// пора перезагрузить в большем разрешении.
+fn downscale_outgrown(record: DownscaleRecord, wanted: (u32, u32)) -> bool {
+    let grew = |want: u32, had: u32| f64::from(want) > f64::from(had) * DOWNSCALE_RELOAD_RATIO;
+    let can_grow = |had: u32, natural: u32| had < natural;
+    (grew(wanted.0, record.limit.0) && can_grow(record.limit.0, record.natural.0))
+        || (grew(wanted.1, record.limit.1) && can_grow(record.limit.1, record.natural.1))
+}
+
+/// Из какого источника загружено медиа стикера. Пишут все загрузчики;
+/// сверка (`reconcile_sticker_media`) по нему замечает, что `cfg` вернул
+/// стикеру другой файл или тип (undo переуказания файла), а `resync_sprites`
+/// оставил старый спрайт, потому что сверяет только размещение.
+static LOADED_FROM: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, StickerSource>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn note_loaded_source(sticker: &Sticker) {
+    if let Ok(mut map) = LOADED_FROM.lock() {
+        map.insert(sticker.id, sticker.source.clone());
+    }
+}
+
+fn loaded_source(id: Uuid) -> Option<StickerSource> {
+    LOADED_FROM.lock().ok()?.get(&id).cloned()
+}
+
+fn forget_loaded_source(id: Uuid) {
+    if let Ok(mut map) = LOADED_FROM.lock() {
+        map.remove(&id);
+    }
+}
+
+/// Забыть учёт по удалённым стикерам.
+fn prune_media_records(cfg: &Config) {
+    let alive = |id: &Uuid| cfg.stickers.iter().any(|s| s.id == *id);
+    if let Ok(mut map) = LOADED_FROM.lock() {
+        map.retain(|id, _| alive(id));
+    }
+    if let Ok(mut map) = DOWNSCALED.lock() {
+        map.retain(|id, _| alive(id));
+    }
+}
+
+/// Превью скрытой анимации для редактора: только первый кадр, уменьшенный
+/// под экранный размер, без атласа. Через потоковый декодер `rst-media` —
+/// он понимает GIF/APNG/WebP, а `Device::load_image` GIF не читает вовсе.
+fn load_animation_preview(device: &Device, sticker: &Sticker) -> Option<Sprite> {
+    let path = sticker_image_path(&sticker.source)?;
+    let limit = sticker_load_limit(sticker);
+    let mut source = media_animation::StreamingAnimation::open_with_max_size(path, limit).ok()?;
+    let first = source.next_frame().ok()?;
+    let (w, h) = (source.width(), source.height());
+    let texture = device
+        .create_texture_from_rgba_owned(first.rgba, w, h)
+        .ok()?;
+    note_downscale(
+        sticker.id,
+        media_animation::frame_dimensions(path),
+        (w, h),
+        limit,
+    );
+    note_loaded_source(sticker);
+    Some(Sprite::new(
+        texture,
+        sticker.placement.clone(),
+        sticker.transform,
+    ))
 }
 
 /// Загрузить спрайт стикера по текущему `cfg`-состоянию `sticker.source`:
@@ -8210,12 +8453,23 @@ fn load_sticker_sprite(device: &Device, sticker: &Sticker) -> Option<(Sprite, St
         }
     );
     if is_animation {
-        match media_animation::decode_animation(path) {
+        let limit = sticker_load_limit(sticker);
+        match media_animation::decode_animation_with_max_size(path, limit) {
             Ok(anim) if anim.frames.len() >= 2 => {
+                let (w, h) = (anim.width, anim.height);
                 let frames: Vec<(Vec<u8>, Duration)> =
                     anim.frames.into_iter().map(|f| (f.rgba, f.delay)).collect();
-                match device.create_texture_atlas(&frames, anim.width, anim.height) {
+                // Кадры отдаются атласу во владение: он освобождает каждый,
+                // как только скопировал, и пик памяти не удваивается.
+                match device.create_texture_atlas_owned(frames, w, h) {
                     Ok(atlas) => {
+                        note_downscale(
+                            sticker.id,
+                            media_animation::frame_dimensions(path),
+                            (w, h),
+                            limit,
+                        );
+                        note_loaded_source(sticker);
                         let f0 = atlas.frames[0];
                         let sprite = Sprite::new(
                             atlas.texture.clone(),
@@ -8240,8 +8494,16 @@ fn load_sticker_sprite(device: &Device, sticker: &Sticker) -> Option<(Sprite, St
                 media_animation::MediaError::TooManyFrames { .. }
                 | media_animation::MediaError::TooLargeForAtlas { .. },
             ) => {
-                if let Some((texture, source, first_delay)) = open_streaming_animation(device, path)
+                if let Some((texture, source, first_delay)) =
+                    open_streaming_animation(device, path, limit)
                 {
+                    note_downscale(
+                        sticker.id,
+                        media_animation::frame_dimensions(path),
+                        (source.width(), source.height()),
+                        limit,
+                    );
+                    note_loaded_source(sticker);
                     let sprite = Sprite::new(
                         texture.clone(),
                         sticker.placement.clone(),
@@ -8276,8 +8538,9 @@ fn load_sticker_sprite(device: &Device, sticker: &Sticker) -> Option<(Sprite, St
 fn open_streaming_animation(
     device: &Device,
     path: &Path,
+    limit: Option<(u32, u32)>,
 ) -> Option<(Texture, media_animation::StreamingAnimation, Duration)> {
-    let mut source = match media_animation::StreamingAnimation::open(path) {
+    let mut source = match media_animation::StreamingAnimation::open_with_max_size(path, limit) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "потоковая анимация: не удалось открыть");
@@ -8473,6 +8736,7 @@ fn load_sticker_video(
     .with_video(textures);
     let duration = source.duration();
     let hw = source.hw_accel();
+    note_loaded_source(sticker);
     Some((
         sprite,
         VideoPlayback {
@@ -8492,16 +8756,424 @@ fn load_sticker_video(
 /// сама анимация не нужна.
 fn load_static_sprite(device: &Device, sticker: &Sticker) -> Option<Sprite> {
     let path = sticker_image_path(&sticker.source)?;
-    match device.load_image(path) {
-        Ok(texture) => Some(Sprite::new(
-            texture,
-            sticker.placement.clone(),
-            sticker.transform,
-        )),
+    let limit = sticker_load_limit(sticker);
+    match device.load_image_with_max_size(path, limit) {
+        Ok(texture) => {
+            note_downscale(
+                sticker.id,
+                rst_render::image_dimensions(path),
+                (texture.width(), texture.height()),
+                limit,
+            );
+            note_loaded_source(sticker);
+            Some(Sprite::new(
+                texture,
+                sticker.placement.clone(),
+                sticker.transform,
+            ))
+        }
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "не удалось загрузить изображение стикера");
             None
         }
+    }
+}
+
+/// Сколько медиа стикеру нужно держать в памяти прямо сейчас.
+///
+/// Скрытый стикер вне режима редактирования не рисуется вовсе, и держать его
+/// атлас (десятки-сотни МБ у длинного GIF) или открытое видео незачем — замер
+/// 2026-09-19: пять скрытых стикеров стоили процессу +71 МБ private и +58 МБ
+/// видеопамяти в полном покое. В режиме редактирования скрытый стикер виден
+/// замороженным кадром под шахматкой (см. `redraw`), поэтому ему хватает
+/// превью — первого кадра статичной текстурой, без атласа.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaNeed {
+    None,
+    Preview,
+    Full,
+}
+
+/// Что из медиа стикера сейчас реально загружено.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaHave {
+    None,
+    /// Первый кадр анимации статичной текстурой (только режим редактирования).
+    Preview,
+    /// Атлас анимации или статичная картинка.
+    Full,
+    /// Открытое видео. Не выгружается никогда: закрытие видео с аппаратным
+    /// декодом теряет пул поверхностей d3d11va (~68 МБ на 1080p) до конца
+    /// процесса — см. `Drop for HwDecode` в rst-video. Цикл «скрыл-показал»
+    /// с выгрузкой копил бы эту утечку.
+    Video,
+}
+
+/// Решение сверки для одного стикера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaAction {
+    Nothing,
+    LoadFull,
+    LoadPreview,
+    /// Стикер только что перестал быть нужен — завести таймер выгрузки.
+    ArmRelease,
+    Release,
+}
+
+/// Сколько скрытый стикер держит медиа, прежде чем его выгрузить.
+///
+/// Скрыть/показать все стикеры — частое действие (хоткей, трей), а повторный
+/// декод длинного GIF занимает заметные доли секунды на потоке координатора.
+/// Минута покрывает «спрятал на время звонка и вернул» без перезагрузки, а в
+/// долгом покое память всё равно освобождается.
+const HIDDEN_MEDIA_RELEASE_DELAY: Duration = Duration::from_secs(60);
+
+fn sticker_media_need(sticker: &Sticker, edit_active: bool) -> MediaNeed {
+    if sticker.visible {
+        MediaNeed::Full
+    } else if edit_active {
+        MediaNeed::Preview
+    } else {
+        MediaNeed::None
+    }
+}
+
+/// Чистое решение сверки. `failed` — уровень, загрузка которого уже не
+/// удалась (файл пропал, битый) и который не повторяем, пока потребность не
+/// упадёт до `None`; `hidden_for` — сколько стикер уже ждёт выгрузки.
+fn media_action(
+    need: MediaNeed,
+    have: MediaHave,
+    failed: Option<MediaNeed>,
+    hidden_for: Option<Duration>,
+) -> MediaAction {
+    match (need, have) {
+        (MediaNeed::Full, MediaHave::Full | MediaHave::Video) => MediaAction::Nothing,
+        (MediaNeed::Full, _) if failed == Some(MediaNeed::Full) => MediaAction::Nothing,
+        (MediaNeed::Full, _) => MediaAction::LoadFull,
+        // Уже загруженное целиком остаётся под шахматкой как есть:
+        // замороженный кадр — тот, на котором стикер спрятали.
+        (MediaNeed::Preview, MediaHave::None) if failed.is_none() => MediaAction::LoadPreview,
+        (MediaNeed::Preview, _) => MediaAction::Nothing,
+        (MediaNeed::None, MediaHave::None | MediaHave::Video) => MediaAction::Nothing,
+        (MediaNeed::None, MediaHave::Preview | MediaHave::Full) => match hidden_for {
+            None => MediaAction::ArmRelease,
+            Some(d) if d >= HIDDEN_MEDIA_RELEASE_DELAY => MediaAction::Release,
+            Some(_) => MediaAction::Nothing,
+        },
+    }
+}
+
+/// Учёт того, какие стикеры держат медиа и почему (см. [`MediaNeed`]).
+#[derive(Default)]
+struct MediaResidency {
+    /// Стикеры, чей спрайт — превью (первый кадр), а не полная анимация.
+    preview_only: HashSet<Uuid>,
+    /// Неудавшиеся загрузки — чтобы не повторять их на каждой итерации цикла.
+    failed: HashMap<Uuid, MediaNeed>,
+    /// С какого момента скрытый стикер ждёт выгрузки.
+    hidden_since: HashMap<Uuid, Instant>,
+}
+
+impl MediaResidency {
+    /// Когда координатору проснуться, чтобы выгрузить ближайший скрытый стикер.
+    fn next_release_deadline(&self) -> Option<Instant> {
+        self.hidden_since
+            .values()
+            .min()
+            .map(|since| *since + HIDDEN_MEDIA_RELEASE_DELAY)
+    }
+}
+
+/// Привести загруженные медиа в соответствие с тем, что стикерам нужно
+/// сейчас: догрузить показанные, дать превью скрытым в режиме
+/// редактирования, выгрузить давно скрытые. Раз за итерацию цикла — тем же
+/// дешёвым приёмом, что гейт `mask_needed`, а не в каждой из точек, где
+/// меняется видимость (хоткей, трей, тулбар, пресеты, undo/redo, группы).
+/// Возвращает `true`, если набор спрайтов изменился и нужен кадр.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_sticker_media(
+    device: &Device,
+    cfg: &Config,
+    edit_active: bool,
+    gesture_active: bool,
+    now: Instant,
+    residency: &mut MediaResidency,
+    sprites: &mut Vec<(Uuid, Sprite)>,
+    animations: &mut HashMap<Uuid, StickerAnimation>,
+    videos: &mut HashMap<Uuid, VideoPlayback>,
+    audio_mixer: Option<&AudioMixer>,
+) -> bool {
+    // Спрайты убирают и другие пути (удаление, `recover_device`) — учёт
+    // догоняет их здесь, а не в каждой точке.
+    residency
+        .preview_only
+        .retain(|id| sprites.iter().any(|(sid, _)| sid == id));
+    residency
+        .failed
+        .retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
+    residency
+        .hidden_since
+        .retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
+    prune_media_records(cfg);
+
+    let mut changed = false;
+    for sticker in &cfg.stickers {
+        // Кусок окна получает кадры от захвата, а не с диска — не наш.
+        if sticker_image_path(&sticker.source).is_none() {
+            residency.hidden_since.remove(&sticker.id);
+            continue;
+        }
+        let id = sticker.id;
+        // Медиа загружено из другого источника (undo переуказания файла,
+        // смена типа) — выбросить и загрузить заново по текущему.
+        if loaded_source(id).is_some_and(|src| src != sticker.source) {
+            sprites.retain(|(sid, _)| *sid != id);
+            animations.remove(&id);
+            videos.remove(&id);
+            residency.preview_only.remove(&id);
+            residency.failed.remove(&id);
+            note_downscale(id, None, (0, 0), None);
+            forget_loaded_source(id);
+            changed = true;
+        }
+        let need = sticker_media_need(sticker, edit_active);
+        let have = if videos.contains_key(&id) {
+            MediaHave::Video
+        } else if residency.preview_only.contains(&id) {
+            MediaHave::Preview
+        } else if sprites.iter().any(|(sid, _)| *sid == id) {
+            MediaHave::Full
+        } else {
+            MediaHave::None
+        };
+        // Таймер выгрузки живёт, только пока есть что выгружать: иначе его
+        // дедлайн ушёл бы в прошлое и будил бы координатор без конца.
+        if need != MediaNeed::None || matches!(have, MediaHave::None | MediaHave::Video) {
+            residency.hidden_since.remove(&id);
+        }
+        if need == MediaNeed::None {
+            residency.failed.remove(&id);
+        }
+        let hidden_for = residency
+            .hidden_since
+            .get(&id)
+            .map(|since| now.saturating_duration_since(*since));
+        let mut action = media_action(need, have, residency.failed.get(&id).copied(), hidden_for);
+        // Стикер растянули сильнее, чем позволяет уменьшенная текстура, —
+        // догрузить в нужном разрешении, но не посреди жеста (иначе декод на
+        // каждом движении мыши), а когда его отпустили.
+        if action == MediaAction::Nothing
+            && need == MediaNeed::Full
+            && have == MediaHave::Full
+            && !gesture_active
+        {
+            if let (Some(record), Some(wanted)) = (downscale_record(id), sticker_load_limit(sticker)) {
+                if downscale_outgrown(record, wanted) {
+                    action = MediaAction::LoadFull;
+                }
+            }
+        }
+        match action {
+            MediaAction::Nothing => {}
+            MediaAction::ArmRelease => {
+                residency.hidden_since.insert(id, now);
+            }
+            MediaAction::Release => {
+                sprites.retain(|(sid, _)| *sid != id);
+                animations.remove(&id);
+                note_downscale(id, None, (0, 0), None);
+                residency.preview_only.remove(&id);
+                residency.hidden_since.remove(&id);
+                changed = true;
+            }
+            MediaAction::LoadFull => {
+                // Старый спрайт живёт до конца ветки: иначе новая текстура
+                // могла бы занять адрес старой, и сравнение кадров монитора
+                // (`Texture::identity`) не заметило бы подмены.
+                let _previous = sprites
+                    .iter()
+                    .position(|(sid, _)| *sid == id)
+                    .map(|i| sprites.remove(i));
+                animations.remove(&id);
+                residency.preview_only.remove(&id);
+                if let Some((sprite, anim)) = load_sticker_sprite(device, sticker) {
+                    sprites.push((id, sprite));
+                    animations.insert(id, anim);
+                } else if let Some((sprite, playback)) =
+                    load_sticker_video(device, sticker, audio_mixer)
+                {
+                    sprites.push((id, sprite));
+                    videos.insert(id, playback);
+                } else if let Some(sprite) = load_static_sprite(device, sticker) {
+                    sprites.push((id, sprite));
+                } else {
+                    residency.failed.insert(id, MediaNeed::Full);
+                }
+                changed = true;
+            }
+            MediaAction::LoadPreview => {
+                let is_video = matches!(
+                    &sticker.source,
+                    StickerSource::File {
+                        media_type: MediaType::Video,
+                        ..
+                    }
+                );
+                // У видео превью без открытия декодера не взять — скрытое
+                // видео в редакторе показывает одну шахматку.
+                let is_animation = matches!(
+                    &sticker.source,
+                    StickerSource::File {
+                        media_type: MediaType::Animation,
+                        ..
+                    }
+                );
+                let preview = if is_video {
+                    None
+                } else if is_animation {
+                    load_animation_preview(device, sticker)
+                } else {
+                    load_static_sprite(device, sticker)
+                };
+                match preview {
+                    Some(sprite) => {
+                        sprites.push((id, sprite));
+                        if is_animation {
+                            residency.preview_only.insert(id);
+                        }
+                        changed = true;
+                    }
+                    None => {
+                        residency.failed.insert(id, MediaNeed::Preview);
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod media_residency_tests {
+    use super::*;
+
+    const LONG: Duration = HIDDEN_MEDIA_RELEASE_DELAY;
+
+    #[test]
+    fn visible_sticker_needs_full_hidden_needs_preview_only_in_editor() {
+        let mut sticker = Sticker {
+            visible: true,
+            ..Sticker::default()
+        };
+        assert_eq!(sticker_media_need(&sticker, false), MediaNeed::Full);
+        assert_eq!(sticker_media_need(&sticker, true), MediaNeed::Full);
+        sticker.visible = false;
+        assert_eq!(sticker_media_need(&sticker, true), MediaNeed::Preview);
+        assert_eq!(sticker_media_need(&sticker, false), MediaNeed::None);
+    }
+
+    #[test]
+    fn shown_sticker_loads_full_even_over_preview() {
+        use MediaAction::*;
+        assert_eq!(media_action(MediaNeed::Full, MediaHave::None, None, None), LoadFull);
+        assert_eq!(media_action(MediaNeed::Full, MediaHave::Preview, None, None), LoadFull);
+        assert_eq!(media_action(MediaNeed::Full, MediaHave::Full, None, None), Nothing);
+        assert_eq!(media_action(MediaNeed::Full, MediaHave::Video, None, None), Nothing);
+    }
+
+    #[test]
+    fn failed_load_is_not_retried_every_iteration() {
+        use MediaAction::*;
+        assert_eq!(
+            media_action(MediaNeed::Full, MediaHave::None, Some(MediaNeed::Full), None),
+            Nothing
+        );
+        assert_eq!(
+            media_action(MediaNeed::Preview, MediaHave::None, Some(MediaNeed::Preview), None),
+            Nothing
+        );
+        // Превью не вышло (видео), но показ стикера — другой уровень: пробуем.
+        assert_eq!(
+            media_action(MediaNeed::Full, MediaHave::None, Some(MediaNeed::Preview), None),
+            LoadFull
+        );
+    }
+
+    #[test]
+    fn hidden_in_editor_gets_preview_and_keeps_frozen_full_frame() {
+        use MediaAction::*;
+        assert_eq!(media_action(MediaNeed::Preview, MediaHave::None, None, None), LoadPreview);
+        assert_eq!(media_action(MediaNeed::Preview, MediaHave::Full, None, None), Nothing);
+        assert_eq!(media_action(MediaNeed::Preview, MediaHave::Video, None, None), Nothing);
+    }
+
+    #[test]
+    fn hidden_media_is_released_only_after_delay() {
+        use MediaAction::*;
+        assert_eq!(media_action(MediaNeed::None, MediaHave::Full, None, None), ArmRelease);
+        assert_eq!(
+            media_action(MediaNeed::None, MediaHave::Full, None, Some(LONG / 2)),
+            Nothing
+        );
+        assert_eq!(media_action(MediaNeed::None, MediaHave::Full, None, Some(LONG)), Release);
+        assert_eq!(
+            media_action(MediaNeed::None, MediaHave::Preview, None, Some(LONG)),
+            Release
+        );
+    }
+
+    #[test]
+    fn open_video_is_never_released() {
+        assert_eq!(
+            media_action(MediaNeed::None, MediaHave::Video, None, Some(LONG * 10)),
+            MediaAction::Nothing
+        );
+    }
+
+    #[test]
+    fn load_limit_is_screen_size_with_headroom_and_floor() {
+        set_max_monitor_scale(1.0);
+        let mut sticker = Sticker::default();
+        sticker.placement = Placement {
+            w: 289.0,
+            h: 514.0,
+            ..sticker.placement
+        };
+        assert_eq!(sticker_load_limit(&sticker), Some((434, 771)));
+        sticker.placement.w = 10.0;
+        sticker.placement.h = 10.0;
+        assert_eq!(sticker_load_limit(&sticker), Some((64, 64)));
+        sticker.placement.w = f64::NAN;
+        assert_eq!(sticker_load_limit(&sticker), None);
+    }
+
+    #[test]
+    fn reload_only_when_stretched_past_ratio_and_source_has_more_pixels() {
+        let record = DownscaleRecord {
+            natural: (720, 1280),
+            limit: (434, 771),
+        };
+        // Небольшое растягивание — в пределах запаса.
+        assert!(!downscale_outgrown(record, (500, 890)));
+        // Растянули заметно — перезагрузить.
+        assert!(downscale_outgrown(record, (600, 1067)));
+        // Предел уже упёрся в исходник — больше пикселей взять неоткуда.
+        let full = DownscaleRecord {
+            natural: (720, 1280),
+            limit: (720, 1280),
+        };
+        assert!(!downscale_outgrown(full, (2000, 3000)));
+    }
+
+    #[test]
+    fn release_deadline_follows_oldest_hidden_sticker() {
+        let mut residency = MediaResidency::default();
+        assert_eq!(residency.next_release_deadline(), None);
+        let t0 = Instant::now();
+        residency.hidden_since.insert(Uuid::new_v4(), t0 + Duration::from_secs(5));
+        residency.hidden_since.insert(Uuid::new_v4(), t0);
+        assert_eq!(residency.next_release_deadline(), Some(t0 + LONG));
     }
 }
 
@@ -17897,6 +18569,261 @@ fn apply_pinned_gesture(
     }
 }
 
+// ============================================================================
+// TASK I2: Render path optimizations (mask cache, monitor skipping, scratch)
+// ============================================================================
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static MASKS_CREATED: AtomicU64 = AtomicU64::new(0);
+static MASKS_REUSED: AtomicU64 = AtomicU64::new(0);
+static MONITORS_REDRAWN: AtomicU64 = AtomicU64::new(0);
+static MONITORS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+fn maybe_report_render_stats() {
+    thread_local! {
+        static LAST_REPORT: std::cell::RefCell<Option<Instant>> = const { std::cell::RefCell::new(None) };
+    }
+    let should_report = LAST_REPORT.with(|cell| {
+        let mut last = cell.borrow_mut();
+        let now = Instant::now();
+        match *last {
+            Some(prev) if now.duration_since(prev).as_secs() >= 5 => {
+                *last = Some(now);
+                true
+            }
+            None => {
+                *last = Some(now);
+                false
+            }
+            _ => false,
+        }
+    });
+
+    if should_report {
+        let created = MASKS_CREATED.load(Ordering::Relaxed);
+        let reused = MASKS_REUSED.load(Ordering::Relaxed);
+        let redrawn = MONITORS_REDRAWN.load(Ordering::Relaxed);
+        let skipped = MONITORS_SKIPPED.load(Ordering::Relaxed);
+        tracing::debug!(
+            masks_created = created,
+            masks_reused = reused,
+            monitors_redrawn = redrawn,
+            monitors_skipped = skipped,
+            "render_stats: 5s interval"
+        );
+    }
+}
+
+fn hash_rects(w: u32, h: u32, rects: &[Rect]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+
+    let mut hasher = DefaultHasher::new();
+    hasher.write_u32(w);
+    hasher.write_u32(h);
+    hasher.write_usize(rects.len());
+    for r in rects {
+        hasher.write_i32(r.x);
+        hasher.write_i32(r.y);
+        hasher.write_u32(r.w);
+        hasher.write_u32(r.h);
+    }
+    hasher.finish()
+}
+
+fn compute_monitor_signature(
+    monitor_id: &MonitorId,
+    ms: &MonitorState,
+    cfg: &Config,
+    edit: &EditState,
+    sprites: &[(Uuid, Sprite)],
+    occluders: Option<&[OccluderSet]>,
+) -> Option<u64> {
+    if edit.active
+        || !edit.pinned_windows.is_empty()
+        || !edit.pin_flashes.is_empty()
+        || edit.banner.is_some()
+        || edit.video_timeline.is_some()
+        || edit.cursor_panel.is_some()
+        || edit.tooltip.is_some()
+        || edit.window_picker.is_some()
+        || edit.pinned_panel.is_some()
+        || edit.group_editor.is_some()
+        || edit.gap_panel.is_some()
+        || edit.group_manager.is_some()
+        || edit.preset_picker.is_some()
+        || edit.window_pick_list.is_some()
+        || edit.confirm.is_some()
+        || edit.window_crop_hover.is_some()
+        || edit.window_crop.is_some()
+        || edit.mitosis.is_some()
+        || !edit.crop_windows_shown.is_empty()
+        || edit.video_playing
+        // Панель у курсора ещё выезжает/уезжает — кадр обязан меняться.
+        || edit
+            .cursor_panel_slide
+            .next_deadline(Instant::now())
+            .is_some()
+    {
+        return None;
+    }
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+
+    let mut hasher = DefaultHasher::new();
+    hasher.write_u32(ms.width);
+    hasher.write_u32(ms.height);
+    hasher.write_u32(ms.scale.to_bits());
+
+    let mut visible_count = 0usize;
+    for s in cfg.stickers.iter().filter(|s| s.placement.monitor_id == *monitor_id && s.visible) {
+        visible_count += 1;
+        if let Some((_, sprite)) = sprites.iter().find(|(id, _)| *id == s.id) {
+            if sprite.video.is_some() {
+                return None;
+            }
+            // Кусок окна получает кадры захвата в ту же текстуру — как видео.
+            if matches!(s.source, StickerSource::WindowCrop { .. }) {
+                return None;
+            }
+            // Потоковая анимация перезаливает одну и ту же текстуру на месте:
+            // ни UV, ни идентичность не меняются, а картинка — да. У атласа
+            // кадр всегда меньше текстуры (uv_scale < 1), у потоковой — нет.
+            let is_animation = matches!(
+                &s.source,
+                StickerSource::File {
+                    media_type: MediaType::Animation,
+                    ..
+                }
+            );
+            if is_animation && sprite.uv_scale == [1.0, 1.0] {
+                return None;
+            }
+            // Подмена текстуры (перезагрузка медиа) при тех же UV.
+            hasher.write_usize(sprite.texture.identity());
+            hasher.write_u32(sprite.uv_offset[0].to_bits());
+            hasher.write_u32(sprite.uv_offset[1].to_bits());
+            hasher.write_u32(sprite.uv_scale[0].to_bits());
+            hasher.write_u32(sprite.uv_scale[1].to_bits());
+        }
+        hasher.write(s.id.as_bytes());
+        hasher.write_i64(s.order);
+        // Смена правила видимости (пресет, трей) перекладывает стикер в
+        // другую группу окклюдеров при тех же окнах — маска меняется.
+        let group_idx = occluders
+            .and_then(|groups| groups.iter().position(|g| g.stickers.contains(&s.id)));
+        hasher.write_usize(group_idx.unwrap_or(usize::MAX));
+        hasher.write_u64(s.placement.cx.to_bits());
+        hasher.write_u64(s.placement.cy.to_bits());
+        hasher.write_u64(s.placement.w.to_bits());
+        hasher.write_u64(s.placement.h.to_bits());
+        hasher.write_u64(s.transform.rotation.to_bits());
+        hasher.write_u64(s.transform.opacity.to_bits());
+        hasher.write_u8(s.transform.flip_h as u8);
+        hasher.write_u8(s.transform.flip_v as u8);
+    }
+    hasher.write_usize(visible_count);
+
+    if let Some(groups) = occluders {
+        hasher.write_usize(groups.len());
+        for g in groups {
+            hasher.write_usize(g.rects.len());
+            for r in &g.rects {
+                hasher.write_i32(r.x);
+                hasher.write_i32(r.y);
+                hasher.write_u32(r.w);
+                hasher.write_u32(r.h);
+            }
+        }
+    } else {
+        hasher.write_usize(0);
+    }
+
+    Some(hasher.finish())
+}
+
+thread_local! {
+    static FRAME_SCRATCH: std::cell::RefCell<Vec<Sprite>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ORDER_SCRATCH: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    static MASK_SLOTS_SCRATCH: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct FrameScratchGuard {
+    frame: Vec<Sprite>,
+}
+
+impl Drop for FrameScratchGuard {
+    fn drop(&mut self) {
+        self.frame.clear();
+        FRAME_SCRATCH.with(|cell| {
+            let mut v = cell.borrow_mut();
+            if v.capacity() < self.frame.capacity() {
+                *v = std::mem::take(&mut self.frame);
+            }
+        });
+    }
+}
+
+impl std::ops::Deref for FrameScratchGuard {
+    type Target = Vec<Sprite>;
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
+}
+
+impl std::ops::DerefMut for FrameScratchGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.frame
+    }
+}
+
+struct OrderScratchGuard {
+    indices: Vec<usize>,
+}
+
+impl Drop for OrderScratchGuard {
+    fn drop(&mut self) {
+        self.indices.clear();
+        ORDER_SCRATCH.with(|cell| {
+            let mut v = cell.borrow_mut();
+            if v.capacity() < self.indices.capacity() {
+                *v = std::mem::take(&mut self.indices);
+            }
+        });
+    }
+}
+
+struct MaskSlotsScratchGuard {
+    slots: Vec<(usize, usize)>,
+}
+
+impl Drop for MaskSlotsScratchGuard {
+    fn drop(&mut self) {
+        self.slots.clear();
+        MASK_SLOTS_SCRATCH.with(|cell| {
+            let mut v = cell.borrow_mut();
+            if v.capacity() < self.slots.capacity() {
+                *v = std::mem::take(&mut self.slots);
+            }
+        });
+    }
+}
+
+impl std::ops::Deref for MaskSlotsScratchGuard {
+    type Target = Vec<(usize, usize)>;
+    fn deref(&self) -> &Self::Target {
+        &self.slots
+    }
+}
+
+impl std::ops::DerefMut for MaskSlotsScratchGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slots
+    }
+}
+
 /// Собрать и отрисовать кадр (ADR-006 — только по событию): затемнение (если
 /// активен режим редактирования), стикеры по `order` (снизу вверх), затем
 /// рамка выделения поверх, тулбар/панель у курсора/модал.
@@ -17931,15 +18858,21 @@ fn redraw(
     occluders: Option<&[OccluderSet]>,
     window_snapshot: &[WindowInfo],
     monitor_bounds: &HashMap<MonitorId, MonitorBounds>,
+    mask_cache: &mut HashMap<usize, CachedMask>,
+    checkerboard_cache: &mut CheckerboardCache,
 ) -> bool {
-    let mut frame: Vec<Sprite> = Vec::with_capacity(sprites.len() + 1 + 12);
+    let mut frame = FrameScratchGuard {
+        frame: FRAME_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut())),
+    };
     // (индекс в `frame`, индекс группы в `occluders`) для каждого видимого
     // стикера этого монитора, у которого `visibility.mode != Always` (M4).
     // Заполняется только в ветке `sticker.visible` ниже — единственное
     // место, где в `frame` попадает реальный спрайт стикера (шахматка
     // скрытого стикера и весь остальной UI никогда не маскируются, и то, и
     // то видно только при `edit.active`, а маски там всё равно выключены).
-    let mut sticker_mask_slots: Vec<(usize, usize)> = Vec::new();
+    let mut sticker_mask_slots = MaskSlotsScratchGuard {
+        slots: MASK_SLOTS_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut())),
+    };
     // Растровый шрифт — целочисленный пиксельный масштаб; `scale` (DPI/96)
     // округляем, а не берём как есть (text::rasterize ждёт `u32`).
     let text_scale = scale.round().max(1.0) as u32;
@@ -17961,14 +18894,20 @@ fn redraw(
     // шахматкой по форме AABB вместо реального содержимого (SPEC.md 3.7):
     // стикер остаётся полностью интерактивным (см. `hit_sticker_at`), просто
     // не видно, что под ней.
-    let mut order: Vec<&Sticker> = cfg
-        .stickers
-        .iter()
-        .filter(|s| s.placement.monitor_id == *monitor_id)
-        .filter(|s| s.visible || edit.active)
-        .collect();
-    order.sort_by_key(|s| s.order);
-    for sticker in order {
+    let mut order_guard = OrderScratchGuard {
+        indices: ORDER_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut())),
+    };
+    order_guard.indices.extend(
+        cfg.stickers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.placement.monitor_id == *monitor_id)
+            .filter(|(_, s)| s.visible || edit.active)
+            .map(|(i, _)| i),
+    );
+    order_guard.indices.sort_by_key(|&i| cfg.stickers[i].order);
+    for &idx in &order_guard.indices {
+        let sticker = &cfg.stickers[idx];
         if sticker.visible {
             let group_idx = occluders
                 .and_then(|groups| groups.iter().position(|g| g.stickers.contains(&sticker.id)));
@@ -18020,8 +18959,7 @@ fn redraw(
         let cell_px = (CHECKERBOARD_CELL_DIP * f64::from(scale)).round().max(1.0) as u32;
         let w_px = (bounds.w * f64::from(scale)).round().max(1.0) as u32;
         let h_px = (bounds.h * f64::from(scale)).round().max(1.0) as u32;
-        let rgba = rst_render::checkerboard_tile(cell_px, w_px, h_px);
-        match renderer.create_texture_from_rgba(&rgba, w_px, h_px) {
+        match checkerboard_cache.get_or_create(renderer, cell_px, w_px, h_px) {
             Ok(tex) => {
                 let rect = Box2D {
                     cx: bounds.x + bounds.w / 2.0,
@@ -18685,33 +19623,40 @@ fn redraw(
         PresentSync::VSync
     };
     let draw_result = if edit.active || sticker_mask_slots.is_empty() {
+        if sticker_mask_slots.is_empty() {
+            // Масок на этом мониторе больше нет — держать их текстуры
+            // (по размеру монитора каждая) незачем.
+            mask_cache.clear();
+        }
         renderer.draw(&frame, sync)
     } else {
-        // Одна GPU-текстура маски на ГРУППУ окклюдеров (не на стикер) —
-        // строится заново каждый вызов `redraw`, а не кэшируется вместе с
-        // топологией (`occluder_cache` в `run()`): рендер event-driven
-        // (ADR-006), `redraw` и так вызывается только на реальные события,
-        // а свежий размер текстуры маски гарантированно совпадает с
-        // текущим размером цели монитора (пересчитанный на смене DPI/
-        // ресайза кэш топологии мог бы держать маску старого размера).
-        let mut group_textures: HashMap<usize, Texture> = HashMap::new();
+        // Кэшированная GPU-текстура маски на ГРУППУ окклюдеров (TASK I2).
+        // Перестраивается только когда меняются rects группы или размер монитора.
         let mut device_lost_building_mask = false;
         let mut mask_build_failed = false;
         if let Some(groups) = occluders {
-            for &(_, group_idx) in &sticker_mask_slots {
-                if group_textures.contains_key(&group_idx) {
+            for &(_, group_idx) in sticker_mask_slots.iter() {
+                if group_idx >= groups.len() {
+                    continue;
+                }
+                let rects = &groups[group_idx].rects;
+                let rects_hash = hash_rects(width_px, height_px, rects);
+                let is_cached = mask_cache.get(&group_idx).is_some_and(|c| c.hash == rects_hash);
+                if is_cached {
+                    MASKS_REUSED.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 let build = renderer
                     .device
                     .create_mask_texture(width_px, height_px)
                     .and_then(|tex| {
-                        renderer.device.draw_mask(&tex, &groups[group_idx].rects)?;
+                        renderer.device.draw_mask(&tex, rects)?;
                         Ok(tex)
                     });
                 match build {
                     Ok(tex) => {
-                        group_textures.insert(group_idx, tex);
+                        mask_cache.insert(group_idx, CachedMask { texture: tex, hash: rects_hash });
+                        MASKS_CREATED.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
                         let device_lost = matches!(e, RenderError::DeviceLost(_));
@@ -18728,6 +19673,7 @@ fn redraw(
                     }
                 }
             }
+            mask_cache.retain(|k, _| *k < groups.len());
         }
         if device_lost_building_mask {
             return true;
@@ -18738,8 +19684,8 @@ fn redraw(
         // прочих несмертельных ошибок текстур в этой функции.
         let mut masks: Vec<Option<&Texture>> = vec![None; frame.len()];
         if !mask_build_failed {
-            for &(idx, group_idx) in &sticker_mask_slots {
-                masks[idx] = group_textures.get(&group_idx);
+            for &(idx, group_idx) in sticker_mask_slots.iter() {
+                masks[idx] = mask_cache.get(&group_idx).map(|c| &c.texture);
             }
         }
         renderer.draw_masked(&frame, &masks, sync)
@@ -18777,6 +19723,7 @@ fn redraw_all(
     if pin_follow_active(edit) {
         rst_win32::dwm::wait_for_composition();
     }
+    maybe_report_render_stats();
     for (monitor_id, ms) in monitors_map.iter_mut() {
         // Устаревшая цель на уже уничтоженном устройстве, которую не
         // удалось пересоздать при последнем восстановлении — не рисуем: её
@@ -18786,6 +19733,21 @@ fn redraw_all(
         // успешного `recover_device` для этого монитора.
         if ms.broken {
             continue;
+        }
+        let occluders = occluder_cache.get(monitor_id).map(Vec::as_slice);
+        let current_sig = compute_monitor_signature(
+            monitor_id,
+            ms,
+            cfg,
+            edit,
+            sprites,
+            occluders,
+        );
+        if let Some(sig) = current_sig {
+            if ms.last_frame_hash == Some(sig) {
+                MONITORS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         }
         let mut renderer = Renderer {
             device,
@@ -18803,13 +19765,17 @@ fn redraw_all(
             ms.height,
             ms.scale,
             monitor_id,
-            occluder_cache.get(monitor_id).map(Vec::as_slice),
+            occluders,
             window_snapshot,
             monitor_bounds,
+            &mut ms.mask_cache,
+            &mut ms.checkerboard_cache,
         );
         if device_lost {
             return true;
         }
+        ms.last_frame_hash = current_sig;
+        MONITORS_REDRAWN.fetch_add(1, Ordering::Relaxed);
     }
     false
 }
@@ -18846,6 +19812,9 @@ fn recover_device(
         }
     };
     for (id, ms) in monitors_map.iter_mut() {
+        ms.mask_cache.clear();
+        ms.checkerboard_cache.clear();
+        ms.last_frame_hash = None;
         match WindowTarget::new(&new_device, ms.overlay.hwnd(), ms.width, ms.height) {
             Ok(target) => {
                 ms.target = target;
@@ -18897,6 +19866,11 @@ fn recover_device(
     animations.clear();
     videos.retain(|id, _| cfg.stickers.iter().any(|s| s.id == *id));
     for sticker in &cfg.stickers {
+        // Скрытые перезагрузит `reconcile_sticker_media`, если они нужны
+        // (превью в редакторе); открытое видео перепривязывается всегда.
+        if !sticker.visible && !videos.contains_key(&sticker.id) {
+            continue;
+        }
         if let Some((sprite, anim)) = load_sticker_sprite(&new_device, sticker) {
             sprites.push((sticker.id, sprite));
             animations.insert(sticker.id, anim);
@@ -19087,7 +20061,7 @@ fn add_sticker(
         Some(Err(
             media_animation::MediaError::TooManyFrames { .. }
             | media_animation::MediaError::TooLargeForAtlas { .. },
-        )) => match open_streaming_animation(renderer.device, &path) {
+        )) => match open_streaming_animation(renderer.device, &path, None) {
             Some((texture, source, first_delay)) => (
                 texture.clone(),
                 [0.0, 0.0],

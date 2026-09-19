@@ -20,6 +20,7 @@ anyhow = "1"
 chrono = { workspace = true }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
