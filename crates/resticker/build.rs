@@ -39,11 +39,6 @@ fn emit_delay_load_args() {
         println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
     }
     println!("cargo:rustc-link-lib=dylib=delayimp");
-    // delayimp.lib просит динамический vcruntime.lib, а rustc линкует
-    // vcruntime статически: без этого исключения exe начинает требовать
-    // VCRUNTIME140.dll и не запустится там, где нет VC++ Redistributable
-    // (замер dumpbin 2026-09-19 — до delay-load этого импорта не было).
-    println!("cargo:rustc-link-arg=/NODEFAULTLIB:vcruntime.lib");
 }
 
 /// FFmpeg собран тулчейном MinGW-w64 gcc (docs/M5B_VIDEO_DESIGN.md §1), и
@@ -110,6 +105,8 @@ fn copy_ffmpeg_dlls() {
         "в {bin_dir:?} не найдено ни одной *.dll — сборка FFmpeg неполная"
     );
 
+    copy_vcruntime_dlls(&dests);
+
     for name in MINGW_RUNTIME_DLLS {
         let src = find_mingw_runtime_dll(name, &bin_dir).unwrap_or_else(|| {
             panic!(
@@ -120,6 +117,77 @@ fn copy_ffmpeg_dlls() {
         });
         copy_to_all(&src, &dests);
     }
+}
+
+/// Рантайм Visual C++, без которого exe теперь не стартует.
+///
+/// Появился вместе с delay-load FFmpeg: `delayimp.lib` — объект MSVC, и он
+/// тянет динамический vcruntime (замер dumpbin 2026-09-19: до delay-load
+/// импорта VCRUNTIME140 у exe не было). На машине без VC++ Redistributable
+/// это ровно тот отказ «программа не запускается вовсе», который уже
+/// случался с недостающими DLL FFmpeg, поэтому рантайм кладём рядом.
+const VCRUNTIME_DLLS: &[&str] = &["vcruntime140.dll", "vcruntime140_1.dll"];
+
+fn copy_vcruntime_dlls(dests: &[&Path]) {
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        return;
+    }
+    for name in VCRUNTIME_DLLS {
+        match find_vcruntime_dll(name) {
+            Some(src) => copy_to_all(&src, dests),
+            // Не жёсткая ошибка: на машине без redist-каталога сборка
+            // по-прежнему возможна, просто получившийся exe потребует
+            // установленного VC++ Redistributable.
+            None => println!(
+                "cargo:warning=не найден {name} (redist Visual C++) — exe потребует                  установленного VC++ Redistributable"
+            ),
+        }
+    }
+}
+
+/// Ищет DLL рантайма в redist-каталоге установленной Visual Studio /
+/// Build Tools; `VCToolsRedistDir` задаётся Developer Command Prompt.
+fn find_vcruntime_dll(name: &str) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = env::var_os("VCToolsRedistDir") {
+        roots.push(PathBuf::from(dir));
+    }
+    for program_files in ["ProgramFiles(x86)", "ProgramFiles"] {
+        let Some(base) = env::var_os(program_files) else {
+            continue;
+        };
+        let base = PathBuf::from(base).join("Microsoft Visual Studio");
+        let Ok(years) = fs::read_dir(&base) else {
+            continue;
+        };
+        for year in years.flatten() {
+            let Ok(editions) = fs::read_dir(year.path()) else {
+                continue;
+            };
+            for edition in editions.flatten() {
+                let redist = edition.path().join("VC").join("Redist").join("MSVC");
+                let Ok(versions) = fs::read_dir(&redist) else {
+                    continue;
+                };
+                for version in versions.flatten() {
+                    roots.push(version.path());
+                }
+            }
+        }
+    }
+    for root in roots {
+        let x64 = root.join("x64");
+        let Ok(crt_dirs) = fs::read_dir(&x64) else {
+            continue;
+        };
+        for crt in crt_dirs.flatten() {
+            let candidate = crt.path().join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn copy_to_all(src: &Path, dests: &[&Path]) {

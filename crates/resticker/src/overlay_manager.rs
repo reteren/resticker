@@ -8303,7 +8303,14 @@ fn set_max_monitor_scale(scale: f64) {
 
 /// Запас сверх экранного размера стикера при даунскейле: покрывает поворот,
 /// небольшое растягивание и переезд на монитор с большим DPI без перезагрузки.
+///
+/// У анимации запас почти нулевой, и это осознанно: кадры множатся на весь
+/// атлас, и полуторный запас по стороне — это вдвое больше памяти на ВСЮ
+/// анимацию (замер 2026-09-19: GIF 718×1280 на 90 кадров — 120 МБ против
+/// 65 МБ). Растянули сильно — атлас перезагрузится под новый размер
+/// (`downscale_outgrown`).
 const DOWNSCALE_HEADROOM: f64 = 1.5;
+const DOWNSCALE_HEADROOM_ANIMATION: f64 = 1.15;
 
 /// Во сколько раз экранный размер должен превысить предел, под который
 /// текстуру ужали, чтобы перезагрузить её в большем разрешении.
@@ -8315,8 +8322,19 @@ const DOWNSCALE_RELOAD_RATIO: f64 = 1.25;
 /// нужного.
 fn sticker_load_limit(sticker: &Sticker) -> Option<(u32, u32)> {
     let scale = f64::from(MAX_MONITOR_SCALE_MILLI.load(std::sync::atomic::Ordering::Relaxed)) / 1000.0;
-    let w = (sticker.placement.w * scale * DOWNSCALE_HEADROOM).ceil();
-    let h = (sticker.placement.h * scale * DOWNSCALE_HEADROOM).ceil();
+    let headroom = if matches!(
+        &sticker.source,
+        StickerSource::File {
+            media_type: MediaType::Animation,
+            ..
+        }
+    ) {
+        DOWNSCALE_HEADROOM_ANIMATION
+    } else {
+        DOWNSCALE_HEADROOM
+    };
+    let w = (sticker.placement.w * scale * headroom).ceil();
+    let h = (sticker.placement.h * scale * headroom).ceil();
     if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
         return None;
     }
@@ -8494,15 +8512,12 @@ fn load_sticker_sprite(device: &Device, sticker: &Sticker) -> Option<(Sprite, St
                 media_animation::MediaError::TooManyFrames { .. }
                 | media_animation::MediaError::TooLargeForAtlas { .. },
             ) => {
+                // Потоковому режиму предел НЕ передаётся: он ресайзит каждый
+                // кадр на лету, и это дороже, чем декодировать натуральный
+                // (замер 2026-09-19: 20.6% ядра против 2.5% у атласа).
                 if let Some((texture, source, first_delay)) =
-                    open_streaming_animation(device, path, limit)
+                    open_streaming_animation(device, path, None)
                 {
-                    note_downscale(
-                        sticker.id,
-                        media_animation::frame_dimensions(path),
-                        (source.width(), source.height()),
-                        limit,
-                    );
                     note_loaded_source(sticker);
                     let sprite = Sprite::new(
                         texture.clone(),
@@ -9140,7 +9155,17 @@ mod media_residency_tests {
             h: 514.0,
             ..sticker.placement
         };
+        // Статичная картинка — полуторный запас.
         assert_eq!(sticker_load_limit(&sticker), Some((434, 771)));
+        let animated = Sticker {
+            source: StickerSource::File {
+                path: std::path::PathBuf::from("a.gif"),
+                media_type: MediaType::Animation,
+            },
+            placement: sticker.placement.clone(),
+            ..Sticker::default()
+        };
+        assert_eq!(sticker_load_limit(&animated), Some((333, 592)));
         sticker.placement.w = 10.0;
         sticker.placement.h = 10.0;
         assert_eq!(sticker_load_limit(&sticker), Some((64, 64)));
