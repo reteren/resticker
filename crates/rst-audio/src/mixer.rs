@@ -297,7 +297,8 @@ impl MixerCore {
     }
 
     fn set_channels(&self, channels: u16) {
-        self.channels.store(channels.max(1) as u32, Ordering::Relaxed);
+        self.channels
+            .store(channels.max(1) as u32, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -479,9 +480,8 @@ impl AudioMixer {
         stream.play()?;
 
         let stream = Arc::new(stream);
-        let threshold_frames = (stream_config.sample_rate as u64
-            * DEFAULT_IDLE_TIMEOUT.as_millis() as u64)
-            / 1000;
+        let threshold_frames =
+            (stream_config.sample_rate as u64 * DEFAULT_IDLE_TIMEOUT.as_millis() as u64) / 1000;
         let controller = Arc::new(CpalStreamController::new(
             Arc::downgrade(&stream),
             threshold_frames,

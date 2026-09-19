@@ -401,7 +401,12 @@ impl Device {
         let (orig_w, orig_h) = (img.width(), img.height());
         let (target_w, target_h) = compute_downscale_dimensions(orig_w, orig_h, max_size);
         let rgba = if target_w != orig_w || target_h != orig_h {
-            image::imageops::resize(&img, target_w, target_h, image::imageops::FilterType::Triangle)
+            image::imageops::resize(
+                &img,
+                target_w,
+                target_h,
+                image::imageops::FilterType::Triangle,
+            )
         } else {
             img.to_rgba8()
         };
@@ -1896,7 +1901,10 @@ mod gpu_tests {
             assert_eq!(f_b.delay, f_o.delay);
         }
         assert_eq!(atlas_borrowed.texture.width(), atlas_owned.texture.width());
-        assert_eq!(atlas_borrowed.texture.height(), atlas_owned.texture.height());
+        assert_eq!(
+            atlas_borrowed.texture.height(),
+            atlas_owned.texture.height()
+        );
 
         unsafe { DestroyWindow(hwnd) }.unwrap();
     }

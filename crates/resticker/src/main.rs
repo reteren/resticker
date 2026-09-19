@@ -87,11 +87,16 @@ struct TrayMenuState {
 /// окно уничтожается, освобождая память WebView2.
 fn schedule_tray_menu_idle_cleanup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let state = app.state::<TrayMenuState>();
-    let current_epoch = state.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let current_epoch = state
+        .epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     let app_clone = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(60));
-        let _lifecycle = TRAY_MENU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        let _lifecycle = TRAY_MENU_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = app_clone.state::<TrayMenuState>();
         let untouched = state.epoch.load(std::sync::atomic::Ordering::SeqCst) == current_epoch;
         let waiting_to_show = state.pending.load(std::sync::atomic::Ordering::Acquire);
@@ -112,14 +117,18 @@ fn schedule_tray_menu_idle_cleanup<R: tauri::Runtime>(app: &tauri::AppHandle<R>)
 /// замеряется в tracing). Само окно показывается после того, как webview сообщит свой
 /// размер ([`tray_menu_ready`]).
 fn show_tray_menu<R: tauri::Runtime>(app: &impl tauri::Manager<R>, x: i32, y: i32) {
-    let _lifecycle = TRAY_MENU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    let _lifecycle = TRAY_MENU_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let state = app.state::<TrayMenuState>();
     *state.origin.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y));
     state
         .pending
         .store(true, std::sync::atomic::Ordering::Release);
     // Инвалидируем любой ожидающий 60с-таймер очистки
-    state.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state
+        .epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let w = if let Some(w) = app.get_webview_window(TRAY_MENU_LABEL) {
         // Открытое меню по повторному клику закрывается — так ведёт себя и
@@ -135,9 +144,7 @@ fn show_tray_menu<R: tauri::Runtime>(app: &impl tauri::Manager<R>, x: i32, y: i3
         w
     } else {
         let t0 = std::time::Instant::now();
-        let effects = EffectsBuilder::new()
-            .effect(Effect::Acrylic)
-            .build();
+        let effects = EffectsBuilder::new().effect(Effect::Acrylic).build();
         let builder = tauri::WebviewWindowBuilder::new(
             app,
             TRAY_MENU_LABEL,
@@ -425,9 +432,7 @@ fn show_settings_window<R: tauri::Runtime>(app: &impl tauri::Manager<R>) {
         w
     } else {
         let t0 = std::time::Instant::now();
-        let effects = EffectsBuilder::new()
-            .effect(Effect::Acrylic)
-            .build();
+        let effects = EffectsBuilder::new().effect(Effect::Acrylic).build();
         let builder = tauri::WebviewWindowBuilder::new(
             app,
             "settings",
@@ -1449,7 +1454,10 @@ mod tests {
         assert!(!state.pending.load(std::sync::atomic::Ordering::SeqCst));
         assert!(state.origin.lock().unwrap().is_none());
 
-        let next = state.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let next = state
+            .epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         assert_eq!(next, 1);
         assert_eq!(state.epoch.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

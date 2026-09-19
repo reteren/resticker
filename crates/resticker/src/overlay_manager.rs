@@ -5064,6 +5064,14 @@ fn run(
     // сообщения, вычитанного во время дренажа очереди, но не подошедшего
     // под условие коалесинга (переносится на следующую итерацию цикла).
     let mut pending: Option<OverlayMessage> = None;
+    // Один холостой тик перед циклом: всё, что делается «раз за итерацию» —
+    // подписка на готовность кадра видео, расчёт дедлайнов анимации, приём
+    // первого кадра — живёт ВНУТРИ цикла, а сам цикл ждёт сообщения. Пока
+    // окна настроек и меню создавались при старте, их события будили
+    // координатор случайно; без них стикер-видео «поверх всех» на тихом
+    // рабочем столе так и остался бы пустой текстурой (замер 2026-09-19:
+    // ноль сообщений за 12 секунд, зелёный кадр вместо картинки).
+    let _ = tx.send(OverlayMessage::AnimationTick);
     loop {
         let msg = match pending.take() {
             Some(m) => m,
@@ -7354,12 +7362,7 @@ fn run(
         // Медиа ровно тем стикерам, которым оно сейчас нужно (показанным,
         // и превью скрытым в редакторе) — после всех веток, менявших
         // видимость, и до решения, какие видео играют.
-        set_max_monitor_scale(
-            monitor_bounds
-                .values()
-                .map(|b| b.scale)
-                .fold(1.0, f64::max),
-        );
+        set_max_monitor_scale(monitor_bounds.values().map(|b| b.scale).fold(1.0, f64::max));
         if reconcile_sticker_media(
             &device,
             &cfg,
@@ -8321,7 +8324,8 @@ const DOWNSCALE_RELOAD_RATIO: f64 = 1.25;
 /// 720×1280, показанный стикером 289×514 DIP, держал атлас в 6 раз больше
 /// нужного.
 fn sticker_load_limit(sticker: &Sticker) -> Option<(u32, u32)> {
-    let scale = f64::from(MAX_MONITOR_SCALE_MILLI.load(std::sync::atomic::Ordering::Relaxed)) / 1000.0;
+    let scale =
+        f64::from(MAX_MONITOR_SCALE_MILLI.load(std::sync::atomic::Ordering::Relaxed)) / 1000.0;
     let headroom = if matches!(
         &sticker.source,
         StickerSource::File {
@@ -8983,7 +8987,9 @@ fn reconcile_sticker_media(
             && have == MediaHave::Full
             && !gesture_active
         {
-            if let (Some(record), Some(wanted)) = (downscale_record(id), sticker_load_limit(sticker)) {
+            if let (Some(record), Some(wanted)) =
+                (downscale_record(id), sticker_load_limit(sticker))
+            {
                 if downscale_outgrown(record, wanted) {
                     action = MediaAction::LoadFull;
                 }
@@ -9091,26 +9097,53 @@ mod media_residency_tests {
     #[test]
     fn shown_sticker_loads_full_even_over_preview() {
         use MediaAction::*;
-        assert_eq!(media_action(MediaNeed::Full, MediaHave::None, None, None), LoadFull);
-        assert_eq!(media_action(MediaNeed::Full, MediaHave::Preview, None, None), LoadFull);
-        assert_eq!(media_action(MediaNeed::Full, MediaHave::Full, None, None), Nothing);
-        assert_eq!(media_action(MediaNeed::Full, MediaHave::Video, None, None), Nothing);
+        assert_eq!(
+            media_action(MediaNeed::Full, MediaHave::None, None, None),
+            LoadFull
+        );
+        assert_eq!(
+            media_action(MediaNeed::Full, MediaHave::Preview, None, None),
+            LoadFull
+        );
+        assert_eq!(
+            media_action(MediaNeed::Full, MediaHave::Full, None, None),
+            Nothing
+        );
+        assert_eq!(
+            media_action(MediaNeed::Full, MediaHave::Video, None, None),
+            Nothing
+        );
     }
 
     #[test]
     fn failed_load_is_not_retried_every_iteration() {
         use MediaAction::*;
         assert_eq!(
-            media_action(MediaNeed::Full, MediaHave::None, Some(MediaNeed::Full), None),
+            media_action(
+                MediaNeed::Full,
+                MediaHave::None,
+                Some(MediaNeed::Full),
+                None
+            ),
             Nothing
         );
         assert_eq!(
-            media_action(MediaNeed::Preview, MediaHave::None, Some(MediaNeed::Preview), None),
+            media_action(
+                MediaNeed::Preview,
+                MediaHave::None,
+                Some(MediaNeed::Preview),
+                None
+            ),
             Nothing
         );
         // Превью не вышло (видео), но показ стикера — другой уровень: пробуем.
         assert_eq!(
-            media_action(MediaNeed::Full, MediaHave::None, Some(MediaNeed::Preview), None),
+            media_action(
+                MediaNeed::Full,
+                MediaHave::None,
+                Some(MediaNeed::Preview),
+                None
+            ),
             LoadFull
         );
     }
@@ -9118,20 +9151,35 @@ mod media_residency_tests {
     #[test]
     fn hidden_in_editor_gets_preview_and_keeps_frozen_full_frame() {
         use MediaAction::*;
-        assert_eq!(media_action(MediaNeed::Preview, MediaHave::None, None, None), LoadPreview);
-        assert_eq!(media_action(MediaNeed::Preview, MediaHave::Full, None, None), Nothing);
-        assert_eq!(media_action(MediaNeed::Preview, MediaHave::Video, None, None), Nothing);
+        assert_eq!(
+            media_action(MediaNeed::Preview, MediaHave::None, None, None),
+            LoadPreview
+        );
+        assert_eq!(
+            media_action(MediaNeed::Preview, MediaHave::Full, None, None),
+            Nothing
+        );
+        assert_eq!(
+            media_action(MediaNeed::Preview, MediaHave::Video, None, None),
+            Nothing
+        );
     }
 
     #[test]
     fn hidden_media_is_released_only_after_delay() {
         use MediaAction::*;
-        assert_eq!(media_action(MediaNeed::None, MediaHave::Full, None, None), ArmRelease);
+        assert_eq!(
+            media_action(MediaNeed::None, MediaHave::Full, None, None),
+            ArmRelease
+        );
         assert_eq!(
             media_action(MediaNeed::None, MediaHave::Full, None, Some(LONG / 2)),
             Nothing
         );
-        assert_eq!(media_action(MediaNeed::None, MediaHave::Full, None, Some(LONG)), Release);
+        assert_eq!(
+            media_action(MediaNeed::None, MediaHave::Full, None, Some(LONG)),
+            Release
+        );
         assert_eq!(
             media_action(MediaNeed::None, MediaHave::Preview, None, Some(LONG)),
             Release
@@ -9196,7 +9244,9 @@ mod media_residency_tests {
         let mut residency = MediaResidency::default();
         assert_eq!(residency.next_release_deadline(), None);
         let t0 = Instant::now();
-        residency.hidden_since.insert(Uuid::new_v4(), t0 + Duration::from_secs(5));
+        residency
+            .hidden_since
+            .insert(Uuid::new_v4(), t0 + Duration::from_secs(5));
         residency.hidden_since.insert(Uuid::new_v4(), t0);
         assert_eq!(residency.next_release_deadline(), Some(t0 + LONG));
     }
@@ -18703,7 +18753,11 @@ fn compute_monitor_signature(
     hasher.write_u32(ms.scale.to_bits());
 
     let mut visible_count = 0usize;
-    for s in cfg.stickers.iter().filter(|s| s.placement.monitor_id == *monitor_id && s.visible) {
+    for s in cfg
+        .stickers
+        .iter()
+        .filter(|s| s.placement.monitor_id == *monitor_id && s.visible)
+    {
         visible_count += 1;
         if let Some((_, sprite)) = sprites.iter().find(|(id, _)| *id == s.id) {
             if sprite.video.is_some() {
@@ -18737,8 +18791,8 @@ fn compute_monitor_signature(
         hasher.write_i64(s.order);
         // Смена правила видимости (пресет, трей) перекладывает стикер в
         // другую группу окклюдеров при тех же окнах — маска меняется.
-        let group_idx = occluders
-            .and_then(|groups| groups.iter().position(|g| g.stickers.contains(&s.id)));
+        let group_idx =
+            occluders.and_then(|groups| groups.iter().position(|g| g.stickers.contains(&s.id)));
         hasher.write_usize(group_idx.unwrap_or(usize::MAX));
         hasher.write_u64(s.placement.cx.to_bits());
         hasher.write_u64(s.placement.cy.to_bits());
@@ -19666,7 +19720,9 @@ fn redraw(
                 }
                 let rects = &groups[group_idx].rects;
                 let rects_hash = hash_rects(width_px, height_px, rects);
-                let is_cached = mask_cache.get(&group_idx).is_some_and(|c| c.hash == rects_hash);
+                let is_cached = mask_cache
+                    .get(&group_idx)
+                    .is_some_and(|c| c.hash == rects_hash);
                 if is_cached {
                     MASKS_REUSED.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -19680,7 +19736,13 @@ fn redraw(
                     });
                 match build {
                     Ok(tex) => {
-                        mask_cache.insert(group_idx, CachedMask { texture: tex, hash: rects_hash });
+                        mask_cache.insert(
+                            group_idx,
+                            CachedMask {
+                                texture: tex,
+                                hash: rects_hash,
+                            },
+                        );
                         MASKS_CREATED.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
@@ -19760,14 +19822,7 @@ fn redraw_all(
             continue;
         }
         let occluders = occluder_cache.get(monitor_id).map(Vec::as_slice);
-        let current_sig = compute_monitor_signature(
-            monitor_id,
-            ms,
-            cfg,
-            edit,
-            sprites,
-            occluders,
-        );
+        let current_sig = compute_monitor_signature(monitor_id, ms, cfg, edit, sprites, occluders);
         if let Some(sig) = current_sig {
             if ms.last_frame_hash == Some(sig) {
                 MONITORS_SKIPPED.fetch_add(1, Ordering::Relaxed);

@@ -167,10 +167,7 @@ pub fn decode_animation_with_max_size(
 
         total_bytes += rgba.len();
         check_thresholds(decoded.len() + 1, total_bytes)?;
-        decoded.push(DecodedFrame {
-            rgba,
-            delay,
-        });
+        decoded.push(DecodedFrame { rgba, delay });
     }
 
     if decoded.len() < 2 {
@@ -664,9 +661,18 @@ mod tests {
             (500, 281)
         );
         // Нулевые размеры / вырожденный вход
-        assert_eq!(compute_downscale_dimensions(0, 100, Some((50, 50))), (0, 100));
-        assert_eq!(compute_downscale_dimensions(100, 0, Some((50, 50))), (100, 0));
-        assert_eq!(compute_downscale_dimensions(100, 100, Some((0, 50))), (100, 100));
+        assert_eq!(
+            compute_downscale_dimensions(0, 100, Some((50, 50))),
+            (0, 100)
+        );
+        assert_eq!(
+            compute_downscale_dimensions(100, 0, Some((50, 50))),
+            (100, 0)
+        );
+        assert_eq!(
+            compute_downscale_dimensions(100, 100, Some((0, 50))),
+            (100, 100)
+        );
     }
 
     fn sized_gif_fixture(w: u32, h: u32, frame_colors: &[[u8; 4]], delays_ms: &[u32]) -> Vec<u8> {
@@ -685,12 +691,7 @@ mod tests {
 
     #[test]
     fn decode_animation_with_max_size_downscales_frames_proportionally() {
-        let gif = sized_gif_fixture(
-            80,
-            40,
-            &[[255, 0, 0, 255], [0, 255, 0, 255]],
-            &[100, 200],
-        );
+        let gif = sized_gif_fixture(80, 40, &[[255, 0, 0, 255], [0, 255, 0, 255]], &[100, 200]);
         let (_dir, path) = write_fixture(&gif, "sized.gif");
 
         // Без предела — оригинальный размер 80×40
@@ -701,8 +702,8 @@ mod tests {
         assert_eq!(original.frames[0].rgba.len(), 80 * 40 * 4);
 
         // С пределом (20, 20): пропорциональный ресайз до 20×10 (scale = 20/80 = 0.25)
-        let downscaled = decode_animation_with_max_size(&path, Some((20, 20)))
-            .expect("декод с даунскейлом");
+        let downscaled =
+            decode_animation_with_max_size(&path, Some((20, 20))).expect("декод с даунскейлом");
         assert_eq!(downscaled.width, 20);
         assert_eq!(downscaled.height, 10);
         assert_eq!(downscaled.frames.len(), 2);
@@ -722,12 +723,7 @@ mod tests {
 
     #[test]
     fn streaming_animation_with_max_size_downscales_frames() {
-        let gif = sized_gif_fixture(
-            60,
-            30,
-            &[[255, 0, 0, 255], [0, 0, 255, 255]],
-            &[100, 100],
-        );
+        let gif = sized_gif_fixture(60, 30, &[[255, 0, 0, 255], [0, 0, 255, 255]], &[100, 100]);
         let (_dir, path) = write_fixture(&gif, "stream_sized.gif");
 
         let mut stream = StreamingAnimation::open_with_max_size(&path, Some((20, 20)))

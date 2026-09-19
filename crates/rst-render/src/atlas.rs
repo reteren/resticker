@@ -195,8 +195,14 @@ mod tests {
         );
 
         // Граничные случаи: нулевые размеры
-        assert_eq!(compute_downscale_dimensions(0, 100, Some((50, 50))), (0, 100));
-        assert_eq!(compute_downscale_dimensions(100, 100, Some((0, 50))), (100, 100));
+        assert_eq!(
+            compute_downscale_dimensions(0, 100, Some((50, 50))),
+            (0, 100)
+        );
+        assert_eq!(
+            compute_downscale_dimensions(100, 100, Some((0, 50))),
+            (100, 100)
+        );
     }
 
     #[test]
