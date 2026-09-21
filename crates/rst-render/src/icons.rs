@@ -28,8 +28,22 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
         // панели у курсора: пользователь просил сделать кнопку тулбара
         // «такой же, как на основном тулбаре» (2026-09-06), а две похожие,
         // но разные пиктограммы одного смысла — худший вид расхождения.
-        Icon::Eye => return eye_rgba(EYE_OPEN_PNG, size_px, color_of(icon)),
-        Icon::EyeOff => return eye_rgba(EYE_CLOSED_PNG, size_px, color_of(icon)),
+        Icon::Eye => {
+            return raster_icon_rgba(
+                EYE_OPEN_PNG,
+                size_px,
+                color_of(icon),
+                RasterFit::WholeCanvas,
+            );
+        }
+        Icon::EyeOff => {
+            return raster_icon_rgba(
+                EYE_CLOSED_PNG,
+                size_px,
+                color_of(icon),
+                RasterFit::WholeCanvas,
+            );
+        }
         Icon::OrderUp => draw_order_up(&mut canvas, s),
         Icon::OrderDown => draw_order_down(&mut canvas, s),
         Icon::Duplicate => draw_duplicate(&mut canvas, s),
@@ -37,7 +51,10 @@ pub fn icon_rgba(icon: Icon, size_px: u32) -> Vec<u8> {
         Icon::FileOpen => draw_file_open(&mut canvas, s),
         Icon::PresetSave => draw_preset_save(&mut canvas, s),
         Icon::PresetLoad => draw_preset_load(&mut canvas, s),
-        Icon::Settings => draw_settings(&mut canvas, s),
+        // Шестерёнка — рисунок пользователя (2026-09-21), как глаза и булавка.
+        Icon::Settings => {
+            return raster_icon_rgba(SETTINGS_PNG, size_px, color_of(icon), RasterFit::Content);
+        }
         Icon::Exit => draw_exit(&mut canvas, s),
         Icon::Play => draw_play(&mut canvas, s),
         Icon::Pause => draw_pause(&mut canvas, s),
@@ -126,32 +143,63 @@ const EYE_CLOSED_PNG: &[u8] = include_bytes!("../assets/eye_closed.png");
 /// лишь добавляет к нему косую черту.
 const RASTER_ICON_FRAC: f64 = 0.82;
 
+/// Шестерёнка — рисунок пользователя (2026-09-21) взамен нарисованной
+/// примитивами: 1024×1024, белый силуэт на прозрачном, с полями вокруг.
+const SETTINGS_PNG: &[u8] = include_bytes!("../assets/settings.png");
+
+/// Как вписывать присланный PNG в квадрат иконки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RasterFit {
+    /// Канва исходника и есть рисунок (глаза нарисованы во всю канву).
+    WholeCanvas,
+    /// У исходника есть поля: берётся прямоугольник непрозрачных пикселей,
+    /// иначе иконка выйдет мельче соседей ровно на величину этих полей.
+    Content,
+}
+
+/// Доля стороны иконки для рисунка, обрезанного до содержимого
+/// ([`RasterFit::Content`]).
+///
+/// Соседи по панели рисуются примитивами внутри примерно 0.76 стороны. Столько
+/// же отдавалось и обрезанному рисунку, но присланная шестерёнка залитая, а не
+/// штриховая: при равной ширине пятно читается тяжелее контура и лезет вперёд
+/// ряда. Отсюда −15% (запрос пользователя 2026-09-21).
+const RASTER_CONTENT_FRAC: f64 = 0.646;
+
 /// Растровая иконка `size_px`×`size_px` из PNG: из исходника берётся только
-/// АЛЬФА, цвет заменяется на `color` (как у [`pinned_badge_rgba`]),
-/// рисунок вписывается в [`RASTER_ICON_FRAC`] стороны и центрируется.
-fn eye_rgba(png: &[u8], size_px: u32, color: [u8; 3]) -> Vec<u8> {
+/// АЛЬФА, цвет заменяется на `color` (как у [`pinned_badge_rgba`]), рисунок
+/// вписывается в долю стороны (см. `fit`) с сохранением пропорций и
+/// центрируется.
+fn raster_icon_rgba(png: &[u8], size_px: u32, color: [u8; 3], fit: RasterFit) -> Vec<u8> {
     let mut out = vec![0u8; (size_px as usize) * (size_px as usize) * 4];
     let decoded = match image::load_from_memory(png) {
         Ok(img) => img.into_rgba8(),
         Err(e) => {
             // Битый ресурс — не повод ронять оверлей (тот же принцип, что у
             // булавки): пустая иконка честнее паники, причина видна в логе.
-            tracing::warn!(error = %e, "иконка-глаз не декодировалась");
+            tracing::warn!(error = %e, "растровая иконка не декодировалась");
             return out;
         }
     };
-    let inner = ((f64::from(size_px) * RASTER_ICON_FRAC).round() as u32).clamp(1, size_px);
-    let scaled = image::imageops::resize(
-        &decoded,
-        inner,
-        inner,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let off = (size_px - inner) / 2;
-    for y in 0..inner {
-        for x in 0..inner {
+    let (source, frac) = match fit {
+        RasterFit::WholeCanvas => (decoded, RASTER_ICON_FRAC),
+        RasterFit::Content => (crop_to_content(decoded), RASTER_CONTENT_FRAC),
+    };
+    let (src_w, src_h) = (source.width().max(1), source.height().max(1));
+    let box_px = ((f64::from(size_px) * frac).round() as u32).clamp(1, size_px);
+    // Пропорции сохраняем: квадратный рисунок займёт весь бокс, вытянутый
+    // впишется по длинной стороне.
+    let scale = f64::from(box_px) / f64::from(src_w.max(src_h));
+    let dst_w = ((f64::from(src_w) * scale).round() as u32).clamp(1, size_px);
+    let dst_h = ((f64::from(src_h) * scale).round() as u32).clamp(1, size_px);
+    let scaled =
+        image::imageops::resize(&source, dst_w, dst_h, image::imageops::FilterType::Lanczos3);
+    let off_x = (size_px - dst_w) / 2;
+    let off_y = (size_px - dst_h) / 2;
+    for y in 0..dst_h {
+        for x in 0..dst_w {
             let alpha = scaled.get_pixel(x, y).0[3];
-            let i = (((y + off) * size_px + (x + off)) as usize) * 4;
+            let i = (((y + off_y) * size_px + (x + off_x)) as usize) * 4;
             out[i] = color[0];
             out[i + 1] = color[1];
             out[i + 2] = color[2];
@@ -159,6 +207,26 @@ fn eye_rgba(png: &[u8], size_px: u32, color: [u8; 3]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Обрезать прозрачные поля вокруг рисунка. Полностью прозрачный исходник
+/// возвращается как есть — обрезать там нечего.
+fn crop_to_content(img: image::RgbaImage) -> image::RgbaImage {
+    let (mut min_x, mut min_y) = (u32::MAX, u32::MAX);
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    for (x, y, px) in img.enumerate_pixels() {
+        if px.0[3] == 0 {
+            continue;
+        }
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    if min_x > max_x || min_y > max_y {
+        return img;
+    }
+    image::imageops::crop_imm(&img, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1).to_image()
 }
 
 /// Цвет иконки.
@@ -191,7 +259,7 @@ fn color_of(icon: Icon) -> [u8; 3] {
         // Закрытый глаз — СОСТОЯНИЕ «скрыт», а не «недоступно»: тот же
         // светлый тон, что у открытого. Пара глаз в программе одна на обе
         // кнопки видимости (2026-09-06), рисунок — присланный пользователем
-        // PNG, см. `eye_rgba`.
+        // PNG, см. `raster_icon_rgba`.
         Icon::EyeOff => LIGHT,
         // Выключенный переключатель полосы больше НЕ красится в DIM: тон
         // на тон с фоном кнопки — ровно та жалоба, из-за которой у него
@@ -449,37 +517,6 @@ fn draw_preset_load(cv: &mut Canvas, s: f64) {
         (0.38 * s, 0.48 * s),
         (0.62 * s, 0.48 * s),
     );
-}
-
-/// «Настройки»: три ползунка с ручками.
-fn draw_settings(cv: &mut Canvas, s: f64) {
-    // Шестерёнка ШТРИХОМ, а не заливкой (репорт пользователя 2026-09-17:
-    // залитая выбивалась из ряда). Соседи по тулбару — линейные знаки той же
-    // толщины (`draw_exit`, `draw_duplicate`, `draw_file_open` — 0.09s), и
-    // плотное пятно среди них читалось как чужое.
-    //
-    // Ползунков здесь нет по той же причине, по которой их убрали: в этом же
-    // тулбаре ползунок значит прозрачность и громкость.
-    let (cx, cy) = (0.5 * s, 0.5 * s);
-    const STROKE: f64 = 0.085;
-    // Обод и ступица — два кольца; между ними пусто, как у настоящей шестерни.
-    stroke_ellipse(cv, cx, cy, 0.235 * s, 0.235 * s, STROKE * s);
-    stroke_ellipse(cv, cx, cy, 0.095 * s, 0.095 * s, STROKE * s);
-    // Восемь зубцов — короткие лучи от обода наружу, той же толщины, что и
-    // штрих: длиннее — знак превращается в солнце, короче — в пунктир.
-    const TEETH: usize = 8;
-    let (from_r, to_r) = (0.215 * s, 0.35 * s);
-    for i in 0..TEETH {
-        let a = std::f64::consts::TAU * i as f64 / TEETH as f64;
-        line(
-            cv,
-            cx + from_r * a.cos(),
-            cy + from_r * a.sin(),
-            cx + to_r * a.cos(),
-            cy + to_r * a.sin(),
-            STROKE * s,
-        );
-    }
 }
 
 /// «Выйти»: дверь со стрелкой наружу.
