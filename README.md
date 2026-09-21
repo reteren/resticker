@@ -1,164 +1,235 @@
-# resticker
+<p align="center">
+  <img src="crates/resticker/icons/128x128@2x.png" width="128" alt="resticker">
+</p>
 
-> Приклей что угодно к своему монитору.
+<h1 align="center">resticker</h1>
 
-**resticker** — это desktop-оверлей для Windows 11, который позволяет закреплять картинки, GIF, видео и целые окна приложений поверх рабочего стола. Что-то среднее между OBS-сценой, работающей в реальном времени прямо на десктопе, и PowerToys Always On Top.
+<p align="center">Stick anything to your monitor.</p>
 
-Стикер лежит поверх всего, не мешает работе (клики проходят насквозь), и настраивается по одному хоткею: перетащить, отмасштабировать, повернуть, сделать полупрозрачным, спрятать или указать, над какими именно окнами он должен быть виден.
+resticker puts images, GIFs, videos and pieces of other people's windows on top
+of your desktop and then gets out of the way. Clicks pass straight through, so
+you can keep working with a sticker sitting over your text editor. When you
+actually want to move something, one hotkey turns the whole screen into an
+editor, and another turns it back.
 
-**Статус:** активная разработка, финальная доводка перед релизом 1.0. Основные вехи (стикеры, слои видимости, анимация и видео, стикеры-окна, пресеты) реализованы — см. [ROADMAP.md](ROADMAP.md) за точным списком готового и оставшегося.
-**Платформа:** Windows 11 (x64). Windows 10 и другие ОС не поддерживаются и не планируются.
-**Язык интерфейса:** английский (весь UI — окно настроек, оверлей, меню трея, уведомления).
-**Лицензия:** MIT.
+It also does a few things to windows themselves: pin one on top, slice one in
+half, cut a rectangle out of one, or collect several into a numbered group that
+comes back with `Ctrl+Alt+3`.
 
----
-
-## Скриншоты
-
-> TODO: сюда пойдут скриншоты режима редактирования, панели у курсора,
-> окна настроек (вкладки «Стикеры»/«Пресеты») и гифка с живым лупом
-> анимированного стикера — ROADMAP.md M8. Не добавлены в этом срезе:
-> нужен реальный запуск приложения на экране, чтобы их снять.
+![Stickers over the desktop](docs/img/desktop.png)
 
 ---
 
-## Что умеет (план на 1.0)
+## Status
 
-**Стикеры**
-- Изображения: PNG, JPEG, WebP, BMP, TIFF (с альфа-каналом)
-- Анимация: GIF, анимированный WebP, APNG
-- Видео: всё, что читает FFmpeg (MP4/H.264, HEVC, VP9, AV1, MKV, MOV…), с лупом и звуком
-- Видео с прозрачностью: WebM/VP9 (`yuva420p`), ProRes 4444 (`yuva444p10le`)
-- Окна приложений — можно «приклеить» чужое окно так же, как картинку
+**Shipped:** stickers (images, GIF/APNG/WebP animation, video with sound and a
+seek bar, transparent video), the edit mode with handles, rotation, snapping,
+marquee select and undo/redo, visibility layers, window pinning, window groups,
+window crop, window mitosis, presets, multi-monitor with hot-plug, tray,
+autostart, silent start, ru/en interface, and an NSIS installer.
 
-**Взаимодействие**
-- Стикеры кликабельно-прозрачны: обычная работа за компьютером никак не затрагивается
-- Глобальный хоткей включает режим редактирования: экран затемняется на 50%, стикеры становятся интерактивными
-- Выделение и трансформация в стиле Photoshop: 8 ручек, поворот за углом, `Shift` — пропорции, `Alt` — от центра, `Shift` при повороте — шаг 15°
-- Мультивыделение рамкой и `Shift`+клик
-- Магнит к краям и центрам мониторов
-- Undo / Redo (`Ctrl+Z` / `Ctrl+Shift+Z`)
-- Тулбар под выделением: прозрачность, слои видимости, скрытие, порядок, дублирование, удаление
+**Measured** on the dev machine (two monitors, 2560×1440 and 1920×1080,
+GTX 1070 Ti, release build):
 
-**Слои видимости**
-- Для каждого стикера задаётся список окон/процессов, над которыми он виден
-- «Только рабочий стол» — пустой список: любое окно перекрывает стикер
-- «Поверх всего» — стикер всегда сверху
-- Скрытый стикер в режиме редактирования отображается чёрно-розовой шахматкой (как missing texture в Source)
-
-**Мультимонитор**
-- Стикеры переносятся между мониторами, живут в координатах конкретного монитора
-- Корректная работа со смешанным DPI
-- Умное поведение при отключении/возврате монитора
-
-**Прочее**
-- Пресеты: сохранить и загрузить всю расстановку в один клик
-- Иконка в трее, автозапуск, тихий старт
-- Опция исключения стикеров из скриншотов и захвата OBS
-
----
-
-## Технологический стек
-
-| Слой | Технология | Почему |
-|---|---|---|
-| Язык | Rust (edition 2024) | Обязателен для Tauri; даёт нужный уровень контроля над памятью и потоками без GC-пауз |
-| Окно настроек | Tauri 2 + TypeScript | Быстрая разработка UI, готовый трей, автообновления |
-| Рендер оверлеев | Direct3D 11 + DirectComposition, напрямую через `windows-rs` | Единственный путь к аппаратной попиксельной прозрачности **и** zero-copy интеропу с аппаратным декодом видео |
-| Системный слой | `windows` (windows-rs) | Win32: хуки, перечисление окон, хоткеи, трей |
-| Изображения | `image` | PNG/JPEG/WebP/GIF/APNG |
-| Видео | `ffmpeg-next` (LGPL-сборка, decode-only) | Форматы «любые», аппаратный декод через D3D11VA |
-| Звук | `cpal` (WASAPI) | Микшер для аудиодорожек видео-стикеров |
-
-Подробное обоснование — в [DECISIONS.md](DECISIONS.md).
-
-**Важно:** оверлеи — это не окна Tauri. Tauri отвечает только за окно настроек. 25 стикеров = от одного до трёх нативных Win32-окон (по одному на монитор), а не 25 WebView. Почему именно так — [ARCHITECTURE.md](ARCHITECTURE.md).
-
----
-
-## Документация
-
-| Файл | Что внутри |
+| | Measured |
 |---|---|
-| [SPEC.md](SPEC.md) | Функциональная спецификация: что именно делает программа |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Техническая архитектура, решение проблемы слоёв, оптимизация CPU |
-| [ROADMAP.md](ROADMAP.md) | Дорожная карта по вехам, от M0 до 1.0 |
-| [DECISIONS.md](DECISIONS.md) | ADR — принятые решения и отвергнутые альтернативы с обоснованием |
-| [CONFIG.md](CONFIG.md) | Формат конфигов, схема данных, пресеты |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Сборка из исходников, стиль кода, структура репозитория |
+| Idle RAM, everything closed | **62 MB**, one process |
+| Idle CPU | **0 %** |
+| Three animations and a video on screen | **96 MB**, ~3 % of one core |
+| Settings window, cold open | **~300 ms** |
+| WebView2 processes while its windows are closed | **0** |
+
+The settings window and the tray menu are built only when you open them and
+destroyed when you close them, so most of the time there is no browser engine
+in memory at all. FFmpeg is delay-loaded too: no video, no 100 MB of decoder
+mapped into the process.
+
+**Not verified:** mixed DPI (both monitors here are 100 %), and every video
+format except MP4/H.264. The list of extensions comes from the code, not from
+a test run of each one.
 
 ---
 
-## Установка
+## Install
 
-Готового релиза на странице релизов ещё нет — до тех пор единственный способ
-поставить resticker — собрать инсталлятор из исходников (ниже) и запустить
-получившийся `resticker_<версия>_x64-setup.exe` из
-`target/release/bundle/nsis/`. Инсталлятор не подписан сертификатом (его пока
-нет) — Windows SmartScreen предупредит о неизвестном издателе, это ожидаемо
-до появления подписи.
+Grab `resticker_x.y.z_x64-setup.exe` from the
+[latest release](../../releases/latest) and run it. It installs per user, no
+admin rights needed.
 
-## Сборка
+> SmartScreen will warn on first run. The build isn't code-signed, certificates
+> cost money this project doesn't have. *More info → Run anyway*, or build it
+> yourself below.
 
-Требуется:
-- Rust stable (MSVC toolchain), `rustup target add x86_64-pc-windows-msvc`
-- Visual Studio Build Tools 2022 с Windows 11 SDK
-- Node.js 20+ и pnpm
-- FFmpeg dev-библиотеки (LGPL shared build) и `libclang` — см. [CONTRIBUTING.md](CONTRIBUTING.md)
+Windows 11 x64 only. Windows 10 isn't supported.
+
+---
+
+## Hotkeys
+
+| | |
+|---|---|
+| `Ctrl+Alt+S` | edit mode, in and out |
+| `Ctrl+Alt+H` | show / hide every sticker |
+| `Ctrl+Alt+M` | mute / unmute |
+| `Ctrl+Alt+T` | pin the window under the cursor on top |
+| `Ctrl+Alt+U` | unpin everything |
+| `Ctrl+Alt+G` | window group menu |
+| `Ctrl+Alt+1` … `9` | bring back a group |
+| `Ctrl+Alt+Shift+G` | delete the open group |
+| `Ctrl+Alt+Shift+T` | pin the open group on top |
+| `Ctrl+Alt+F` | slice a window in half |
+| `Ctrl+Alt+C` | cut a piece out of a window |
+
+All of them are rebindable in Settings → Controls and take effect immediately.
+Only the edit-mode one is mandatory; the rest can be cleared. If something else
+already owns a combination, the app tells you on screen instead of silently
+doing nothing.
+
+---
+
+## Features
+
+**Stickers**
+- Images: PNG, JPG, WebP, BMP, GIF
+- Animation: GIF, APNG, animated WebP, recognised by the file's magic bytes
+  rather than its extension
+- Video: MP4, MKV, WebM, MOV, AVI, WMV, FLV, MPG, TS, M2TS, 3GP, OGV and the
+  rest of what FFmpeg reads, with sound, looping and a seek bar
+- Transparent video: VP9 with alpha, ProRes 4444
+- Hardware decode through D3D11VA, the frame never travels through the CPU
+- Per-sticker opacity, rotation, flip and z-order
+
+**Edit mode**
+- Eight handles, rotation by the corner, `Shift` keeps the ratio, `Alt` resizes
+  from the center, `Shift` while rotating snaps to 15°
+- Marquee and `Shift`+click for multiple stickers, magnets to monitor edges and
+  centers
+- `Ctrl+Z` / `Ctrl+Shift+Z`
+- A toolbar under the selection: opacity, visibility layers, hide, order,
+  duplicate, delete
+- A hidden sticker shows up as the black-and-pink missing-texture checkerboard,
+  because that's what it deserves
+
+**Visibility layers**
+
+This is the part I like most. Every sticker decides what it hides under:
+always on top, desktop only, under any window that covers it, under a chosen
+list of windows, or over everything except a chosen list. The window list is
+live: open a new window and it appears there.
+
+**Windows**
+- Pin the window under the cursor on top, optionally with an outline
+- Snap gap: when a window snaps to an edge it shrinks by a few percent so the
+  sticker underneath stays visible
+- Groups: tick a few windows, give them a number, and the whole layout comes
+  back with `Ctrl+Alt+<number>`. Groups are tied to the boot session, since
+  after a reboot those windows don't exist anymore
+- Crop: drag a rectangle out of any window and keep that piece floating on top.
+  It's a live mirror, the content updates with the source. It also **can't be
+  clicked** — it's mirrored pixels, not a window, and Windows has no way to
+  deliver a click into it. The strip on top is how you move and pin it
+- Mitosis: cut a window in half and get a second instance of the same app next
+  to it. The axis picks itself from where the cursor is. Made for two Explorer
+  windows side by side, works for anything that can open a second window
+
+**Presets**
+
+Save the whole arrangement under a name and bring it back in one click. If a
+file went missing since you saved it, the app says which ones didn't make it.
+
+**Multi-monitor**
+
+Stickers live in their own monitor's coordinates and can be dragged across.
+Plugging, unplugging and resolution changes are handled live: unplug a monitor
+and its stickers move to the primary one, plug it back and they return.
+
+![Settings](docs/img/settings.png)
+
+---
+
+## A few notes from the build side
+
+- Stickers aren't web views. They're drawn with Direct3D 11 and
+  DirectComposition into one native window per monitor, so 40 stickers still
+  cost one window, not 40. Tauri only runs the settings window and the tray
+  menu.
+- Those two windows are created on demand and destroyed on close. That's where
+  most of the memory went before: two hidden WebView2 windows were holding
+  around 350 MB of browser processes doing nothing.
+- A hidden sticker isn't loaded at all. In the editor it shows its first frame
+  under the checkerboard, and a minute after you hide it the atlas is dropped.
+- Animations are downscaled to the size they're actually drawn at. A 718×1280
+  GIF shown as a 289×514 sticker was keeping a 315 MB atlas of full-resolution
+  frames.
+- Frames of an animation live in one texture atlas, so playing it only swaps UV
+  coordinates instead of uploading a new frame every tick. Streaming
+  frame-by-frame was measured and it costs several times more CPU.
+- Window crop pieces are real windows, not sprites: one for the content, one
+  for the strip, and the content one never takes focus so your cursor stays
+  where you were typing.
+- The window tracker only does a full sweep of every window when it sees one it
+  doesn't know. Alt-tabbing just re-reads the z-order.
+- Config is `%APPDATA%\resticker\config.json`, logs are in
+  `%LOCALAPPDATA%\resticker\logs`. `RUST_LOG=resticker=debug` makes them
+  talkative.
+
+---
+
+## What it can't do
+
+Windows limitations, not bugs:
+
+- Exclusive fullscreen games own the output, no overlay shows up over them.
+  Borderless is fine.
+- A window running as administrator can't be pinned, sliced or cropped unless
+  resticker runs elevated too.
+- DRM-protected video (Netflix in a browser, that sort of thing) does whatever
+  it wants underneath the overlay.
+- Transparent video decodes on the CPU. GPUs don't do alpha.
+- A window minimised to the tray is invisible to the enumeration, so it can't
+  join a group.
+- The cropped piece can't be clicked, see above.
+
+---
+
+## Building
+
+You'll need Rust stable (MSVC), Visual Studio Build Tools 2022 with the Windows
+11 SDK, Node.js 20+, libclang, and an FFmpeg 7.1 LGPL shared build (decoders
+only). The version matters: the bindings are generated for libavcodec 61 and
+the build script rejects anything else.
 
 ```powershell
-git clone https://github.com/<user>/resticker
+git clone https://github.com/reteren/resticker
 cd resticker
-pnpm install
+npm install
 
-# FFmpeg-линкуемые крейты (rst-video, resticker) требуют эти переменные —
-# путь подставьте свой, см. CONTRIBUTING.md за инструкцией по сборке FFmpeg.
-# Версия FFmpeg обязана быть 7.1 (libavcodec 61): под неё написаны биндинги,
-# сборка с другой версией отклоняется build.rs.
-$env:FFMPEG_DIR = "путь\к\ffmpeg-7.1\install"
-$env:LIBCLANG_PATH = "путь\к\llvm\bin"
+$env:FFMPEG_DIR = "path\to\ffmpeg-7.1\install"
+$env:LIBCLANG_PATH = "path\to\llvm\bin"
+$env:MINGW_RUNTIME_DIR = "path\to\msys64\mingw64\bin"
 
-# Запуск без сборки инсталлятора:
-cargo run -p resticker --release
-
-# Инсталлятор (NSIS) со сборкой в release — результат в
-# target/release/bundle/nsis/:
-pnpm tauri build --bundles nsis
+cargo run -p resticker --release                              # just run it
+npx tauri build --config crates/resticker/tauri.conf.json     # NSIS installer
 ```
 
-## Хоткеи по умолчанию
+The installer lands in `target\release\bundle\nsis\`.
 
-| Комбинация | Действие |
-|---|---|
-| `Ctrl+Alt+S` | Войти/выйти из режима редактирования |
-| `Ctrl+Alt+H` | Показать/скрыть все стикеры |
-| `Ctrl+Alt+M` | Заглушить/включить звук всех стикеров |
-
-Все три переназначаются в настройках, вкладка «Управление»: новая комбинация
-начинает работать сразу по кнопке «Применить», перезапуск не нужен. Первые два
-необязательны и могут быть сняты полностью; хоткей режима редактирования
-обязателен.
-
-Конфигурация хранится в `%APPDATA%\resticker\config.json` — формат описан в
-[CONFIG.md](CONFIG.md).
+More detail in [CONTRIBUTING.md](CONTRIBUTING.md); [SPEC.md](SPEC.md) describes
+what the program does down to the corner cases, [ARCHITECTURE.md](ARCHITECTURE.md)
+how it's put together, and [DECISIONS.md](DECISIONS.md) which alternatives were
+tried and thrown away.
 
 ---
 
-## Известные ограничения платформы
+## License
 
-Это не баги, а ограничения Windows. Обойти их нельзя, о них лучше знать заранее:
+MIT, see [LICENSE](LICENSE).
 
-1. **Эксклюзивный полноэкранный режим.** Игра в exclusive fullscreen забирает вывод целиком — никакой оверлей поверх неё не появится. Работает только borderless fullscreen. То же касается некоторых плееров с аппаратным overlay-выводом.
-2. **Окна с правами администратора.** Если целевое окно запущено от админа, а resticker — нет, закрепить его не получится (UIPI блокирует). Решение — запускать resticker с повышенными правами.
-3. **DRM-защищённый контент.** Netflix в Edge и подобное рендерится в защищённом пути; поведение оверлея поверх такого контента непредсказуемо.
-4. **Аппаратный декод видео с альфой.** NVDEC не декодирует альфа-канал вообще. Прозрачные видео (VP9 alpha, ProRes 4444) декодируются программно — это дороже по CPU, чем обычное видео.
+FFmpeg is linked dynamically as an LGPL-2.1 shared build configured with
+`--disable-gpl --disable-nonfree`, decoders only, which puts no GPL
+requirements on this code. Its binaries ship with their own license and aren't
+modified.
 
----
-
-## Лицензия
-
-Код проекта — MIT, см. [LICENSE](LICENSE).
-
-FFmpeg подключается динамически как LGPL-2.1 shared build, собранный с `--disable-gpl --disable-nonfree` (только декодеры). Такая связка не накладывает на код проекта требований GPL. Бинарники FFmpeg распространяются вместе с их лицензией и не модифицируются.
-
-Логика закрепления окон портирована по мотивам модуля Always On Top из [microsoft/PowerToys](https://github.com/microsoft/PowerToys) (MIT). Это самостоятельная реализация на Rust, а не копирование кода.
+Window pinning follows the idea of the Always On Top module from
+[microsoft/PowerToys](https://github.com/microsoft/PowerToys) (MIT). It's a
+separate Rust implementation, not copied code.
